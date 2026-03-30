@@ -1,0 +1,114 @@
+{{- if .Values.dex.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-dex
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dex
+data:
+  config.yaml: |
+    issuer: {{ .Values.auth.oidc.issuer | default (printf "http://%s-dex:5556" (include "kubevirt-ui.fullname" .)) }}
+
+    storage:
+      type: {{ .Values.dex.storage.type | default "memory" }}
+      {{- if eq .Values.dex.storage.type "kubernetes" }}
+      config:
+        inCluster: true
+      {{- end }}
+
+    web:
+      http: 0.0.0.0:5556
+
+    telemetry:
+      http: 0.0.0.0:5558
+
+    # Static clients
+    staticClients:
+      - id: {{ .Values.auth.oidc.clientId | default "kubevirt-ui" }}
+        name: KubeVirt UI
+        {{- if .Values.auth.oidc.clientSecretRef.name }}
+        secretEnv: KUBEVIRT_UI_CLIENT_SECRET
+        {{- else }}
+        secret: kubevirt-ui-secret
+        {{- end }}
+        redirectURIs:
+          {{- if .Values.ingress.enabled }}
+          {{- range .Values.ingress.hosts }}
+          {{- if $.Values.ingress.tls }}
+          - "https://{{ .host }}/auth/callback"
+          {{- else }}
+          - "http://{{ .host }}/auth/callback"
+          {{- end }}
+          {{- end }}
+          {{- else }}
+          - "http://localhost:3333/auth/callback"
+          {{- end }}
+
+    connectors:
+    {{- if and .Values.lldap.enabled (not .Values.dex.connectors) }}
+      # Auto-configured LDAP connector for bundled LLDAP
+      - type: ldap
+        id: lldap
+        name: "KubeVirt UI"
+        config:
+          host: {{ include "kubevirt-ui.fullname" . }}-lldap:3890
+          insecureNoSSL: true
+          bindDN: "uid={{ .Values.lldap.adminUser }},ou=people,{{ .Values.lldap.baseDN }}"
+          bindPW: {{ .Values.lldap.adminPassword | quote }}
+          usernamePrompt: "Username"
+          userSearch:
+            baseDN: "ou=people,{{ .Values.lldap.baseDN }}"
+            filter: "(objectClass=person)"
+            username: uid
+            idAttr: uid
+            emailAttr: mail
+            nameAttr: displayName
+          groupSearch:
+            baseDN: "ou=groups,{{ .Values.lldap.baseDN }}"
+            filter: "(objectClass=groupOfUniqueNames)"
+            userMatchers:
+              - userAttr: dn
+                groupAttr: member
+            nameAttr: cn
+    {{- else if .Values.dex.connectors }}
+      # Custom connectors (external LDAP, GitHub, OIDC, etc.)
+      {{- toYaml .Values.dex.connectors | nindent 6 }}
+    {{- else }}
+      []
+    {{- end }}
+
+    {{- if .Values.dex.enablePasswordDB }}
+    enablePasswordDB: true
+    {{- end }}
+
+    {{- if and .Values.dex.staticPasswords .Values.dex.enablePasswordDB }}
+    staticPasswords:
+      {{- range .Values.dex.staticPasswords }}
+      - email: {{ .email | quote }}
+        hash: {{ .hash | quote }}
+        username: {{ .username | quote }}
+        userID: {{ .userID | quote }}
+      {{- end }}
+    {{- end }}
+
+    # OAuth2 configuration
+    oauth2:
+      skipApprovalScreen: true
+      responseTypes:
+        - code
+        - token
+        - id_token
+
+    # Token expiry
+    expiry:
+      idTokens: "24h"
+      refreshTokens:
+        reuseInterval: "3s"
+        validIfNotUsedFor: "168h"
+        absoluteLifetime: "720h"
+
+    logger:
+      level: {{ .Values.dex.logLevel | default "info" | quote }}
+      format: "text"
+{{- end }}

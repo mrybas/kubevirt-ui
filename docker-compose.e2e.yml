@@ -1,0 +1,18 @@
+services:
+  e2e:
+    build:
+      context: ./e2e
+      dockerfile: Dockerfile
+    depends_on:
+      - frontend
+    networks:
+      - kubevirt-ui
+    volumes:
+      - ./e2e/results:/e2e/results
+    environment:
+      - BASE_URL=http://frontend:3000
+      - API_URL=http://backend:8000
+      - DEX_ISSUER=http://dex:5556
+      - LLDAP_URL=http://lldap:17170
+      - LLDAP_ADMIN_USER=admin
+      - LLDAP_ADMIN_PASSWORD=admin_password

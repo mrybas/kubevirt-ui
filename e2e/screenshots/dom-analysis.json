@@ -1,0 +1,2389 @@
+[
+  {
+    "url": "/dashboard",
+    "title": "Dashboard",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "1H",
+        "x": 1565,
+        "y": 436,
+        "width": 30,
+        "height": 24,
+        "bg": "rgba(14, 165, 233, 0.2)",
+        "color": "rgb(125, 211, 252)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "6H",
+        "x": 1597,
+        "y": 436,
+        "width": 30,
+        "height": 24,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "24H",
+        "x": 1629,
+        "y": 436,
+        "width": 37,
+        "height": 24,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "table",
+    "tableInfo": {
+      "columns": 1,
+      "rows": 1,
+      "headers": [
+        "Cluster CPU %"
+      ]
+    },
+    "typography": {
+      "h1": null,
+      "h2": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "body": {
+        "size": "16px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 0,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 5,
+      "links": 1,
+      "images": 12,
+      "tables": 2,
+      "cards": 14,
+      "inputs": 0,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/vms",
+    "title": "Virtual Machines",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "All VMs",
+          "isActive": true
+        },
+        {
+          "text": "Templates",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Try again",
+        "x": 1027,
+        "y": 192,
+        "width": 122,
+        "height": 40,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      }
+    ],
+    "contentType": "unknown",
+    "tableInfo": null,
+    "typography": {
+      "h1": null,
+      "h2": {
+        "size": "20px",
+        "weight": "600",
+        "color": "rgb(161, 161, 170)"
+      },
+      "body": {
+        "size": "14px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 0,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 1,
+      "links": 0,
+      "images": 0,
+      "tables": 0,
+      "cards": 0,
+      "inputs": 0,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/vms/templates",
+    "title": "VM Templates",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "All VMs",
+          "isActive": true
+        },
+        {
+          "text": "Templates",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Create Template",
+        "x": 1552,
+        "y": 100,
+        "width": 176,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "All Projects",
+        "x": 1512,
+        "y": 172,
+        "width": 138,
+        "height": 38,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(244, 244, 245)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "Create Template",
+        "x": 1000,
+        "y": 487,
+        "width": 176,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "grid",
+    "tableInfo": null,
+    "typography": {
+      "h1": null,
+      "h2": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "body": {
+        "size": "16px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "emptyStateText": "",
+    "formInfo": {
+      "formCount": 1,
+      "inputCount": 1,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 6,
+      "links": 0,
+      "images": 8,
+      "tables": 0,
+      "cards": 2,
+      "inputs": 1,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/storage/images",
+    "title": "Storage Images",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Images",
+          "isActive": true
+        },
+        {
+          "text": "Classes",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "New Disk",
+        "x": 1446,
+        "y": 99,
+        "width": 122,
+        "height": 38,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(244, 244, 245)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "Import Image",
+        "x": 1576,
+        "y": 99,
+        "width": 152,
+        "height": 38,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "Images0",
+        "x": 448,
+        "y": 282,
+        "width": 107,
+        "height": 34,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(251, 191, 36)",
+        "position": "left",
+        "isTopArea": false
+      },
+      {
+        "text": "Data Disks0",
+        "x": 579,
+        "y": 282,
+        "width": 139,
+        "height": 34,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "left",
+        "isTopArea": false
+      },
+      {
+        "text": "New Disk",
+        "x": 945,
+        "y": 656,
+        "width": 122,
+        "height": 38,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(244, 244, 245)",
+        "position": "left",
+        "isTopArea": false
+      },
+      {
+        "text": "Import Image",
+        "x": 1079,
+        "y": 656,
+        "width": 152,
+        "height": 38,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "cards",
+    "tableInfo": null,
+    "typography": {
+      "h1": null,
+      "h2": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "body": {
+        "size": "16px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "emptyStateText": "",
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 1,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 7,
+      "links": 0,
+      "images": 13,
+      "tables": 0,
+      "cards": 10,
+      "inputs": 1,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/storage/classes",
+    "title": "Storage Classes",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Images",
+          "isActive": true
+        },
+        {
+          "text": "Classes",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Refresh",
+        "x": 1622,
+        "y": 97,
+        "width": 106,
+        "height": 38,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(212, 212, 216)",
+        "position": "right",
+        "isTopArea": true
+      }
+    ],
+    "contentType": "table",
+    "tableInfo": {
+      "columns": 9,
+      "rows": 1,
+      "headers": [
+        "",
+        "Name",
+        "Provisioner",
+        "Reclaim",
+        "Binding",
+        "PVs",
+        "PVCs",
+        "Capacity",
+        "Expand"
+      ]
+    },
+    "typography": {
+      "h1": null,
+      "h2": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "body": {
+        "size": "14px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 0,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 1,
+      "links": 0,
+      "images": 5,
+      "tables": 1,
+      "cards": 0,
+      "inputs": 0,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/network",
+    "title": "User Networks",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "User Networks",
+          "isActive": true
+        },
+        {
+          "text": "System Networks",
+          "isActive": true
+        },
+        {
+          "text": "VPCs",
+          "isActive": true
+        },
+        {
+          "text": "Egress Gateways",
+          "isActive": true
+        },
+        {
+          "text": "Security Groups",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Refresh",
+        "x": 1434,
+        "y": 99,
+        "width": 114,
+        "height": 38,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(244, 244, 245)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "Create Network",
+        "x": 1560,
+        "y": 100,
+        "width": 168,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "Create Network",
+        "x": 1004,
+        "y": 551,
+        "width": 168,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "1H",
+        "x": 1565,
+        "y": 696,
+        "width": 30,
+        "height": 24,
+        "bg": "rgba(14, 165, 233, 0.2)",
+        "color": "rgb(125, 211, 252)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "6H",
+        "x": 1597,
+        "y": 696,
+        "width": 30,
+        "height": 24,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "24H",
+        "x": 1629,
+        "y": 696,
+        "width": 37,
+        "height": 24,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "table",
+    "tableInfo": {
+      "columns": 1,
+      "rows": 1,
+      "headers": [
+        "RX"
+      ]
+    },
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 0,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 7,
+      "links": 0,
+      "images": 11,
+      "tables": 4,
+      "cards": 12,
+      "inputs": 0,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/network/system",
+    "title": "System Networks",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "User Networks",
+          "isActive": true
+        },
+        {
+          "text": "System Networks",
+          "isActive": true
+        },
+        {
+          "text": "VPCs",
+          "isActive": true
+        },
+        {
+          "text": "Egress Gateways",
+          "isActive": true
+        },
+        {
+          "text": "Security Groups",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Refresh",
+        "x": 1614,
+        "y": 99,
+        "width": 114,
+        "height": 38,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(244, 244, 245)",
+        "position": "right",
+        "isTopArea": true
+      }
+    ],
+    "contentType": "table",
+    "tableInfo": {
+      "columns": 7,
+      "rows": 2,
+      "headers": [
+        "Name",
+        "CIDR",
+        "Gateway",
+        "Purpose",
+        "Usage",
+        "Status",
+        ""
+      ]
+    },
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 0,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 1,
+      "links": 0,
+      "images": 15,
+      "tables": 1,
+      "cards": 11,
+      "inputs": 0,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/network/vpcs",
+    "title": "VPCs",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "User Networks",
+          "isActive": true
+        },
+        {
+          "text": "System Networks",
+          "isActive": true
+        },
+        {
+          "text": "VPCs",
+          "isActive": true
+        },
+        {
+          "text": "Egress Gateways",
+          "isActive": true
+        },
+        {
+          "text": "Security Groups",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "New VPC",
+        "x": 1602,
+        "y": 96,
+        "width": 126,
+        "height": 40,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "Create your first VPC",
+        "x": 976,
+        "y": 436,
+        "width": 224,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "unknown",
+    "tableInfo": null,
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "600",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "14px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "emptyStateText": "",
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 1,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 3,
+      "links": 0,
+      "images": 5,
+      "tables": 0,
+      "cards": 0,
+      "inputs": 1,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/network/egress-gateways",
+    "title": "Egress Gateways",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "User Networks",
+          "isActive": true
+        },
+        {
+          "text": "System Networks",
+          "isActive": true
+        },
+        {
+          "text": "VPCs",
+          "isActive": true
+        },
+        {
+          "text": "Egress Gateways",
+          "isActive": true
+        },
+        {
+          "text": "Security Groups",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Create Egress Gateway",
+        "x": 1504,
+        "y": 98,
+        "width": 224,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "Create Egress Gateway",
+        "x": 976,
+        "y": 344,
+        "width": 224,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "unknown",
+    "tableInfo": null,
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "600",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "14px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 0,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 3,
+      "links": 0,
+      "images": 4,
+      "tables": 0,
+      "cards": 0,
+      "inputs": 0,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/network/security-groups",
+    "title": "Security Groups",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "User Networks",
+          "isActive": true
+        },
+        {
+          "text": "System Networks",
+          "isActive": true
+        },
+        {
+          "text": "VPCs",
+          "isActive": true
+        },
+        {
+          "text": "Egress Gateways",
+          "isActive": true
+        },
+        {
+          "text": "Security Groups",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "New Security Group",
+        "x": 1492,
+        "y": 96,
+        "width": 236,
+        "height": 40,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "testNo gateway allow rule0 ingress rules",
+        "x": 465,
+        "y": 291,
+        "width": 1162,
+        "height": 42,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(244, 244, 245)",
+        "position": "left",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "unknown",
+    "tableInfo": null,
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "600",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "14px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "emptyStateText": "",
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 1,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 5,
+      "links": 0,
+      "images": 7,
+      "tables": 0,
+      "cards": 0,
+      "inputs": 1,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/cluster",
+    "title": "Cluster",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "1:1",
+        "x": 1479,
+        "y": 260,
+        "width": 50,
+        "height": 34,
+        "bg": "rgba(14, 165, 233, 0.2)",
+        "color": "rgb(125, 211, 252)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "2:1",
+        "x": 1537,
+        "y": 260,
+        "width": 50,
+        "height": 34,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "4:1",
+        "x": 1595,
+        "y": 260,
+        "width": 50,
+        "height": 34,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "8:1",
+        "x": 1653,
+        "y": 260,
+        "width": 50,
+        "height": 34,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "1H",
+        "x": 1533,
+        "y": 1195,
+        "width": 30,
+        "height": 24,
+        "bg": "rgba(14, 165, 233, 0.2)",
+        "color": "rgb(125, 211, 252)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "6H",
+        "x": 1565,
+        "y": 1195,
+        "width": 30,
+        "height": 24,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "24H",
+        "x": 1597,
+        "y": 1195,
+        "width": 37,
+        "height": 24,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "7D",
+        "x": 1636,
+        "y": 1195,
+        "width": 30,
+        "height": 24,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "right",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "table",
+    "tableInfo": {
+      "columns": 6,
+      "rows": 3,
+      "headers": [
+        "Name",
+        "Status",
+        "Roles",
+        "CPU Usage",
+        "Memory Usage",
+        "IP"
+      ]
+    },
+    "typography": {
+      "h1": null,
+      "h2": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "body": {
+        "size": "16px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 0,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 10,
+      "links": 0,
+      "images": 15,
+      "tables": 4,
+      "cards": 22,
+      "inputs": 0,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/folders",
+    "title": "Folders",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "All Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "New Folder",
+        "x": 1572,
+        "y": 96,
+        "width": 156,
+        "height": 40,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "Create your first folder",
+        "x": 964,
+        "y": 436,
+        "width": 248,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "unknown",
+    "tableInfo": null,
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "600",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "14px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "emptyStateText": "",
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 1,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 3,
+      "links": 0,
+      "images": 5,
+      "tables": 0,
+      "cards": 0,
+      "inputs": 1,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/tenants",
+    "title": "Tenants",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "New Tenant",
+        "x": 1572,
+        "y": 96,
+        "width": 156,
+        "height": 40,
+        "bg": "rgb(8, 145, 178)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      }
+    ],
+    "contentType": "unknown",
+    "tableInfo": null,
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "600",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "14px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "emptyStateText": "",
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 1,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 2,
+      "links": 0,
+      "images": 4,
+      "tables": 0,
+      "cards": 0,
+      "inputs": 1,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/users",
+    "title": "Users",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "All Users",
+          "isActive": true
+        },
+        {
+          "text": "Groups",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Create User",
+        "x": 1560,
+        "y": 120,
+        "width": 144,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      },
+      {
+        "text": "Active",
+        "x": 1187,
+        "y": 319,
+        "width": 62,
+        "height": 20,
+        "bg": "rgba(16, 185, 129, 0.1)",
+        "color": "rgb(52, 211, 153)",
+        "position": "right",
+        "isTopArea": false
+      },
+      {
+        "text": "25",
+        "x": 713,
+        "y": 369,
+        "width": 30,
+        "height": 24,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "left",
+        "isTopArea": false
+      },
+      {
+        "text": "50",
+        "x": 747,
+        "y": 369,
+        "width": 30,
+        "height": 24,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "left",
+        "isTopArea": false
+      },
+      {
+        "text": "100",
+        "x": 781,
+        "y": 369,
+        "width": 37,
+        "height": 24,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "left",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "table",
+    "tableInfo": {
+      "columns": 6,
+      "rows": 1,
+      "headers": [
+        "Username",
+        "Email",
+        "Display Name",
+        "Status",
+        "Groups",
+        "Actions"
+      ]
+    },
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "14px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 1,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 7,
+      "links": 0,
+      "images": 6,
+      "tables": 1,
+      "cards": 0,
+      "inputs": 1,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/users/groups",
+    "title": "Groups",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "All Users",
+          "isActive": true
+        },
+        {
+          "text": "Groups",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Create Group",
+        "x": 1552,
+        "y": 120,
+        "width": 152,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "right",
+        "isTopArea": true
+      }
+    ],
+    "contentType": "unknown",
+    "tableInfo": null,
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "14px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 1,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 5,
+      "links": 0,
+      "images": 17,
+      "tables": 0,
+      "cards": 0,
+      "inputs": 1,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/profile",
+    "title": "Profile",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Add Key",
+        "x": 473,
+        "y": 843,
+        "width": 114,
+        "height": 38,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(244, 244, 245)",
+        "position": "left",
+        "isTopArea": false
+      },
+      {
+        "text": "Paste from clipboard",
+        "x": 595,
+        "y": 843,
+        "width": 194,
+        "height": 38,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(161, 161, 170)",
+        "position": "left",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "grid",
+    "tableInfo": null,
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": {
+        "size": "18px",
+        "weight": "600",
+        "color": "rgb(244, 244, 245)"
+      },
+      "body": {
+        "size": "16px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 1,
+      "labelCount": 1
+    },
+    "elementCounts": {
+      "buttons": 2,
+      "links": 0,
+      "images": 4,
+      "tables": 0,
+      "cards": 2,
+      "inputs": 1,
+      "modals": 0
+    }
+  },
+  {
+    "url": "/cli-access",
+    "title": "CLI Access",
+    "layout": {
+      "display": "block",
+      "flexDirection": "row",
+      "gridTemplateColumns": "none",
+      "padding": "24px",
+      "gap": "normal",
+      "width": 1664,
+      "height": 1016
+    },
+    "sidebar": {
+      "width": 255,
+      "background": "rgb(9, 9, 11)",
+      "items": [
+        {
+          "text": "Dashboard",
+          "isActive": true
+        },
+        {
+          "text": "Virtual Machines",
+          "isActive": true
+        },
+        {
+          "text": "Storage",
+          "isActive": true
+        },
+        {
+          "text": "Network",
+          "isActive": true
+        },
+        {
+          "text": "Cluster",
+          "isActive": true
+        },
+        {
+          "text": "Folders",
+          "isActive": true
+        },
+        {
+          "text": "Tenants",
+          "isActive": true
+        },
+        {
+          "text": "Users",
+          "isActive": true
+        },
+        {
+          "text": "Profile",
+          "isActive": true
+        },
+        {
+          "text": "CLI Access",
+          "isActive": true
+        }
+      ]
+    },
+    "buttons": [
+      {
+        "text": "Kubeconfig",
+        "x": 641,
+        "y": 327,
+        "width": 142,
+        "height": 46,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(56, 189, 248)",
+        "position": "left",
+        "isTopArea": false
+      },
+      {
+        "text": "Instructions",
+        "x": 783,
+        "y": 327,
+        "width": 158,
+        "height": 46,
+        "bg": "rgba(0, 0, 0, 0)",
+        "color": "rgb(161, 161, 170)",
+        "position": "left",
+        "isTopArea": false
+      },
+      {
+        "text": "Copy",
+        "x": 657,
+        "y": 390,
+        "width": 90,
+        "height": 38,
+        "bg": "rgb(39, 39, 42)",
+        "color": "rgb(244, 244, 245)",
+        "position": "left",
+        "isTopArea": false
+      },
+      {
+        "text": "Download",
+        "x": 755,
+        "y": 391,
+        "width": 120,
+        "height": 36,
+        "bg": "rgb(2, 132, 199)",
+        "color": "rgb(255, 255, 255)",
+        "position": "left",
+        "isTopArea": false
+      }
+    ],
+    "contentType": "cards",
+    "tableInfo": null,
+    "typography": {
+      "h1": {
+        "size": "24px",
+        "weight": "700",
+        "color": "rgb(244, 244, 245)"
+      },
+      "h2": null,
+      "body": {
+        "size": "16px",
+        "weight": "400",
+        "color": "rgb(161, 161, 170)"
+      }
+    },
+    "colors": {
+      "mainBg": "rgba(0, 0, 0, 0)",
+      "bodyBg": "rgb(9, 9, 11)",
+      "text": "rgb(244, 244, 245)"
+    },
+    "formInfo": {
+      "formCount": 0,
+      "inputCount": 0,
+      "labelCount": 0
+    },
+    "elementCounts": {
+      "buttons": 4,
+      "links": 0,
+      "images": 7,
+      "tables": 0,
+      "cards": 4,
+      "inputs": 0,
+      "modals": 0
+    }
+  }
+]

@@ -1,0 +1,111 @@
+services:
+  lldap:
+    image: lldap/lldap:latest
+    ports:
+      - "3890:3890" # LDAP
+      - "17170:17170" # Web UI (dev only)
+    environment:
+      - LLDAP_LDAP_BASE_DN=dc=kubevirt,dc=local
+      - LLDAP_LDAP_USER_DN=admin
+      - LLDAP_LDAP_USER_PASS=admin_password
+      - LLDAP_JWT_SECRET=kubevirt-ui-lldap-jwt-secret-change-me
+      - LLDAP_DATABASE_URL=sqlite:///data/lldap.db?mode=rwc
+      - LLDAP_VERBOSE=true
+    volumes:
+      - lldap_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:17170/"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      - kubevirt-ui
+
+  dex:
+    image: ghcr.io/dexidp/dex:v2.38.0
+    volumes:
+      - ./dex/config.yaml:/etc/dex/config.yaml:ro
+    ports:
+      - "5556:5556"
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5556/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      lldap:
+        condition: service_healthy
+    networks:
+      - kubevirt-ui
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    ports:
+      - "8888:8000"
+    volumes:
+      - ./backend:/app
+      - ./remote_k8s_kubeconfig:/app/kubeconfig:ro
+    environment:
+      - KUBECONFIG=/app/kubeconfig
+      - LOG_LEVEL=DEBUG
+      - CORS_ORIGINS=http://192.168.196.1:3333,http://localhost:3333,http://192.168.196.1:5173
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+      # Auth configuration
+      - AUTH_TYPE=oidc
+      - OIDC_ISSUER=http://192.168.196.1:5556 # Public URL for token validation
+      - OIDC_INTERNAL_URL=http://dex:5556 # Internal URL for backend->DEX communication
+      - OIDC_CLIENT_ID=kubevirt-ui
+      - OIDC_CLIENT_SECRET=kubevirt-ui-secret
+      # LLDAP configuration
+      - LLDAP_ENABLED=true
+      - LLDAP_URL=http://lldap:17170
+      - LLDAP_ADMIN_USER=admin
+      - LLDAP_ADMIN_PASSWORD=admin_password
+      - LLDAP_LDAP_BASE_DN=dc=kubevirt,dc=local
+      # Feature flags
+      - ENABLE_TENANTS=false
+    command: uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      dex:
+        condition: service_healthy
+    networks:
+      - kubevirt-ui
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    ports:
+      - "3333:3000"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - VITE_API_URL=http://192.168.196.1:8888
+      - VITE_DEX_ISSUER=http://192.168.196.1:5556
+      - VITE_OIDC_CLIENT_ID=kubevirt-ui
+      - CHOKIDAR_USEPOLLING=true
+    command: npm run dev -- --host 0.0.0.0 --port 3000
+    depends_on:
+      - backend
+    networks:
+      - kubevirt-ui
+
+volumes:
+  lldap_data:
+
+networks:
+  kubevirt-ui:
+    driver: bridge

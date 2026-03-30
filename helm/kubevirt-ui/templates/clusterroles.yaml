@@ -1,0 +1,243 @@
+{{- if .Values.rbac.createRoles }}
+---
+# KubeVirt UI Admin Role - Full access to VM resources
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-ui-admin
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    kubevirt-ui.io/role: "admin"
+rules:
+  # VMs - full access
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["*"]
+  # VM migrations
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstancemigrations"]
+    verbs: ["*"]
+  # VM templates
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineclusterinstancetypes", "virtualmachineinstancetypes"]
+    verbs: ["*"]
+  # CDI - full access
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes", "datasources"]
+    verbs: ["*"]
+  # Storage
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["*"]
+  # Snapshots
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["*"]
+  # ConfigMaps/Secrets
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["*"]
+  # Services
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["*"]
+  # Network policies
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["*"]
+  # NAD
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "watch"]
+  # Events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Pods (for console)
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  # RoleBindings - manage access
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["*"]
+  # ResourceQuotas
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "watch"]
+
+---
+# KubeVirt UI Editor Role - Create/Edit/Delete but no access management
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-ui-editor
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    kubevirt-ui.io/role: "editor"
+rules:
+  # VMs - full access
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["*"]
+  # VM migrations
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstancemigrations"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  # VM templates
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineclusterinstancetypes", "virtualmachineinstancetypes"]
+    verbs: ["get", "list", "watch"]
+  # CDI - full access
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes", "datasources"]
+    verbs: ["*"]
+  # Storage
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["*"]
+  # Snapshots
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["*"]
+  # ConfigMaps/Secrets
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["*"]
+  # Services
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["*"]
+  # Network policies
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "delete"]
+  # NAD
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "watch"]
+  # Events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Pods (for console)
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  # ResourceQuotas - read only
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "watch"]
+
+---
+# KubeVirt UI Viewer Role - Read only access
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-ui-viewer
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    kubevirt-ui.io/role: "viewer"
+rules:
+  # VMs - read only
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
+  # VM migrations - read only
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineinstancemigrations"]
+    verbs: ["get", "list", "watch"]
+  # VM templates
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachineclusterinstancetypes", "virtualmachineinstancetypes"]
+    verbs: ["get", "list", "watch"]
+  # CDI - read only
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes", "datasources"]
+    verbs: ["get", "list", "watch"]
+  # Storage - read only
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  # Snapshots - read only
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list", "watch"]
+  # ConfigMaps/Secrets - read only
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  # Services - read only
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  # Network policies - read only
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  # NAD
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "watch"]
+  # Events
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Pods (for logs)
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  # ResourceQuotas
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "list", "watch"]
+
+---
+# Platform Admin ClusterRole - for managing projects and users
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-ui-platform-admin
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    kubevirt-ui.io/role: "platform-admin"
+rules:
+  # Namespaces - full access for project management
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["*"]
+  # ResourceQuotas - full access
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["*"]
+  # RoleBindings - manage access
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["*"]
+  # ClusterRoles - read only
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    verbs: ["get", "list", "watch"]
+  # All VM and storage resources (inherited)
+  - apiGroups: ["kubevirt.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["*"]
+    verbs: ["*"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "configmaps", "secrets", "services", "pods", "pods/log", "events"]
+    verbs: ["*"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["*"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["*"]
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources: ["network-attachment-definitions"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+{{- end }}

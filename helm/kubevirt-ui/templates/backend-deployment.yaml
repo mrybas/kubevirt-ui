@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-backend
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    app.kubernetes.io/component: backend
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "kubevirt-ui.backend.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "kubevirt-ui.backend.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "kubevirt-ui.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: backend
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            # -- Kubernetes client: always in-cluster when deployed via Helm
+            - name: K8S_IN_CLUSTER
+              value: "true"
+            # -- Metrics mode
+            {{- if .Values.metrics.direct }}
+            - name: METRICS_DIRECT
+              value: {{ .Values.metrics.direct | quote }}
+            {{- end }}
+            {{- if .Values.metrics.service }}
+            - name: METRICS_SERVICE
+              value: {{ .Values.metrics.service | quote }}
+            {{- end }}
+            # -- Auth configuration
+            - name: AUTH_TYPE
+              value: {{ .Values.auth.type | quote }}
+            {{- if eq .Values.auth.type "oidc" }}
+            - name: OIDC_ISSUER
+              value: {{ .Values.auth.oidc.issuer | quote }}
+            - name: OIDC_INTERNAL_URL
+              {{- if .Values.dex.enabled }}
+              value: "http://{{ include "kubevirt-ui.fullname" . }}-dex:{{ .Values.dex.service.port }}/dex"
+              {{- else if .Values.auth.oidc.issuerInternal }}
+              value: {{ .Values.auth.oidc.issuerInternal | quote }}
+              {{- else }}
+              value: {{ .Values.auth.oidc.issuer | quote }}
+              {{- end }}
+            - name: OIDC_CLIENT_ID
+              value: {{ .Values.auth.oidc.clientId | quote }}
+            {{- if .Values.auth.oidc.clientSecretRef.name }}
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.oidc.clientSecretRef.name }}
+                  key: {{ .Values.auth.oidc.clientSecretRef.key | default "client-secret" }}
+            {{- else if .Values.dex.enabled }}
+            - name: OIDC_CLIENT_SECRET
+              value: "kubevirt-ui-secret"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.lldap.enabled }}
+            - name: LLDAP_ENABLED
+              value: "true"
+            - name: LLDAP_URL
+              value: "http://{{ include "kubevirt-ui.fullname" . }}-lldap:17170"
+            - name: LLDAP_ADMIN_USER
+              value: {{ .Values.lldap.adminUser | quote }}
+            - name: LLDAP_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kubevirt-ui.lldapSecretName" . }}
+                  key: admin-password
+            - name: LLDAP_LDAP_BASE_DN
+              value: {{ .Values.lldap.baseDN | quote }}
+            {{- end }}
+            # -- User-supplied env vars
+            {{- range $key, $value := .Values.backend.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- with .Values.backend.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /app/config
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "kubevirt-ui.fullname" . }}-config
+        - name: tmp
+          emptyDir: {}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

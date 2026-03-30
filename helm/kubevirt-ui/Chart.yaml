@@ -1,0 +1,20 @@
+apiVersion: v2
+name: kubevirt-ui
+description: A lightweight web interface for managing KubeVirt virtual machines
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - kubevirt
+  - virtualization
+  - kubernetes
+  - ui
+  - vm
+  - kvm
+home: https://github.com/mrybas/kubevirt-ui
+maintainers:
+  - name: Max Rybas
+    email: max.a.rybas@gmail.com
+sources:
+  - https://github.com/mrybas/kubevirt-ui
+kubeVersion: ">=1.26.0-0"

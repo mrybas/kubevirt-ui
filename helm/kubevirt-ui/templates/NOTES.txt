@@ -1,0 +1,59 @@
+
+KubeVirt UI has been deployed to namespace {{ .Release.Namespace }}.
+
+{{- if .Values.ingress.enabled }}
+
+Access the UI at:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+
+{{- else }}
+
+To access the UI, run:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "kubevirt-ui.fullname" . }}-frontend {{ .Values.frontend.service.port }}:{{ .Values.frontend.service.port }}
+
+Then open http://localhost:{{ .Values.frontend.service.port }}
+
+{{- end }}
+
+{{- if and .Values.lldap.enabled .Values.dex.enabled }}
+
+=== Authentication ===
+
+Bundled LLDAP + Dex is enabled.
+
+Initial admin credentials:
+  Username: {{ .Values.lldap.adminUser }}
+  Password: (from secret {{ include "kubevirt-ui.lldapSecretName" . }} key admin-password)
+
+To manage users, port-forward the LLDAP web UI:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "kubevirt-ui.fullname" . }}-lldap 17170:17170
+  Then open http://localhost:17170
+
+IMPORTANT: Change the default admin password in production!
+  Either set lldap.adminPassword in values, or create a secret and set lldap.existingSecret.
+
+{{- else if .Values.dex.enabled }}
+
+Built-in DEX OIDC provider is enabled (without LLDAP).
+{{- if .Values.dex.enablePasswordDB }}
+Static password login is enabled.
+{{- end }}
+
+{{- else if eq .Values.auth.type "oidc" }}
+
+External OIDC provider configured.
+Issuer: {{ .Values.auth.oidc.issuer }}
+
+{{- else if eq .Values.auth.type "none" }}
+
+WARNING: Authentication is disabled (auth.type=none).
+         Anyone can access the UI without login.
+
+{{- end }}
+
+Backend ServiceAccount: {{ include "kubevirt-ui.serviceAccountName" . }}
+K8s API mode:          in-cluster (ServiceAccount token)
+Metrics mode:          {{ if .Values.metrics.direct }}{{ .Values.metrics.direct }}{{ else }}auto-detect (direct when in-cluster){{ end }}

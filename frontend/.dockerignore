@@ -1,0 +1,16 @@
+node_modules
+dist
+.cache
+.vite
+.env
+.env.*
+*.log
+npm-debug.log*
+.git
+.github
+.forgejo
+Dockerfile*
+docker-compose*
+*.md
+.vscode
+.idea

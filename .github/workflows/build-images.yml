@@ -1,0 +1,163 @@
+# Build & push Docker images and Helm chart for KubeVirt UI
+# Triggered on CalVer tags (2026.01.0, etc.) or manual dispatch.
+
+name: Build Images
+
+on:
+  push:
+    tags: ['20*']
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Prepare: compute image tags once, reuse in build jobs
+  # ---------------------------------------------------------------------------
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tags_backend: ${{ steps.meta.outputs.tags_backend }}
+      tags_frontend: ${{ steps.meta.outputs.tags_frontend }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Compute image metadata
+        id: meta
+        shell: bash
+        run: |
+          REGISTRY="${{ env.REGISTRY }}"
+          REPO="${{ github.repository }}"
+
+          BACKEND_IMAGE="${REGISTRY}/${REPO}/backend"
+          FRONTEND_IMAGE="${REGISTRY}/${REPO}/frontend"
+
+          TAGS_BACKEND=""
+          TAGS_FRONTEND=""
+
+          add_tag() {
+            TAGS_BACKEND="${TAGS_BACKEND:+${TAGS_BACKEND},}${BACKEND_IMAGE}:${1}"
+            TAGS_FRONTEND="${TAGS_FRONTEND:+${TAGS_FRONTEND},}${FRONTEND_IMAGE}:${1}"
+          }
+
+          VERSION="${GITHUB_REF#refs/tags/}"
+          add_tag "${VERSION}"
+          add_tag "latest"
+
+          echo "tags_backend=${TAGS_BACKEND}" >> "$GITHUB_OUTPUT"
+          echo "tags_frontend=${TAGS_FRONTEND}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          echo "### Image Tags" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Version:** ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Backend:** ${TAGS_BACKEND}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Frontend:** ${TAGS_FRONTEND}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Build backend image
+  # ---------------------------------------------------------------------------
+  build-backend:
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          target: production
+          push: true
+          tags: ${{ needs.prepare.outputs.tags_backend }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.title=kubevirt-ui-backend
+            org.opencontainers.image.description=KubeVirt UI Backend API
+
+  # ---------------------------------------------------------------------------
+  # Build frontend image
+  # ---------------------------------------------------------------------------
+  build-frontend:
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          target: production
+          push: true
+          tags: ${{ needs.prepare.outputs.tags_frontend }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.title=kubevirt-ui-frontend
+            org.opencontainers.image.description=KubeVirt UI Frontend
+
+  # ---------------------------------------------------------------------------
+  # Package and push Helm chart to OCI registry
+  # ---------------------------------------------------------------------------
+  helm-package:
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Update Chart.yaml with release version
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" helm/kubevirt-ui/Chart.yaml
+          sed -i "s/^version:.*/version: ${VERSION}/" helm/kubevirt-ui/Chart.yaml
+
+      - name: Package Helm chart
+        run: helm package helm/kubevirt-ui/
+
+      - name: Log in to OCI registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Push Helm chart
+        run: helm push kubevirt-ui-*.tgz oci://${{ env.REGISTRY }}/${{ github.repository }}/charts

@@ -1,0 +1,353 @@
+{{- if .Values.rbac.create -}}
+{{- if .Values.rbac.clusterWide }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+rules:
+  # -----------------------------------------------------------------------
+  # KubeVirt core resources
+  # -----------------------------------------------------------------------
+  - apiGroups: ["kubevirt.io"]
+    resources:
+      - virtualmachines
+      - virtualmachineinstances
+      - virtualmachineinstancemigrations
+      - kubevirts
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # KubeVirt subresources (console, VNC, start/stop/restart, hotplug)
+  - apiGroups: ["subresources.kubevirt.io"]
+    resources:
+      - virtualmachines/start
+      - virtualmachines/stop
+      - virtualmachines/restart
+      - virtualmachines/addvolume
+      - virtualmachines/removevolume
+      - virtualmachines/migrate
+      - virtualmachineinstances/console
+      - virtualmachineinstances/vnc
+      - virtualmachineinstances/pause
+      - virtualmachineinstances/unpause
+    verbs: ["get", "update", "put"]
+
+  # Instance types (read-only)
+  - apiGroups: ["instancetype.kubevirt.io"]
+    resources:
+      - virtualmachineclusterinstancetypes
+      - virtualmachineinstancetypes
+      - virtualmachineclusterpreferences
+      - virtualmachinepreferences
+    verbs: ["get", "list", "watch"]
+
+  # -----------------------------------------------------------------------
+  # CDI (DataVolumes, golden images)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources:
+      - datavolumes
+      - datasources
+      - dataimportcrons
+      - cdis
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
+  # KubeVirt snapshots (VirtualMachineSnapshot / VirtualMachineRestore)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["snapshot.kubevirt.io"]
+    resources:
+      - virtualmachinesnapshots
+      - virtualmachinerestores
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+  # -----------------------------------------------------------------------
+  # Volume snapshots
+  # -----------------------------------------------------------------------
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources:
+      - volumesnapshots
+      - volumesnapshotclasses
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
+  # Core resources
+  # -----------------------------------------------------------------------
+  # Namespaces — full CRUD for project/environment management
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Nodes — read-only for cluster overview
+  - apiGroups: [""]
+    resources:
+      - nodes
+    verbs: ["get", "list", "watch"]
+
+  # PVs — read-only for storage overview
+  - apiGroups: [""]
+    resources:
+      - persistentvolumes
+    verbs: ["get", "list", "watch"]
+
+  # ServiceAccounts — create for tenant clusters and kubeconfig generation
+  - apiGroups: [""]
+    resources:
+      - serviceaccounts
+      - serviceaccounts/token
+    verbs: ["get", "list", "watch", "create"]
+
+  # PVCs — full CRUD for disk management
+  - apiGroups: [""]
+    resources:
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ConfigMaps — full CRUD (templates, projects ConfigMap)
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # Secrets — read for kubeconfig download, TLS
+  - apiGroups: [""]
+    resources:
+      - secrets
+    verbs: ["get", "list", "watch"]
+
+  # Events, Pods (read-only for monitoring / console)
+  - apiGroups: [""]
+    resources:
+      - events
+      - pods
+      - pods/log
+    verbs: ["get", "list", "watch"]
+
+  # Services — read + proxy (LINSTOR, metrics)
+  - apiGroups: [""]
+    resources:
+      - services
+      - services/proxy
+    verbs: ["get", "list", "watch", "create"]
+
+  # ResourceQuotas / LimitRanges
+  - apiGroups: [""]
+    resources:
+      - resourcequotas
+      - limitranges
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
+  # Storage
+  # -----------------------------------------------------------------------
+  - apiGroups: ["storage.k8s.io"]
+    resources:
+      - storageclasses
+      - csistoragecapacities
+    verbs: ["get", "list", "watch"]
+
+  # Apps — DaemonSets for BGP speaker deployment
+  - apiGroups: ["apps"]
+    resources:
+      - daemonsets
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+  # -----------------------------------------------------------------------
+  # Networking (Kube-OVN)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["kubeovn.io"]
+    resources:
+      - subnets
+      - vlans
+      - provider-networks
+      - ips
+      - ip-pools
+      - vpcs
+      - vpc-peerings
+      - vpc-dnses
+      - vpc-egress-gateways
+      - ovn-eips
+      - ovn-snat-rules
+      - ovn-dnat-rules
+      - ovn-fips
+      - security-groups
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  - apiGroups: ["k8s.cni.cncf.io"]
+    resources:
+      - network-attachment-definitions
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - networkpolicies
+      - ingresses
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
+  # RBAC (project access management)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - roles
+      - rolebindings
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - clusterroles
+      - clusterrolebindings
+    verbs: ["get", "list", "watch"]
+
+  # Subject access review (permission checks)
+  - apiGroups: ["authorization.k8s.io"]
+    resources:
+      - subjectaccessreviews
+    verbs: ["create"]
+
+  # -----------------------------------------------------------------------
+  # VictoriaMetrics Operator (metrics auto-discovery)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["operator.victoriametrics.com"]
+    resources:
+      - vmsingles
+    verbs: ["get", "list", "watch"]
+
+  # -----------------------------------------------------------------------
+  # Velero (backup/restore/schedules)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["velero.io"]
+    resources:
+      - backups
+      - restores
+      - schedules
+      - backupstoragelocations
+      - deletebackuprequests
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
+  # Batch (CronJobs for scheduled VM actions)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["batch"]
+    resources:
+      - cronjobs
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
+  # Cilium network policies
+  # -----------------------------------------------------------------------
+  - apiGroups: ["cilium.io"]
+    resources:
+      - ciliumnetworkpolicies
+      - ciliumclusterwidenetworkpolicies
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
+  # Cluster API (tenant clusters)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources:
+      - clusters
+      - machinedeployments
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  - apiGroups: ["bootstrap.cluster.x-k8s.io"]
+    resources:
+      - kubeadmconfigtemplates
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  - apiGroups: ["controlplane.cluster.x-k8s.io"]
+    resources:
+      - kamajicontrolplanes
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  - apiGroups: ["infrastructure.cluster.x-k8s.io"]
+    resources:
+      - kubevirtmachinetemplates
+      - kubevirtclusters
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
+  # Flux CD (HelmReleases for tenant addons)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources:
+      - helmreleases
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kubevirt-ui.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubevirt-ui.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+
+{{- else }}
+# -----------------------------------------------------------------------
+# Namespace-scoped Role (single-namespace mode)
+# -----------------------------------------------------------------------
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances", "virtualmachineinstancemigrations"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["subresources.kubevirt.io"]
+    resources:
+      - virtualmachines/start
+      - virtualmachines/stop
+      - virtualmachines/restart
+      - virtualmachines/addvolume
+      - virtualmachines/removevolume
+      - virtualmachineinstances/console
+      - virtualmachineinstances/vnc
+    verbs: ["get", "update", "put"]
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes", "datasources"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources: ["volumesnapshots"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "configmaps", "events", "pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "services/proxy"]
+    verbs: ["get", "list", "watch", "create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "kubevirt-ui.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubevirt-ui.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,14 @@
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2
+pytest-cov==6.0.0
+httpx==0.28.1
+
+# Linting & Formatting
+ruff==0.9.2
+
+# Type checking
+mypy==1.14.1
+
+# Development
+watchfiles==1.0.4

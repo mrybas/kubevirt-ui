@@ -1,0 +1,131 @@
+{{- if .Values.lldap.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-lldap
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    app.kubernetes.io/component: lldap
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kubevirt-ui.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: lldap
+  template:
+    metadata:
+      labels:
+        {{- include "kubevirt-ui.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: lldap
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: lldap
+          image: "{{ .Values.lldap.image.repository }}:{{ .Values.lldap.image.tag }}"
+          imagePullPolicy: {{ .Values.lldap.image.pullPolicy }}
+          ports:
+            - name: ldap
+              containerPort: 3890
+              protocol: TCP
+            - name: http
+              containerPort: 17170
+              protocol: TCP
+          env:
+            - name: LLDAP_LDAP_BASE_DN
+              value: {{ .Values.lldap.baseDN | quote }}
+            - name: LLDAP_LDAP_USER_DN
+              value: {{ .Values.lldap.adminUser | quote }}
+            - name: LLDAP_LDAP_USER_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kubevirt-ui.lldapSecretName" . }}
+                  key: admin-password
+            - name: LLDAP_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kubevirt-ui.lldapSecretName" . }}
+                  key: jwt-secret
+            - name: LLDAP_DATABASE_URL
+              value: "sqlite:///data/lldap.db?mode=rwc"
+            - name: LLDAP_VERBOSE
+              value: {{ .Values.lldap.verbose | quote }}
+          {{- if .Values.lldap.persistence.enabled }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          {{- end }}
+          resources:
+            {{- toYaml .Values.lldap.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      {{- if .Values.lldap.persistence.enabled }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "kubevirt-ui.fullname" . }}-lldap
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-lldap
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    app.kubernetes.io/component: lldap
+spec:
+  type: ClusterIP
+  ports:
+    - name: ldap
+      port: 3890
+      targetPort: ldap
+    - name: http
+      port: 17170
+      targetPort: http
+  selector:
+    {{- include "kubevirt-ui.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: lldap
+{{- if not .Values.lldap.existingSecret }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-lldap
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  admin-password: {{ .Values.lldap.adminPassword | quote }}
+  jwt-secret: {{ .Values.lldap.jwtSecret | quote }}
+{{- end }}
+{{- if .Values.lldap.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-lldap
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.lldap.persistence.size }}
+  {{- if .Values.lldap.persistence.storageClass }}
+  storageClassName: {{ .Values.lldap.persistence.storageClass }}
+  {{- end }}
+{{- end }}
+{{- end }}

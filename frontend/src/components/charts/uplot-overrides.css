@@ -1,0 +1,58 @@
+/* uPlot legend dark-theme overrides */
+.uplot .u-legend {
+  font-size: 11px;
+  font-family: 'Inter', system-ui, sans-serif;
+  padding: 4px 0 0;
+  text-align: left;
+}
+
+.uplot .u-legend .u-series {
+  padding: 2px 8px 2px 0;
+}
+
+.uplot .u-legend .u-series > * {
+  vertical-align: middle;
+}
+
+/* Replace square markers with small round dots */
+.uplot .u-legend .u-marker {
+  width: 8px !important;
+  height: 8px !important;
+  border-radius: 50% !important;
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 4px;
+}
+
+.uplot .u-legend .u-label {
+  color: rgba(148, 163, 184, 0.8);
+  font-size: 11px;
+}
+
+.uplot .u-legend .u-value {
+  color: rgba(226, 232, 240, 0.9);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Axis labels */
+.uplot .u-axis {
+  color: rgba(148, 163, 184, 0.6);
+}
+
+/* Cursor crosshair */
+.uplot .u-cursor-x,
+.uplot .u-cursor-y {
+  border-color: rgba(148, 163, 184, 0.2) !important;
+}
+
+/* Tooltip */
+.uplot .u-tooltip {
+  background: rgb(30, 41, 59);
+  border: 1px solid rgb(51, 65, 85);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  color: rgb(226, 232, 240);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}

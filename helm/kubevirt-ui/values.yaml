@@ -1,0 +1,262 @@
+# Default values for kubevirt-ui
+
+# -- Number of replicas
+replicaCount: 1
+
+# =========================================================================
+# Backend
+# =========================================================================
+backend:
+  image:
+    repository: ghcr.io/mrybas/kubevirt-ui/backend
+    pullPolicy: IfNotPresent
+    tag: ""  # defaults to .Chart.AppVersion
+
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "1"
+
+  service:
+    type: ClusterIP
+    port: 8000
+
+  # -- Extra env vars passed to the backend container
+  env:
+    LOG_LEVEL: INFO
+    CORS_ORIGINS: ""
+    ENABLE_TENANTS: "false"
+
+  # -- Extra env vars from secrets/configmaps
+  envFrom: []
+  #  - secretRef:
+  #      name: my-backend-secrets
+
+# =========================================================================
+# Frontend (nginx + built SPA)
+# =========================================================================
+frontend:
+  image:
+    repository: ghcr.io/mrybas/kubevirt-ui/frontend
+    pullPolicy: IfNotPresent
+    tag: ""  # defaults to .Chart.AppVersion
+
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "128Mi"
+      cpu: "200m"
+
+  service:
+    type: ClusterIP
+    port: 8080
+
+# =========================================================================
+# Metrics
+# =========================================================================
+metrics:
+  # -- Force direct HTTP calls to metrics service (auto-detected when in-cluster).
+  #    Set to "false" to force K8s API proxy mode even inside the cluster.
+  direct: ""  # "", "true", "false" (empty = auto-detect)
+
+  # -- Override metrics backend (format: namespace/service:port).
+  #    Leave empty for auto-discovery (VMSingle CRD → vmsingle label → prometheus label).
+  service: ""  # e.g. "victoria-metrics/vmsingle-vmsingle:8429"
+
+# =========================================================================
+# General
+# =========================================================================
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""  # auto-generated if empty
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# =========================================================================
+# Ingress
+# =========================================================================
+ingress:
+  enabled: false
+  className: "nginx"
+  annotations: {}
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "86400"
+    # nginx.ingress.kubernetes.io/proxy-send-timeout: "86400"
+    # nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  hosts:
+    - host: kubevirt-ui.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: kubevirt-ui-tls
+    #   hosts:
+    #     - kubevirt-ui.local
+
+# =========================================================================
+# RBAC
+# =========================================================================
+rbac:
+  # -- Create RBAC resources for the ServiceAccount
+  create: true
+  # -- Cluster-wide access (required for multi-namespace, node listing, etc.)
+  clusterWide: true
+  # -- Create user-facing ClusterRoles (admin/editor/viewer/platform-admin)
+  createRoles: true
+
+# =========================================================================
+# Network Policy
+# =========================================================================
+networkPolicy:
+  enabled: false
+
+# =========================================================================
+# UI config (mounted as /app/config/config.yaml)
+# =========================================================================
+config:
+  defaultNamespace: default
+  vmDefaults:
+    cpu: 2
+    memory: 2Gi
+  ui:
+    theme: dark
+    language: en
+    pagination: 25
+  features:
+    enableVNCConsole: true
+    enableSerialConsole: true
+    enableLiveMigration: true
+    enableSnapshots: true
+
+# =========================================================================
+# Authentication
+# =========================================================================
+auth:
+  # -- Auth type: none | oidc | token
+  type: oidc
+
+  oidc:
+    # -- OIDC issuer URL (public, reachable from the browser)
+    issuer: ""
+    # -- OIDC issuer URL (internal, backend → IdP). Falls back to issuer.
+    issuerInternal: ""
+    # -- OIDC client ID
+    clientId: "kubevirt-ui"
+    # -- Reference to an existing secret that holds the client secret
+    clientSecretRef:
+      name: ""
+      key: "client-secret"
+
+# =========================================================================
+# DEX (optional built-in OIDC provider)
+# =========================================================================
+dex:
+  enabled: false
+
+  image:
+    repository: ghcr.io/dexidp/dex
+    tag: v2.38.0
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "128Mi"
+      cpu: "200m"
+
+  service:
+    type: ClusterIP
+    port: 5556
+
+  storage:
+    type: memory  # "kubernetes" for production with CRDs
+
+  connectors: []
+    # - type: github
+    #   id: github
+    #   name: GitHub
+    #   config:
+    #     clientID: $GITHUB_CLIENT_ID
+    #     clientSecret: $GITHUB_CLIENT_SECRET
+    #     redirectURI: https://kubevirt-ui.example.com/dex/callback
+
+  staticPasswords: []
+    # - email: "admin@local"
+    #   hash: "$2a$10$..."
+    #   username: "admin"
+    #   userID: "admin-id"
+    #   groups: ["kubevirt-ui-admins"]
+
+  enablePasswordDB: false
+
+  logLevel: "info"  # debug, info, warn, error
+
+# =========================================================================
+# LLDAP (optional bundled LDAP server for user management)
+# =========================================================================
+lldap:
+  # -- Enable bundled LLDAP. When enabled with Dex, auto-configures LDAP connector.
+  enabled: false
+
+  image:
+    repository: lldap/lldap
+    tag: latest
+    pullPolicy: IfNotPresent
+
+  # -- LDAP base DN
+  baseDN: "dc=kubevirt,dc=local"
+  # -- LLDAP admin username
+  adminUser: "admin"
+  # -- LLDAP admin password. Change in production!
+  # If existingSecret is set, this value is ignored.
+  adminPassword: "admin_password"
+  # -- JWT secret for LLDAP web UI. Change in production!
+  jwtSecret: "change-me-in-production"
+  # -- Use existing secret for LLDAP credentials instead of creating one.
+  # Secret must have keys: admin-password, jwt-secret
+  existingSecret: ""
+  # -- Verbose logging
+  verbose: "false"
+
+  resources:
+    requests:
+      memory: "64Mi"
+      cpu: "50m"
+    limits:
+      memory: "256Mi"
+      cpu: "500m"
+
+  persistence:
+    enabled: false
+    size: "1Gi"
+    storageClass: ""

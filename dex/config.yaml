@@ -1,0 +1,72 @@
+# DEX Configuration for KubeVirt UI Development
+# Documentation: https://dexidp.io/docs/
+
+issuer: http://192.168.196.1:5556
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+telemetry:
+  http: 0.0.0.0:5558
+
+# OAuth2 clients
+staticClients:
+  - id: kubevirt-ui
+    name: "KubeVirt UI"
+    secret: kubevirt-ui-secret
+    redirectURIs:
+      - "http://192.168.196.1:3333/callback"
+      - "http://192.168.196.1:3333/auth/callback"
+      - "http://localhost:3333/callback"
+      - "http://localhost:3333/auth/callback"
+      - "http://frontend:3000/callback"
+      - "http://frontend:3000/auth/callback"
+
+# Enable password grants and skip approval screen for dev
+oauth2:
+  skipApprovalScreen: true
+  responseTypes: ["code", "token", "id_token"]
+
+# LDAP connector — connects to LLDAP (bundled) or external LDAP (FreeIPA/AD)
+connectors:
+  - type: ldap
+    id: lldap
+    name: "KubeVirt UI"
+    config:
+      host: lldap:3890
+      insecureNoSSL: true
+      bindDN: uid=admin,ou=people,dc=kubevirt,dc=local
+      bindPW: admin_password
+      usernamePrompt: "Username"
+      userSearch:
+        baseDN: ou=people,dc=kubevirt,dc=local
+        filter: "(objectClass=person)"
+        username: uid
+        idAttr: uid
+        emailAttr: mail
+        nameAttr: displayName
+      groupSearch:
+        baseDN: ou=groups,dc=kubevirt,dc=local
+        filter: "(objectClass=groupOfUniqueNames)"
+        userMatchers:
+          - userAttr: dn
+            groupAttr: member
+        nameAttr: cn
+
+# Expiry settings
+expiry:
+  deviceRequests: "5m"
+  signingKeys: "6h"
+  idTokens: "24h"
+  refreshTokens:
+    reuseInterval: "3s"
+    validIfNotUsedFor: "168h"
+    absoluteLifetime: "720h"
+
+# Logger
+logger:
+  level: "debug"
+  format: "text"
