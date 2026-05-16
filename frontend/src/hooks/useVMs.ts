@@ -1,12 +1,12 @@
 import { useQuery, useMutation, useQueryClient, Query } from '@tanstack/react-query';
 import * as vmApi from '@/api/vms';
-import type { VM, VMCreateRequest, VMUpdateRequest, DiskResizeRequest } from '@/types/vm';
+import type { VM, VMCreateRequest, VMUpdateRequest, VMDisplayNameUpdateRequest, DiskResizeRequest } from '@/types/vm';
 import { notify } from '@/store/notifications';
 
-export function useVMs(namespace?: string, page?: number, perPage?: number) {
+export function useVMs(namespace?: string, page?: number, perPage?: number, search?: string) {
   return useQuery({
-    queryKey: ['vms', namespace || 'all', page, perPage],
-    queryFn: () => vmApi.listVMs(namespace, page, perPage),
+    queryKey: ['vms', namespace || 'all', page, perPage, search],
+    queryFn: () => vmApi.listVMs(namespace, page, perPage, search),
   });
 }
 
@@ -51,6 +51,19 @@ export function useUpdateVM() {
   return useMutation({
     mutationFn: ({ namespace, name, data }: { namespace: string; name: string; data: VMUpdateRequest }) =>
       vmApi.updateVM(namespace, name, data),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['vms'] });
+      queryClient.invalidateQueries({ queryKey: ['vm', variables.namespace, variables.name] });
+    },
+  });
+}
+
+export function useUpdateVMDisplayName() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({ namespace, name, data }: { namespace: string; name: string; data: VMDisplayNameUpdateRequest }) =>
+      vmApi.updateVMDisplayName(namespace, name, data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['vms'] });
       queryClient.invalidateQueries({ queryKey: ['vm', variables.namespace, variables.name] });
@@ -330,7 +343,7 @@ export function useCreateVMSnapshot() {
     }: {
       namespace: string;
       vmName: string;
-      data: { snapshot_name: string };
+      data: { display_name: string };
     }) => vmApi.createVMSnapshot(namespace, vmName, data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['vm-snapshots', variables.namespace, variables.vmName] });

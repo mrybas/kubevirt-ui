@@ -14,6 +14,7 @@ from app.api.health import router as health_router
 from app.api.v1.router import router as api_v1_router
 from app.config import get_settings
 from app.core.k8s_client import K8sClient
+from app.core.vm_cache import VMCacheRegistry
 
 # Configure logging
 settings = get_settings()
@@ -33,6 +34,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     k8s_client = K8sClient()
     await k8s_client.initialize()
     app.state.k8s_client = k8s_client
+
+    # Watch-backed VM list cache (lazy per namespace; populated on first request).
+    app.state.vm_cache = VMCacheRegistry(k8s_client)
 
     # Ensure system namespace exists (needed for SA tokens, settings, templates)
     SYSTEM_NAMESPACE = "kubevirt-ui-system"
@@ -78,6 +82,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             await reconciler_task
         except asyncio.CancelledError:
             pass
+    await app.state.vm_cache.close()
     await k8s_client.close()
     logger.info("KubeVirt UI Backend shut down")
 

@@ -182,7 +182,7 @@ export interface VMNetworkRequest {
  */
 
 export interface VMFromTemplateRequest {
-  name: string;
+  display_name: string;
   template_name: string;
   cpu_cores?: number;
   memory?: string;

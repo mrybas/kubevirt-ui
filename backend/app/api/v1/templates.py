@@ -460,7 +460,10 @@ async def list_golden_images(
         
         for ns in namespaces_to_check:
             try:
-                # 1) Scan VM-owned DataVolumes (cloned disks) to trace source golden image
+                # 1) Scan VM-owned DataVolumes (cloned disks) to trace source golden image.
+                # Owner is read from ownerReferences (set by KubeVirt for DVs created via
+                # dataVolumeTemplates) — this is always the actual VM name regardless of
+                # whether the VM was created with a user-supplied name or generateName.
                 dvs_result = await custom_api.list_namespaced_custom_object(
                     group="cdi.kubevirt.io",
                     version="v1beta1",
@@ -469,8 +472,11 @@ async def list_golden_images(
                     label_selector="kubevirt-ui.io/vm-disk=true",
                 )
                 for dv in dvs_result.get("items", []):
-                    dv_labels = dv.get("metadata", {}).get("labels", {})
-                    vm_name = dv_labels.get("kubevirt-ui.io/vm")
+                    owners = dv.get("metadata", {}).get("ownerReferences") or []
+                    vm_name = next(
+                        (o.get("name") for o in owners if o.get("kind") == "VirtualMachine"),
+                        None,
+                    )
                     if not vm_name:
                         continue
                     vm_full_name = f"{ns}/{vm_name}"

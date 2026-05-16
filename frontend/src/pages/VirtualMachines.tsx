@@ -2,7 +2,7 @@
  * Virtual Machines page - VM list and management
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import {
   Plus,
@@ -63,11 +63,23 @@ export function VirtualMachines() {
   const [pendingActions, setPendingActions] = useState<Set<string>>(new Set());
   const { page, perPage, setPage, setPerPage } = usePagination(50);
 
-  // Reset to page 1 when search or folder filter changes
-  useEffect(() => { setPage(1); }, [searchQuery, filterFolder]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Debounce search query 300ms before sending to backend
+  const [debouncedSearch, setDebouncedSearch] = useState('');
+  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleSearch = (q: string) => {
+    setSearchQuery(q);
+    if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    debounceTimer.current = setTimeout(() => {
+      setDebouncedSearch(q);
+      setPage(1);
+    }, 300);
+  };
+
+  // Reset to page 1 when folder filter changes
+  useEffect(() => { setPage(1); }, [filterFolder]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // VM hooks - if no namespace selected, fetch all VMs from all projects
-  const { data: vmData, isLoading, error, refetch: refetchVMs } = useVMs(selectedNamespace || undefined, page, perPage);
+  const { data: vmData, isLoading, error, refetch: refetchVMs } = useVMs(selectedNamespace || undefined, page, perPage, debouncedSearch || undefined);
   const { data: namespacesData } = useNamespaces();
   const { data: foldersData } = useFoldersFlat();
   const startVM = useStartVM();
@@ -89,19 +101,10 @@ export function VirtualMachines() {
   const addPending = (key: string) => setPendingActions(prev => new Set(prev).add(key));
   const removePending = (key: string) => setPendingActions(prev => { const s = new Set(prev); s.delete(key); return s; });
 
-  // Filter VMs by search and folder
-  const filteredVMs = (vmData?.items || []).filter(vm => {
-    const q = searchQuery.toLowerCase();
-    const matchesSearch = (
-      vm.name.toLowerCase().includes(q) ||
-      vm.namespace.toLowerCase().includes(q) ||
-      (vm.project || '').toLowerCase().includes(q) ||
-      (vm.environment || '').toLowerCase().includes(q) ||
-      (vm.owner || '').toLowerCase().includes(q)
-    );
-    const matchesFolder = !folderNamespaces || folderNamespaces.has(vm.namespace);
-    return matchesSearch && matchesFolder;
-  });
+  // Filter by folder client-side; search is handled server-side via debouncedSearch
+  const filteredVMs = (vmData?.items || []).filter(vm =>
+    !folderNamespaces || folderNamespaces.has(vm.namespace)
+  );
 
   const handleStart = (vm: VM) => {
     const k = vmKey(vm);
@@ -153,10 +156,10 @@ export function VirtualMachines() {
       sortable: true,
       accessor: (vm) => (
         <div>
-          <Link to={`/vms/${vm.namespace}/${vm.name}`} className="font-medium font-mono text-surface-100 hover:text-primary-400" onClick={e => e.stopPropagation()}>
-            {vm.name}
+          <Link to={`/vms/${vm.namespace}/${vm.name}`} className="font-medium text-surface-100 hover:text-primary-400" onClick={e => e.stopPropagation()}>
+            {vm.display_name || vm.name}
           </Link>
-          <p className="text-xs text-surface-500 font-mono">{vm.namespace}</p>
+          <p className="text-xs text-surface-500 font-mono">{vm.name} · {vm.namespace}</p>
         </div>
       ),
     },
@@ -315,8 +318,8 @@ export function VirtualMachines() {
             { label: 'Delete', icon: <Trash2 className="h-4 w-4" />, onClick: (items) => { setBulkSelectedVMs(items as VM[]); setShowBulkDeleteModal(true); }, variant: 'danger' },
           ]}
           searchable
-          searchPlaceholder="Search by name, project, owner..."
-          onSearch={setSearchQuery}
+          searchPlaceholder="Search VMs by display name..."
+          onSearch={handleSearch}
           pagination={{
             page,
             pageSize: perPage,
@@ -351,7 +354,8 @@ export function VirtualMachines() {
                       <Server className="h-5 w-5" />
                     </div>
                     <div>
-                      <h4 className="font-semibold text-surface-100">{vm.name}</h4>
+                      <h4 className="font-semibold text-surface-100">{vm.display_name || vm.name}</h4>
+                      <p className="text-xs text-surface-500 font-mono">{vm.name}</p>
                       <p className="text-xs text-surface-500">{vm.namespace}</p>
                     </div>
                   </div>

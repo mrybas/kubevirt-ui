@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import time
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -11,6 +10,7 @@ from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
 from app.core.auth import User, require_auth
+from app.core.naming import get_display_name, with_synthetic_metadata
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -18,15 +18,21 @@ logger = logging.getLogger(__name__)
 
 # ── Request models ────────────────────────────────────────────────────────────
 
+
 class CreateVMSnapshotRequest(BaseModel):
-    snapshot_name: str = Field(..., pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", max_length=63)
+    display_name: str = Field(..., min_length=1, max_length=100)
 
 
 class RestoreVMSnapshotRequest(BaseModel):
-    restore_name: str | None = Field(None, description="Name for the restore object (auto-generated if empty)")
+    display_name: str | None = Field(
+        None,
+        max_length=100,
+        description="Human-friendly name for the restore (auto-generated if empty)",
+    )
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
+
 
 @router.get("/{name}/snapshots", status_code=status.HTTP_200_OK)
 async def list_vm_snapshots(
@@ -55,16 +61,20 @@ async def list_vm_snapshots(
                 continue
 
             snap_status = snap.get("status", {})
-            snapshots.append({
-                "name": snap["metadata"]["name"],
-                "namespace": namespace,
-                "vm_name": name,
-                "phase": snap_status.get("phase", "Unknown"),
-                "ready": snap_status.get("readyToUse", False),
-                "creation_time": snap.get("metadata", {}).get("creationTimestamp", ""),
-                "indications": snap_status.get("indications", []),
-                "error": snap_status.get("error", {}).get("message"),
-            })
+            snap_metadata = snap.get("metadata", {})
+            snapshots.append(
+                {
+                    "name": snap_metadata["name"],
+                    "display_name": get_display_name(snap_metadata) or snap_metadata["name"],
+                    "namespace": namespace,
+                    "vm_name": name,
+                    "phase": snap_status.get("phase", "Unknown"),
+                    "ready": snap_status.get("readyToUse", False),
+                    "creation_time": snap_metadata.get("creationTimestamp", ""),
+                    "indications": snap_status.get("indications", []),
+                    "error": snap_status.get("error", {}).get("message"),
+                }
+            )
 
         snapshots.sort(key=lambda x: x["creation_time"], reverse=True)
         return snapshots
@@ -93,11 +103,10 @@ async def create_vm_snapshot(
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
 
-        snapshot_body = {
+        snapshot_body: dict[str, Any] = {
             "apiVersion": "snapshot.kubevirt.io/v1beta1",
             "kind": "VirtualMachineSnapshot",
             "metadata": {
-                "name": snap_request.snapshot_name,
                 "namespace": namespace,
                 "labels": {
                     "kubevirt-ui.io/managed": "true",
@@ -112,6 +121,7 @@ async def create_vm_snapshot(
                 },
             },
         }
+        with_synthetic_metadata(snapshot_body, snap_request.display_name, namespace=namespace)
 
         result = await custom_api.create_namespaced_custom_object(
             group="snapshot.kubevirt.io",
@@ -123,6 +133,7 @@ async def create_vm_snapshot(
 
         return {
             "name": result["metadata"]["name"],
+            "display_name": snap_request.display_name,
             "namespace": namespace,
             "vm_name": name,
             "phase": "InProgress",
@@ -194,15 +205,21 @@ async def restore_vm_snapshot(
         # 1. Stop VM if running
         was_running = False
         vm = await custom_api.get_namespaced_custom_object(
-            group="kubevirt.io", version="v1", namespace=namespace,
-            plural="virtualmachines", name=name,
+            group="kubevirt.io",
+            version="v1",
+            namespace=namespace,
+            plural="virtualmachines",
+            name=name,
         )
         original_run_strategy = vm.get("spec", {}).get("runStrategy", "Always")
 
         try:
             await custom_api.get_namespaced_custom_object(
-                group="kubevirt.io", version="v1", namespace=namespace,
-                plural="virtualmachineinstances", name=name,
+                group="kubevirt.io",
+                version="v1",
+                namespace=namespace,
+                plural="virtualmachineinstances",
+                name=name,
             )
             was_running = True
         except ApiException as e:
@@ -211,16 +228,22 @@ async def restore_vm_snapshot(
 
         if was_running:
             await custom_api.patch_namespaced_custom_object(
-                group="kubevirt.io", version="v1", namespace=namespace,
-                plural="virtualmachines", name=name,
+                group="kubevirt.io",
+                version="v1",
+                namespace=namespace,
+                plural="virtualmachines",
+                name=name,
                 body={"spec": {"runStrategy": "Halted"}},
                 _content_type="application/merge-patch+json",
             )
             for _ in range(60):
                 try:
                     await custom_api.get_namespaced_custom_object(
-                        group="kubevirt.io", version="v1", namespace=namespace,
-                        plural="virtualmachineinstances", name=name,
+                        group="kubevirt.io",
+                        version="v1",
+                        namespace=namespace,
+                        plural="virtualmachineinstances",
+                        name=name,
                     )
                     await asyncio.sleep(2)
                 except ApiException as e:
@@ -228,17 +251,19 @@ async def restore_vm_snapshot(
                         break
                     raise
 
-        # 2. Create VirtualMachineRestore
-        restore_name = (
-            (restore_request.restore_name if restore_request and restore_request.restore_name else None)
-            or f"restore-{name}-{int(time.time())}"
+        # 2. Create VirtualMachineRestore. Use display_name if supplied,
+        # otherwise default to "Restore of {snapshot_name}". K8s assigns the
+        # actual resource name via generateName.
+        display_name = (
+            restore_request.display_name
+            if restore_request and restore_request.display_name
+            else f"Restore of {snapshot_name}"
         )
 
-        restore_body = {
+        restore_body: dict[str, Any] = {
             "apiVersion": "snapshot.kubevirt.io/v1beta1",
             "kind": "VirtualMachineRestore",
             "metadata": {
-                "name": restore_name,
                 "namespace": namespace,
                 "labels": {
                     "kubevirt-ui.io/managed": "true",
@@ -254,21 +279,25 @@ async def restore_vm_snapshot(
                 "virtualMachineSnapshotName": snapshot_name,
             },
         }
+        with_synthetic_metadata(restore_body, display_name, namespace=namespace)
 
-        await custom_api.create_namespaced_custom_object(
+        created_restore = await custom_api.create_namespaced_custom_object(
             group="snapshot.kubevirt.io",
             version="v1beta1",
             namespace=namespace,
             plural="virtualmachinerestores",
             body=restore_body,
         )
+        restore_name = created_restore.get("metadata", {}).get("name", "")
 
         # 3. Wait for restore to complete
         for _ in range(120):
             try:
                 restore_obj = await custom_api.get_namespaced_custom_object(
-                    group="snapshot.kubevirt.io", version="v1beta1",
-                    namespace=namespace, plural="virtualmachinerestores",
+                    group="snapshot.kubevirt.io",
+                    version="v1beta1",
+                    namespace=namespace,
+                    plural="virtualmachinerestores",
                     name=restore_name,
                 )
                 conditions = restore_obj.get("status", {}).get("conditions", [])
@@ -285,8 +314,11 @@ async def restore_vm_snapshot(
         # 4. Restart VM if it was running
         if was_running:
             await custom_api.patch_namespaced_custom_object(
-                group="kubevirt.io", version="v1", namespace=namespace,
-                plural="virtualmachines", name=name,
+                group="kubevirt.io",
+                version="v1",
+                namespace=namespace,
+                plural="virtualmachines",
+                name=name,
                 body={"spec": {"runStrategy": original_run_strategy}},
                 _content_type="application/merge-patch+json",
             )
@@ -296,6 +328,7 @@ async def restore_vm_snapshot(
             "vm": name,
             "snapshot": snapshot_name,
             "restore": restore_name,
+            "restore_display_name": display_name,
             "was_running": was_running,
         }
 

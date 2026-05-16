@@ -10,12 +10,13 @@ export function EditVMModal({
   isLoading,
   error,
 }: {
-  vm: { 
-    name: string; 
-    namespace: string; 
-    cpu_cores?: number; 
-    memory?: string; 
-    run_strategy?: string; 
+  vm: {
+    name: string;
+    display_name?: string;
+    namespace: string;
+    cpu_cores?: number;
+    memory?: string;
+    run_strategy?: string;
     status: string;
     console?: { vnc_enabled: boolean; serial_console_enabled: boolean };
   };
@@ -66,7 +67,7 @@ export function EditVMModal({
         <div className="flex items-center justify-between p-6 border-b border-surface-700">
           <div>
             <h2 className="font-display text-xl font-bold text-surface-100">Edit VM</h2>
-            <p className="text-surface-400 text-sm mt-1">{vm.name}</p>
+            <p className="text-surface-400 text-sm mt-1">{vm.display_name || vm.name}</p>
           </div>
           <button onClick={onClose} className="btn-ghost p-2">
             <X className="h-5 w-5" />

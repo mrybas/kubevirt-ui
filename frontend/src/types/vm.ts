@@ -12,6 +12,7 @@ export interface VMConsoleConfig {
 
 export interface VM {
   name: string;
+  display_name: string;
   namespace: string;
   status: string;
   ready: boolean;
@@ -47,7 +48,7 @@ export interface VMStatusResponse {
 }
 
 export interface VMCreateRequest {
-  name: string;
+  display_name: string;
   cpu_cores?: number;
   memory?: string;
   run_strategy?: 'Always' | 'Halted' | 'Manual' | 'RerunOnFailure' | 'Once';
@@ -56,6 +57,10 @@ export interface VMCreateRequest {
   cloud_init?: {
     user_data?: string;
   };
+}
+
+export interface VMDisplayNameUpdateRequest {
+  display_name: string;
 }
 
 export interface VMUpdateRequest {
@@ -141,6 +146,7 @@ export interface VolumeSnapshotInfo {
 
 export interface VMSnapshotInfo {
   name: string;
+  display_name: string;
   namespace: string;
   vm_name: string;
   phase: string;
@@ -172,7 +178,7 @@ export interface AddNICRequest {
 }
 
 export interface CloneVMRequest {
-  new_name: string;
+  display_name: string;
   target_namespace?: string;
   start?: boolean;
 }

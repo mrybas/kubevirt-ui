@@ -1,7 +1,9 @@
 """Virtual Machine API endpoints — CRUD, events, YAML."""
 
 import asyncio
+import json
 import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -12,11 +14,18 @@ from pydantic import BaseModel, Field
 from app.core.auth import User, require_auth
 from app.core.groups import get_user_namespaces
 from app.core.kubevirt import get_hotplug_mode
+from app.core.naming import (
+    DISPLAY_NAME_ANNOTATION,
+    SLUG_LABEL,
+    sanitize_display_name,
+    with_synthetic_metadata,
+)
 from app.api.v1.cluster import get_cluster_settings
 from app.models.vm import (
     VMCreateRequest,
     VMListResponse,
     VMResponse,
+    VMUpdateDisplayNameRequest,
     VMUpdateRequest,
     vm_from_k8s,
 )
@@ -51,12 +60,8 @@ class VMNetworkRequest(BaseModel):
 
 class VMFromTemplateRequest(BaseModel):
     """Request to create VM from template."""
-    
-    name: str = Field(
-        ...,
-        pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
-        max_length=63,
-    )
+
+    display_name: str = Field(..., min_length=1, max_length=100)
     template_name: str
     
     # Optional overrides
@@ -83,13 +88,21 @@ class VMFromTemplateRequest(BaseModel):
 async def list_vms(
     request: Request,
     namespace: str | None = None,
+    search: str | None = Query(None, description="Case-insensitive substring filter on display_name"),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
     user: User = Depends(require_auth),
 ) -> VMListResponse:
     """List VirtualMachines. If namespace is provided, list from that namespace only.
-    Otherwise, list from all enabled project namespaces the user can access."""
+    Otherwise, list from all enabled project namespaces the user can access.
+
+    When ``search`` is supplied, results are filtered in-memory by a
+    case-insensitive substring match against the display name (falling back to
+    ``metadata.name`` if the display-name annotation is missing). Substring
+    semantics support incremental as-you-type filtering on the frontend.
+    """
     k8s_client = request.app.state.k8s_client
+    vm_cache = request.app.state.vm_cache
 
     try:
         # Determine which namespaces to query (RBAC-filtered)
@@ -114,19 +127,22 @@ async def list_vms(
             pass
 
         async def _fetch_ns_vms(ns: str) -> list[VMResponse]:
-            """Fetch VMs, VMIs, and pod IPs for a single namespace."""
-            vms = await k8s_client.list_virtual_machines(namespace=ns)
+            """Fetch VMs (cached), VMIs, and pod IPs for a single namespace."""
+            vms = await vm_cache.list_vms(ns)
             vmis = await k8s_client.list_virtual_machine_instances(namespace=ns)
             vmi_map = {vmi["metadata"]["name"]: vmi for vmi in vmis}
 
             pod_ip_map: dict[str, str] = {}
             try:
                 core_api = k8s_client.core_api
+                # vm.kubevirt.io/name is set by KubeVirt automatically on every
+                # launcher pod and always equals the parent VM's metadata.name
+                # — no client-side stamping required.
                 pods = await core_api.list_namespaced_pod(
-                    namespace=ns, label_selector="kubevirt.io/domain",
+                    namespace=ns, label_selector="vm.kubevirt.io/name",
                 )
                 for pod in pods.items:
-                    vm_name = pod.metadata.labels.get("kubevirt.io/domain", "")
+                    vm_name = pod.metadata.labels.get("vm.kubevirt.io/name", "")
                     ip = _extract_kubeovn_ip(pod.to_dict())
                     if vm_name and ip:
                         pod_ip_map[vm_name] = ip
@@ -160,6 +176,12 @@ async def list_vms(
                 logger.warning(f"Failed to list VMs in namespace {namespaces_to_query[i]}: {result}")
             else:
                 vm_responses.extend(result)
+
+        # Case-insensitive substring filter on display_name. Applied before
+        # pagination so total/pages reflect the filtered set.
+        if search:
+            needle = search.lower()
+            vm_responses = [v for v in vm_responses if needle in v.display_name.lower()]
 
         total = len(vm_responses)
         start = (page - 1) * per_page
@@ -239,7 +261,7 @@ async def get_vm(request: Request, namespace: str, name: str) -> VMResponse:
             core_api = k8s_client.core_api
             pods = await core_api.list_namespaced_pod(
                 namespace=namespace,
-                label_selector=f"kubevirt.io/domain={name}",
+                label_selector=f"vm.kubevirt.io/name={name}",
             )
             for pod in pods.items:
                 ip = _extract_kubeovn_ip(pod.to_dict())
@@ -463,32 +485,102 @@ async def update_vm(
         )
 
 
+@router.patch("/{name}/display-name", response_model=VMResponse)
+async def update_vm_display_name(
+    request: Request,
+    namespace: str,
+    name: str,
+    update: VMUpdateDisplayNameRequest,
+    user: User = Depends(require_auth),
+) -> VMResponse:
+    """Update only a VM's display-name annotation and slug label.
+
+    K8s resource identity (``metadata.name``) is unchanged.
+    """
+    k8s_client = request.app.state.k8s_client
+    slug = sanitize_display_name(update.display_name)
+
+    patch: dict[str, Any] = {
+        "metadata": {
+            "annotations": {DISPLAY_NAME_ANNOTATION: update.display_name},
+            "labels": {SLUG_LABEL: slug},
+        }
+    }
+
+    try:
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        updated_vm = await custom_api.patch_namespaced_custom_object(
+            group="kubevirt.io",
+            version="v1",
+            namespace=namespace,
+            plural="virtualmachines",
+            name=name,
+            body=patch,
+            _content_type="application/merge-patch+json",
+        )
+
+        vmi = None
+        try:
+            vmi = await k8s_client.get_virtual_machine_instance(
+                name=name, namespace=namespace
+            )
+        except ApiException:
+            pass
+
+        logger.info(
+            f"User {user.username} renamed VM {namespace}/{name} "
+            f"display_name={update.display_name!r}"
+        )
+        return vm_from_k8s(updated_vm, vmi)
+
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"VM {name} not found in namespace {namespace}",
+            ) from e
+        logger.error(f"Failed to update VM display_name {namespace}/{name}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update display name: {e.reason}",
+        ) from e
+
+
 @router.post("", response_model=VMResponse, status_code=status.HTTP_201_CREATED)
 async def create_vm(
     request: Request, namespace: str, vm_request: VMCreateRequest,
     user: User = Depends(require_auth),
 ) -> VMResponse:
-    """Create a new VirtualMachine."""
+    """Create a new VirtualMachine.
+
+    Uses K8s ``generateName`` for collision-free server-side name assignment.
+    Display name is stored in the ``kubevirt-ui.io/display-name`` annotation.
+    """
     k8s_client = request.app.state.k8s_client
 
-    # Build VM manifest
+    # Build VM body (no metadata.name; placeholder DV refs based on slug).
     vm_manifest = vm_request.to_k8s_manifest(namespace)
 
-    # Stamp owner annotation
-    vm_manifest.setdefault("metadata", {}).setdefault("annotations", {})["kubevirt-ui.io/owner"] = user.email or user.username
+    # Inject generateName, display-name annotation, slug label.
+    with_synthetic_metadata(vm_manifest, vm_request.display_name, namespace=namespace)
+
+    # Stamp owner annotation (preserve display-name annotation set above).
+    vm_manifest["metadata"].setdefault("annotations", {})[
+        "kubevirt-ui.io/owner"
+    ] = user.email or user.username
 
     try:
         created_vm = await k8s_client.create_virtual_machine(
             namespace=namespace, body=vm_manifest
         )
+        actual_name = created_vm.get("metadata", {}).get("name", "")
+        logger.info(
+            f"User {user.username} created VM {namespace}/{actual_name} "
+            f"(display_name={vm_request.display_name!r})"
+        )
         return vm_from_k8s(created_vm, None)
 
     except ApiException as e:
-        if e.status == 409:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"VM {vm_request.name} already exists",
-            )
         if e.status == 403:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -516,8 +608,6 @@ async def create_vm_from_template(
     k8s_client = request.app.state.k8s_client
     
     try:
-        import json
-        
         # 1. Get the template
         try:
             cm = await k8s_client.core_api.read_namespaced_config_map(
@@ -559,8 +649,12 @@ async def create_vm_from_template(
             )
         
         # 3. Build DataVolume spec for dataVolumeTemplates
-        disk_name = f"{vm_request.name}-root"
-        
+        # DV name must be literal (volumes[].dataVolume.name references it by exact
+        # match), so we can't use K8s generateName for the DV. Use a client-side
+        # unique suffix to avoid collisions between VMs sharing the same display name.
+        slug = sanitize_display_name(vm_request.display_name)
+        disk_name = f"{slug}-root-{uuid.uuid4().hex[:6]}"
+
         dv_storage: dict[str, Any] = {
             "resources": {
                 "requests": {
@@ -571,12 +665,14 @@ async def create_vm_from_template(
         if storage_class:
             dv_storage["storageClassName"] = storage_class
         
+        # DV → VM ownership is set automatically by KubeVirt via ownerReferences
+        # when using dataVolumeTemplates — no client-side label is needed to track
+        # which VM owns the DV.
         dv_template = {
             "metadata": {
                 "name": disk_name,
                 "labels": {
                     "kubevirt-ui.io/managed": "true",
-                    "kubevirt-ui.io/vm": vm_request.name,
                     "kubevirt-ui.io/vm-disk": "true",
                 },
             },
@@ -790,21 +886,22 @@ async def create_vm_from_template(
                     {"name": "default", "bridge": {}}
                 ]
         
-        # Build template metadata with optional annotations
-        template_metadata: dict[str, Any] = {
-            "labels": {
-                "kubevirt.io/domain": vm_request.name,
-            },
-        }
+        # Build template metadata. We deliberately do NOT set
+        # ``kubevirt.io/domain`` — KubeVirt stamps each launcher pod with
+        # ``vm.kubevirt.io/name=<actual_vm_name>`` automatically, which is what
+        # list_vms/get_vm use to find pods.
+        template_metadata: dict[str, Any] = {}
         if template_annotations:
             template_metadata["annotations"] = template_annotations
-        
+
         # 6. Build and create VM manifest with dataVolumeTemplates
         # KubeVirt manages the DV lifecycle: creates DV, waits for ready, sets ownerRef
-        
-        # Read namespace labels for project/environment
+
+        # Read namespace labels for project/environment. The ``app`` label uses
+        # the slug — it's informational only (k8s-style "app" grouping), not a
+        # lookup key for anything that needs the actual VM name.
         vm_labels: dict[str, str] = {
-            "app": vm_request.name,
+            "app": slug,
             "kubevirt-ui.io/managed": "true",
             "kubevirt-ui.io/template": vm_request.template_name,
         }
@@ -817,12 +914,11 @@ async def create_vm_from_template(
                 vm_labels["kubevirt-ui.io/environment"] = ns_labels["kubevirt-ui.io/environment"]
         except Exception:
             pass
-        
-        vm_manifest = {
+
+        vm_manifest: dict[str, Any] = {
             "apiVersion": "kubevirt.io/v1",
             "kind": "VirtualMachine",
             "metadata": {
-                "name": vm_request.name,
                 "namespace": namespace,
                 "labels": vm_labels,
                 "annotations": {
@@ -838,7 +934,10 @@ async def create_vm_from_template(
                 },
             },
         }
-        
+
+        # Inject generateName + display-name annotation + slug label.
+        with_synthetic_metadata(vm_manifest, vm_request.display_name, namespace=namespace)
+
         created_vm = await custom_api.create_namespaced_custom_object(
             group="kubevirt.io",
             version="v1",
@@ -846,9 +945,14 @@ async def create_vm_from_template(
             plural="virtualmachines",
             body=vm_manifest,
         )
-        
+        actual_name = created_vm.get("metadata", {}).get("name", "")
+
+        logger.info(
+            f"User {user.username} created VM from template {namespace}/{actual_name} "
+            f"(display_name={vm_request.display_name!r}, template={vm_request.template_name})"
+        )
         return vm_from_k8s(created_vm, None)
-    
+
     except HTTPException:
         raise
     except ApiException as e:

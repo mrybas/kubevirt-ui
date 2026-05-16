@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import logging
+import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -12,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from app.core.auth import User, require_auth
 from app.core.kubevirt import kubevirt_subresource_call
+from app.core.naming import sanitize_display_name, with_synthetic_metadata
 from app.models.vm import VMStatusResponse
 
 router = APIRouter()
@@ -20,20 +22,26 @@ logger = logging.getLogger(__name__)
 
 # ── Request models ────────────────────────────────────────────────────────────
 
+
 class StopVMRequest(BaseModel):
     """Request model for stopping a VM."""
+
     force: bool = Field(False, description="Force stop (immediate, no graceful shutdown)")
-    grace_period: int = Field(120, ge=0, le=600, description="Grace period in seconds (default: 120)")
+    grace_period: int = Field(
+        120, ge=0, le=600, description="Grace period in seconds (default: 120)"
+    )
 
 
 class MigrateVMRequest(BaseModel):
     """Request model for live migrating a VM."""
+
     target_node: str = Field(..., description="Target node to migrate the VM to")
 
 
 class CloneVMRequest(BaseModel):
-    new_name: str = Field(..., pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", max_length=63,
-                          description="Name for the cloned VM")
+    display_name: str = Field(
+        ..., min_length=1, max_length=100, description="Human-friendly name for the cloned VM"
+    )
     target_namespace: str | None = Field(None, description="Target namespace (defaults to same)")
     start: bool = Field(False, description="Start the cloned VM immediately")
 
@@ -46,6 +54,7 @@ class ResizeVMRequest(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+
 @router.post("/{name}/start", response_model=VMStatusResponse)
 async def start_vm(request: Request, namespace: str, name: str) -> VMStatusResponse:
     """Start a VirtualMachine."""
@@ -53,9 +62,7 @@ async def start_vm(request: Request, namespace: str, name: str) -> VMStatusRespo
 
     try:
         patch = {"spec": {"runStrategy": "Always"}}
-        await k8s_client.patch_virtual_machine(
-            name=name, namespace=namespace, body=patch
-        )
+        await k8s_client.patch_virtual_machine(name=name, namespace=namespace, body=patch)
         return VMStatusResponse(name=name, namespace=namespace, action="start", success=True)
 
     except ApiException as e:
@@ -72,13 +79,13 @@ async def start_vm(request: Request, namespace: str, name: str) -> VMStatusRespo
 
 @router.post("/{name}/stop", response_model=VMStatusResponse)
 async def stop_vm(
-    request: Request, 
-    namespace: str, 
+    request: Request,
+    namespace: str,
     name: str,
     stop_request: StopVMRequest = StopVMRequest(),
 ) -> VMStatusResponse:
     """Stop a VirtualMachine using subresource API.
-    
+
     - Graceful stop: sends ACPI shutdown signal, waits for grace_period
     - Force stop: immediately terminates the VM (like pulling the power cord)
     """
@@ -90,14 +97,19 @@ async def stop_vm(
             body["gracePeriod"] = 0
         else:
             body["gracePeriod"] = stop_request.grace_period
-        
+
         success, resp_text = await kubevirt_subresource_call(
-            k8s_client, "put", namespace, name, "stop", body,
+            k8s_client,
+            "put",
+            namespace,
+            name,
+            "stop",
+            body,
         )
-        
+
         if not success:
             raise Exception(f"Stop subresource failed: {resp_text}")
-        
+
         action = "force_stop" if stop_request.force else "stop"
         return VMStatusResponse(name=name, namespace=namespace, action=action, success=True)
 
@@ -107,12 +119,13 @@ async def stop_vm(
         # If subresource API fails, fall back to patching runStrategy
         try:
             patch = {"spec": {"runStrategy": "Halted"}}
-            await k8s_client.patch_virtual_machine(
-                name=name, namespace=namespace, body=patch
-            )
+            await k8s_client.patch_virtual_machine(name=name, namespace=namespace, body=patch)
             return VMStatusResponse(
-                name=name, namespace=namespace, action="stop", success=True,
-                message="Stopped via runStrategy (subresource API unavailable)"
+                name=name,
+                namespace=namespace,
+                action="stop",
+                success=True,
+                message="Stopped via runStrategy (subresource API unavailable)",
             )
         except Exception:
             raise HTTPException(
@@ -127,21 +140,15 @@ async def restart_vm(request: Request, namespace: str, name: str) -> VMStatusRes
     k8s_client = request.app.state.k8s_client
 
     try:
-        await k8s_client.delete_virtual_machine_instance(
-            name=name, namespace=namespace
-        )
-        return VMStatusResponse(
-            name=name, namespace=namespace, action="restart", success=True
-        )
+        await k8s_client.delete_virtual_machine_instance(name=name, namespace=namespace)
+        return VMStatusResponse(name=name, namespace=namespace, action="restart", success=True)
 
     except ApiException as e:
         if e.status == 404:
             # VMI doesn't exist, try to start the VM
             try:
                 patch = {"spec": {"runStrategy": "Always"}}
-                await k8s_client.patch_virtual_machine(
-                    name=name, namespace=namespace, body=patch
-                )
+                await k8s_client.patch_virtual_machine(name=name, namespace=namespace, body=patch)
                 return VMStatusResponse(
                     name=name, namespace=namespace, action="start", success=True
                 )
@@ -165,7 +172,7 @@ async def migrate_vm(
     user: User = Depends(require_auth),
 ) -> VMStatusResponse:
     """Live migrate a running VM to a target node.
-    
+
     1. Validates the VM is running and not already on the target node.
     2. Patches the VM template with nodeSelector for the target node.
     3. Creates a VirtualMachineInstanceMigration CR to trigger migration.
@@ -300,8 +307,11 @@ async def recreate_vm(
 
         # 1. Get the VM
         vm = await custom_api.get_namespaced_custom_object(
-            group="kubevirt.io", version="v1", namespace=namespace,
-            plural="virtualmachines", name=name,
+            group="kubevirt.io",
+            version="v1",
+            namespace=namespace,
+            plural="virtualmachines",
+            name=name,
         )
 
         # 2. Find the root disk and its DataVolume template
@@ -325,7 +335,7 @@ async def recreate_vm(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="VM has no dataVolumeTemplate — cannot determine golden image for recreate. "
-                       "Only VMs created from templates support recreate.",
+                "Only VMs created from templates support recreate.",
             )
 
         # Verify golden image source exists
@@ -342,7 +352,8 @@ async def recreate_vm(
 
         try:
             await core_api.read_namespaced_persistent_volume_claim(
-                name=golden_name, namespace=golden_ns,
+                name=golden_name,
+                namespace=golden_ns,
             )
         except ApiException as e:
             if e.status == 404:
@@ -358,8 +369,11 @@ async def recreate_vm(
 
         try:
             await custom_api.get_namespaced_custom_object(
-                group="kubevirt.io", version="v1", namespace=namespace,
-                plural="virtualmachineinstances", name=name,
+                group="kubevirt.io",
+                version="v1",
+                namespace=namespace,
+                plural="virtualmachineinstances",
+                name=name,
             )
             was_running = True
         except ApiException as e:
@@ -368,16 +382,22 @@ async def recreate_vm(
 
         if was_running or original_run_strategy in ("Always", "RerunOnFailure"):
             await custom_api.patch_namespaced_custom_object(
-                group="kubevirt.io", version="v1", namespace=namespace,
-                plural="virtualmachines", name=name,
+                group="kubevirt.io",
+                version="v1",
+                namespace=namespace,
+                plural="virtualmachines",
+                name=name,
                 body={"spec": {"runStrategy": "Halted"}},
                 _content_type="application/merge-patch+json",
             )
             for _ in range(90):
                 try:
                     await custom_api.get_namespaced_custom_object(
-                        group="kubevirt.io", version="v1", namespace=namespace,
-                        plural="virtualmachineinstances", name=name,
+                        group="kubevirt.io",
+                        version="v1",
+                        namespace=namespace,
+                        plural="virtualmachineinstances",
+                        name=name,
                     )
                     await asyncio.sleep(2)
                 except ApiException as e:
@@ -388,14 +408,20 @@ async def recreate_vm(
         # 4. Delete the root DV and PVC
         try:
             await custom_api.delete_namespaced_custom_object(
-                group="cdi.kubevirt.io", version="v1beta1", namespace=namespace,
-                plural="datavolumes", name=root_dv_name,
+                group="cdi.kubevirt.io",
+                version="v1beta1",
+                namespace=namespace,
+                plural="datavolumes",
+                name=root_dv_name,
             )
             for _ in range(30):
                 try:
                     await custom_api.get_namespaced_custom_object(
-                        group="cdi.kubevirt.io", version="v1beta1", namespace=namespace,
-                        plural="datavolumes", name=root_dv_name,
+                        group="cdi.kubevirt.io",
+                        version="v1beta1",
+                        namespace=namespace,
+                        plural="datavolumes",
+                        name=root_dv_name,
                     )
                     await asyncio.sleep(1)
                 except ApiException:
@@ -406,12 +432,14 @@ async def recreate_vm(
 
         try:
             await core_api.delete_namespaced_persistent_volume_claim(
-                name=root_dv_name, namespace=namespace,
+                name=root_dv_name,
+                namespace=namespace,
             )
             for _ in range(30):
                 try:
                     await core_api.read_namespaced_persistent_volume_claim(
-                        name=root_dv_name, namespace=namespace,
+                        name=root_dv_name,
+                        namespace=namespace,
                     )
                     await asyncio.sleep(1)
                 except ApiException:
@@ -422,8 +450,11 @@ async def recreate_vm(
 
         # 5. Start VM — KubeVirt will re-create the DV from dataVolumeTemplates
         await custom_api.patch_namespaced_custom_object(
-            group="kubevirt.io", version="v1", namespace=namespace,
-            plural="virtualmachines", name=name,
+            group="kubevirt.io",
+            version="v1",
+            namespace=namespace,
+            plural="virtualmachines",
+            name=name,
             body={"spec": {"runStrategy": original_run_strategy}},
             _content_type="application/merge-patch+json",
         )
@@ -435,7 +466,7 @@ async def recreate_vm(
             "golden_image": f"{golden_ns}/{golden_name}",
             "was_running": was_running,
             "message": f"VM '{name}' is being recreated from golden image '{golden_name}'. "
-                       "Network config and SSH keys are preserved.",
+            "Network config and SSH keys are preserved.",
         }
 
     except HTTPException:
@@ -465,8 +496,11 @@ async def clone_vm(
 
         # 1. Get source VM
         source_vm = await custom_api.get_namespaced_custom_object(
-            group="kubevirt.io", version="v1", namespace=namespace,
-            plural="virtualmachines", name=name,
+            group="kubevirt.io",
+            version="v1",
+            namespace=namespace,
+            plural="virtualmachines",
+            name=name,
         )
 
         source_spec = source_vm.get("spec", {})
@@ -474,15 +508,18 @@ async def clone_vm(
         # 2. Deep copy the VM spec
         new_spec = copy.deepcopy(source_spec)
 
-        # 3. Update DataVolume names and references
+        # 3. Update DataVolume names and references. DV names must be literal in
+        # the manifest (volume refs match by exact name), so we can't use
+        # generateName for DVs — assign a fresh unique slug-prefixed name to
+        # each one, keyed off the clone's display name.
+        clone_slug = sanitize_display_name(clone_request.display_name)
         dv_templates = new_spec.get("dataVolumeTemplates", [])
-        volume_rename_map = {}
+        volume_rename_map: dict[str, str] = {}
 
-        for dv in dv_templates:
+        for idx, dv in enumerate(dv_templates):
             old_name = dv.get("metadata", {}).get("name", "")
-            new_dv_name = old_name.replace(name, clone_request.new_name, 1)
-            if new_dv_name == old_name:
-                new_dv_name = f"{clone_request.new_name}-{old_name}"
+            suffix = uuid.uuid4().hex[:6]
+            new_dv_name = f"{clone_slug}-disk{idx}-{suffix}"
             dv["metadata"]["name"] = new_dv_name
             dv["metadata"].pop("uid", None)
             dv["metadata"].pop("resourceVersion", None)
@@ -507,15 +544,13 @@ async def clone_vm(
 
         # 5. Build clone manifest
         source_labels = source_vm.get("metadata", {}).get("labels", {})
-        clone_labels = {k: v for k, v in source_labels.items()
-                        if not k.startswith("kubevirt.io/")}
+        clone_labels = {k: v for k, v in source_labels.items() if not k.startswith("kubevirt.io/")}
         clone_labels["kubevirt-ui.io/cloned-from"] = name
 
-        clone_manifest = {
+        clone_manifest: dict[str, Any] = {
             "apiVersion": "kubevirt.io/v1",
             "kind": "VirtualMachine",
             "metadata": {
-                "name": clone_request.new_name,
                 "namespace": target_ns,
                 "labels": clone_labels,
                 "annotations": {
@@ -525,16 +560,24 @@ async def clone_vm(
             "spec": new_spec,
         }
 
-        # 6. Create the clone
-        await custom_api.create_namespaced_custom_object(
-            group="kubevirt.io", version="v1", namespace=target_ns,
-            plural="virtualmachines", body=clone_manifest,
+        # Inject generateName + display-name annotation + slug label.
+        with_synthetic_metadata(clone_manifest, clone_request.display_name, namespace=target_ns)
+
+        # 6. Create the clone — K8s assigns the actual name via generateName.
+        created = await custom_api.create_namespaced_custom_object(
+            group="kubevirt.io",
+            version="v1",
+            namespace=target_ns,
+            plural="virtualmachines",
+            body=clone_manifest,
         )
+        actual_name = created.get("metadata", {}).get("name", "")
 
         return {
             "status": "cloned",
             "source": f"{namespace}/{name}",
-            "clone": f"{target_ns}/{clone_request.new_name}",
+            "clone": f"{target_ns}/{actual_name}",
+            "clone_display_name": clone_request.display_name,
             "start": clone_request.start,
             "volumes_cloned": list(volume_rename_map.values()),
         }
@@ -596,8 +639,11 @@ async def resize_vm(
         }
 
         await custom_api.patch_namespaced_custom_object(
-            group="kubevirt.io", version="v1", namespace=namespace,
-            plural="virtualmachines", name=name,
+            group="kubevirt.io",
+            version="v1",
+            namespace=namespace,
+            plural="virtualmachines",
+            name=name,
             body=patch_body,
             _content_type="application/merge-patch+json",
         )
@@ -606,8 +652,11 @@ async def resize_vm(
         needs_restart = False
         try:
             await custom_api.get_namespaced_custom_object(
-                group="kubevirt.io", version="v1", namespace=namespace,
-                plural="virtualmachineinstances", name=name,
+                group="kubevirt.io",
+                version="v1",
+                namespace=namespace,
+                plural="virtualmachineinstances",
+                name=name,
             )
             needs_restart = True
         except ApiException as e:
@@ -627,7 +676,8 @@ async def resize_vm(
             "vm": name,
             "changes": changes,
             "needs_restart": needs_restart,
-            "message": "VM resized. " + ("Restart required for changes to take effect." if needs_restart else ""),
+            "message": "VM resized. "
+            + ("Restart required for changes to take effect." if needs_restart else ""),
         }
 
     except HTTPException:

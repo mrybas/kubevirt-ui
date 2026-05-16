@@ -14,7 +14,7 @@ export function SnapshotsTab({ vm }: { vm: any }) {
   const handleCreate = () => {
     if (!snapshotName.trim()) return;
     createSnapshot.mutate(
-      { namespace: vm.namespace, vmName: vm.name, data: { snapshot_name: snapshotName.trim() } },
+      { namespace: vm.namespace, vmName: vm.name, data: { display_name: snapshotName.trim() } },
       { onSuccess: () => setSnapshotName('') }
     );
   };
@@ -50,7 +50,8 @@ export function SnapshotsTab({ vm }: { vm: any }) {
               value={snapshotName}
               onChange={(e) => setSnapshotName(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
-              placeholder="Snapshot name (e.g. before-upgrade)"
+              placeholder="Snapshot name (e.g. Before upgrade)"
+              maxLength={100}
               className="input flex-1"
             />
             <button
@@ -93,7 +94,9 @@ export function SnapshotsTab({ vm }: { vm: any }) {
               <div key={snap.name} className="px-4 py-3 flex items-center justify-between gap-4">
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="font-medium text-surface-200 truncate">{snap.name}</span>
+                    <span className="font-medium text-surface-200 truncate">
+                      {snap.display_name || snap.name}
+                    </span>
                     {snap.ready ? (
                       <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs bg-emerald-500/10 text-emerald-400">
                         <CheckCircle className="h-3 w-3" />

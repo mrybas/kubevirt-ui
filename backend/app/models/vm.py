@@ -4,6 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.core.naming import get_display_name, sanitize_display_name
+
 
 class VMDiskConfig(BaseModel):
     """Disk configuration for VM creation."""
@@ -37,7 +39,7 @@ class VMCloudInitConfig(BaseModel):
 class VMCreateRequest(BaseModel):
     """Request model for creating a VM."""
 
-    name: str = Field(..., min_length=1, max_length=63, pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    display_name: str = Field(..., min_length=1, max_length=100)
     cpu_cores: int = Field(default=2, ge=1, le=128)
     memory: str = Field(default="2Gi", pattern=r"^\d+[KMGT]i?$")
     run_strategy: str = Field(default="Always", pattern=r"^(Always|Halted|Manual|RerunOnFailure|Once)$")
@@ -66,7 +68,15 @@ class VMCreateRequest(BaseModel):
     node_selector: dict[str, str] = Field(default_factory=dict)
 
     def to_k8s_manifest(self, namespace: str) -> dict[str, Any]:
-        """Convert to Kubernetes VirtualMachine manifest."""
+        """Convert to Kubernetes VirtualMachine manifest.
+
+        Internal placeholder references (DataVolume names, labels) use a slug
+        derived from display_name. The endpoint layer is responsible for adding
+        ``metadata.generateName`` via ``with_synthetic_metadata`` and rewriting
+        any internal name references after K8s assigns the real name.
+        """
+        slug = sanitize_display_name(self.display_name)
+
         # Build volumes and disks
         volumes: list[dict[str, Any]] = []
         disk_specs: list[dict[str, Any]] = []
@@ -90,7 +100,7 @@ class VMCreateRequest(BaseModel):
                 volumes.append(
                     {
                         "name": disk.name,
-                        "dataVolume": {"name": f"{self.name}-{disk.name}"},
+                        "dataVolume": {"name": f"{slug}-{disk.name}"},
                     }
                 )
             elif disk.source_type == "pvc":
@@ -160,7 +170,7 @@ class VMCreateRequest(BaseModel):
             "template": {
                 "metadata": {
                     "labels": {
-                        "kubevirt.io/vm": self.name,
+                        "kubevirt.io/vm": slug,
                         **self.labels,
                     }
                 },
@@ -180,19 +190,19 @@ class VMCreateRequest(BaseModel):
                 "name": self.preference,
             }
 
-        # Build full manifest
+        # Build full manifest. The endpoint adds metadata.generateName via
+        # with_synthetic_metadata; do not set metadata.name here.
         manifest: dict[str, Any] = {
             "apiVersion": "kubevirt.io/v1",
             "kind": "VirtualMachine",
             "metadata": {
-                "name": self.name,
                 "namespace": namespace,
                 "labels": {
-                    "app": self.name,
+                    "app": slug,
                     "kubevirt-ui.io/created-by": "kubevirt-ui",
                     **self.labels,
                 },
-                "annotations": self.annotations,
+                "annotations": dict(self.annotations),
             },
             "spec": vm_spec,
         }
@@ -205,6 +215,12 @@ class VMConsoleConfig(BaseModel):
     
     vnc_enabled: bool = True
     serial_console_enabled: bool = False
+
+
+class VMUpdateDisplayNameRequest(BaseModel):
+    """Request model for updating only a VM's display name."""
+
+    display_name: str = Field(..., min_length=1, max_length=100)
 
 
 class VMUpdateRequest(BaseModel):
@@ -272,6 +288,7 @@ class VMResponse(BaseModel):
     """Response model for a VirtualMachine."""
 
     name: str
+    display_name: str
     namespace: str
     status: str
     ready: bool
@@ -486,6 +503,7 @@ def vm_from_k8s(vm: dict[str, Any], vmi: dict[str, Any] | None, pod_ip: str | No
 
     return VMResponse(
         name=metadata.get("name", ""),
+        display_name=get_display_name(metadata) or metadata.get("name", ""),
         namespace=metadata.get("namespace", ""),
         status=status.get("printableStatus", "Unknown"),
         ready=status.get("ready", False),

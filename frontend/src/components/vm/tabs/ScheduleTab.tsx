@@ -28,7 +28,7 @@ export function ScheduleTab({ vm }: { vm: any }) {
       {
         namespace: vm.namespace,
         data: {
-          name: scheduleName.trim(),
+          display_name: scheduleName.trim(),
           action,
           schedule: cronExpr.trim(),
           vm_name: vm.name,
@@ -77,7 +77,8 @@ export function ScheduleTab({ vm }: { vm: any }) {
                   type="text"
                   value={scheduleName}
                   onChange={(e) => setScheduleName(e.target.value)}
-                  placeholder="e.g. auto-shutdown"
+                  placeholder="e.g. Daily auto-shutdown"
+                  maxLength={100}
                   className="input w-full"
                 />
               </div>
@@ -152,7 +153,9 @@ export function ScheduleTab({ vm }: { vm: any }) {
               <div key={sched.name} className="px-4 py-3 flex items-center justify-between gap-4">
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-2">
-                    <span className="font-medium text-surface-200 truncate">{sched.name}</span>
+                    <span className="font-medium text-surface-200 truncate">
+                      {sched.display_name || sched.name}
+                    </span>
                     <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs ${actionColors[sched.action] || 'text-surface-400 bg-surface-700'}`}>
                       {sched.action}
                     </span>

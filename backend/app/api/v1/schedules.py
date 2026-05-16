@@ -14,6 +14,7 @@ from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
 from app.core.auth import User, require_auth
+from app.core.naming import get_display_name, with_synthetic_metadata
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -25,11 +26,23 @@ ACTION_LABEL = "kubevirt-ui.io/action"
 
 
 class CreateScheduleRequest(BaseModel):
-    name: str = Field(..., pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", max_length=63)
-    action: str = Field(..., description="Action to perform: stop, start, restart, delete, snapshot")
+    display_name: str = Field(..., min_length=1, max_length=100)
+    action: str = Field(
+        ..., description="Action to perform: stop, start, restart, delete, snapshot"
+    )
     schedule: str = Field(..., description="Cron expression (e.g. '0 18 * * *' for daily at 18:00)")
-    vm_name: str = Field(..., pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", max_length=63, description="Target VM name")
-    vm_namespace: str = Field(..., pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", max_length=63, description="Target VM namespace")
+    vm_name: str = Field(
+        ...,
+        pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+        max_length=63,
+        description="Target VM K8s name",
+    )
+    vm_namespace: str = Field(
+        ...,
+        pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+        max_length=63,
+        description="Target VM namespace",
+    )
     suspend: bool = Field(False, description="Create in suspended state")
 
 
@@ -38,22 +51,49 @@ def _build_cronjob(req: CreateScheduleRequest, namespace: str) -> dict[str, Any]
     # Map action to kubectl command (exec form — no shell, prevents injection)
     action_commands: dict[str, list[str]] = {
         "stop": [
-            "kubectl", "patch", "vm", req.vm_name, "-n", req.vm_namespace,
-            "--type", "merge", "-p", '{"spec":{"runStrategy":"Halted"}}',
+            "kubectl",
+            "patch",
+            "vm",
+            req.vm_name,
+            "-n",
+            req.vm_namespace,
+            "--type",
+            "merge",
+            "-p",
+            '{"spec":{"runStrategy":"Halted"}}',
         ],
         "start": [
-            "kubectl", "patch", "vm", req.vm_name, "-n", req.vm_namespace,
-            "--type", "merge", "-p", '{"spec":{"runStrategy":"Always"}}',
+            "kubectl",
+            "patch",
+            "vm",
+            req.vm_name,
+            "-n",
+            req.vm_namespace,
+            "--type",
+            "merge",
+            "-p",
+            '{"spec":{"runStrategy":"Always"}}',
         ],
         "restart": [
-            "kubectl", "delete", "vmi", req.vm_name, "-n", req.vm_namespace,
+            "kubectl",
+            "delete",
+            "vmi",
+            req.vm_name,
+            "-n",
+            req.vm_namespace,
             "--ignore-not-found",
         ],
         "delete": [
-            "kubectl", "delete", "vm", req.vm_name, "-n", req.vm_namespace,
+            "kubectl",
+            "delete",
+            "vm",
+            req.vm_name,
+            "-n",
+            req.vm_namespace,
         ],
         "snapshot": [
-            "sh", "-c",
+            "sh",
+            "-c",
             "kubectl apply -f - <<'SNAPSHOT_EOF'\n"
             "apiVersion: snapshot.kubevirt.io/v1beta1\n"
             "kind: VirtualMachineSnapshot\n"
@@ -81,11 +121,10 @@ def _build_cronjob(req: CreateScheduleRequest, namespace: str) -> dict[str, Any]
 
     command = action_commands[req.action]
 
-    return {
+    body: dict[str, Any] = {
         "apiVersion": "batch/v1",
         "kind": "CronJob",
         "metadata": {
-            "name": req.name,
             "namespace": namespace,
             "labels": {
                 SCHEDULE_LABEL: "true",
@@ -129,6 +168,8 @@ def _build_cronjob(req: CreateScheduleRequest, namespace: str) -> dict[str, Any]
             },
         },
     }
+    with_synthetic_metadata(body, req.display_name, namespace=namespace)
+    return body
 
 
 @router.get("", status_code=status.HTTP_200_OK)
@@ -156,6 +197,7 @@ async def list_scheduled_actions(
         schedules = []
         for cj in result.items:
             labels = cj.metadata.labels or {}
+            annotations = cj.metadata.annotations or {}
             last_schedule = None
             if cj.status and cj.status.last_schedule_time:
                 last_schedule = cj.status.last_schedule_time.isoformat()
@@ -163,18 +205,26 @@ async def list_scheduled_actions(
             # Count active jobs
             active_count = len(cj.status.active) if cj.status and cj.status.active else 0
 
-            schedules.append({
-                "name": cj.metadata.name,
-                "namespace": cj.metadata.namespace,
-                "vm_name": labels.get(VM_LABEL, ""),
-                "vm_namespace": labels.get(NS_LABEL, ""),
-                "action": labels.get(ACTION_LABEL, ""),
-                "schedule": cj.spec.schedule,
-                "suspended": cj.spec.suspend or False,
-                "last_schedule_time": last_schedule,
-                "active_jobs": active_count,
-                "creation_time": cj.metadata.creation_timestamp.isoformat() if cj.metadata.creation_timestamp else "",
-            })
+            schedules.append(
+                {
+                    "name": cj.metadata.name,
+                    "display_name": (
+                        get_display_name({"annotations": annotations, "name": cj.metadata.name})
+                        or cj.metadata.name
+                    ),
+                    "namespace": cj.metadata.namespace,
+                    "vm_name": labels.get(VM_LABEL, ""),
+                    "vm_namespace": labels.get(NS_LABEL, ""),
+                    "action": labels.get(ACTION_LABEL, ""),
+                    "schedule": cj.spec.schedule,
+                    "suspended": cj.spec.suspend or False,
+                    "last_schedule_time": last_schedule,
+                    "active_jobs": active_count,
+                    "creation_time": cj.metadata.creation_timestamp.isoformat()
+                    if cj.metadata.creation_timestamp
+                    else "",
+                }
+            )
 
         return schedules
 
@@ -208,6 +258,7 @@ async def create_scheduled_action(
 
         return {
             "name": result.metadata.name,
+            "display_name": schedule_request.display_name,
             "namespace": result.metadata.namespace,
             "vm_name": schedule_request.vm_name,
             "action": schedule_request.action,
@@ -284,8 +335,13 @@ async def update_scheduled_action(
         )
 
         labels = result.metadata.labels or {}
+        annotations = result.metadata.annotations or {}
         return {
             "name": result.metadata.name,
+            "display_name": (
+                get_display_name({"annotations": annotations, "name": result.metadata.name})
+                or result.metadata.name
+            ),
             "namespace": result.metadata.namespace,
             "vm_name": labels.get(VM_LABEL, ""),
             "action": labels.get(ACTION_LABEL, ""),

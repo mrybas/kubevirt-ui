@@ -134,7 +134,7 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   const selectedFolder = allFolders.find((f) => f.name === selectedFolderName) ?? null;
   
   // Form state — pre-populate from defaultTemplate if provided
-  const [vmName, setVmName] = useState('');
+  const [displayName, setDisplayName] = useState('');
   const [vmCount, setVmCount] = useState(1);
   const nameInputRef = useRef<HTMLInputElement>(null);
   const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; failed: string[] } | null>(null);
@@ -167,26 +167,26 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
     projectImageNames.has(t.golden_image_name)
   );
   
-  // Generate VM names based on pattern and count
-  const generateVMNames = (): string[] => {
+  // Generate display names based on pattern and count
+  const generateDisplayNames = (): string[] => {
     const count = vmCount || 1;
-    if (count === 1 && !vmName.includes('{n}')) return [vmName];
+    if (count === 1 && !displayName.includes('{n}')) return [displayName];
     const padLen = String(count).length;
     return Array.from({ length: count }, (_, i) => {
       const num = String(i + 1).padStart(padLen, '0');
-      return vmName.includes('{n}')
-        ? vmName.replace(/\{n\}/g, num)
-        : `${vmName}-${num}`;
+      return displayName.includes('{n}')
+        ? displayName.replace(/\{n\}/g, num)
+        : `${displayName} ${num}`;
     });
   };
-  
+
   // Insert {n} counter placeholder at cursor position in name input
   const insertCounter = () => {
     const input = nameInputRef.current;
-    const start = input?.selectionStart ?? vmName.length;
-    const end = input?.selectionEnd ?? vmName.length;
-    const newName = vmName.slice(0, start) + '{n}' + vmName.slice(end);
-    setVmName(newName);
+    const start = input?.selectionStart ?? displayName.length;
+    const end = input?.selectionEnd ?? displayName.length;
+    const newName = displayName.slice(0, start) + '{n}' + displayName.slice(end);
+    setDisplayName(newName);
     requestAnimationFrame(() => {
       input?.focus();
       const pos = start + 3;
@@ -196,14 +196,14 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   
   const handleSubmit = async () => {
     if (!selectedTemplate || !selectedProject) return;
-    
-    const names = generateVMNames();
+
+    const names = generateDisplayNames();
     const failed: string[] = [];
     setBatchProgress({ current: 0, total: names.length, failed: [] });
-    
+
     for (let i = 0; i < names.length; i++) {
       const request: VMFromTemplateRequest = {
-        name: names[i]!,
+        display_name: names[i]!,
         template_name: selectedTemplate.name,
         start: startVM,
       };
@@ -385,24 +385,26 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   );
   
   const renderCustomizeStep = () => {
-    const names = generateVMNames();
-    
+    const names = generateDisplayNames();
+
     return (
       <div className="space-y-4">
         <h3 className="text-lg font-semibold text-surface-100">Customize VM</h3>
-        
+
         <div>
           <label className="block text-sm font-medium text-surface-300 mb-1">
-            VM Name *
+            Display Name *
           </label>
           <div className="flex gap-2">
             <input
               ref={nameInputRef}
               type="text"
-              value={vmName}
-              onChange={(e) => setVmName(e.target.value.toLowerCase().replace(/[^a-z0-9\-{}]/g, ''))}
-              placeholder={vmCount > 1 ? 'my-vm-{n}' : 'my-vm'}
-              className="flex-1 px-3 py-2 bg-surface-800 border border-surface-700 rounded-md text-surface-100 placeholder-surface-500 focus:outline-none focus:ring-2 focus:ring-primary-500 font-mono"
+              value={displayName}
+              onChange={(e) => {
+                if (e.target.value.length <= 100) setDisplayName(e.target.value);
+              }}
+              placeholder={vmCount > 1 ? 'Web Server {n}' : 'e.g. Web Server (prod)'}
+              className="flex-1 px-3 py-2 bg-surface-800 border border-surface-700 rounded-md text-surface-100 placeholder-surface-500 focus:outline-none focus:ring-2 focus:ring-primary-500"
             />
             <button
               type="button"
@@ -414,10 +416,11 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
             </button>
           </div>
           <p className="text-xs text-surface-500 mt-1">
-            Lowercase letters, numbers, and hyphens. Use <span className="font-mono text-primary-400">{'{n}'}</span> for auto-numbering.
+            Any text up to 100 characters. K8s resource name will be auto-generated.
+            {vmCount > 1 && <> Use <span className="font-mono text-primary-400">{'{n}'}</span> for sequential numbering.</>}
           </p>
         </div>
-        
+
         <div>
           <label className="block text-sm font-medium text-surface-300 mb-1">
             Number of VMs
@@ -452,21 +455,21 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
             )}
           </div>
         </div>
-        
-        {vmCount > 1 && vmName && (
+
+        {vmCount > 1 && displayName && (
           <div className="bg-surface-800/50 border border-surface-700 rounded-lg p-3">
             <p className="text-xs font-medium text-surface-400 mb-1.5">Preview ({vmCount} VMs)</p>
             <div className="flex flex-wrap gap-1.5">
               {names.slice(0, 5).map((n) => (
-                <span key={n} className="px-2 py-0.5 bg-surface-700 text-surface-200 rounded text-xs font-mono">{n}</span>
+                <span key={n} className="px-2 py-0.5 bg-surface-700 text-surface-200 rounded text-xs">{n}</span>
               ))}
               {names.length > 5 && (
                 <span className="px-2 py-0.5 text-surface-500 text-xs">...and {names.length - 5} more</span>
               )}
             </div>
-            {!vmName.includes('{n}') && (
+            {!displayName.includes('{n}') && (
               <p className="text-xs text-amber-400 mt-2">
-                Tip: Add <button type="button" onClick={insertCounter} className="font-mono underline">{'{n}'}</button> to the name for sequential numbering
+                Tip: Add <button type="button" onClick={insertCounter} className="font-mono underline">{'{n}'}</button> for sequential numbering
               </p>
             )}
           </div>
@@ -663,7 +666,7 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   );
   
   const renderReviewStep = () => {
-    const names = generateVMNames();
+    const names = generateDisplayNames();
     
     return (
       <div className="space-y-4">
@@ -691,8 +694,8 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
             </div>
           ) : (
             <div className="flex justify-between">
-              <span className="text-surface-400">VM Name</span>
-              <span className="text-surface-100 font-medium">{vmName}</span>
+              <span className="text-surface-400">Display Name</span>
+              <span className="text-surface-100 font-medium">{displayName}</span>
             </div>
           )}
           <div className="flex justify-between">
@@ -775,14 +778,10 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
     switch (step) {
       case 'template':
         return !!selectedTemplate && !!selectedProject;
-      case 'customize': {
-        if (!vmName || vmName.length < 2) return false;
-        // Validate generated name is a valid k8s name
-        const sampleName = vmName.replace(/\{n\}/g, '1');
-        return /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(sampleName);
-      }
+      case 'customize':
+        return displayName.trim().length >= 1 && displayName.length <= 100;
       case 'network':
-        return true; // Pod network (no NICs) is always valid; NICs are optional
+        return true;
       case 'cloudInit':
         return true;
       case 'review':

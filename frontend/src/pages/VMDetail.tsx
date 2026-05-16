@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -29,7 +29,7 @@ import {
   MoreVertical,
   RefreshCw,
 } from 'lucide-react';
-import { useVM, useStartVM, useStopVM, useRestartVM, useMigrateVM, useVMYaml, useUpdateVM, useDeleteVM, useRecreateVM, useCloneVM, useResizeVM } from '@/hooks/useVMs';
+import { useVM, useStartVM, useStopVM, useRestartVM, useMigrateVM, useVMYaml, useUpdateVM, useDeleteVM, useRecreateVM, useCloneVM, useResizeVM, useUpdateVMDisplayName } from '@/hooks/useVMs';
 import { StatusBadge } from '@/components/common/StatusBadge';
 import VMMetricsPanel from '@/components/charts/VMMetricsPanel';
 import { OverviewTab, ConsoleTab, DisksTab, NetworkTab, EventsTab, YamlTab, SnapshotsTab, ScheduleTab } from '@/components/vm/tabs';
@@ -81,6 +81,9 @@ export function VMDetail() {
   const [isMoreMenuOpen, setIsMoreMenuOpen] = useState(false);
   const [isMigrateModalOpen, setIsMigrateModalOpen] = useState(false);
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
+  const [isEditDisplayNameOpen, setIsEditDisplayNameOpen] = useState(false);
+  const [editDisplayNameValue, setEditDisplayNameValue] = useState('');
+  const updateDisplayName = useUpdateVMDisplayName();
   
   const handleStop = (force: boolean) => {
     setIsStopMenuOpen(false);
@@ -131,6 +134,25 @@ export function VMDetail() {
   const isStarting = ['Starting', 'Provisioning', 'Pending', 'Scheduling', 'Scheduled'].includes(vm.status);
   const isStopped = ['Stopped', 'Halted', 'Failed'].includes(vm.status);
 
+  useEffect(() => {
+    const prev = document.title;
+    document.title = vm.display_name || vm.name;
+    return () => { document.title = prev; };
+  }, [vm.display_name, vm.name]);
+
+  const openEditDisplayName = () => {
+    setEditDisplayNameValue(vm.display_name || vm.name);
+    setIsEditDisplayNameOpen(true);
+  };
+
+  const saveDisplayName = () => {
+    if (!editDisplayNameValue.trim()) return;
+    updateDisplayName.mutate(
+      { namespace: namespace!, name: name!, data: { display_name: editDisplayNameValue.trim() } },
+      { onSuccess: () => setIsEditDisplayNameOpen(false) }
+    );
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
@@ -142,13 +164,31 @@ export function VMDetail() {
           <div>
             <div className="flex items-center gap-3">
               <h1 className="font-display text-2xl font-bold text-surface-100">
-                {vm.name}
+                {vm.display_name || vm.name}
               </h1>
+              <button
+                onClick={openEditDisplayName}
+                className="p-1 rounded hover:bg-surface-800 text-surface-500 hover:text-surface-300 transition-colors"
+                title="Edit display name"
+              >
+                <Pencil className="h-4 w-4" />
+              </button>
               <StatusBadge status={vm.status} />
             </div>
-            <p className="text-surface-400 mt-1">
-              {vm.namespace} • {vm.node ? `Node: ${vm.node}` : 'Not scheduled'}
-            </p>
+            <div className="flex items-center gap-2 mt-1">
+              <p className="text-surface-400">
+                Resource: <span className="font-mono text-surface-300">{vm.name}</span>
+              </p>
+              <button
+                onClick={() => navigator.clipboard.writeText(vm.name)}
+                className="p-0.5 rounded hover:bg-surface-800 text-surface-600 hover:text-surface-400 transition-colors"
+                title="Copy K8s name"
+              >
+                <Copy className="h-3.5 w-3.5" />
+              </button>
+              <span className="text-surface-600">•</span>
+              <p className="text-surface-400">{vm.namespace} • {vm.node ? `Node: ${vm.node}` : 'Not scheduled'}</p>
+            </div>
           </div>
         </div>
 
@@ -405,14 +445,18 @@ export function VMDetail() {
             </div>
             <div className="p-6 space-y-4">
               <div>
-                <label className="block text-sm text-surface-400 mb-1">Clone Name</label>
+                <label className="block text-sm text-surface-400 mb-1">Display Name</label>
                 <input
                   type="text"
                   value={cloneName}
                   onChange={(e) => setCloneName(e.target.value)}
                   className="input w-full"
-                  placeholder="e.g. my-vm-clone"
+                  placeholder="e.g. My VM Clone"
+                  maxLength={100}
                 />
+                <p className="text-xs text-surface-500 mt-1">
+                  Any text up to 100 characters. K8s resource name will be auto-generated.
+                </p>
               </div>
               <label className="flex items-center gap-2 text-sm text-surface-300 cursor-pointer">
                 <input type="checkbox" checked={cloneStart} onChange={(e) => setCloneStart(e.target.checked)} className="rounded" />
@@ -427,7 +471,7 @@ export function VMDetail() {
               <button
                 onClick={() => {
                   cloneVM.mutate(
-                    { namespace: namespace!, name: name!, data: { new_name: cloneName, start: cloneStart } },
+                    { namespace: namespace!, name: name!, data: { display_name: cloneName, start: cloneStart } },
                     { onSuccess: () => setIsCloneModalOpen(false) }
                   );
                 }}
@@ -542,6 +586,45 @@ export function VMDetail() {
           ))}
         </div>
       </div>
+
+      {/* Edit Display Name Modal */}
+      {isEditDisplayNameOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-surface-900 rounded-lg shadow-xl w-full max-w-md">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-surface-700">
+              <h3 className="text-lg font-semibold text-surface-100">Edit Display Name</h3>
+              <button onClick={() => setIsEditDisplayNameOpen(false)} className="p-1 hover:bg-surface-800 rounded">
+                <X className="w-5 h-5 text-surface-400" />
+              </button>
+            </div>
+            <div className="px-6 py-4 space-y-3">
+              <input
+                type="text"
+                value={editDisplayNameValue}
+                onChange={(e) => { if (e.target.value.length <= 100) setEditDisplayNameValue(e.target.value); }}
+                placeholder="e.g. Web Server (prod)"
+                className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-md text-surface-100 placeholder-surface-500 focus:outline-none focus:ring-2 focus:ring-primary-500"
+                autoFocus
+                onKeyDown={(e) => { if (e.key === 'Enter') saveDisplayName(); if (e.key === 'Escape') setIsEditDisplayNameOpen(false); }}
+              />
+              <p className="text-xs text-surface-500">K8s resource name (<span className="font-mono">{vm.name}</span>) will not change.</p>
+              {updateDisplayName.error && (
+                <p className="text-sm text-red-400">{updateDisplayName.error.message}</p>
+              )}
+            </div>
+            <div className="flex justify-end gap-3 px-6 py-4 border-t border-surface-700">
+              <button onClick={() => setIsEditDisplayNameOpen(false)} className="btn-secondary">Cancel</button>
+              <button
+                onClick={saveDisplayName}
+                disabled={!editDisplayNameValue.trim() || updateDisplayName.isPending}
+                className="btn-primary"
+              >
+                {updateDisplayName.isPending ? <><Loader2 className="h-4 w-4 animate-spin" /> Saving...</> : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Tab Content */}
       <div className="animate-fade-in">

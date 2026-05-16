@@ -1,6 +1,7 @@
 import { apiRequest } from './client';
 import type {
   VM, VMListResponse, VMStatusResponse, VMCreateRequest, VMUpdateRequest,
+  VMDisplayNameUpdateRequest,
   DiskDetailResponse, DiskResizeRequest,
   StopVMOptions, VMEvent, VMEventsResponse, AttachDiskRequest, HotplugCapabilities,
   VolumeSnapshotInfo, VMSnapshotInfo, VMInterfaceInfo, AddNICRequest, CloneVMRequest, ResizeVMRequest,
@@ -9,12 +10,14 @@ import type {
 export type {
   StopVMOptions, VMEvent, VMEventsResponse, AttachDiskRequest, HotplugCapabilities,
   VolumeSnapshotInfo, VMSnapshotInfo, VMInterfaceInfo, AddNICRequest, CloneVMRequest, ResizeVMRequest,
+  VMDisplayNameUpdateRequest,
 };
 
-export async function listVMs(namespace?: string, page?: number, perPage?: number): Promise<VMListResponse> {
+export async function listVMs(namespace?: string, page?: number, perPage?: number, search?: string): Promise<VMListResponse> {
   const params = new URLSearchParams();
   if (page && page > 1) params.set('page', String(page));
   if (perPage) params.set('per_page', String(perPage));
+  if (search) params.set('search', search);
   const query = params.toString() ? `?${params}` : '';
   if (namespace) {
     return apiRequest<VMListResponse>(`/namespaces/${namespace}/vms${query}`);
@@ -44,6 +47,17 @@ export async function updateVM(
 ): Promise<VM> {
   return apiRequest<VM>(`/namespaces/${namespace}/vms/${name}`, {
     method: 'PUT',
+    body: data,
+  });
+}
+
+export async function updateVMDisplayName(
+  namespace: string,
+  name: string,
+  data: VMDisplayNameUpdateRequest
+): Promise<VM> {
+  return apiRequest<VM>(`/namespaces/${namespace}/vms/${name}/display-name`, {
+    method: 'PATCH',
     body: data,
   });
 }
@@ -217,7 +231,7 @@ export async function listVMSnapshots(
 export async function createVMSnapshot(
   namespace: string,
   vmName: string,
-  data: { snapshot_name: string }
+  data: { display_name: string }
 ): Promise<VMSnapshotInfo> {
   return apiRequest<VMSnapshotInfo>(
     `/namespaces/${namespace}/vms/${vmName}/snapshots`,

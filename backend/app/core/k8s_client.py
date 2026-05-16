@@ -88,9 +88,18 @@ class K8sClient:
     # =========================================================================
 
     async def list_virtual_machines(
-        self, namespace: str | None = None
+        self,
+        namespace: str | None = None,
+        label_selector: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List VirtualMachines in namespace or all namespaces."""
+        """List VirtualMachines in namespace or all namespaces.
+
+        ``label_selector`` follows the K8s label selector syntax, e.g.
+        ``"kubevirt-ui.io/slug=my-vm"``.
+        """
+        kwargs: dict[str, Any] = {}
+        if label_selector:
+            kwargs["label_selector"] = label_selector
         try:
             if namespace:
                 result = await self.custom_api.list_namespaced_custom_object(
@@ -98,12 +107,14 @@ class K8sClient:
                     version=KUBEVIRT_API_VERSION,
                     namespace=namespace,
                     plural="virtualmachines",
+                    **kwargs,
                 )
             else:
                 result = await self.custom_api.list_cluster_custom_object(
                     group=KUBEVIRT_API_GROUP,
                     version=KUBEVIRT_API_VERSION,
                     plural="virtualmachines",
+                    **kwargs,
                 )
             return result.get("items", [])
         except ApiException as e:

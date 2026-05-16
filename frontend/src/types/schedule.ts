@@ -1,5 +1,6 @@
 export interface ScheduleInfo {
   name: string;
+  display_name: string;
   namespace: string;
   vm_name: string;
   vm_namespace: string;
@@ -12,7 +13,7 @@ export interface ScheduleInfo {
 }
 
 export interface CreateScheduleRequest {
-  name: string;
+  display_name: string;
   action: string;
   schedule: string;
   vm_name: string;
