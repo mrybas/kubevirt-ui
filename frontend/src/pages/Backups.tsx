@@ -1035,7 +1035,7 @@ export default function Backups() {
             await createSnapshotSchedule.mutateAsync({
               namespace: data.namespace,
               data: {
-                name: data.name,
+                display_name: data.name,
                 action: 'snapshot',
                 schedule: data.schedule,
                 vm_name: data.vm_name,

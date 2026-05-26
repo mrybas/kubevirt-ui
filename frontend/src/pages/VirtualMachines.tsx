@@ -55,7 +55,6 @@ export function VirtualMachines() {
   const navigate = useNavigate();
   const { selectedNamespace } = useAppStore();
   const [viewMode, setViewMode] = useState<ViewMode>('table');
-  const [searchQuery, setSearchQuery] = useState('');
   const [filterFolder, setFilterFolder] = useState('');
   const [showCreateWizard, setShowCreateWizard] = useState(false);
   const [deleteModalVM, setDeleteModalVM] = useState<VM | null>(null);
@@ -67,7 +66,6 @@ export function VirtualMachines() {
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleSearch = (q: string) => {
-    setSearchQuery(q);
     if (debounceTimer.current) clearTimeout(debounceTimer.current);
     debounceTimer.current = setTimeout(() => {
       setDebouncedSearch(q);
