@@ -32,6 +32,14 @@ spec:
           image: "{{ .Values.dex.image.repository }}:{{ .Values.dex.image.tag }}"
           imagePullPolicy: {{ .Values.dex.image.pullPolicy }}
           command: ["dex", "serve", "/etc/dex/config.yaml"]
+          {{- with .Values.dex.extraEnv }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.dex.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - name: http
               containerPort: 5556

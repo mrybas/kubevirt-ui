@@ -221,6 +221,22 @@ dex:
 
   logLevel: "info"  # debug, info, warn, error
 
+  # -- Extra env vars for the Dex container. Useful for OIDC client secrets
+  # referenced via `secretEnv:` in staticClients, or any other Dex env-var
+  # substitution (e.g. `$LDAP_BIND_PW` inside a connector config).
+  extraEnv: []
+  #  - name: LDAP_BIND_PW
+  #    valueFrom:
+  #      secretKeyRef:
+  #        name: dex-ldap
+  #        key: bindPW
+
+  # -- Extra env vars sourced from Secrets/ConfigMaps. Convenient for bundling
+  # multiple OIDC client secrets + LDAP creds into a single Secret.
+  envFrom: []
+  #  - secretRef:
+  #      name: dex-secrets
+
 # =========================================================================
 # LLDAP (optional bundled LDAP server for user management)
 # =========================================================================
