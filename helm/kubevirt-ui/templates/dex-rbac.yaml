@@ -1,0 +1,44 @@
+{{- if .Values.dex.enabled }}
+{{- /*
+  Dex with storage.type=kubernetes auto-creates its own CRDs
+  (authcodes, authrequests, oauth2clients, signingkeies, refreshtokens,
+  passwords, offlinesessionses, connectors, devicerequests, devicetokens)
+  on first start, then reads/writes instances of them in its own namespace.
+  Without these permissions the pod crashes during initialization with
+  "Forbidden" errors from the kube-apiserver.
+
+  Kept as a separate ClusterRole so it only exists when Dex is actually
+  enabled — keeps cluster-scope blast radius minimal for non-Dex installs.
+*/}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-dex
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dex
+rules:
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["create", "get", "list", "watch"]
+  - apiGroups: ["dex.coreos.com"]
+    resources: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-dex
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    app.kubernetes.io/component: dex
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "kubevirt-ui.fullname" . }}-dex
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubevirt-ui.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
