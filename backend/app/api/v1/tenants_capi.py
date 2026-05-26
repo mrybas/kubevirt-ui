@@ -468,19 +468,7 @@ def _build_kubeadm_config_template_cr(
     }
 
 
-def _build_ingress(req: TenantCreateRequest) -> dict[str, Any]:
-    host = _endpoint_host(req.name)
-    controller = _ingress_controller()
-    # Kamaji TCP requires TLS passthrough so the tenant kube-apiserver cert
-    # is presented end-to-end. ssl-passthrough annotation is nginx-only;
-    # other controllers (Traefik/Contour) need a different CRD entirely.
-    if "ingress-nginx" not in controller:
-        logger.warning(
-            f"Ingress controller {controller!r} is not ingress-nginx — "
-            "ssl-passthrough annotation will be ignored; tenant kube-apiserver "
-            "may be unreachable. See backlog_tenant_ingress_discovery for "
-            "per-controller dispatch design."
-        )
+def _build_ingress_nginx(req: TenantCreateRequest, host: str) -> dict[str, Any]:
     return {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "Ingress",
@@ -515,6 +503,118 @@ def _build_ingress(req: TenantCreateRequest) -> dict[str, Any]:
             ],
         },
     }
+
+
+def _build_ingress_haproxy(req: TenantCreateRequest, host: str) -> dict[str, Any]:
+    body = _build_ingress_nginx(req, host)
+    # Same Ingress shape, different annotation key.
+    body["metadata"]["annotations"] = {
+        "haproxy.org/ssl-passthrough": "true",
+        "haproxy.org/backend-protocol": "h2",
+    }
+    return body
+
+
+def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str) -> dict[str, Any]:
+    # Traefik entryPoint name varies by deployment; default to "websecure"
+    # (Traefik's standard HTTPS entry point). Override via env if needed.
+    entry_point = os.getenv("TENANTS_TRAEFIK_ENTRYPOINT", "websecure")
+    return {
+        "apiVersion": "traefik.io/v1alpha1",
+        "kind": "IngressRouteTCP",
+        "metadata": {
+            "name": f"{req.name}-api",
+            "namespace": _tenant_ns(req.name),
+        },
+        "spec": {
+            "entryPoints": [entry_point],
+            "routes": [{
+                "match": f"HostSNI(`{host}`)",
+                "services": [{
+                    "name": req.name,
+                    "port": 6443,
+                }],
+            }],
+            "tls": {"passthrough": True},
+        },
+    }
+
+
+def _build_httpproxy_contour(req: TenantCreateRequest, host: str) -> dict[str, Any]:
+    return {
+        "apiVersion": "projectcontour.io/v1",
+        "kind": "HTTPProxy",
+        "metadata": {
+            "name": f"{req.name}-api",
+            "namespace": _tenant_ns(req.name),
+        },
+        "spec": {
+            "virtualhost": {
+                "fqdn": host,
+                "tls": {"passthrough": True},
+            },
+            "tcpproxy": {
+                "services": [{
+                    "name": req.name,
+                    "port": 6443,
+                }],
+            },
+        },
+    }
+
+
+async def _create_tenant_apiserver_ingress(k8s, req: TenantCreateRequest) -> None:
+    """Expose the tenant kube-apiserver (Kamaji TCP) externally with TLS passthrough.
+
+    Dispatches to the right resource shape per ingress controller. All current
+    targets require end-to-end TLS passthrough — the tenant apiserver cert is
+    served by Kamaji directly and ingress must not terminate.
+    """
+    host = _endpoint_host(req.name)
+    ns = _tenant_ns(req.name)
+    controller = _ingress_controller()
+
+    if "ingress-nginx" in controller:
+        body = _build_ingress_nginx(req, host)
+        networking_api = client.NetworkingV1Api(k8s._api_client)
+        await networking_api.create_namespaced_ingress(namespace=ns, body=body)
+        logger.info(f"Created nginx Ingress {ns}/{req.name}-api host={host}")
+        return
+
+    if "haproxy" in controller:
+        body = _build_ingress_haproxy(req, host)
+        networking_api = client.NetworkingV1Api(k8s._api_client)
+        await networking_api.create_namespaced_ingress(namespace=ns, body=body)
+        logger.info(f"Created haproxy Ingress {ns}/{req.name}-api host={host}")
+        return
+
+    if "traefik" in controller:
+        body = _build_ingressroutetcp_traefik(req, host)
+        await k8s.custom_api.create_namespaced_custom_object(
+            group="traefik.io", version="v1alpha1", namespace=ns,
+            plural="ingressroutetcps", body=body,
+        )
+        logger.info(f"Created Traefik IngressRouteTCP {ns}/{req.name}-api host={host}")
+        return
+
+    if "contour" in controller:
+        body = _build_httpproxy_contour(req, host)
+        await k8s.custom_api.create_namespaced_custom_object(
+            group="projectcontour.io", version="v1", namespace=ns,
+            plural="httpproxies", body=body,
+        )
+        logger.info(f"Created Contour HTTPProxy {ns}/{req.name}-api host={host}")
+        return
+
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            f"Ingress controller {controller!r} not supported for tenant "
+            "kube-apiserver exposure. Supported controllers (matched by substring): "
+            "ingress-nginx, traefik, contour, haproxy. Tenant kube-apiserver "
+            "needs end-to-end TLS passthrough, which requires per-controller logic."
+        ),
+    )
 
 
 async def _wait_for_tcp_service_ip(
@@ -620,10 +720,7 @@ async def _create_capi_resources(
                 group=group, version=version, namespace=ns, plural=plural, body=body,
             )
 
-    # 7. Ingress for external access (UI, kubectl from outside)
-    networking_api = client.NetworkingV1Api(k8s._api_client)
-    ingress_body = _build_ingress(req)
-    await networking_api.create_namespaced_ingress(
-        namespace=ns,
-        body=ingress_body,
-    )
+    # 7. Expose tenant kube-apiserver externally with TLS passthrough.
+    #    Resource shape depends on the ingress controller (nginx Ingress vs
+    #    Traefik IngressRouteTCP vs Contour HTTPProxy).
+    await _create_tenant_apiserver_ingress(k8s, req)
