@@ -7,8 +7,10 @@ KubevirtMachineTemplate, KubeadmConfigTemplate, and Ingress CRs.
 import asyncio
 import json
 import logging
+import os
 from typing import Any
 
+from fastapi import HTTPException
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 
@@ -26,12 +28,33 @@ from app.api.v1.tenants_common import (
     OIDC_CLIENT_ID,
     _tenant_ns,
     _endpoint_host,
+    _ingress_class,
+    _ingress_controller,
 )
 
 logger = logging.getLogger(__name__)
 
-INGRESS_CLASS = "nginx"
-CONTAINER_DISK_IMAGE = "git.nas.ssh.org.ua/dev/ubuntu-container-disk:v1.30.2"
+def _resolve_worker_container_disk_image(req: TenantCreateRequest) -> str:
+    """Resolve the OCI image for the worker VM's root containerDisk.
+
+    Priority:
+      1. req.worker_image_url when source_type == 'registry' (per-tenant choice)
+      2. TENANTS_DEFAULT_WORKER_IMAGE env (cluster-level default)
+      3. raise — no silent default, no hardcoded private registry.
+    """
+    if req.worker_image_source_type == "registry" and req.worker_image_url:
+        return req.worker_image_url
+    env_default = os.getenv("TENANTS_DEFAULT_WORKER_IMAGE")
+    if env_default:
+        return env_default
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "No worker container image: set worker_image_source_type='registry' "
+            "+ worker_image_url in the request, or TENANTS_DEFAULT_WORKER_IMAGE "
+            "env on the backend."
+        ),
+    )
 
 
 def _build_cluster_cr(
@@ -301,7 +324,7 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
                                         {
                                             "name": "root",
                                             "containerDisk": {
-                                                "image": CONTAINER_DISK_IMAGE,
+                                                "image": _resolve_worker_container_disk_image(req),
                                             },
                                         },
                                         {
@@ -447,6 +470,17 @@ def _build_kubeadm_config_template_cr(
 
 def _build_ingress(req: TenantCreateRequest) -> dict[str, Any]:
     host = _endpoint_host(req.name)
+    controller = _ingress_controller()
+    # Kamaji TCP requires TLS passthrough so the tenant kube-apiserver cert
+    # is presented end-to-end. ssl-passthrough annotation is nginx-only;
+    # other controllers (Traefik/Contour) need a different CRD entirely.
+    if "ingress-nginx" not in controller:
+        logger.warning(
+            f"Ingress controller {controller!r} is not ingress-nginx — "
+            "ssl-passthrough annotation will be ignored; tenant kube-apiserver "
+            "may be unreachable. See backlog_tenant_ingress_discovery for "
+            "per-controller dispatch design."
+        )
     return {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "Ingress",
@@ -459,7 +493,7 @@ def _build_ingress(req: TenantCreateRequest) -> dict[str, Any]:
             },
         },
         "spec": {
-            "ingressClassName": INGRESS_CLASS,
+            "ingressClassName": _ingress_class(),
             "rules": [
                 {
                     "host": host,

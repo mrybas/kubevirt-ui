@@ -44,6 +44,7 @@ from app.api.v1.tenants_common import (
     OIDC_CLIENT_ID,
     _tenant_ns,
     _endpoint_host,
+    _ensure_cluster_config,
     _get_addon_catalog,
     _namespace_exists,
     _create_namespace,
@@ -445,6 +446,7 @@ async def list_tenants(
 ) -> TenantListResponse:
     """List all tenants (CAPI Clusters in tenant-* namespaces)."""
     k8s = request.app.state.k8s_client
+    await _ensure_cluster_config(k8s)
 
     try:
         result = await k8s.custom_api.list_cluster_custom_object(
@@ -482,6 +484,7 @@ async def list_tenants(
 async def create_tenant(request: Request, req: TenantCreateRequest, user: User = Depends(require_auth)) -> TenantResponse:
     """Create a new tenant cluster."""
     k8s = request.app.state.k8s_client
+    await _ensure_cluster_config(k8s)
     ns = _tenant_ns(req.name)
 
     # Check if already exists
@@ -559,6 +562,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
 async def get_tenant(request: Request, name: str, user: User = Depends(require_auth)) -> TenantResponse:
     """Get tenant details."""
     k8s = request.app.state.k8s_client
+    await _ensure_cluster_config(k8s)
     ns = _tenant_ns(name)
 
     try:
@@ -642,6 +646,7 @@ async def get_tenant_kubeconfig(
     type=oidc   → OIDC kubeconfig for end-users (uses current user's token or exec plugin)
     """
     k8s = request.app.state.k8s_client
+    await _ensure_cluster_config(k8s)
     ns = _tenant_ns(name)
 
     # Try CAPI kubeconfig first ({name}-kubeconfig, key: value), fall back to

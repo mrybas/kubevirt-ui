@@ -17,6 +17,7 @@ from app.api.v1.tenants_common import (
     TENANT_NS_PREFIX,
     VPCDNS_VIP,
     VPCDNS_FORWARD_DNS,
+    _mgmt_cidr_drop,
 )
 
 logger = logging.getLogger(__name__)
@@ -278,23 +279,31 @@ async def _create_tenant_vpc(k8s, tenant_name: str) -> dict[str, str]:
     # 2. Create default subnet in VPC
     #    provider must match NAD: {nad_name}.{namespace}.ovn
     provider = get_nad_provider(nad_name, tenant_ns)
-    # ACL rules: allow intra-VPC, block host/private networks, allow internet
+    # ACL rules: allow intra-VPC + VpcDns, block host mgmt + all RFC1918
+    # (mgmt CIDR is autodiscovered from Node InternalIPs, redundant under
+    # RFC1918 but kept for explicit blocking + future non-RFC1918 setups).
     acls = [
         {"action": "allow-related", "direction": "from-lport",
          "match": f"ip4.src == {cidr} && ip4.dst == {cidr}", "priority": 3000},
         {"action": "allow-related", "direction": "from-lport",
          "match": f"ip4.src == {cidr} && ip4.dst == {VPCDNS_VIP}", "priority": 2500},
-        {"action": "drop", "direction": "from-lport",
-         "match": f"ip4.src == {cidr} && ip4.dst == 192.168.196.0/24", "priority": 2000},
+    ]
+    mgmt_cidr = _mgmt_cidr_drop()
+    if mgmt_cidr:
+        acls.append({
+            "action": "drop", "direction": "from-lport",
+            "match": f"ip4.src == {cidr} && ip4.dst == {mgmt_cidr}", "priority": 2000,
+        })
+    acls.extend([
         {"action": "drop", "direction": "from-lport",
          "match": f"ip4.src == {cidr} && ip4.dst == 10.0.0.0/8", "priority": 1999},
         {"action": "drop", "direction": "from-lport",
          "match": f"ip4.src == {cidr} && ip4.dst == 172.16.0.0/12", "priority": 1998},
         {"action": "drop", "direction": "from-lport",
-         "match": f"ip4.src == {cidr} && ip4.dst == 192.168.203.0/24", "priority": 1997},
+         "match": f"ip4.src == {cidr} && ip4.dst == 192.168.0.0/16", "priority": 1997},
         {"action": "allow-related", "direction": "from-lport",
          "match": f"ip4.src == {cidr}", "priority": 1000},
-    ]
+    ])
 
     # Reserve fixed IP for TCP pod (gateway + 1) — must be excluded from DHCP pool
     # so VpcDns pods don't claim it before the TCP deployment starts.

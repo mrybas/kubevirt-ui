@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 from typing import Any
 
 import yaml
@@ -34,11 +35,133 @@ FLUX_HELM_VERSION = "v2"
 VPCDNS_VIP = "10.96.0.200"
 VPCDNS_FORWARD_DNS = "10.96.0.10"  # kube-dns ClusterIP (Talos uses this)
 
-METALB_IP = "192.168.196.199"
-
 # OIDC defaults (can be overridden by env)
 OIDC_ISSUER = os.getenv("OIDC_ISSUER", "")
 OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID", "kubevirt-ui")
+
+# ---------------------------------------------------------------------------
+# Cluster-discovered config (ingress IP/class + mgmt CIDR)
+# Populated lazily via _ensure_cluster_config(k8s); env overrides win.
+# ---------------------------------------------------------------------------
+
+_CLUSTER_CONFIG_TTL_SEC = 300
+
+# {"ingress_ip": str, "ingress_class": str, "ingress_controller": str,
+#  "mgmt_cidr": str | None, "fetched_at": float}
+_cluster_config: dict[str, Any] | None = None
+
+
+async def _ensure_cluster_config(k8s) -> dict[str, Any]:
+    """Populate cluster-discovered config (ingress IP/class, mgmt CIDR).
+
+    Idempotent + TTL-cached. Env overrides bypass discovery per-field.
+    Must be awaited at the entry of any tenant handler before any sync
+    getter (_endpoint_host, _ingress_class, _mgmt_cidr_drop) is called.
+    """
+    global _cluster_config
+    now = time.monotonic()
+    if _cluster_config and (now - _cluster_config["fetched_at"]) < _CLUSTER_CONFIG_TTL_SEC:
+        return _cluster_config
+
+    ip_override = os.getenv("TENANTS_INGRESS_IP")
+    class_override = os.getenv("TENANTS_INGRESS_CLASS")
+    cidr_override = os.getenv("TENANTS_MGMT_CIDR")
+
+    ingress_class = class_override
+    ingress_controller = "unknown"
+    if not ingress_class:
+        networking_api = client.NetworkingV1Api(k8s._api_client)
+        classes = await networking_api.list_ingress_class()
+        default = next(
+            (c for c in classes.items
+             if (c.metadata.annotations or {}).get(
+                 "ingressclass.kubernetes.io/is-default-class") == "true"),
+            None,
+        )
+        if default is None:
+            raise RuntimeError(
+                "No default IngressClass on cluster; "
+                "set TENANTS_INGRESS_CLASS env var"
+            )
+        ingress_class = default.metadata.name
+        ingress_controller = default.spec.controller or "unknown"
+    else:
+        # Try to also resolve the controller string for the override class
+        try:
+            networking_api = client.NetworkingV1Api(k8s._api_client)
+            ic = await networking_api.read_ingress_class(name=ingress_class)
+            ingress_controller = ic.spec.controller or "unknown"
+        except ApiException:
+            pass
+
+    ingress_ip = ip_override
+    if not ingress_ip:
+        svcs = await k8s.core_api.list_service_for_all_namespaces()
+        candidates = [
+            s for s in svcs.items
+            if s.spec and s.spec.type == "LoadBalancer"
+            and s.status and s.status.load_balancer
+            and s.status.load_balancer.ingress
+        ]
+        # Heuristic: pick the Service whose name OR namespace mentions the
+        # ingress class. Common conventions: ingress-nginx/ingress-nginx-controller,
+        # traefik/traefik, projectcontour/envoy.
+        match = next(
+            (s for s in candidates
+             if ingress_class in s.metadata.name
+             or ingress_class in (s.metadata.namespace or "")
+             or "ingress" in s.metadata.name),
+            None,
+        )
+        if match is None:
+            raise RuntimeError(
+                f"No LoadBalancer Service found for ingress class {ingress_class}; "
+                "set TENANTS_INGRESS_IP env var"
+            )
+        lb = match.status.load_balancer.ingress[0]
+        ingress_ip = lb.ip or lb.hostname
+        if not ingress_ip:
+            raise RuntimeError(
+                f"Service {match.metadata.namespace}/{match.metadata.name} has no LB IP/hostname"
+            )
+
+    mgmt_cidr = cidr_override
+    if not mgmt_cidr:
+        try:
+            nodes = await k8s.core_api.list_node()
+            ips = []
+            for n in nodes.items:
+                for addr in (n.status.addresses or []):
+                    if addr.type == "InternalIP" and addr.address:
+                        ips.append(addr.address)
+            if ips:
+                octets = ips[0].split(".")
+                if len(octets) == 4:
+                    mgmt_cidr = f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+        except ApiException as e:
+            logger.warning(f"Failed to autodiscover mgmt CIDR from Nodes: {e}")
+            mgmt_cidr = None
+
+    _cluster_config = {
+        "ingress_ip": ingress_ip,
+        "ingress_class": ingress_class,
+        "ingress_controller": ingress_controller,
+        "mgmt_cidr": mgmt_cidr,
+        "fetched_at": now,
+    }
+    logger.info(
+        f"Cluster config: ingress_ip={ingress_ip} class={ingress_class} "
+        f"controller={ingress_controller} mgmt_cidr={mgmt_cidr}"
+    )
+    return _cluster_config
+
+
+def _require_cluster_config() -> dict[str, Any]:
+    if _cluster_config is None:
+        raise RuntimeError(
+            "_ensure_cluster_config(k8s) must be awaited before this call"
+        )
+    return _cluster_config
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +173,19 @@ def _tenant_ns(name: str) -> str:
 
 
 def _endpoint_host(name: str) -> str:
-    return f"{name}.{METALB_IP}.nip.io"
+    return f"{name}.{_require_cluster_config()['ingress_ip']}.nip.io"
+
+
+def _ingress_class() -> str:
+    return _require_cluster_config()["ingress_class"]
+
+
+def _ingress_controller() -> str:
+    return _require_cluster_config()["ingress_controller"]
+
+
+def _mgmt_cidr_drop() -> str | None:
+    return _require_cluster_config()["mgmt_cidr"]
 
 
 async def _get_addon_catalog(k8s) -> AddonCatalog:
