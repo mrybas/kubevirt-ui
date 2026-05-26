@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from kubernetes_asyncio.client import ApiException
 
 from app.core.auth import User, require_auth
-from app.core.groups import get_user_namespaces
+from app.core.groups import get_user_namespaces, is_admin as is_admin_user
 from app.models.namespace import NamespaceListResponse, NamespaceResponse
 
 router = APIRouter()
@@ -35,9 +35,9 @@ async def list_namespaces(
     k8s_client = request.app.state.k8s_client
 
     try:
-        # Check if user is admin (has admin group)
-        is_admin = "kubevirt-ui-admins" in user.groups
-        
+        # Check if user is admin (group name configurable via ADMIN_GROUPS env)
+        is_admin = is_admin_user(user.groups)
+
         if include_all and is_admin:
             # Admin requested all namespaces
             namespaces = await k8s_client.list_namespaces()

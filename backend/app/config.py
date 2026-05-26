@@ -33,6 +33,16 @@ class Settings(BaseSettings):
     # Feature flags
     enable_tenants: bool = False
 
+    # Auth — comma-separated list of group names whose members are KubeVirt UI
+    # admins (full cluster-wide access). Set this via ADMIN_GROUPS env var to
+    # match the names of groups returned by your IdP (e.g. "admins" for FreeIPA
+    # default, "kubevirt-ui-admins" for our bundled LLDAP).
+    admin_groups: str = "kubevirt-ui-admins"
+
+    @property
+    def admin_groups_list(self) -> list[str]:
+        return [g.strip() for g in self.admin_groups.split(",") if g.strip()]
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

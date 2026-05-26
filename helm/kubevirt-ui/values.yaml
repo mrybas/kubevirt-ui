@@ -163,6 +163,12 @@ auth:
   # -- Auth type: none | oidc | token
   type: oidc
 
+  # -- Comma-separated list of group names whose members are treated as
+  # KubeVirt UI admins (full cluster access). Defaults to the bundled-LLDAP
+  # convention "kubevirt-ui-admins"; set to e.g. "admins" or
+  # "admins,platform-team" to match your external IdP's groups.
+  adminGroups: "kubevirt-ui-admins"
+
   oidc:
     # -- OIDC issuer URL (public, reachable from the browser)
     issuer: ""

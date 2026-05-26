@@ -196,11 +196,15 @@ rules:
       - rolebindings
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
+  # Backend creates user-scoped ClusterRoles (kubevirt-ui-ns-viewer) and
+  # binds users to cluster-admin via ClusterRoleBindings when generating
+  # kubeconfig. Without create/update/delete here, /api/v1/auth/kubeconfig
+  # fails with 403 for any IdP user.
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources:
       - clusterroles
       - clusterrolebindings
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # Subject access review (permission checks)
   - apiGroups: ["authorization.k8s.io"]

@@ -302,8 +302,9 @@ async def _ensure_service_account(
         else:
             raise
 
-    # 3. Determine role from groups
-    user_is_admin = any(g in groups for g in ["kubevirt-ui-admins", "system:masters"])
+    # 3. Determine role from groups (admin group names from ADMIN_GROUPS env)
+    from app.core.groups import is_admin as _is_admin
+    user_is_admin = _is_admin(groups) or "system:masters" in groups
     binding_name = f"{sa_name}-binding"
     subject = RbacV1Subject(kind="ServiceAccount", name=sa_name, namespace=SA_NAMESPACE)
 

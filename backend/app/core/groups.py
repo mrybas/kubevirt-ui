@@ -63,8 +63,14 @@ def get_known_teams() -> list[dict[str, Any]]:
 
 
 def is_admin(groups: list[str]) -> bool:
-    """Check if user is platform admin."""
-    return "kubevirt-ui-admins" in groups
+    """Check if user is platform admin.
+
+    Group names are read from settings.admin_groups (env var ADMIN_GROUPS,
+    comma-separated). Defaults to "kubevirt-ui-admins" for backward compat.
+    """
+    from app.config import get_settings
+    admin_groups = set(get_settings().admin_groups_list)
+    return any(g in admin_groups for g in groups)
 
 
 async def get_user_namespaces(k8s_client: Any, user: Any) -> list[str]:

@@ -54,6 +54,10 @@ spec:
             # -- Auth configuration
             - name: AUTH_TYPE
               value: {{ .Values.auth.type | quote }}
+            {{- if .Values.auth.adminGroups }}
+            - name: ADMIN_GROUPS
+              value: {{ .Values.auth.adminGroups | quote }}
+            {{- end }}
             {{- if eq .Values.auth.type "oidc" }}
             - name: OIDC_ISSUER
               value: {{ .Values.auth.oidc.issuer | quote }}
