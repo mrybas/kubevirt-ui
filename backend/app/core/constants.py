@@ -30,6 +30,11 @@ LABEL_PREFIX = "kubevirt-ui.io"
 # System namespace
 SYSTEM_NAMESPACE = "kubevirt-ui-system"
 
+# Kube-OVN system networking — default cluster VPC + system subnets that
+# non-admin users must never see. Filtered out of VPC/Subnet list responses.
+KUBEOVN_SYSTEM_VPC = "ovn-cluster"
+KUBEOVN_SYSTEM_SUBNETS = frozenset({"join", "ovn-default"})
+
 
 def parse_k8s_capacity(cap: str) -> int:
     """Parse a Kubernetes capacity/quantity string like '100Gi' to bytes."""

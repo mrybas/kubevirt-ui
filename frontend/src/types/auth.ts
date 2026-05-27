@@ -21,6 +21,7 @@ export interface UserInfo {
   email: string;
   username: string;
   groups: string[];
+  is_admin: boolean;
 }
 
 export interface AuthState {

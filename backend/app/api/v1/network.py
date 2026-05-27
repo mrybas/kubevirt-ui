@@ -9,8 +9,14 @@ from kubernetes_asyncio.client import ApiException
 
 from app.core.allocators import allocate_vpc_cidr
 from app.core.auth import User, require_auth, require_admin
+from app.core.constants import (
+    KUBEOVN_API_GROUP,
+    KUBEOVN_API_VERSION,
+    KUBEOVN_SYSTEM_SUBNETS as SYSTEM_SUBNETS,
+    KUBEOVN_SYSTEM_VPC as SYSTEM_VPC_NAME,
+)
 from app.core.errors import k8s_error_to_http
-from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
+from app.core.groups import get_user_namespaces, is_admin
 from app.models.network import (
     ProviderNetworkCreate,
     ProviderNetworkResponse,
@@ -34,6 +40,32 @@ from app.models.network import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+async def _user_visible_vpc_names(k8s, user: User) -> set[str]:
+    """Return the set of VPC names visible to a non-admin user.
+
+    A VPC is visible if its ``spec.namespaces`` intersects the user's RBAC-
+    allowed namespaces and it is not the built-in system VPC. Admins should
+    not call this — they see everything.
+    """
+    user_ns = set(await get_user_namespaces(k8s, user))
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="vpcs",
+        )
+    except ApiException:
+        return set()
+
+    visible: set[str] = set()
+    for item in result.get("items", []):
+        name = item.get("metadata", {}).get("name", "")
+        if not name or name == SYSTEM_VPC_NAME:
+            continue
+        vpc_ns = set(item.get("spec", {}).get("namespaces", []) or [])
+        if vpc_ns & user_ns:
+            visible.add(name)
+    return visible
 
 
 
@@ -699,9 +731,15 @@ async def delete_vlan(request: Request, name: str, user: User = Depends(require_
 
 @router.get("/subnets", response_model=list[SubnetResponse])
 async def list_subnets(request: Request, user: User = Depends(require_auth)) -> list[SubnetResponse]:
-    """List all Kube-OVN Subnets."""
+    """List all Kube-OVN Subnets.
+
+    Non-admin users see only subnets whose ``spec.vpc`` is bound (via VPC
+    namespaces) to one of their RBAC-allowed namespaces. Built-in kube-ovn
+    system subnets (``join``, ``ovn-default``) are always excluded for non-
+    admins.
+    """
     k8s = request.app.state.k8s_client
-    
+
     try:
         result = await k8s.custom_api.list_cluster_custom_object(
             group=KUBEOVN_API_GROUP,
@@ -712,9 +750,28 @@ async def list_subnets(request: Request, user: User = Depends(require_auth)) -> 
         if e.status == 404:
             return []
         raise k8s_error_to_http(e, "network operation")
-    
+
+    # For non-admin users, compute the set of visible VPC names upfront so we
+    # can filter subnets in a single pass. Admins see everything.
+    user_is_admin = is_admin(user.groups)
+    visible_vpcs: set[str] | None = None
+    if not user_is_admin:
+        visible_vpcs = await _user_visible_vpc_names(k8s, user)
+
     subnets = []
     for item in result.get("items", []):
+        if not user_is_admin:
+            subnet_name = item.get("metadata", {}).get("name", "")
+            if subnet_name in SYSTEM_SUBNETS:
+                continue
+            # Subnets without an explicit spec.vpc belong to the default
+            # ``ovn-cluster`` VPC; treat that as system and exclude.
+            subnet_vpc = item.get("spec", {}).get("vpc") or SYSTEM_VPC_NAME
+            if subnet_vpc == SYSTEM_VPC_NAME:
+                continue
+            assert visible_vpcs is not None
+            if subnet_vpc not in visible_vpcs:
+                continue
         spec = item.get("spec", {})
         status = item.get("status", {})
         
@@ -1299,7 +1356,12 @@ async def _get_vpc_peerings(k8s, vpc_name: str) -> list[VpcPeeringInfo]:
 
 @router.get("/vpcs", response_model=list[VpcResponse])
 async def list_vpcs(request: Request, tenant: str | None = None, user: User = Depends(require_auth)) -> list[VpcResponse]:
-    """List all VPCs, optionally filtered by tenant."""
+    """List all VPCs, optionally filtered by tenant.
+
+    Non-admin users see only VPCs bound to namespaces they have folder/env
+    access to. The built-in ``ovn-cluster`` system VPC is always excluded for
+    non-admins.
+    """
     k8s = request.app.state.k8s_client
 
     try:
@@ -1320,8 +1382,20 @@ async def list_vpcs(request: Request, tenant: str | None = None, user: User = De
             return []
         raise k8s_error_to_http(e, "network operation")
 
+    # Non-admin scope filter — apply before fetching per-VPC subnets to avoid
+    # extra API calls for VPCs the user can't see. The network.py VpcResponse
+    # model doesn't carry the namespaces list, so inspect the raw items.
+    items = result.get("items", [])
+    if not is_admin(user.groups):
+        user_ns = set(await get_user_namespaces(k8s, user))
+        items = [
+            it for it in items
+            if it.get("metadata", {}).get("name") != SYSTEM_VPC_NAME
+            and (set(it.get("spec", {}).get("namespaces") or []) & user_ns)
+        ]
+
     vpcs = []
-    for item in result.get("items", []):
+    for item in items:
         vpc = _parse_vpc_response(item)
         vpc.subnets = await _get_vpc_subnets(k8s, vpc.name)
         vpcs.append(vpc)

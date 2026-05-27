@@ -30,6 +30,7 @@ import clsx from 'clsx';
 import { FolderTree } from '../folders/FolderTree';
 import { useFoldersTree } from '../../hooks/useFolders';
 import { useFeatures } from '../../hooks/useFeatures';
+import { useAuthStore } from '../../store/auth';
 
 const SidebarCollapsedContext = createContext(false);
 
@@ -51,6 +52,7 @@ interface NavItem {
   icon: React.ComponentType<{ className?: string }>;
   children?: NavItem[];
   end?: boolean; // For exact path matching
+  requiresAdmin?: boolean;
 }
 
 const navigation: NavItem[] = [
@@ -70,13 +72,14 @@ const navigation: NavItem[] = [
     icon: HardDrive,
     children: [
       { name: 'Images', href: '/storage/images', icon: HardDrive },
-      { name: 'Classes', href: '/storage/classes', icon: Server },
+      { name: 'Classes', href: '/storage/classes', icon: Server, requiresAdmin: true },
     ],
   },
   {
     name: 'Network',
     href: '/network',
     icon: Network,
+    requiresAdmin: true,
     children: [
       { name: 'Networks', href: '/network', icon: Globe, end: true },
       { name: 'Egress Gateways', href: '/network/egress-gateways', icon: Globe },
@@ -88,6 +91,7 @@ const navigation: NavItem[] = [
     name: 'Security',
     href: '/security',
     icon: ShieldCheck,
+    requiresAdmin: true,
     children: [
       { name: 'Security Groups', href: '/network/security-groups', icon: Shield },
       { name: 'Cilium Policies', href: '/security/cilium-policies', icon: Lock },
@@ -95,8 +99,8 @@ const navigation: NavItem[] = [
       { name: 'Network Flows', href: '/security/network-flows', icon: Activity },
     ],
   },
-  { name: 'Backups', href: '/backups', icon: Archive },
-  { name: 'Cluster', href: '/cluster', icon: Box },
+  { name: 'Backups', href: '/backups', icon: Archive, requiresAdmin: true },
+  { name: 'Cluster', href: '/cluster', icon: Box, requiresAdmin: true },
 ];
 
 const adminNavigation: NavItem[] = [
@@ -260,8 +264,25 @@ function FoldersSidebarSection() {
   );
 }
 
+/** Filter a nav item list so admin-only items are hidden for regular users. */
+function filterNav(items: NavItem[], isAdmin: boolean): NavItem[] {
+  return items
+    .filter(item => !item.requiresAdmin || isAdmin)
+    .map(item => ({
+      ...item,
+      children: item.children
+        ? item.children.filter(child => !child.requiresAdmin || isAdmin)
+        : undefined,
+    }));
+}
+
 export function Sidebar() {
   const { data: features } = useFeatures();
+  const { user, config } = useAuthStore();
+  // Treat "no auth" mode as admin so dev environments see everything
+  const isAdmin = config?.type === 'none' || (user?.is_admin ?? false);
+  const filteredNavigation = filterNav(navigation, isAdmin);
+
   const [collapsed, setCollapsed] = useState(() => {
     // Auto-collapse on mobile regardless of localStorage
     if (typeof window !== 'undefined' && window.innerWidth < 768) return true;
@@ -358,7 +379,7 @@ export function Sidebar() {
 
         {/* Navigation */}
         <nav className="flex-1 overflow-y-auto space-y-1 p-2">
-          {navigation.map((item) => (
+          {filteredNavigation.map((item) => (
             <NavItemComponent key={item.href} item={item} />
           ))}
 
@@ -369,19 +390,21 @@ export function Sidebar() {
             </div>
           )}
 
-          {/* Admin Section */}
-          <div className={clsx('pt-4 mt-4 border-t border-surface-800')}>
-            {!collapsed && (
-              <p className="px-3 py-2 text-xs font-semibold text-surface-500 uppercase tracking-wider">
-                Admin
-              </p>
-            )}
-            {adminNavigation
-              .filter((item) => item.href !== '/tenants' || features?.enableTenants)
-              .map((item) => (
-                <NavItemComponent key={item.href} item={item} />
-              ))}
-          </div>
+          {/* Admin Section — visible to admins only */}
+          {isAdmin && (
+            <div className={clsx('pt-4 mt-4 border-t border-surface-800')}>
+              {!collapsed && (
+                <p className="px-3 py-2 text-xs font-semibold text-surface-500 uppercase tracking-wider">
+                  Admin
+                </p>
+              )}
+              {adminNavigation
+                .filter((item) => item.href !== '/tenants' || features?.enableTenants)
+                .map((item) => (
+                  <NavItemComponent key={item.href} item={item} />
+                ))}
+            </div>
+          )}
         </nav>
 
         {/* Footer */}

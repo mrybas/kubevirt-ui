@@ -28,6 +28,7 @@ export function Login() {
             email: 'anonymous@local',
             username: 'Anonymous',
             groups: ['kubevirt-ui-admins'],
+            is_admin: true,
           });
           navigate('/dashboard');
         }

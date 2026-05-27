@@ -40,6 +40,7 @@ const Groups = lazy(() => import('./pages/Groups'));
 const Profile = lazy(() => import('./pages/Profile'));
 const CLIAccess = lazy(() => import('./pages/CLIAccess'));
 const NotFound = lazy(() => import('./pages/NotFound'));
+const AccessDenied = lazy(() => import('./pages/AccessDenied'));
 
 // Protected route wrapper
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -63,6 +64,27 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
   // Redirect to login if not authenticated
   if (!isAuthenticated) {
     return <Navigate to="/login" state={{ from: location }} replace />;
+  }
+
+  return <>{children}</>;
+}
+
+// Admin-only route guard
+function RequireAdmin({ children }: { children: React.ReactNode }) {
+  const { user, config, isLoading } = useAuthStore();
+
+  // No auth configured → behave as admin (dev mode)
+  if (config?.type === 'none') return <>{children}</>;
+
+  // Still resolving auth state — render nothing to avoid flash
+  if (isLoading) return null;
+
+  if (!user?.is_admin) {
+    return (
+      <Suspense fallback={null}>
+        <AccessDenied />
+      </Suspense>
+    );
   }
 
   return <>{children}</>;
@@ -135,39 +157,40 @@ function AppRoutes() {
                     {/* Storage */}
                     <Route path="/storage" element={<Navigate to="/storage/images" replace />} />
                     <Route path="/storage/images" element={<Storage />} />
-                    <Route path="/storage/classes" element={<StorageClasses />} />
+                    <Route path="/storage/classes" element={<RequireAdmin><StorageClasses /></RequireAdmin>} />
                     <Route path="/storage/:namespace/:name" element={<ImageDetail />} />
-                    {/* Network */}
-                    <Route path="/network" element={<Networks />} />
-                    <Route path="/network/vpcs" element={<Navigate to="/network?tab=vpcs" replace />} />
-                    <Route path="/network/subnets" element={<Navigate to="/network?tab=subnets" replace />} />
-                    <Route path="/network/system" element={<Navigate to="/network?tab=system" replace />} />
-                    <Route path="/network/subnets/create" element={<Navigate to="/network?tab=subnets&create=true" replace />} />
-                    <Route path="/network/subnets/:name" element={<NetworkDetail />} />
-                    <Route path="/network/vpcs/create" element={<Navigate to="/network?tab=vpcs&create=true" replace />} />
-                    <Route path="/network/vpcs/:name" element={<VPCDetail />} />
-                    <Route path="/network/egress-gateways" element={<EgressGateways />} />
-                    <Route path="/network/ovn-gateways" element={<OvnGateways />} />
-                    <Route path="/network/bgp" element={<BgpPeering />} />
-                    <Route path="/network/security-groups" element={<SecurityGroups />} />
-                    <Route path="/network/security-groups/:name" element={<SecurityGroupDetail />} />
-                    {/* Backups */}
-                    <Route path="/backups" element={<Backups />} />
-                    {/* Security */}
-                    <Route path="/security/network-flows" element={<NetworkFlows />} />
-                    <Route path="/security/cilium-policies" element={<CiliumPolicies />} />
-                    <Route path="/security/baseline" element={<SecurityBaseline />} />
+                    {/* Network — admin only */}
+                    <Route path="/network" element={<RequireAdmin><Networks /></RequireAdmin>} />
+                    <Route path="/network/vpcs" element={<RequireAdmin><Navigate to="/network?tab=vpcs" replace /></RequireAdmin>} />
+                    <Route path="/network/subnets" element={<RequireAdmin><Navigate to="/network?tab=subnets" replace /></RequireAdmin>} />
+                    <Route path="/network/system" element={<RequireAdmin><Navigate to="/network?tab=system" replace /></RequireAdmin>} />
+                    <Route path="/network/subnets/create" element={<RequireAdmin><Navigate to="/network?tab=subnets&create=true" replace /></RequireAdmin>} />
+                    <Route path="/network/subnets/:name" element={<RequireAdmin><NetworkDetail /></RequireAdmin>} />
+                    <Route path="/network/vpcs/create" element={<RequireAdmin><Navigate to="/network?tab=vpcs&create=true" replace /></RequireAdmin>} />
+                    <Route path="/network/vpcs/:name" element={<RequireAdmin><VPCDetail /></RequireAdmin>} />
+                    <Route path="/network/egress-gateways" element={<RequireAdmin><EgressGateways /></RequireAdmin>} />
+                    <Route path="/network/ovn-gateways" element={<RequireAdmin><OvnGateways /></RequireAdmin>} />
+                    <Route path="/network/bgp" element={<RequireAdmin><BgpPeering /></RequireAdmin>} />
+                    <Route path="/network/security-groups" element={<RequireAdmin><SecurityGroups /></RequireAdmin>} />
+                    <Route path="/network/security-groups/:name" element={<RequireAdmin><SecurityGroupDetail /></RequireAdmin>} />
+                    {/* Backups — admin only */}
+                    <Route path="/backups" element={<RequireAdmin><Backups /></RequireAdmin>} />
+                    {/* Security — admin only */}
+                    <Route path="/security/network-flows" element={<RequireAdmin><NetworkFlows /></RequireAdmin>} />
+                    <Route path="/security/cilium-policies" element={<RequireAdmin><CiliumPolicies /></RequireAdmin>} />
+                    <Route path="/security/baseline" element={<RequireAdmin><SecurityBaseline /></RequireAdmin>} />
+                    {/* Cluster — admin only */}
+                    <Route path="/cluster" element={<RequireAdmin><Cluster /></RequireAdmin>} />
                     {/* Other */}
-                    <Route path="/cluster" element={<Cluster />} />
                     <Route path="/projects" element={<Projects />} />
                     <Route path="/folders" element={<Folders />} />
                     <Route path="/folders/new" element={<Navigate to="/folders?create=true" replace />} />
                     <Route path="/folders/:name" element={<FolderDetail />} />
-                    {/* Tenants — only when feature enabled */}
+                    {/* Tenants — admin only, and only when feature enabled */}
                     {features?.enableTenants ? (
                       <>
-                        <Route path="/tenants" element={<Tenants />} />
-                        <Route path="/tenants/:name" element={<TenantDetail />} />
+                        <Route path="/tenants" element={<RequireAdmin><Tenants /></RequireAdmin>} />
+                        <Route path="/tenants/:name" element={<RequireAdmin><TenantDetail /></RequireAdmin>} />
                       </>
                     ) : (
                       <>
@@ -175,8 +198,9 @@ function AppRoutes() {
                         <Route path="/tenants/:name" element={<Navigate to="/dashboard" replace />} />
                       </>
                     )}
-                    <Route path="/users" element={<Users />} />
-                    <Route path="/users/groups" element={<Groups />} />
+                    {/* Users — admin only */}
+                    <Route path="/users" element={<RequireAdmin><Users /></RequireAdmin>} />
+                    <Route path="/users/groups" element={<RequireAdmin><Groups /></RequireAdmin>} />
                     <Route path="/profile" element={<Profile />} />
                     <Route path="/cli-access" element={<CLIAccess />} />
                     <Route path="*" element={<NotFound />} />

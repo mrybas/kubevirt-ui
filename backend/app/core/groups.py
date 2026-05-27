@@ -71,11 +71,16 @@ def get_known_teams() -> list[dict[str, Any]]:
 def is_admin(groups: list[str]) -> bool:
     """Check if user is platform admin.
 
-    Group names are read from settings.admin_groups (env var ADMIN_GROUPS,
-    comma-separated). Defaults to "kubevirt-ui-admins" for backward compat.
+    Two admin signals are honored:
+    - Membership in any group from settings.admin_groups (env var ADMIN_GROUPS,
+      comma-separated; defaults to "kubevirt-ui-admins").
+    - Presence of "system:masters" (Kubernetes' built-in cluster-admin group,
+      typically only set for SA/cert tokens — mirrors the kubeconfig endpoint).
     """
     from app.config import get_settings
     admin_groups = set(get_settings().admin_groups_list)
+    if "system:masters" in groups:
+        return True
     return any(g in admin_groups for g in groups)
 
 

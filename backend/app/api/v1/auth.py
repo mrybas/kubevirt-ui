@@ -61,6 +61,7 @@ class UserInfoResponse(BaseModel):
     email: str
     username: str
     groups: list[str]
+    is_admin: bool
 
 
 @router.get("/config", response_model=AuthConfigResponse)
@@ -192,6 +193,7 @@ async def get_current_user_info(user: User = Depends(require_auth)) -> UserInfoR
         email=user.email,
         username=user.username,
         groups=user.groups,
+        is_admin=is_admin(user.groups),
     )
 
 
@@ -304,7 +306,7 @@ async def _ensure_service_account(
 
     # 3. Determine role from groups (admin group names from ADMIN_GROUPS env)
     from app.core.groups import is_admin as _is_admin
-    user_is_admin = _is_admin(groups) or "system:masters" in groups
+    user_is_admin = _is_admin(groups)
     binding_name = f"{sa_name}-binding"
     subject = RbacV1Subject(kind="ServiceAccount", name=sa_name, namespace=SA_NAMESPACE)
 
