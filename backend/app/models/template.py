@@ -149,16 +149,27 @@ class VMImage(BaseModel):
 
 class VMImageCreate(BaseModel):
     """Model for creating a VM image.
-    
-    If `name` is not provided, it will be auto-generated from `display_name`
-    using the pattern {slug}-{uuid6} (e.g. "ubuntu-24-04-server-a7f3e2").
+
+    K8s name is generated server-side via ``generateName``; the human-friendly
+    ``display_name`` is stored in the ``kubevirt-ui.io/display-name`` annotation
+    and a sanitized slug in the ``kubevirt-ui.io/slug`` label.
+
+    Both ``name`` and ``display_name`` are Pydantic-optional; the handler
+    enforces "at least one required" at runtime (same soft contract as
+    ``create_tenant_image``). When only ``name`` is supplied, it acts as the
+    generateName seed AND the display-name annotation fallback — preserving
+    older Terraform/CLI clients that passed ``name=...`` only.
     """
 
     name: str | None = Field(
         None,
         pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
         max_length=63,
-        description="K8s-safe name. Auto-generated from display_name if not provided.",
+        description=(
+            "Optional generateName seed (also display-name fallback for "
+            "back-compat). Not used verbatim as metadata.name — K8s always "
+            "appends a random suffix."
+        ),
     )
     display_name: str | None = Field(None, description="Human-friendly name (stored in annotation)")
     description: str | None = None
@@ -251,21 +262,34 @@ class AttachDiskRequest(BaseModel):
 
 
 class CreateImageFromDiskRequest(BaseModel):
-    """Request to create an image from an existing disk into a project namespace."""
+    """Request to create an image from an existing disk into a project namespace.
+
+    K8s name is generated server-side via ``generateName``; the human-friendly
+    ``display_name`` is stored in the ``kubevirt-ui.io/display-name`` annotation.
+    Both ``name`` and ``display_name`` are Pydantic-optional; the handler
+    enforces "at least one required" at runtime (soft contract matching
+    ``create_tenant_image``). When only ``name`` is supplied, it acts as the
+    generateName seed AND the display-name annotation fallback.
+    """
 
     source_disk_name: str
     source_namespace: str
-    
+
     # Target namespace for the new image (defaults to source_namespace if not provided)
     target_namespace: str | None = None
-    
+
     # New image details
-    name: str = Field(
-        ...,
+    name: str | None = Field(
+        None,
         pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
         max_length=63,
+        description=(
+            "Optional generateName seed (also display-name fallback for "
+            "back-compat). Not used verbatim as metadata.name — K8s always "
+            "appends a random suffix."
+        ),
     )
-    display_name: str | None = None
+    display_name: str | None = Field(None, description="Human-friendly name (stored in annotation)")
     description: str | None = None
     os_type: str = "linux"
     os_version: str | None = None

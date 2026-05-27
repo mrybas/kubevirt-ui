@@ -189,7 +189,7 @@ export async function listDiskSnapshots(
 export async function createDiskSnapshot(
   namespace: string,
   pvcName: string,
-  data: { snapshot_name: string; snapshot_class?: string }
+  data: { display_name: string; snapshot_class?: string }
 ): Promise<VolumeSnapshotInfo> {
   return apiRequest<VolumeSnapshotInfo>(
     `/namespaces/${namespace}/disks/${pvcName}/snapshots`,
@@ -335,7 +335,7 @@ export async function resizeVM(
 export async function saveDiskAsImage(
   namespace: string,
   pvcName: string,
-  data: { image_name: string; display_name?: string }
+  data: { display_name: string }
 ): Promise<{ status: string; image_name: string; source_pvc: string; size: string }> {
   return apiRequest<{ status: string; image_name: string; source_pvc: string; size: string }>(
     `/namespaces/${namespace}/disks/${pvcName}/save-as-image`,

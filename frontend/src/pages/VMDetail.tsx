@@ -92,11 +92,20 @@ export function VMDetail() {
   const [editDisplayNameValue, setEditDisplayNameValue] = useState('');
   const updateDisplayName = useUpdateVMDisplayName();
   
+  // Must be called unconditionally (before any early returns) — Rules of Hooks.
+  // vm may still be undefined at this point when loading/errored.
+  useEffect(() => {
+    if (!vm) return;
+    const prev = document.title;
+    document.title = vm.display_name || vm.name;
+    return () => { document.title = prev; };
+  }, [vm?.display_name, vm?.name]);
+
   const handleStop = (force: boolean) => {
     setIsStopMenuOpen(false);
     stopVM.mutate({ namespace: namespace!, name: name!, force });
   };
-  
+
   const handleDeleteConfirm = () => {
     deleteVM.mutate(
       { namespace: namespace!, name: name! },
@@ -140,12 +149,6 @@ export function VMDetail() {
   const isRunning = vm.status === 'Running';
   const isStarting = ['Starting', 'Provisioning', 'Pending', 'Scheduling', 'Scheduled'].includes(vm.status);
   const isStopped = ['Stopped', 'Halted', 'Failed'].includes(vm.status);
-
-  useEffect(() => {
-    const prev = document.title;
-    document.title = vm.display_name || vm.name;
-    return () => { document.title = prev; };
-  }, [vm.display_name, vm.name]);
 
   const openEditDisplayName = () => {
     setEditDisplayNameValue(vm.display_name || vm.name);

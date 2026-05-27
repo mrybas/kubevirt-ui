@@ -73,6 +73,15 @@ class VpcCreateRequest(BaseModel):
         description="CIDR for default subnet (auto-assigned from 10.{200+N}.0.0/24 if empty)",
     )
     tenant: Optional[str] = Field(None, description="Tenant name to bind this VPC to")
+    namespaces: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Namespaces bound to this VPC (becomes spec.namespaces on the Vpc and "
+            "default subnet). Mutually independent of 'tenant': when both are "
+            "supplied, 'namespaces' wins. When neither is supplied, the VPC is "
+            "created with no namespace binding."
+        ),
+    )
     enable_nat_gateway: bool = Field(
         False,
         description="Enable NAT gateway for internet access from VPC",
@@ -81,6 +90,27 @@ class VpcCreateRequest(BaseModel):
         default_factory=list,
         description="Initial static routes",
     )
+
+    @field_validator("namespaces")
+    @classmethod
+    def validate_namespace_names(cls, v: list[str]) -> list[str]:
+        """Surface-level format check; existence + managed-label is enforced in the handler."""
+        import re
+        ns_re = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+        for ns in v:
+            if not ns or len(ns) > 253 or not ns_re.match(ns):
+                raise ValueError(
+                    f"Invalid namespace name: {ns!r} (must match "
+                    f"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$, max 253 chars)"
+                )
+        # De-dup while preserving order
+        seen: set[str] = set()
+        out: list[str] = []
+        for ns in v:
+            if ns not in seen:
+                seen.add(ns)
+                out.append(ns)
+        return out
 
     @field_validator("subnet_cidr")
     @classmethod

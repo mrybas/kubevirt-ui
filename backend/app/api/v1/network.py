@@ -1,6 +1,7 @@
 """Kube-OVN Network Management API endpoints."""
 
 import logging
+import os
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -62,11 +63,32 @@ NAD_API_VERSION = "v1"
 
 
 async def _find_kubeovn_namespace(k8s) -> str:
-    """Find the namespace where kube-ovn controller is deployed.
+    """Resolve the namespace where kube-ovn controller is deployed.
+
+    Resolution order:
+        1. ``KUBE_OVN_NAMESPACE`` env var (default "kube-ovn") — preferred.
+           Verified to actually contain a kube-ovn-controller Deployment so
+           a misconfigured env var still falls back to discovery.
+        2. Cluster-wide Deployment search by label/name.
 
     This is needed for infrastructure subnets — their NADs must be in
     the kube-ovn namespace because VPC NAT Gateway pods run there.
     """
+    configured_ns = os.getenv("KUBE_OVN_NAMESPACE", "kube-ovn")
+    # Honor the env var when the deployment actually exists there.
+    try:
+        await k8s.apps_api.read_namespaced_deployment(
+            name="kube-ovn-controller", namespace=configured_ns,
+        )
+        return configured_ns
+    except ApiException as e:
+        if e.status != 404:
+            logger.warning(
+                "Failed to read kube-ovn-controller in %s: %s; falling back to cluster-wide search",
+                configured_ns, e,
+            )
+
+    # Fallback: search by label across the cluster
     try:
         deployments = await k8s.apps_api.list_deployment_for_all_namespaces(
             label_selector="app=kube-ovn-controller",
@@ -83,7 +105,14 @@ async def _find_kubeovn_namespace(k8s) -> str:
                 return dep.metadata.namespace
     except ApiException:
         pass
-    raise HTTPException(status_code=500, detail="Cannot find kube-ovn namespace")
+    raise HTTPException(
+        status_code=500,
+        detail=(
+            f"kube-ovn-controller Deployment not found in namespace "
+            f"'{configured_ns}' (KUBE_OVN_NAMESPACE) nor anywhere else in the cluster. "
+            "Install kube-ovn or set KUBE_OVN_NAMESPACE to the correct namespace."
+        ),
+    )
 
 
 async def _find_infra_subnet(k8s) -> dict | None:

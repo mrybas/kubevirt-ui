@@ -47,6 +47,7 @@ export interface CreateVpcRequest {
   name: string;
   subnet_cidr?: string;
   enable_nat_gateway?: boolean;
+  namespaces?: string[];
 }
 
 export interface AddVpcPeeringRequest {

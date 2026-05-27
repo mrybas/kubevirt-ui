@@ -60,6 +60,7 @@ interface WizardState {
   vpcSubnetCidr: string;
   vpcEnableNat: boolean;
   vpcEnablePeering: boolean;
+  vpcNamespaces: string[];
 }
 
 const initialState: WizardState = {
@@ -82,6 +83,7 @@ const initialState: WizardState = {
   vpcSubnetCidr: '10.100.0.0/24',
   vpcEnableNat: true,
   vpcEnablePeering: true,
+  vpcNamespaces: [],
 };
 
 // Helper to convert IP to number for comparison
@@ -224,14 +226,11 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
   // Fetch available namespaces for the subnet
   const { data: namespacesData } = useNamespaces();
   
-  // Filter to only show "user" namespaces (exclude system ones)
+  // Only show namespaces the backend will accept — kubevirt-ui.io/managed=true
   const userNamespaces = useMemo(() => {
     if (!namespacesData?.items) return [];
-    const systemPrefixes = ['kube-', 'flux-', 'cilium-', 'ingress-', 'metallb-', 'piraeus-', 'victoria-', 'monitoring', 'grafana-', 'kubevirt-ui-'];
-    const systemNamespaces = ['default', 'cdi', 'kubevirt', 'cluster-crds'];
     return namespacesData.items
-      .filter(ns => !systemPrefixes.some(p => ns.name.startsWith(p)))
-      .filter(ns => !systemNamespaces.includes(ns.name))
+      .filter(ns => ns.labels?.['kubevirt-ui.io/managed'] === 'true')
       .map(ns => ns.name);
   }, [namespacesData]);
 
@@ -398,6 +397,7 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
         name: state.vpcName,
         subnet_cidr: state.vpcSubnetCidr || undefined,
         enable_nat_gateway: state.vpcEnableNat,
+        ...(state.vpcNamespaces.length > 0 ? { namespaces: state.vpcNamespaces } : {}),
       });
       // TODO: if peering enabled, create peering with ovn-cluster (default VPC)
       onClose();
@@ -1181,6 +1181,42 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                   />
                 </button>
               </div>
+
+              {/* Namespaces picker */}
+              {userNamespaces.length > 0 && (
+                <div>
+                  <label className="block text-sm font-medium text-surface-200 mb-2">
+                    Namespaces
+                    <span className="ml-1 font-normal text-surface-500">(optional — leave empty for unrestricted)</span>
+                  </label>
+                  <div className="max-h-36 overflow-y-auto rounded-lg border border-surface-700 bg-surface-900/50 divide-y divide-surface-700/50">
+                    {userNamespaces.map((ns: string) => (
+                      <label
+                        key={ns}
+                        className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-surface-700/40 transition-colors"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={state.vpcNamespaces.includes(ns)}
+                          onChange={() => setState((s) => ({
+                            ...s,
+                            vpcNamespaces: s.vpcNamespaces.includes(ns)
+                              ? s.vpcNamespaces.filter(n => n !== ns)
+                              : [...s.vpcNamespaces, ns],
+                          }))}
+                          className="rounded border-surface-600 text-primary-500 bg-surface-800 focus:ring-primary-500 focus:ring-offset-0"
+                        />
+                        <span className="text-sm font-mono text-surface-200">{ns}</span>
+                      </label>
+                    ))}
+                  </div>
+                  {state.vpcNamespaces.length > 0 && (
+                    <p className="text-xs text-primary-400 mt-1">
+                      {state.vpcNamespaces.length} namespace{state.vpcNamespaces.length > 1 ? 's' : ''} selected
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         );
@@ -1271,6 +1307,13 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                     ) : (
                       <span className="text-surface-500">Disabled</span>
                     )}
+                  </dd>
+                  <dt className="text-surface-400">Namespaces:</dt>
+                  <dd className="text-surface-200">
+                    {state.vpcNamespaces.length > 0
+                      ? <span className="font-mono">{state.vpcNamespaces.join(', ')}</span>
+                      : <span className="text-surface-500">Unrestricted</span>
+                    }
                   </dd>
                 </dl>
               </div>

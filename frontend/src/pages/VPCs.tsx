@@ -2,7 +2,7 @@
  * VPC List Page
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Plus,
@@ -17,6 +17,7 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { useVpcs, useCreateVpc, useDeleteVpc } from '../hooks/useVpcs';
+import { useNamespaces } from '../hooks/useNamespaces';
 import type { Vpc } from '../types/vpc';
 import { DataTable, type Column } from '@/components/common/DataTable';
 import type { MenuItem } from '@/components/common/KebabMenu';
@@ -191,9 +192,26 @@ export default function VPCs({
 function CreateVpcModal({ onClose }: { onClose: () => void }) {
   const [name, setName] = useState('');
   const [cidr, setCidr] = useState('');
+  const [selectedNamespaces, setSelectedNamespaces] = useState<string[]>([]);
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState('');
   const createVpc = useCreateVpc();
+  const { data: namespacesData } = useNamespaces();
+
+  // Only show namespaces the backend will accept — kubevirt-ui.io/managed=true
+  const userNamespaces = useMemo(() => {
+    if (!namespacesData?.items) return [];
+    return namespacesData.items
+      .filter(ns => ns.labels?.['kubevirt-ui.io/managed'] === 'true')
+      .map(ns => ns.name)
+      .sort();
+  }, [namespacesData]);
+
+  const toggleNamespace = (ns: string) => {
+    setSelectedNamespaces(prev =>
+      prev.includes(ns) ? prev.filter(n => n !== ns) : [...prev, ns]
+    );
+  };
 
   const canCreate = name.length > 0;
 
@@ -204,6 +222,7 @@ function CreateVpcModal({ onClose }: { onClose: () => void }) {
       await createVpc.mutateAsync({
         name,
         ...(cidr ? { subnet_cidr: cidr } : {}),
+        ...(selectedNamespaces.length > 0 ? { namespaces: selectedNamespaces } : {}),
       });
       onClose();
     } catch (e: unknown) {
@@ -248,6 +267,39 @@ function CreateVpcModal({ onClose }: { onClose: () => void }) {
             <p className="text-xs text-surface-500 mt-1">
               CIDR for the default subnet. Leave empty to auto-allocate.
             </p>
+          </div>
+
+          {/* Namespaces picker */}
+          <div>
+            <label className="block text-sm font-medium text-surface-300 mb-1">
+              Namespaces
+              <span className="ml-1 font-normal text-surface-500">(optional — leave empty for unrestricted)</span>
+            </label>
+            {userNamespaces.length === 0 ? (
+              <p className="text-xs text-surface-500 italic">Loading namespaces…</p>
+            ) : (
+              <div className="max-h-36 overflow-y-auto rounded-lg border border-surface-700 bg-surface-900/50 divide-y divide-surface-700/50">
+                {userNamespaces.map(ns => (
+                  <label
+                    key={ns}
+                    className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-surface-700/40 transition-colors"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedNamespaces.includes(ns)}
+                      onChange={() => toggleNamespace(ns)}
+                      className="rounded border-surface-600 text-primary-500 bg-surface-800 focus:ring-primary-500 focus:ring-offset-0"
+                    />
+                    <span className="text-sm font-mono text-surface-200">{ns}</span>
+                  </label>
+                ))}
+              </div>
+            )}
+            {selectedNamespaces.length > 0 && (
+              <p className="text-xs text-primary-400 mt-1">
+                {selectedNamespaces.length} namespace{selectedNamespaces.length > 1 ? 's' : ''} selected
+              </p>
+            )}
           </div>
 
           {error && (

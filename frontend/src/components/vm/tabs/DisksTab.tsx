@@ -56,7 +56,7 @@ function DiskSnapshotsPanel({
     if (!snapshotName) return;
     setSnapshotError('');
     createSnapshot.mutate(
-      { namespace, pvcName, data: { snapshot_name: snapshotName } },
+      { namespace, pvcName, data: { display_name: snapshotName } },
       {
         onSuccess: () => setSnapshotName(''),
         onError: (err: any) => setSnapshotError(err?.message || 'Failed to create snapshot'),
@@ -466,7 +466,7 @@ export function DisksTab({ vm }: { vm: any }) {
                                   onKeyDown={(e: React.KeyboardEvent) => {
                                     if (e.key === 'Enter' && saveImageName) {
                                       saveAsImage.mutate(
-                                        { namespace: vm.namespace, pvcName: disk.source_name!, data: { image_name: saveImageName } },
+                                        { namespace: vm.namespace, pvcName: disk.source_name!, data: { display_name: saveImageName } },
                                         {
                                           onSuccess: () => { setSaveImageDisk(null); setSaveImageName(''); setSaveImageMsg({ type: 'success', text: `Image ${saveImageName} is being created.` }); },
                                           onError: (err: any) => setSaveImageMsg({ type: 'error', text: err?.message || 'Failed to save as image' }),
@@ -481,7 +481,7 @@ export function DisksTab({ vm }: { vm: any }) {
                                   onClick={() => {
                                     if (!saveImageName) return;
                                     saveAsImage.mutate(
-                                      { namespace: vm.namespace, pvcName: disk.source_name!, data: { image_name: saveImageName } },
+                                      { namespace: vm.namespace, pvcName: disk.source_name!, data: { display_name: saveImageName } },
                                       {
                                         onSuccess: () => { setSaveImageDisk(null); setSaveImageName(''); setSaveImageMsg({ type: 'success', text: `Image ${saveImageName} is being created.` }); },
                                         onError: (err: any) => setSaveImageMsg({ type: 'error', text: err?.message || 'Failed to save as image' }),

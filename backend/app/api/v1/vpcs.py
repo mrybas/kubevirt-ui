@@ -12,6 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
+from app.api.v1.tenants_common import _tenant_ns
 from app.core.allocators import allocate_vpc_cidr
 from app.core.auth import User, require_auth, require_admin
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
@@ -169,14 +170,48 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     else:
         cidr, gateway = await allocate_vpc_cidr(k8s)
 
-    bind_namespace = f"tenant-{data.tenant}" if data.tenant else None
+    # Resolve namespace bindings.
+    # Precedence (matches V1 contract): explicit data.namespaces wins;
+    # otherwise fall back to data.tenant → ["tenant-<name>"]; otherwise none.
+    if data.namespaces:
+        bind_namespaces: list[str] = list(data.namespaces)
+    elif data.tenant:
+        bind_namespaces = [_tenant_ns(data.tenant)]
+    else:
+        bind_namespaces = []
+
+    # Validate each bound namespace: must exist AND carry kubevirt-ui.io/managed=true.
+    # The managed label is the contract for "this namespace was created by us
+    # (project / tenant)" so we don't accidentally bind a VPC to kube-system or
+    # an unrelated user namespace.
+    for ns in bind_namespaces:
+        try:
+            ns_obj = await k8s.core_api.read_namespace(name=ns)
+        except ApiException as e:
+            if e.status == 404:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Namespace '{ns}' does not exist",
+                )
+            raise k8s_error_to_http(e, f"reading namespace '{ns}'")
+        ns_labels = (ns_obj.metadata.labels or {})
+        if ns_labels.get("kubevirt-ui.io/managed") != "true":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Namespace '{ns}' is not managed by kubevirt-ui "
+                    "(missing label kubevirt-ui.io/managed=true). VPCs can "
+                    "only be bound to managed namespaces."
+                ),
+            )
+
     labels: dict[str, str] = {"kubevirt-ui.io/managed": "true"}
     if data.tenant:
         labels["kubevirt-ui.io/tenant"] = data.tenant
 
     # Build VPC spec
     vpc_spec: dict[str, Any] = {
-        "namespaces": [bind_namespace] if bind_namespace else [],
+        "namespaces": bind_namespaces,
     }
     if data.enable_nat_gateway:
         vpc_spec["enableExternal"] = True
@@ -216,7 +251,7 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             "vpc": data.name,
             "enableDHCP": True,
             "natOutgoing": data.enable_nat_gateway,
-            **({"namespaces": [bind_namespace]} if bind_namespace else {}),
+            **({"namespaces": bind_namespaces} if bind_namespaces else {}),
         },
     }
 
@@ -351,6 +386,7 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             VpcStaticRoute(cidr=r.cidr, nextHopIP=r.next_hop_ip, policy=r.policy)
             for r in data.static_routes
         ],
+        namespaces=bind_namespaces,
         ready=False,
     )
 

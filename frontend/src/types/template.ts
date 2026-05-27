@@ -128,7 +128,7 @@ export interface GoldenImageListResponse {
 export interface CreateImageFromDiskRequest {
   source_disk_name: string;
   source_namespace: string;
-  name: string;
+  name?: string;
   display_name?: string;
   description?: string;
   os_type?: string;

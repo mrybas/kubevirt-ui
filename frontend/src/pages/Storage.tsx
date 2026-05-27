@@ -585,7 +585,7 @@ function ImportImageModal({
 
     const data: GoldenImageCreate & { disk_type: DiskType; persistent: boolean } = {
       name: name || undefined,
-      display_name: displayName || name || undefined,
+      display_name: displayName,
       description: description || undefined,
       os_type: osType,
       size,
@@ -604,7 +604,7 @@ function ImportImageModal({
     await onSubmit(data, selectedProject);
   };
 
-  const isValid = (name.length > 0 || displayName.length > 0) && sourceUrl.length > 0 && selectedProject.length > 0;
+  const isValid = displayName.length > 0 && sourceUrl.length > 0 && selectedProject.length > 0;
 
   const popularImages = [
     { name: 'Ubuntu 22.04', url: 'https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img' },
@@ -641,23 +641,23 @@ function ImportImageModal({
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-surface-300 mb-1.5">Name *</label>
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
-                placeholder="ubuntu-22-04"
-                className="input w-full"
-                required
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-surface-300 mb-1.5">Display Name</label>
+              <label className="block text-sm font-medium text-surface-300 mb-1.5">Display Name *</label>
               <input
                 type="text"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
                 placeholder="Ubuntu 22.04 LTS"
+                className="input w-full"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-surface-300 mb-1.5">K8s Name <span className="font-normal text-surface-500">(optional seed)</span></label>
+              <input
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                placeholder="ubuntu-22-04"
                 className="input w-full"
               />
             </div>
@@ -840,7 +840,7 @@ function NewDiskModal({
 
     const data: GoldenImageCreate & { disk_type: DiskType; persistent: boolean } = {
       name: name || undefined,
-      display_name: displayName || name || undefined,
+      display_name: displayName,
       size,
       storage_class: storageClass || defaultSC || undefined,
       disk_type: 'data',
@@ -858,7 +858,7 @@ function NewDiskModal({
     await onSubmit(data, selectedProject);
   };
 
-  const isValid = name.length > 0 && selectedProject.length > 0 && (sourceType === 'blank' || cloneFrom.length > 0);
+  const isValid = displayName.length > 0 && selectedProject.length > 0 && (sourceType === 'blank' || cloneFrom.length > 0);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
@@ -889,23 +889,23 @@ function NewDiskModal({
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-surface-300 mb-1.5">Name *</label>
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
-                placeholder="data-disk"
-                className="input w-full"
-                required
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-surface-300 mb-1.5">Display Name</label>
+              <label className="block text-sm font-medium text-surface-300 mb-1.5">Display Name *</label>
               <input
                 type="text"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
                 placeholder="Database Storage"
+                className="input w-full"
+                required
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-surface-300 mb-1.5">K8s Name <span className="font-normal text-surface-500">(optional seed)</span></label>
+              <input
+                type="text"
+                value={name}
+                onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+                placeholder="data-disk"
                 className="input w-full"
               />
             </div>

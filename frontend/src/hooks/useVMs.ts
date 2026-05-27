@@ -269,7 +269,7 @@ export function useCreateDiskSnapshot() {
     }: {
       namespace: string;
       pvcName: string;
-      data: { snapshot_name: string; snapshot_class?: string };
+      data: { display_name: string; snapshot_class?: string };
     }) => vmApi.createDiskSnapshot(namespace, pvcName, data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['disk-snapshots', variables.namespace, variables.pvcName] });
@@ -515,7 +515,7 @@ export function useSaveDiskAsImage() {
     }: {
       namespace: string;
       pvcName: string;
-      data: { image_name: string; display_name?: string };
+      data: { display_name: string };
     }) => vmApi.saveDiskAsImage(namespace, pvcName, data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['vm-disks', variables.namespace] });

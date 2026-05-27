@@ -81,11 +81,11 @@ rules:
       - namespaces
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
-  # Nodes — read-only for cluster overview
+  # Nodes — read for cluster overview; patch for BGP label (bgp.py:_label_nodes)
   - apiGroups: [""]
     resources:
       - nodes
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
 
   # PVs — read-only for storage overview
   - apiGroups: [""]
@@ -154,6 +154,12 @@ rules:
     resources:
       - daemonsets
     verbs: ["get", "list", "watch", "create", "delete"]
+
+  # Apps — Deployments read-only (network.py:_find_kubeovn_namespace)
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+    verbs: ["get", "list", "watch"]
 
   # -----------------------------------------------------------------------
   # Networking (Kube-OVN)

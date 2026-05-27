@@ -830,10 +830,16 @@ async def create_vm_from_template(
             net_specs: list[dict[str, Any]] = []
             iface_specs: list[dict[str, Any]] = []
             static_ips: list[str] = []
+            has_bridge = False  # tracks whether any NIC uses bridge binding
 
             for idx, nic in enumerate(nic_list):
                 subnet_name = nic.subnet
-                # Look up subnet to get VLAN name (used as NAD name)
+                # Look up Subnet CR to decide how to attach this NIC:
+                #   - spec.vlan present → VLAN-backed underlay → multus + bridge (existing path)
+                #   - spec.vlan absent  → VPC overlay         → default pod network + masquerade +
+                #                                                ovn.kubernetes.io/logical_switch annotation
+                # The VPC pattern mirrors tenants_capi._build_kubevirt_machine_template_cr.
+                vlan_name: str | None = None
                 try:
                     subnet_obj = await custom_api.get_cluster_custom_object(
                         group="kubeovn.io",
@@ -841,21 +847,39 @@ async def create_vm_from_template(
                         plural="subnets",
                         name=subnet_name,
                     )
-                    vlan_name = subnet_obj.get("spec", {}).get("vlan", subnet_name)
+                    vlan_name = subnet_obj.get("spec", {}).get("vlan") or None
                 except Exception:
+                    # Failed lookup → assume the caller knows; treat as VLAN
+                    # with subnet_name as the NAD name (legacy behavior).
                     vlan_name = subnet_name
 
-                # Unique interface name per NIC
-                iface_name = vlan_name if idx == 0 else f"{vlan_name}-{idx}"
-                nad_ref = f"{namespace}/{vlan_name}"
-
-                # First NIC is the default network
-                multus_entry: dict[str, Any] = {"networkName": nad_ref}
-                if idx == 0:
-                    multus_entry["default"] = True
-
-                net_specs.append({"name": iface_name, "multus": multus_entry})
-                iface_specs.append({"name": iface_name, "bridge": {}})
+                if vlan_name:
+                    # VLAN-backed underlay: multus + bridge binding.
+                    iface_name = vlan_name if idx == 0 else f"{vlan_name}-{idx}"
+                    nad_ref = f"{namespace}/{vlan_name}"
+                    multus_entry: dict[str, Any] = {"networkName": nad_ref}
+                    if idx == 0:
+                        multus_entry["default"] = True
+                    net_specs.append({"name": iface_name, "multus": multus_entry})
+                    iface_specs.append({"name": iface_name, "bridge": {}})
+                    has_bridge = True
+                else:
+                    # VPC overlay: default pod network + masquerade. The
+                    # logical_switch annotation (stamped below) steers the
+                    # primary OVN interface to this subnet's logical switch.
+                    # Secondary VPC NICs would need per-subnet NADs wrapping
+                    # the OVN CNI — out of scope for now.
+                    if idx != 0:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=(
+                                "VPC subnets can only be the primary NIC. Use "
+                                "VLAN-backed subnets for additional NICs."
+                            ),
+                        )
+                    iface_name = "default"
+                    net_specs.append({"name": iface_name, "pod": {}})
+                    iface_specs.append({"name": iface_name, "masquerade": {}})
 
                 if nic.static_ip:
                     static_ips.append(nic.static_ip)
@@ -863,13 +887,16 @@ async def create_vm_from_template(
             vm_spec["networks"] = net_specs
             vm_spec["domain"]["devices"]["interfaces"] = iface_specs
 
-            # Annotations for live migration support with bridge binding
-            template_annotations["kubevirt.io/allow-pod-bridge-network-live-migration"] = "true"
+            # Live-migration annotation is only required when a bridge-bound
+            # interface is in play; pure pod-network VMs migrate fine without it.
+            if has_bridge:
+                template_annotations["kubevirt.io/allow-pod-bridge-network-live-migration"] = "true"
 
-            # Kube-OVN: set logical_switch for default network so DHCP works
-            if nic_list:
-                first_subnet = nic_list[0].subnet
-                template_annotations["ovn.kubernetes.io/logical_switch"] = first_subnet
+            # Kube-OVN: set logical_switch for the primary NIC. For VPC overlays
+            # this is what attaches the pod to the right logical switch; for
+            # VLAN-backed primaries it also gives DHCP/IPAM scoping. Works for both.
+            first_subnet = nic_list[0].subnet
+            template_annotations["ovn.kubernetes.io/logical_switch"] = first_subnet
 
             # Static IPs via Kube-OVN annotation (comma-separated for multi-NIC)
             if static_ips:

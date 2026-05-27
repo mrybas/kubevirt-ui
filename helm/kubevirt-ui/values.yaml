@@ -29,6 +29,11 @@ backend:
     LOG_LEVEL: INFO
     CORS_ORIGINS: ""
     ENABLE_TENANTS: "false"
+    # -- Namespace where kube-ovn-controller Deployment lives. Backend
+    # reads this to locate the kube-ovn install instead of doing a
+    # cluster-wide Deployment scan. Cluster-wide discovery still runs as
+    # a fallback if the Deployment is not found in this namespace.
+    KUBE_OVN_NAMESPACE: "kube-ovn"
 
   # -- Extra env vars from secrets/configmaps
   envFrom: []

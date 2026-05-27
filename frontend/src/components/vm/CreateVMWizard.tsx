@@ -509,8 +509,21 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   };
   
   const renderNetworkStep = () => {
-    // Filter subnets that have a VLAN (external networks) and match the VM's target namespace
-    const externalSubnets = subnets?.filter((s: any) => s.vlan && (!s.namespace || s.namespace === selectedProject)) || [];
+    // Include both VPC-backed (s.vpc) and VLAN-backed (s.vlan) subnets for VM attachment.
+    // Exclude infrastructure subnets (used for NAT gateway, not VM NICs).
+    // VPC subnets may have no namespace (cluster-wide) — those always pass the namespace filter.
+    const externalSubnets = (subnets || [])
+      .filter((s: any) =>
+        (s.vpc || s.vlan) &&
+        s.purpose !== 'infrastructure' &&
+        (!s.namespace || s.namespace === selectedProject)
+      )
+      // Sort: VPC-backed first (base infrastructure), then VLAN-backed external
+      .sort((a: any, b: any) => {
+        if (a.vpc && !b.vpc) return -1;
+        if (!a.vpc && b.vpc) return 1;
+        return 0;
+      });
 
     const addNic = (subnetName: string) => {
       if (!nics.find(n => n.subnet === subnetName)) {
@@ -566,7 +579,12 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
                       <span>CIDR: <span className="font-mono text-surface-300">{info.cidr_block}</span></span>
                       <span>GW: <span className="font-mono text-surface-300">{info.gateway}</span></span>
                       <span className="text-emerald-400">{info.statistics?.available || 0} IPs free</span>
-                      <span className="text-surface-500">DHCP</span>
+                      {info.vpc
+                        ? <span className="text-primary-400">VPC: {info.vpc}</span>
+                        : info.vlan
+                          ? <span className="text-amber-400">VLAN {info.vlan}</span>
+                          : <span className="text-surface-500">DHCP</span>
+                      }
                     </div>
                   )}
                 </div>
@@ -577,27 +595,36 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
 
         {/* Available subnets as tiles */}
         <div>
-          <h4 className="text-sm font-medium text-surface-300 mb-2">
-            {nics.length === 0 ? 'Available External Networks' : 'Add Another NIC'}
+          <h4 className="text-sm font-medium text-surface-300 mb-2" title="Subnets in your VPCs and any VLAN-backed external subnets">
+            {nics.length === 0 ? 'Available Networks' : 'Add Another NIC'}
           </h4>
           {externalSubnets.length === 0 ? (
             <div className="text-center py-8 text-surface-500 bg-surface-800/50 rounded-lg">
               <Network className="w-8 h-8 mx-auto mb-2 opacity-50" />
-              <p className="text-sm">No external networks configured for this project.</p>
+              <p className="text-sm">No VPC or external networks available for this project.</p>
               <p className="text-xs mt-1">VM will use the default pod network.</p>
             </div>
           ) : (
             <div className="grid grid-cols-1 gap-2">
               {externalSubnets.map((subnet: any) => {
                 const isAdded = !!nics.find(n => n.subnet === subnet.name);
+                // VPC subnets can only be the primary (first) NIC — backend doesn't support secondary VPC NICs
+                const isVpcSecondaryDisabled = !!subnet.vpc && nics.length > 0 && !isAdded;
                 return (
                   <button
                     key={subnet.name}
-                    onClick={() => isAdded ? removeNic(nics.findIndex(n => n.subnet === subnet.name)) : addNic(subnet.name)}
+                    onClick={() => {
+                      if (isVpcSecondaryDisabled) return;
+                      isAdded ? removeNic(nics.findIndex(n => n.subnet === subnet.name)) : addNic(subnet.name);
+                    }}
+                    disabled={isVpcSecondaryDisabled}
+                    title={isVpcSecondaryDisabled ? 'VPC subnets can only be used as the primary NIC (NIC 1)' : undefined}
                     className={`p-3 rounded-lg border text-left transition-all ${
-                      isAdded
-                        ? 'border-emerald-500/40 bg-emerald-500/5 opacity-50'
-                        : 'border-surface-700 hover:border-emerald-500/40 hover:bg-emerald-500/5 bg-surface-800'
+                      isVpcSecondaryDisabled
+                        ? 'border-surface-700 bg-surface-800/50 opacity-40 cursor-not-allowed'
+                        : isAdded
+                          ? 'border-emerald-500/40 bg-emerald-500/5 opacity-50'
+                          : 'border-surface-700 hover:border-emerald-500/40 hover:bg-emerald-500/5 bg-surface-800'
                     }`}
                   >
                     <div className="flex items-center gap-3">
@@ -605,7 +632,16 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
                         <Globe className={`w-4 h-4 ${isAdded ? 'text-emerald-400' : 'text-surface-400'}`} />
                       </div>
                       <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {subnet.vpc ? (
+                            <span className="text-xs font-semibold px-1.5 py-0.5 rounded bg-primary-500/20 text-primary-400">
+                              VPC: {subnet.vpc}
+                            </span>
+                          ) : subnet.vlan ? (
+                            <span className="text-xs font-semibold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-400">
+                              VLAN {subnet.vlan}
+                            </span>
+                          ) : null}
                           <span className="text-sm font-medium text-surface-100">{subnet.name}</span>
                           <span className="text-xs font-mono text-surface-500">{subnet.cidr_block}</span>
                           {isAdded && <Check className="w-3.5 h-3.5 text-emerald-400" />}
@@ -613,7 +649,6 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
                         <div className="flex items-center gap-3 text-xs text-surface-500 mt-0.5">
                           <span>GW: {subnet.gateway}</span>
                           <span className="text-emerald-400">{subnet.statistics?.available || 0} IPs free</span>
-                          {subnet.vlan && <span>VLAN: {subnet.vlan}</span>}
                         </div>
                       </div>
                       {!isAdded && <Plus className="w-4 h-4 text-surface-500" />}

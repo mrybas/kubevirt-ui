@@ -10,7 +10,7 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client.rest import ApiException
 
 from app.core.auth import User, require_auth
-from app.core.naming import generate_k8s_name, DISPLAY_NAME_ANNOTATION
+from app.core.naming import DISPLAY_NAME_ANNOTATION, SLUG_LABEL, sanitize_display_name
 from app.models.template import (
     VMTemplate,
     VMTemplateCreate,
@@ -688,16 +688,21 @@ async def create_golden_image(
     - project: image is labeled as available to all envs in the project
     """
     k8s_client = request.app.state.k8s_client
-    
-    # Resolve name: auto-generate from display_name if not provided
+
+    # At-least-one runtime check (soft contract — matches create_tenant_image).
     if not image.name and not image.display_name:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Either 'name' or 'display_name' must be provided",
         )
-    if not image.name:
-        image.name = generate_k8s_name(image.display_name)
-    
+
+    # Synthetic naming: seed comes from `name` if the client supplied it
+    # (back-compat with Terraform/CLI), otherwise from display_name. The
+    # display-name annotation falls back to `name` when only `name` was given.
+    seed = image.name or image.display_name
+    display_name_value = image.display_name or image.name
+    slug = sanitize_display_name(seed)
+
     # Use namespace from request parameter (disk lives in project namespace)
     target_namespace = namespace
     
@@ -752,34 +757,38 @@ async def create_golden_image(
             MANAGED_LABEL: "true",
             "kubevirt-ui.io/disk-type": image.disk_type or "image",
             "kubevirt-ui.io/persistent": str(image.persistent).lower(),
+            SLUG_LABEL: slug,
         }
-        
+
         # Scope labels
         scope = image.scope or "environment"
         dv_labels["kubevirt-ui.io/scope"] = scope
         if scope == "project" and project_name:
             dv_labels["kubevirt-ui.io/project"] = project_name
-        
+
+        # Synthetic naming: generateName + display-name annotation + slug label.
+        # Same manual stamping pattern as tenants_crud.create_tenant_image —
+        # preserves seed-override semantics that with_synthetic_metadata lacks.
         dv = {
             "apiVersion": "cdi.kubevirt.io/v1beta1",
             "kind": "DataVolume",
             "metadata": {
-                "name": image.name,
+                "generateName": f"{slug}-",
                 "namespace": target_namespace,
                 "labels": dv_labels,
-                "annotations": {},
+                "annotations": {
+                    DISPLAY_NAME_ANNOTATION: display_name_value,
+                },
             },
             "spec": {
                 "source": source,
                 "storage": image_storage,
             },
         }
-        
-        # Add optional labels
+
+        # Add optional labels/annotations
         if image.os_type:
             dv["metadata"]["labels"]["kubevirt-ui.io/os-type"] = image.os_type
-        if image.display_name:
-            dv["metadata"]["annotations"]["kubevirt-ui.io/display-name"] = image.display_name
         if image.description:
             dv["metadata"]["annotations"]["kubevirt-ui.io/description"] = image.description
         if image.os_version:
@@ -798,7 +807,7 @@ async def create_golden_image(
         return GoldenImage(
             name=result["metadata"]["name"],
             namespace=result["metadata"]["namespace"],
-            display_name=image.display_name,
+            display_name=display_name_value,
             description=image.description,
             os_type=image.os_type,
             os_version=image.os_version,
@@ -1002,9 +1011,23 @@ async def create_golden_image_from_disk(
 ) -> GoldenImage:
     """Create an image by cloning an existing disk (snapshot) into a project namespace."""
     k8s_client = request.app.state.k8s_client
-    
+
     # Target namespace - use namespace from request, default to source_namespace
     target_namespace = req.target_namespace or req.source_namespace
+
+    # At-least-one runtime check (soft contract — matches create_tenant_image).
+    if not req.name and not req.display_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either 'name' or 'display_name' must be provided",
+        )
+
+    # Synthetic naming: seed comes from `name` if the client supplied it
+    # (back-compat), else from display_name. Display-name annotation falls
+    # back to `name` when only `name` was given.
+    seed = req.name or req.display_name
+    display_name_value = req.display_name or req.name
+    slug = sanitize_display_name(seed)
     
     try:
         # Verify target namespace exists
@@ -1039,19 +1062,23 @@ async def create_golden_image_from_disk(
         if storage_class:
             clone_storage["storageClassName"] = storage_class
         
-        # Build DataVolume with PVC clone source
+        # Build DataVolume with PVC clone source.
+        # Synthetic naming: generateName + display-name annotation + slug label.
         dv = {
             "apiVersion": "cdi.kubevirt.io/v1beta1",
             "kind": "DataVolume",
             "metadata": {
-                "name": req.name,
+                "generateName": f"{slug}-",
                 "namespace": target_namespace,
                 "labels": {
                     MANAGED_LABEL: "true",
                     "kubevirt-ui.io/os-type": req.os_type,
                     "kubevirt-ui.io/cloned-from": f"{req.source_namespace}/{req.source_disk_name}",
+                    SLUG_LABEL: slug,
                 },
-                "annotations": {},
+                "annotations": {
+                    DISPLAY_NAME_ANNOTATION: display_name_value,
+                },
             },
             "spec": {
                 "source": {
@@ -1063,9 +1090,7 @@ async def create_golden_image_from_disk(
                 "storage": clone_storage,
             },
         }
-        
-        if req.display_name:
-            dv["metadata"]["annotations"]["kubevirt-ui.io/display-name"] = req.display_name
+
         if req.description:
             dv["metadata"]["annotations"]["kubevirt-ui.io/description"] = req.description
         if req.os_version:
@@ -1084,7 +1109,7 @@ async def create_golden_image_from_disk(
         return GoldenImage(
             name=result["metadata"]["name"],
             namespace=result["metadata"]["namespace"],
-            display_name=req.display_name,
+            display_name=display_name_value,
             description=req.description,
             os_type=req.os_type,
             os_version=req.os_version,

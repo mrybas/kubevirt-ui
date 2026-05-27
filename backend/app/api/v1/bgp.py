@@ -146,9 +146,15 @@ def _parse_speaker_args(ds: Any) -> dict[str, Any]:
 
 
 async def _label_nodes(k8s, node_names: list[str], add: bool = True) -> None:
-    """Add or remove BGP label from nodes."""
+    """Add or remove BGP label from nodes.
+
+    Raises HTTPException if the K8s API rejects the patch (e.g. 403 due to
+    missing RBAC for `nodes` patch). Surfacing the error lets the frontend
+    show a real failure instead of silently skipping nodes.
+    """
     label_value = "true" if add else None
     body = {"metadata": {"labels": {BGP_NODE_LABEL: label_value}}}
+    action = "label node" if add else "unlabel node"
     for name in node_names:
         try:
             await k8s.core_api.patch_node(
@@ -156,7 +162,8 @@ async def _label_nodes(k8s, node_names: list[str], add: bool = True) -> None:
                 _content_type="application/merge-patch+json",
             )
         except ApiException as e:
-            logger.warning(f"Failed to {'label' if add else 'unlabel'} node {name}: {e}")
+            logger.warning(f"Failed to {action} {name}: {e}")
+            raise k8s_error_to_http(e, f"{action} {name}") from e
 
 
 async def _get_bgp_nodes(k8s) -> list[str]:
