@@ -42,7 +42,7 @@ export default function CLIAccess() {
       }
     }
     fetchKubeconfig();
-  }, []);
+  }, [idToken, refreshToken]);
 
   if (loading) {
     return (
