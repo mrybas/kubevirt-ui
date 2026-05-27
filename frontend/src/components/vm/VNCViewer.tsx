@@ -1,6 +1,7 @@
 import { useRef, useState, useCallback } from 'react';
 import { VncScreen, VncScreenHandle } from 'react-vnc';
 import { Loader2, Monitor, AlertTriangle, Maximize2, Minimize2, Power } from 'lucide-react';
+import { useAuthStore } from '../../store/auth';
 
 interface VNCViewerProps {
   namespace: string;
@@ -15,10 +16,15 @@ export function VNCViewer({ namespace, vmName, isRunning }: VNCViewerProps) {
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [isFullscreen, setIsFullscreen] = useState(false);
 
+  // WebSocket cannot send Authorization headers; backend's _ws_authenticate
+  // expects the OIDC access_token as a query param.
+  const accessToken = useAuthStore((s) => s.accessToken);
+
   // Build WebSocket URL to backend proxy
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   const host = window.location.host;
-  const wsUrl = `${protocol}//${host}/api/v1/namespaces/${namespace}/vms/${vmName}/console/vnc`;
+  const tokenQuery = accessToken ? `?token=${encodeURIComponent(accessToken)}` : '';
+  const wsUrl = `${protocol}//${host}/api/v1/namespaces/${namespace}/vms/${vmName}/console/vnc${tokenQuery}`;
 
   const handleConnect = useCallback(() => {
     console.log('VNC connected');

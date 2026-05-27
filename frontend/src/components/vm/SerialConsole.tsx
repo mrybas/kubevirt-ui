@@ -4,6 +4,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import 'xterm/css/xterm.css';
 import { Loader2, Terminal as TerminalIcon, AlertTriangle, Maximize2, Minimize2 } from 'lucide-react';
+import { useAuthStore } from '../../store/auth';
 
 interface SerialConsoleProps {
   namespace: string;
@@ -77,10 +78,13 @@ export function SerialConsole({ namespace, vmName, isRunning }: SerialConsolePro
       terminalInstance.current.clear();
     }
 
-    // Build WebSocket URL
+    // Build WebSocket URL. WS cannot send Authorization headers; backend's
+    // _ws_authenticate expects the OIDC access_token as a query param.
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
-    const wsUrl = `${protocol}//${host}/api/v1/namespaces/${namespace}/vms/${vmName}/console/serial`;
+    const accessToken = useAuthStore.getState().accessToken;
+    const tokenQuery = accessToken ? `?token=${encodeURIComponent(accessToken)}` : '';
+    const wsUrl = `${protocol}//${host}/api/v1/namespaces/${namespace}/vms/${vmName}/console/serial${tokenQuery}`;
 
     // Connect WebSocket
     const ws = new WebSocket(wsUrl);
