@@ -605,12 +605,14 @@ async def list_sessions(
 
 def _generate_gateway_examples(
     cluster_as: int, neighbor_as: int, node_ips: list[str],
+    gateway_ip: str | None = None,
 ) -> list[GatewayConfigExample]:
     """Generate gateway config examples based on current speaker config."""
+    router_id = gateway_ip or "<GATEWAY_IP>"
     nodes_frr = "\n".join(f"  neighbor {ip} remote-as {cluster_as}" for ip in node_ips)
     nodes_frr_activate = "\n".join(f"    neighbor {ip} activate" for ip in node_ips)
-    nodes_bird = "\n".join(
-        f'  neighbor k8s_node_{i+1} from k8s_nodes {{\n    neighbor {ip};\n  }}'
+    nodes_bird = "\n\n".join(
+        f"protocol bgp k8s_node_{i+1} from k8s_nodes {{\n  neighbor {ip};\n}}"
         for i, ip in enumerate(node_ips)
     )
 
@@ -619,7 +621,7 @@ hostname gateway
 log syslog informational
 !
 router bgp {neighbor_as}
-  bgp router-id <GATEWAY_IP>
+  bgp router-id {router_id}
   no bgp ebgp-requires-policy
   !
 {nodes_frr}
@@ -636,7 +638,7 @@ router bgp {neighbor_as}
 """
 
     bird_config = f"""log syslog all;
-router id <GATEWAY_IP>;
+router id {router_id};
 
 protocol device {{
   scan time 10;
@@ -668,7 +670,7 @@ template bgp k8s_nodes {{
   keepalive time 10;
 }}
 
-{nodes_bird if nodes_bird else '# neighbor k8s_node_1 from k8s_nodes {{ neighbor <NODE_IP>; }}'}
+{nodes_bird if nodes_bird else '# protocol bgp k8s_node_1 from k8s_nodes {{ neighbor <NODE_IP>; }}'}
 
 # Verify: birdc show protocols all
 # Routes: birdc show route
@@ -694,12 +696,17 @@ template bgp k8s_nodes {{
 async def get_gateway_config_examples(
     request: Request, user: User = Depends(require_auth),
 ) -> list[GatewayConfigExample]:
-    """Generate gateway config examples with actual ASN and node IPs from speaker config."""
+    """Generate gateway config examples with actual ASN and node IPs from speaker config.
+
+    Returns 404 when the speaker DaemonSet is not deployed yet — the UI should
+    hide the example-config button until listeners exist.
+    """
     k8s = request.app.state.k8s_client
     namespace = await _find_kubeovn_namespace(k8s)
 
     cluster_as = 65001
     neighbor_as = 65000
+    gateway_ip: str | None = None
     try:
         ds = await k8s.apps_api.read_namespaced_daemon_set(
             name=SPEAKER_NAME, namespace=namespace,
@@ -711,7 +718,18 @@ async def get_gateway_config_examples(
                     cluster_as = int(val)
                 elif key == "neighbor-as":
                     neighbor_as = int(val)
-    except (ApiException, AttributeError, ValueError, IndexError):
+                elif key == "neighbor-address":
+                    addrs = [a.strip() for a in val.split(",") if a.strip()]
+                    if addrs:
+                        gateway_ip = addrs[0]
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=404,
+                detail="BGP speaker not deployed — deploy it first to see gateway config examples",
+            ) from e
+        raise
+    except (AttributeError, ValueError, IndexError):
         pass
 
     node_ips: list[str] = []
@@ -740,4 +758,4 @@ async def get_gateway_config_examples(
         except ApiException:
             node_ips = ["<NODE_IP_1>", "<NODE_IP_2>"]
 
-    return _generate_gateway_examples(cluster_as, neighbor_as, node_ips)
+    return _generate_gateway_examples(cluster_as, neighbor_as, node_ips, gateway_ip)

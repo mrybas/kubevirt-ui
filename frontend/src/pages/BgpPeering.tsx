@@ -720,7 +720,8 @@ export default function BgpPeering() {
 
       {showAnnounce && <AnnounceModal onClose={() => setShowAnnounce(false)} />}
 
-      {/* Gateway Config Examples */}
+      {/* Gateway Config Examples — only visible once speaker DaemonSet is deployed */}
+      {speaker?.deployed && (
       <div className="bg-surface-800 border border-surface-700 rounded-xl p-5">
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-sm font-semibold text-surface-200 flex items-center gap-2">
@@ -786,6 +787,7 @@ export default function BgpPeering() {
           </div>
         )}
       </div>
+      )}
 
       {deleteConfirm && (
         <Modal
