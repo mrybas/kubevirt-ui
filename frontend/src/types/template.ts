@@ -141,6 +141,7 @@ export interface CreateImageFromDiskRequest {
 
 export interface PersistentDisk {
   name: string;
+  display_name?: string;
   namespace: string;
   size: string;
   storage_class?: string;
@@ -150,7 +151,7 @@ export interface PersistentDisk {
 }
 
 export interface PersistentDiskCreate {
-  name: string;
+  display_name: string;
   size?: string;
   storage_class?: string;
   source_golden_image?: string;

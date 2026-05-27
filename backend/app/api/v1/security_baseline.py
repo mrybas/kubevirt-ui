@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_admin
 from app.core.errors import k8s_error_to_http
 
 logger = logging.getLogger(__name__)
@@ -192,7 +192,7 @@ async def list_security_baselines(
 @router.post("", response_model=SecurityBaselineResponse, status_code=201)
 async def create_security_baseline(
     request: Request, data: SecurityBaselineCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> SecurityBaselineResponse:
     """Create a security baseline policy from a preset."""
     k8s = request.app.state.k8s_client
@@ -260,7 +260,7 @@ async def create_security_baseline(
 @router.delete("/{name}")
 async def delete_security_baseline(
     request: Request, name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> dict:
     """Delete a security baseline policy."""
     k8s = request.app.state.k8s_client

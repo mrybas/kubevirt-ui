@@ -17,7 +17,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException, V1ConfigMap, V1ObjectMeta
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_admin
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION, SYSTEM_NAMESPACE as _SYSTEM_NS
 from app.core.errors import k8s_error_to_http
 from app.models.egress_gateway import (
@@ -315,7 +315,7 @@ async def get_egress_gateway(request: Request, name: str, user: User = Depends(r
 @router.post("", response_model=EgressGatewayResponse, status_code=201)
 async def create_egress_gateway(
     request: Request, data: EgressGatewayCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> EgressGatewayResponse:
     """Create an egress gateway (VPC + subnet + VpcEgressGateway)."""
     k8s = request.app.state.k8s_client
@@ -590,7 +590,7 @@ async def create_egress_gateway(
 
 
 @router.delete("/{name}")
-async def delete_egress_gateway(request: Request, name: str, user: User = Depends(require_auth)) -> dict:
+async def delete_egress_gateway(request: Request, name: str, user: User = Depends(require_admin)) -> dict:
     """Delete an egress gateway. Fails if VPCs are still attached."""
     k8s = request.app.state.k8s_client
 
@@ -624,7 +624,7 @@ async def delete_egress_gateway(request: Request, name: str, user: User = Depend
 @router.post("/{name}/attach", response_model=AttachedVpcInfo)
 async def attach_tenant_vpc(
     request: Request, name: str, data: AttachTenantRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> AttachedVpcInfo:
     """Attach a tenant VPC to an egress gateway."""
     k8s = request.app.state.k8s_client
@@ -637,7 +637,7 @@ async def attach_tenant_vpc(
 @router.post("/{name}/detach")
 async def detach_tenant_vpc(
     request: Request, name: str, data: DetachTenantRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> dict:
     """Detach a tenant VPC from an egress gateway."""
     k8s = request.app.state.k8s_client

@@ -198,6 +198,22 @@ async def require_auth(
     return user
 
 
+async def require_admin(
+    user: User = Depends(require_auth),
+) -> User:
+    """Require user to be a platform admin.
+
+    Admin groups are configured via ADMIN_GROUPS env var (see app.config).
+    """
+    from app.core.groups import is_admin
+    if not is_admin(user.groups):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin role required",
+        )
+    return user
+
+
 async def validate_k8s_token(request: Request, token: str) -> User | None:
     """Validate Kubernetes ServiceAccount token."""
     try:

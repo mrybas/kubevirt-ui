@@ -21,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 from kubernetes_asyncio.stream import WsApiClient
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_admin
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION, SYSTEM_NAMESPACE
 from app.core.errors import k8s_error_to_http, validate_k8s_name
 from app.models.ovn_gateway import (
@@ -475,7 +475,7 @@ async def get_ovn_gateway(
 @router.post("", response_model=OvnGatewayResponse, status_code=201)
 async def create_ovn_gateway(
     request: Request, data: OvnGatewayCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> OvnGatewayResponse:
     """Enable OVN NAT for a VPC.
 
@@ -613,7 +613,7 @@ async def create_ovn_gateway(
 
 @router.delete("/{vpc_name}")
 async def delete_ovn_gateway(
-    request: Request, vpc_name: str, user: User = Depends(require_auth),
+    request: Request, vpc_name: str, user: User = Depends(require_admin),
 ) -> dict:
     """Disable OVN NAT for a VPC — cascade deletes all NAT rules."""
     k8s = request.app.state.k8s_client
@@ -643,7 +643,7 @@ async def list_snat_rules(
 @router.post("/{vpc_name}/snat-rules", response_model=OvnSnatRuleInfo, status_code=201)
 async def create_snat_rule(
     request: Request, vpc_name: str, data: OvnSnatRuleCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> OvnSnatRuleInfo:
     """Create an additional SNAT rule for a VPC."""
     k8s = request.app.state.k8s_client
@@ -690,7 +690,7 @@ async def create_snat_rule(
 @router.delete("/{vpc_name}/snat-rules/{rule_name}")
 async def delete_snat_rule(
     request: Request, vpc_name: str, rule_name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> dict:
     """Delete a SNAT rule."""
     k8s = request.app.state.k8s_client
@@ -723,7 +723,7 @@ async def list_dnat_rules(
 @router.post("/{vpc_name}/dnat-rules", response_model=OvnDnatRuleInfo, status_code=201)
 async def create_dnat_rule(
     request: Request, vpc_name: str, data: OvnDnatRuleCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> OvnDnatRuleInfo:
     """Create a DNAT rule (port forwarding) for a VPC."""
     k8s = request.app.state.k8s_client
@@ -765,7 +765,7 @@ async def create_dnat_rule(
 @router.delete("/{vpc_name}/dnat-rules/{rule_name}")
 async def delete_dnat_rule(
     request: Request, vpc_name: str, rule_name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> dict:
     """Delete a DNAT rule."""
     k8s = request.app.state.k8s_client
@@ -798,7 +798,7 @@ async def list_fips(
 @router.post("/{vpc_name}/fips", response_model=OvnFipInfo, status_code=201)
 async def create_fip(
     request: Request, vpc_name: str, data: OvnFipCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> OvnFipInfo:
     """Create a Floating IP (1:1 NAT) for a VPC."""
     k8s = request.app.state.k8s_client
@@ -841,7 +841,7 @@ async def create_fip(
 @router.delete("/{vpc_name}/fips/{fip_name}")
 async def delete_fip(
     request: Request, vpc_name: str, fip_name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> dict:
     """Delete a Floating IP."""
     k8s = request.app.state.k8s_client
@@ -863,7 +863,7 @@ async def delete_fip(
 
 @router.post("/{vpc_name}/patch-lsp")
 async def patch_lsp(
-    request: Request, vpc_name: str, user: User = Depends(require_auth),
+    request: Request, vpc_name: str, user: User = Depends(require_admin),
 ) -> dict:
     """Retry LSP options patching for a VPC's OVN NAT.
 

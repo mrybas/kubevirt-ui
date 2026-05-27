@@ -21,6 +21,12 @@ rules:
   - apiGroups: ["kubevirt.io"]
     resources: ["virtualmachineclusterinstancetypes", "virtualmachineinstancetypes"]
     verbs: ["*"]
+  # VNC and serial console subresources
+  - apiGroups: ["subresources.kubevirt.io"]
+    resources:
+      - virtualmachineinstances/vnc
+      - virtualmachineinstances/console
+    verbs: ["get", "create"]
   # CDI - full access
   - apiGroups: ["cdi.kubevirt.io"]
     resources: ["datavolumes", "datasources"]
@@ -88,6 +94,12 @@ rules:
   - apiGroups: ["kubevirt.io"]
     resources: ["virtualmachineclusterinstancetypes", "virtualmachineinstancetypes"]
     verbs: ["get", "list", "watch"]
+  # VNC and serial console subresources
+  - apiGroups: ["subresources.kubevirt.io"]
+    resources:
+      - virtualmachineinstances/vnc
+      - virtualmachineinstances/console
+    verbs: ["get", "create"]
   # CDI - full access
   - apiGroups: ["cdi.kubevirt.io"]
     resources: ["datavolumes", "datasources"]

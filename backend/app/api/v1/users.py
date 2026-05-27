@@ -10,8 +10,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from app.core.auth import User, require_auth
-from app.core.groups import is_admin
+from app.core.auth import User, require_admin
 from app.core.lldap_client import LLDAP_ENABLED, get_lldap_client, LLDAPError
 
 logger = logging.getLogger(__name__)
@@ -84,12 +83,6 @@ class AddMemberRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _require_admin(user: User) -> None:
-    """Raise 403 if user is not an admin."""
-    if not is_admin(user.groups):
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-
 def _require_lldap() -> None:
     """Raise 501 if LLDAP is not enabled."""
     if not LLDAP_ENABLED:
@@ -131,9 +124,8 @@ def _group_response(g: dict) -> GroupResponse:
 # ---------------------------------------------------------------------------
 
 @users_router.get("", response_model=UserListResponse)
-async def list_users(user: User = Depends(require_auth)):
+async def list_users(user: User = Depends(require_admin)):
     """List all users."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -150,9 +142,8 @@ async def list_users(user: User = Depends(require_auth)):
 
 
 @users_router.get("/{user_id}", response_model=UserResponse)
-async def get_user_detail(user_id: str, user: User = Depends(require_auth)):
+async def get_user_detail(user_id: str, user: User = Depends(require_admin)):
     """Get a single user."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -167,9 +158,8 @@ async def get_user_detail(user_id: str, user: User = Depends(require_auth)):
 
 
 @users_router.post("", response_model=UserResponse, status_code=201)
-async def create_user(body: CreateUserRequest, user: User = Depends(require_auth)):
+async def create_user(body: CreateUserRequest, user: User = Depends(require_admin)):
     """Create a new user."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -195,9 +185,8 @@ async def create_user(body: CreateUserRequest, user: User = Depends(require_auth
 
 
 @users_router.put("/{user_id}", response_model=UserResponse)
-async def update_user(user_id: str, body: UpdateUserRequest, user: User = Depends(require_auth)):
+async def update_user(user_id: str, body: UpdateUserRequest, user: User = Depends(require_admin)):
     """Update a user."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -218,9 +207,8 @@ async def update_user(user_id: str, body: UpdateUserRequest, user: User = Depend
 
 
 @users_router.post("/{user_id}/password", status_code=204)
-async def reset_password(user_id: str, body: SetPasswordRequest, user: User = Depends(require_auth)):
+async def reset_password(user_id: str, body: SetPasswordRequest, user: User = Depends(require_admin)):
     """Reset a user's password."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -240,9 +228,8 @@ async def reset_password(user_id: str, body: SetPasswordRequest, user: User = De
 
 
 @users_router.post("/{user_id}/disable", status_code=204)
-async def disable_user(user_id: str, user: User = Depends(require_auth)):
+async def disable_user(user_id: str, user: User = Depends(require_admin)):
     """Disable a user by adding to disabled-users group."""
-    _require_admin(user)
     _require_lldap()
 
     if user_id == "admin":
@@ -264,9 +251,8 @@ async def disable_user(user_id: str, user: User = Depends(require_auth)):
 
 
 @users_router.post("/{user_id}/enable", status_code=204)
-async def enable_user(user_id: str, user: User = Depends(require_auth)):
+async def enable_user(user_id: str, user: User = Depends(require_admin)):
     """Enable a user by removing from disabled-users group."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -285,9 +271,8 @@ async def enable_user(user_id: str, user: User = Depends(require_auth)):
 
 
 @users_router.delete("/{user_id}", status_code=204)
-async def delete_user(user_id: str, user: User = Depends(require_auth)):
+async def delete_user(user_id: str, user: User = Depends(require_admin)):
     """Delete a user."""
-    _require_admin(user)
     _require_lldap()
 
     if user_id == "admin":
@@ -307,9 +292,8 @@ async def delete_user(user_id: str, user: User = Depends(require_auth)):
 # ---------------------------------------------------------------------------
 
 @groups_router.get("", response_model=GroupListResponse)
-async def list_groups(user: User = Depends(require_auth)):
+async def list_groups(user: User = Depends(require_admin)):
     """List all groups."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -326,9 +310,8 @@ async def list_groups(user: User = Depends(require_auth)):
 
 
 @groups_router.get("/{group_id}", response_model=GroupResponse)
-async def get_group_detail(group_id: int, user: User = Depends(require_auth)):
+async def get_group_detail(group_id: int, user: User = Depends(require_admin)):
     """Get a single group."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -340,9 +323,8 @@ async def get_group_detail(group_id: int, user: User = Depends(require_auth)):
 
 
 @groups_router.post("", response_model=GroupResponse, status_code=201)
-async def create_group(body: CreateGroupRequest, user: User = Depends(require_auth)):
+async def create_group(body: CreateGroupRequest, user: User = Depends(require_admin)):
     """Create a new group."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -358,9 +340,8 @@ async def create_group(body: CreateGroupRequest, user: User = Depends(require_au
 
 
 @groups_router.delete("/{group_id}", status_code=204)
-async def delete_group(group_id: int, user: User = Depends(require_auth)):
+async def delete_group(group_id: int, user: User = Depends(require_admin)):
     """Delete a group."""
-    _require_admin(user)
     _require_lldap()
 
     # Protect the lldap_admin group (id=1 typically)
@@ -377,9 +358,8 @@ async def delete_group(group_id: int, user: User = Depends(require_auth)):
 
 
 @groups_router.post("/{group_id}/members", status_code=201)
-async def add_member(group_id: int, body: AddMemberRequest, user: User = Depends(require_auth)):
+async def add_member(group_id: int, body: AddMemberRequest, user: User = Depends(require_admin)):
     """Add a user to a group."""
-    _require_admin(user)
     _require_lldap()
 
     try:
@@ -393,9 +373,8 @@ async def add_member(group_id: int, body: AddMemberRequest, user: User = Depends
 
 
 @groups_router.delete("/{group_id}/members/{member_id}", status_code=204)
-async def remove_member(group_id: int, member_id: str, user: User = Depends(require_auth)):
+async def remove_member(group_id: int, member_id: str, user: User = Depends(require_admin)):
     """Remove a user from a group."""
-    _require_admin(user)
     _require_lldap()
 
     try:

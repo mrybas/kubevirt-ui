@@ -30,6 +30,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { useVM, useStartVM, useStopVM, useRestartVM, useMigrateVM, useVMYaml, useUpdateVM, useDeleteVM, useRecreateVM, useCloneVM, useResizeVM, useUpdateVMDisplayName } from '@/hooks/useVMs';
+import { useBreadcrumbOverride } from '@/contexts/BreadcrumbContext';
 import { StatusBadge } from '@/components/common/StatusBadge';
 import VMMetricsPanel from '@/components/charts/VMMetricsPanel';
 import { OverviewTab, ConsoleTab, DisksTab, NetworkTab, EventsTab, YamlTab, SnapshotsTab, ScheduleTab } from '@/components/vm/tabs';
@@ -66,6 +67,12 @@ export function VMDetail() {
   const cloneVM = useCloneVM();
   const resizeVM = useResizeVM();
   
+  // Keep breadcrumb in sync with the human-readable display_name
+  useBreadcrumbOverride(
+    vm ? `/vms/${vm.namespace}/${vm.name}` : undefined,
+    vm ? (vm.display_name || vm.name) : undefined,
+  );
+
   const [activeTab, setActiveTab] = useState<TabId>('overview');
   const [isRecreateConfirmOpen, setIsRecreateConfirmOpen] = useState(false);
   const [isCloneModalOpen, setIsCloneModalOpen] = useState(false);

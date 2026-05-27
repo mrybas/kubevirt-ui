@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_admin
 from app.core.errors import k8s_error_to_http
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION, KUBEVIRT_API_GROUP, KUBEVIRT_API_VERSION
 from app.models.vpc import (
@@ -113,7 +113,7 @@ async def list_security_groups(request: Request, user: User = Depends(require_au
 @router.post("", response_model=SecurityGroupResponse, status_code=201)
 async def create_security_group(
     request: Request, data: SecurityGroupCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> SecurityGroupResponse:
     """Create a SecurityGroup."""
     logger.info(f"Creating SecurityGroup: {data.name} with {len(data.ingress_rules)} ingress, {len(data.egress_rules)} egress rules")
@@ -175,7 +175,7 @@ async def get_security_group(request: Request, name: str, user: User = Depends(r
 @router.put("/{name}", response_model=SecurityGroupResponse)
 async def update_security_group(
     request: Request, name: str, data: SecurityGroupUpdateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> SecurityGroupResponse:
     """Update a SecurityGroup (replace rules)."""
     k8s = request.app.state.k8s_client
@@ -224,7 +224,7 @@ async def update_security_group(
 
 
 @router.delete("/{name}")
-async def delete_security_group(request: Request, name: str, user: User = Depends(require_auth)) -> dict:
+async def delete_security_group(request: Request, name: str, user: User = Depends(require_admin)) -> dict:
     """Delete a SecurityGroup."""
     k8s = request.app.state.k8s_client
 

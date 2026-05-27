@@ -10,6 +10,10 @@ from kubernetes_asyncio.client.rest import ApiException
 
 from app.core.auth import User, require_auth
 from app.core.kubevirt import get_hotplug_mode, kubevirt_subresource_call
+from app.core.naming import (
+    get_display_name,
+    with_synthetic_metadata,
+)
 from app.models.template import (
     PersistentDisk,
     PersistentDiskCreate,
@@ -94,6 +98,7 @@ async def list_persistent_disks(
             
             disks.append(PersistentDisk(
                 name=dv_name,
+                display_name=get_display_name(metadata) or dv_name,
                 namespace=metadata.get("namespace"),
                 size=size,
                 storage_class=storage_class,
@@ -135,13 +140,13 @@ async def create_persistent_disk(
         else:
             source = {"blank": {}}
         
-        # Build DataVolume
+        # Build DataVolume. The K8s name is assigned server-side via
+        # `metadata.generateName` (collision-free); display_name lives in an
+        # annotation. See app/core/naming.py.
         dv = {
             "apiVersion": "cdi.kubevirt.io/v1beta1",
             "kind": "DataVolume",
             "metadata": {
-                "name": disk.name,
-                "namespace": namespace,
                 "labels": {
                     PERSISTENT_DISK_LABEL: "true",
                     MANAGED_LABEL: "true",
@@ -163,10 +168,13 @@ async def create_persistent_disk(
                 },
             },
         }
-        
+
         if disk.storage_class:
             dv["spec"]["pvc"]["storageClassName"] = disk.storage_class
-        
+
+        # Inject generateName + display-name annotation + slug label.
+        with_synthetic_metadata(dv, disk.display_name, namespace=namespace)
+
         # Create DataVolume
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
         result = await custom_api.create_namespaced_custom_object(
@@ -176,15 +184,17 @@ async def create_persistent_disk(
             plural="datavolumes",
             body=dv,
         )
-        
+
+        result_md = result.get("metadata", {})
         return PersistentDisk(
-            name=result["metadata"]["name"],
-            namespace=result["metadata"]["namespace"],
+            name=result_md["name"],
+            display_name=get_display_name(result_md) or result_md["name"],
+            namespace=result_md["namespace"],
             size=disk.size,
             storage_class=disk.storage_class,
             status=result.get("status", {}).get("phase", "Pending"),
             attached_to=None,
-            created=result["metadata"].get("creationTimestamp"),
+            created=result_md.get("creationTimestamp"),
         )
     
     except ApiException as e:
@@ -700,16 +710,23 @@ async def save_disk_as_image(
     request: Request,
     user: User = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Clone a disk's PVC as a new image DataVolume for reuse as VM template."""
+    """Clone a disk's PVC as a new image DataVolume for reuse as VM template.
+
+    Image's K8s name is assigned server-side via ``generateName``; the
+    human-friendly ``display_name`` is stored in an annotation.
+    """
     k8s_client = request.app.state.k8s_client
     body = await request.json()
-    image_name = body.get("image_name")
-    display_name = body.get("display_name", image_name)
+    display_name = body.get("display_name")
+    # Back-compat: older clients sent `image_name` (used as both K8s name and
+    # display name); accept it as the display name when display_name is absent.
+    if not display_name:
+        display_name = body.get("image_name")
 
-    if not image_name:
+    if not display_name:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="image_name is required",
+            detail="display_name is required",
         )
 
     try:
@@ -725,13 +742,12 @@ async def save_disk_as_image(
         access_modes = source_pvc.spec.access_modes or ["ReadWriteMany"]
         capacity = source_pvc.status.capacity.get("storage", "10Gi") if source_pvc.status.capacity else "10Gi"
 
-        # Create DataVolume that clones the source PVC
+        # Create DataVolume that clones the source PVC. Use generateName for
+        # collision-free K8s naming.
         dv_body = {
             "apiVersion": "cdi.kubevirt.io/v1beta1",
             "kind": "DataVolume",
             "metadata": {
-                "name": image_name,
-                "namespace": namespace,
                 "labels": {
                     MANAGED_LABEL: "true",
                     PERSISTENT_DISK_LABEL: "false",
@@ -739,7 +755,6 @@ async def save_disk_as_image(
                     "kubevirt-ui.io/os-type": "linux",
                 },
                 "annotations": {
-                    "kubevirt-ui.io/display-name": display_name,
                     "kubevirt-ui.io/cloned-from": name,
                     "cdi.kubevirt.io/storage.usePopulator": "true",
                 },
@@ -764,7 +779,10 @@ async def save_disk_as_image(
             },
         }
 
-        await custom_api.create_namespaced_custom_object(
+        # Inject generateName + display-name annotation + slug label.
+        with_synthetic_metadata(dv_body, display_name, namespace=namespace)
+
+        result = await custom_api.create_namespaced_custom_object(
             group="cdi.kubevirt.io",
             version="v1beta1",
             namespace=namespace,
@@ -772,9 +790,13 @@ async def save_disk_as_image(
             body=dv_body,
         )
 
+        result_md = result.get("metadata", {})
         return {
             "status": "cloning",
-            "image_name": image_name,
+            "name": result_md.get("name"),
+            "display_name": get_display_name(result_md) or display_name,
+            # Back-compat key for older clients.
+            "image_name": result_md.get("name"),
             "source_pvc": name,
             "size": capacity,
         }
@@ -818,14 +840,17 @@ async def list_disk_snapshots(
             if source_pvc != name:
                 continue
 
+            snap_metadata = snap.get("metadata", {})
             snap_status = snap.get("status", {})
             restore_size = snap_status.get("restoreSize", "")
             ready = snap_status.get("readyToUse", False)
-            creation = snap.get("metadata", {}).get("creationTimestamp", "")
+            creation = snap_metadata.get("creationTimestamp", "")
             snap_class = snap.get("spec", {}).get("volumeSnapshotClassName", "")
+            snap_name = snap_metadata.get("name", "")
 
             result.append({
-                "name": snap["metadata"]["name"],
+                "name": snap_name,
+                "display_name": get_display_name(snap_metadata) or snap_name,
                 "namespace": namespace,
                 "pvc_name": source_pvc,
                 "storage_class": snap_class,
@@ -856,16 +881,24 @@ async def create_disk_snapshot(
     request: Request,
     user: User = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Create a VolumeSnapshot from a PVC."""
+    """Create a VolumeSnapshot from a PVC.
+
+    K8s name is assigned server-side via ``generateName``; display_name lives
+    in the ``kubevirt-ui.io/display-name`` annotation.
+    """
     k8s_client = request.app.state.k8s_client
     body = await request.json()
-    snapshot_name = body.get("snapshot_name")
+    display_name = body.get("display_name")
+    # Back-compat: older clients sent `snapshot_name` (used as both K8s name
+    # and display name); accept it as display_name when missing.
+    if not display_name:
+        display_name = body.get("snapshot_name")
     snapshot_class = body.get("snapshot_class", "")
 
-    if not snapshot_name:
+    if not display_name:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="snapshot_name is required",
+            detail="display_name is required",
         )
 
     try:
@@ -889,8 +922,6 @@ async def create_disk_snapshot(
             "apiVersion": "snapshot.storage.k8s.io/v1",
             "kind": "VolumeSnapshot",
             "metadata": {
-                "name": snapshot_name,
-                "namespace": namespace,
                 "labels": {
                     "kubevirt-ui.io/managed": "true",
                     "kubevirt-ui.io/source-pvc": name,
@@ -906,6 +937,9 @@ async def create_disk_snapshot(
         if snapshot_class:
             snapshot_body["spec"]["volumeSnapshotClassName"] = snapshot_class
 
+        # Inject generateName + display-name annotation + slug label.
+        with_synthetic_metadata(snapshot_body, display_name, namespace=namespace)
+
         result = await custom_api.create_namespaced_custom_object(
             group="snapshot.storage.k8s.io",
             version="v1",
@@ -914,14 +948,16 @@ async def create_disk_snapshot(
             body=snapshot_body,
         )
 
+        result_md = result.get("metadata", {})
         return {
-            "name": result["metadata"]["name"],
+            "name": result_md["name"],
+            "display_name": get_display_name(result_md) or display_name,
             "namespace": namespace,
             "pvc_name": name,
             "storage_class": snapshot_class,
             "size": "",
             "ready": False,
-            "creation_time": result["metadata"].get("creationTimestamp", ""),
+            "creation_time": result_md.get("creationTimestamp", ""),
             "snapshot_class": snapshot_class,
         }
 

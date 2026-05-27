@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
 from app.api.v1.network import _find_kubeovn_namespace
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_admin
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.core.errors import k8s_error_to_http
 from app.models.bgp import (
@@ -177,7 +177,7 @@ async def _get_bgp_nodes(k8s) -> list[str]:
 @router.post("/speaker", response_model=SpeakerStatusResponse, status_code=201)
 async def deploy_speaker(
     request: Request, data: SpeakerDeployRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> SpeakerStatusResponse:
     """Deploy kube-ovn-speaker DaemonSet."""
     k8s = request.app.state.k8s_client
@@ -223,7 +223,7 @@ async def get_speaker(
 @router.put("/speaker", response_model=SpeakerStatusResponse)
 async def update_speaker(
     request: Request, data: SpeakerDeployRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> SpeakerStatusResponse:
     """Update speaker config (patches DaemonSet args, triggers rolling restart)."""
     k8s = request.app.state.k8s_client
@@ -265,7 +265,7 @@ async def update_speaker(
 
 @router.delete("/speaker")
 async def delete_speaker(
-    request: Request, user: User = Depends(require_auth),
+    request: Request, user: User = Depends(require_admin),
 ) -> dict:
     """Undeploy speaker: delete DaemonSet and remove node labels."""
     k8s = request.app.state.k8s_client
@@ -410,7 +410,7 @@ async def list_announcements(
 @router.post("/announcements", response_model=AnnouncementResponse)
 async def create_announcement(
     request: Request, data: AnnouncementRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> AnnouncementResponse:
     """Add BGP announcement annotation to a resource."""
     k8s = request.app.state.k8s_client
@@ -459,7 +459,7 @@ async def create_announcement(
 @router.delete("/announcements", response_model=AnnouncementResponse)
 async def delete_announcement(
     request: Request, data: AnnouncementRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> AnnouncementResponse:
     """Remove BGP announcement annotation from a resource."""
     k8s = request.app.state.k8s_client

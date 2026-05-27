@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_admin
 from app.core.errors import k8s_error_to_http
 
 logger = logging.getLogger(__name__)
@@ -225,7 +225,7 @@ async def get_cilium_policy(
 @router.post("", response_model=CiliumPolicyResponse, status_code=201)
 async def create_cilium_policy(
     request: Request, data: CiliumPolicyCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> CiliumPolicyResponse:
     """Create a CiliumNetworkPolicy from template or custom spec."""
     k8s = request.app.state.k8s_client
@@ -281,7 +281,7 @@ async def create_cilium_policy(
 @router.delete("/{namespace}/{name}")
 async def delete_cilium_policy(
     request: Request, namespace: str, name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> dict:
     """Delete a CiliumNetworkPolicy."""
     k8s = request.app.state.k8s_client

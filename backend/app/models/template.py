@@ -211,6 +211,7 @@ class PersistentDisk(BaseModel):
     """Persistent disk model (independent DataVolume)."""
 
     name: str
+    display_name: str
     namespace: str
     size: str
     storage_class: str | None = None
@@ -220,16 +221,16 @@ class PersistentDisk(BaseModel):
 
 
 class PersistentDiskCreate(BaseModel):
-    """Model for creating a persistent disk."""
+    """Model for creating a persistent disk.
 
-    name: str = Field(
-        ...,
-        pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
-        max_length=63,
-    )
+    K8s name is generated server-side via ``generateName``; the human-friendly
+    ``display_name`` is stored in the ``kubevirt-ui.io/display-name`` annotation.
+    """
+
+    display_name: str = Field(..., min_length=1, max_length=128)
     size: str = Field("50Gi")
     storage_class: str | None = None
-    
+
     # Optional: clone from image in the same namespace
     source_image: str | None = None
 

@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client.rest import ApiException
 from kubernetes_asyncio.client import RbacAuthorizationV1Api
 
-from app.core.auth import User, require_auth, check_folder_access
+from app.core.auth import User, require_auth, require_admin, check_folder_access
 
 from app.models.folder import (
     FolderCreateRequest,
@@ -552,7 +552,7 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
 
 
 @router.post("", response_model=FolderResponse, status_code=201)
-async def create_folder(request: Request, folder: FolderCreateRequest, user: User = Depends(require_auth)):
+async def create_folder(request: Request, folder: FolderCreateRequest, user: User = Depends(require_admin)):
     """Create a folder (ConfigMap entry) with optional initial environments."""
     k8s_client = request.app.state.k8s_client
 
@@ -678,7 +678,7 @@ async def get_folder(request: Request, name: str, user: User = Depends(require_a
 
 
 @router.patch("/{name}", response_model=FolderResponse)
-async def update_folder(request: Request, name: str, update: FolderUpdateRequest, user: User = Depends(require_auth)):
+async def update_folder(request: Request, name: str, update: FolderUpdateRequest, user: User = Depends(require_admin)):
     """Update folder metadata (display name, description, quota)."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_folders_configmap(k8s_client)
@@ -712,7 +712,7 @@ async def update_folder(request: Request, name: str, update: FolderUpdateRequest
 
 
 @router.delete("/{name}", status_code=204)
-async def delete_folder(request: Request, name: str, cascade: bool = False, user: User = Depends(require_auth)):
+async def delete_folder(request: Request, name: str, cascade: bool = False, user: User = Depends(require_admin)):
     """Delete a folder. Must be empty unless cascade=true."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_folders_configmap(k8s_client)
@@ -761,7 +761,7 @@ async def delete_folder(request: Request, name: str, cascade: bool = False, user
 
 
 @router.post("/{name}/move", response_model=FolderResponse)
-async def move_folder(request: Request, name: str, move: FolderMoveRequest, user: User = Depends(require_auth)):
+async def move_folder(request: Request, name: str, move: FolderMoveRequest, user: User = Depends(require_admin)):
     """Move a folder to a new parent (or to root if new_parent_id is null)."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_folders_configmap(k8s_client)
@@ -879,8 +879,9 @@ async def _create_environment_ns(
     response_model=FolderEnvironmentResponse,
     status_code=201,
 )
+# TODO Phase 2: relax to require_folder_member (admin OR folder member) once folder-member concept exists
 async def add_environment(
-    request: Request, name: str, env: AddFolderEnvironmentRequest, user: User = Depends(require_auth),
+    request: Request, name: str, env: AddFolderEnvironmentRequest, user: User = Depends(require_admin),
 ):
     """Add an environment (namespace) to a folder."""
     k8s_client = request.app.state.k8s_client
@@ -897,7 +898,8 @@ async def add_environment(
 
 
 @router.delete("/{name}/environments/{environment}", status_code=204)
-async def remove_environment(request: Request, name: str, environment: str, user: User = Depends(require_auth)):
+# TODO Phase 2: relax to require_folder_member (admin OR folder member) once folder-member concept exists
+async def remove_environment(request: Request, name: str, environment: str, user: User = Depends(require_admin)):
     """Remove an environment (delete its namespace)."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_folders_configmap(k8s_client)
@@ -1030,7 +1032,7 @@ async def list_folder_access(request: Request, name: str, user: User = Depends(r
 
 @router.post("/{name}/access", response_model=FolderAccessEntry, status_code=201)
 async def add_folder_access(
-    request: Request, name: str, access: AddFolderAccessRequest, user: User = Depends(require_auth),
+    request: Request, name: str, access: AddFolderAccessRequest, user: User = Depends(require_admin),
 ):
     """Add access to a folder or specific environment."""
     k8s_client = request.app.state.k8s_client
@@ -1148,7 +1150,7 @@ async def add_folder_access(
 
 
 @router.delete("/{name}/access/{binding_id}", status_code=204)
-async def remove_folder_access(request: Request, name: str, binding_id: str, user: User = Depends(require_auth)):
+async def remove_folder_access(request: Request, name: str, binding_id: str, user: User = Depends(require_admin)):
     """Remove access from a folder (deletes binding from all descendant namespaces if folder-scope)."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_folders_configmap(k8s_client)
@@ -1345,7 +1347,7 @@ async def migrate_projects_to_folders(k8s_client: Any) -> list[str]:
 
 
 @router.post("/migrate-from-projects", status_code=200)
-async def migrate_from_projects(request: Request, user: User = Depends(require_auth)):
+async def migrate_from_projects(request: Request, user: User = Depends(require_admin)):
     """Migrate all projects to root-level folders. Idempotent."""
     k8s_client = request.app.state.k8s_client
     migrated = await migrate_projects_to_folders(k8s_client)

@@ -9,7 +9,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_admin
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.core.errors import k8s_error_to_http
 
@@ -169,7 +169,7 @@ async def get_subnet_acls(
 @router.put("/{name}/acls", response_model=SubnetAclListResponse)
 async def replace_subnet_acls(
     request: Request, name: str, data: SubnetAclUpdateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> SubnetAclListResponse:
     """Replace all ACL rules on a subnet."""
     k8s = request.app.state.k8s_client
@@ -194,7 +194,7 @@ async def replace_subnet_acls(
 @router.post("/{name}/acls", response_model=SubnetAclListResponse, status_code=201)
 async def add_subnet_acl(
     request: Request, name: str, data: SubnetAclAddRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> SubnetAclListResponse:
     """Add a single ACL rule to a subnet."""
     k8s = request.app.state.k8s_client
@@ -231,7 +231,7 @@ async def add_subnet_acl(
 @router.delete("/{name}/acls/{index}")
 async def delete_subnet_acl(
     request: Request, name: str, index: int,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> dict:
     """Remove an ACL rule by index."""
     k8s = request.app.state.k8s_client

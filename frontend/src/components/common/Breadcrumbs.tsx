@@ -1,4 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
+import { useBreadcrumbContext } from '@/contexts/BreadcrumbContext';
 
 const LABELS: Record<string, string> = {
   dashboard: 'Dashboard',
@@ -26,15 +27,19 @@ function toLabel(segment: string): string {
 
 export function Breadcrumbs() {
   const location = useLocation();
+  const { overrides } = useBreadcrumbContext();
   const segments = location.pathname.split('/').filter(Boolean);
 
   if (segments.length <= 1) return null;
 
-  const crumbs = segments.map((seg, i) => ({
-    label: toLabel(seg),
-    href: '/' + segments.slice(0, i + 1).join('/'),
-    isLast: i === segments.length - 1,
-  }));
+  const crumbs = segments.map((seg, i) => {
+    const href = '/' + segments.slice(0, i + 1).join('/');
+    return {
+      label: overrides[href] ?? toLabel(seg),
+      href,
+      isLast: i === segments.length - 1,
+    };
+  });
 
   return (
     <nav className="flex items-center gap-1.5 text-sm mb-4" aria-label="Breadcrumb">

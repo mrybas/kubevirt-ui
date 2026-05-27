@@ -196,15 +196,43 @@ rules:
       - rolebindings
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
-  # Backend creates user-scoped ClusterRoles (kubevirt-ui-ns-viewer) and
-  # binds users to cluster-admin via ClusterRoleBindings when generating
-  # kubeconfig. Without create/update/delete here, /api/v1/auth/kubeconfig
-  # fails with 403 for any IdP user.
+  # ClusterRoles / ClusterRoleBindings — read access is broad (needed for lookups).
+  # Mutations are split below to limit privilege-escalation surface.
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources:
       - clusterroles
       - clusterrolebindings
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch"]
+
+  # ClusterRole create — cannot be scoped by resourceNames in K8s RBAC (no instance
+  # name exists at admission time), so create is kept as a separate broad rule.
+  # The backend only ever creates: system:vpc-dns and kubevirt-ui-ns-viewer.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - clusterroles
+    verbs: ["create"]
+
+  # ClusterRole update/patch/delete — scoped to the exact names managed by this
+  # backend. Prevents the SA from mutating any other ClusterRole (privilege escalation).
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - clusterroles
+    resourceNames:
+      - "system:vpc-dns"
+      - "vpc-dns"
+      - "kubevirt-ui-admin"
+      - "kubevirt-ui-editor"
+      - "kubevirt-ui-viewer"
+      - "kubevirt-ui-ns-viewer"
+    verbs: ["update", "patch", "delete"]
+
+  # ClusterRoleBinding mutations — kept broad because per-user CRBs are generated
+  # with dynamic names (kubevirt-ui-<sanitized-sub>) that cannot be enumerated.
+  # Privilege-escalation risk is mitigated by the scoped ClusterRole write rules above.
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - clusterrolebindings
+    verbs: ["create", "update", "patch", "delete"]
 
   # Subject access review (permission checks)
   - apiGroups: ["authorization.k8s.io"]

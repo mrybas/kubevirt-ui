@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
 from app.core.allocators import allocate_vpc_cidr
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_admin
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.core.errors import k8s_error_to_http
 from app.models.vpc import (
@@ -155,7 +155,7 @@ async def list_vpcs(request: Request, tenant: str | None = None, user: User = De
 
 
 @router.post("", response_model=VpcResponse, status_code=201)
-async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depends(require_auth)) -> VpcResponse:
+async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depends(require_admin)) -> VpcResponse:
     """Create a VPC with a default subnet.
 
     If subnet_cidr is not provided, auto-allocates a /24 from 10.{200+N}.0.0/24.
@@ -376,7 +376,7 @@ async def get_vpc(request: Request, name: str, user: User = Depends(require_auth
 
 
 @router.delete("/{name}")
-async def delete_vpc(request: Request, name: str, user: User = Depends(require_auth)) -> dict:
+async def delete_vpc(request: Request, name: str, user: User = Depends(require_admin)) -> dict:
     """Delete a VPC and cascade-delete its subnets and peerings."""
     k8s = request.app.state.k8s_client
 
@@ -438,7 +438,7 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
 @router.post("/{name}/peerings", response_model=VpcPeeringInfo, status_code=201)
 async def create_vpc_peering(
     request: Request, name: str, data: VpcPeeringCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> VpcPeeringInfo:
     """Create a VPC peering connection. Path VPC is the local side."""
     k8s = request.app.state.k8s_client
@@ -483,7 +483,7 @@ async def create_vpc_peering(
 
 
 @router.delete("/{name}/peerings/{remote_vpc}")
-async def delete_vpc_peering(request: Request, name: str, remote_vpc: str, user: User = Depends(require_auth)) -> dict:
+async def delete_vpc_peering(request: Request, name: str, remote_vpc: str, user: User = Depends(require_admin)) -> dict:
     """Delete a VPC peering connection."""
     k8s = request.app.state.k8s_client
 
@@ -546,7 +546,7 @@ async def get_vpc_routes(request: Request, name: str, user: User = Depends(requi
 @router.put("/{name}/routes", response_model=list[VpcStaticRoute])
 async def update_vpc_routes(
     request: Request, name: str, data: VpcStaticRoutesUpdateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> list[VpcStaticRoute]:
     """Replace all static routes on a VPC."""
     k8s = request.app.state.k8s_client

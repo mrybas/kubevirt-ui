@@ -14,6 +14,12 @@ from kubernetes_asyncio.client import ApiException
 
 from app.core.auth import User, require_auth
 from app.core.errors import k8s_error_to_http
+from app.core.naming import (
+    DISPLAY_NAME_ANNOTATION,
+    SLUG_LABEL,
+    get_display_name,
+    sanitize_display_name,
+)
 from app.models.tenant import (
     AddonCatalog,
     DiscoveryResponse,
@@ -1017,7 +1023,7 @@ def _parse_tenant_image_dv(dv: dict[str, Any]) -> GoldenImage:
     return GoldenImage(
         name=metadata.get("name", ""),
         namespace=metadata.get("namespace", ""),
-        display_name=annotations.get("kubevirt-ui.io/display-name", metadata.get("name", "")),
+        display_name=get_display_name(metadata) or metadata.get("name", ""),
         os_type=labels.get("kubevirt-ui.io/os-type"),
         size=size,
         status=display_status,
@@ -1062,17 +1068,20 @@ async def create_tenant_image(
     if not await _namespace_exists(k8s, ns):
         raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
 
-    # Resolve name
-    if not image.name and not image.display_name:
+    # Resolve seed (for K8s generateName prefix) and display_name (annotation).
+    #
+    # Back-compat: older clients (Terraform / CLI) passed `name="my-image"`
+    # expecting `metadata.name = "my-image"` (deterministic). We can't keep
+    # that exactly — generateName always appends 5 random chars — but we
+    # preserve the prefix: `my-image-XXXXX`. The display_name annotation
+    # carries the human-friendly label independently.
+    seed = image.name or image.display_name
+    display_name = image.display_name or image.name
+    if not seed or not display_name:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Either 'name' or 'display_name' must be provided",
         )
-    if not image.name:
-        # Simple slug from display_name
-        import re
-        slug = re.sub(r"[^a-z0-9]+", "-", (image.display_name or "").lower()).strip("-")[:50]
-        image.name = slug or "image"
 
     # Determine source
     if image.source_url:
@@ -1090,20 +1099,14 @@ async def create_tenant_image(
         "kubevirt-ui.io/tenant-image": "true",
         "kubevirt-ui.io/tenant": name,
     }
-    dv_annotations: dict[str, str] = {}
     if image.os_type:
         dv_labels["kubevirt-ui.io/os-type"] = image.os_type
-    if image.display_name:
-        dv_annotations["kubevirt-ui.io/display-name"] = image.display_name
 
     dv_body = {
         "apiVersion": "cdi.kubevirt.io/v1beta1",
         "kind": "DataVolume",
         "metadata": {
-            "name": image.name,
-            "namespace": ns,
             "labels": dv_labels,
-            "annotations": dv_annotations,
         },
         "spec": {
             "source": source,
@@ -1116,6 +1119,17 @@ async def create_tenant_image(
             },
         },
     }
+
+    # Stamp generateName + display-name annotation + slug label manually so we
+    # can use `image.name` (when present) as the generateName seed instead of
+    # the default `slug(display_name)`. Equivalent to `with_synthetic_metadata`
+    # except for the seed override.
+    slug = sanitize_display_name(seed)
+    md = dv_body["metadata"]
+    md["generateName"] = f"{slug}-"
+    md["namespace"] = ns
+    md.setdefault("annotations", {})[DISPLAY_NAME_ANNOTATION] = display_name
+    md["labels"][SLUG_LABEL] = slug
 
     try:
         result = await k8s.custom_api.create_namespaced_custom_object(
