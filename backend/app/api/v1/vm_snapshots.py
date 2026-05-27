@@ -9,7 +9,7 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.naming import get_display_name, with_synthetic_metadata
 
 router = APIRouter()
@@ -39,7 +39,7 @@ async def list_vm_snapshots(
     request: Request,
     namespace: str,
     name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_viewer()),
 ) -> list[dict[str, Any]]:
     """List VirtualMachineSnapshots for a specific VM."""
     k8s_client = request.app.state.k8s_client
@@ -95,7 +95,7 @@ async def create_vm_snapshot(
     namespace: str,
     name: str,
     snap_request: CreateVMSnapshotRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Create a VirtualMachineSnapshot for a VM."""
     k8s_client = request.app.state.k8s_client
@@ -157,7 +157,7 @@ async def delete_vm_snapshot(
     namespace: str,
     name: str,
     snapshot_name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> None:
     """Delete a VirtualMachineSnapshot."""
     k8s_client = request.app.state.k8s_client
@@ -190,7 +190,7 @@ async def restore_vm_snapshot(
     name: str,
     snapshot_name: str,
     restore_request: RestoreVMSnapshotRequest | None = None,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Restore a VM from a VirtualMachineSnapshot.
 

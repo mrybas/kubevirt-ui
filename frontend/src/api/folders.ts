@@ -15,6 +15,7 @@ import type {
   FolderAccessEntry,
   FolderAccessListResponse,
   AddFolderAccessRequest,
+  PatchFolderAccessRequest,
 } from '../types/folder';
 
 // Folders
@@ -98,5 +99,19 @@ export async function removeFolderAccess(
 ): Promise<void> {
   await apiRequest<void>(`/folders/${folderName}/access/${bindingId}`, {
     method: 'DELETE',
+  });
+}
+
+/**
+ * Phase 2: Partial PATCH for LDAP-group-based access block.
+ * Omitted fields keep their current value; send [] to clear a list.
+ */
+export async function patchFolderAccess(
+  folderName: string,
+  request: PatchFolderAccessRequest
+): Promise<void> {
+  await apiRequest<void>(`/folders/${folderName}/access`, {
+    method: 'PATCH',
+    body: request,
   });
 }

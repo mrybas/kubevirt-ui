@@ -16,6 +16,7 @@ import {
   listFolderAccess,
   addFolderAccess,
   removeFolderAccess,
+  patchFolderAccess,
 } from '../api/folders';
 import type {
   CreateFolderRequest,
@@ -23,6 +24,7 @@ import type {
   MoveFolderRequest,
   AddFolderEnvironmentRequest,
   AddFolderAccessRequest,
+  PatchFolderAccessRequest,
 } from '../types/folder';
 
 export function useFoldersTree() {
@@ -136,6 +138,18 @@ export function useRemoveFolderAccess(folderName: string) {
     mutationFn: (bindingId: string) => removeFolderAccess(folderName, bindingId),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['folders', folderName, 'access'] });
+      queryClient.invalidateQueries({ queryKey: ['folders'] });
+    },
+  });
+}
+
+/** Phase 2: Partial PATCH for LDAP-group-based access block */
+export function usePatchFolderAccess(folderName: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (request: PatchFolderAccessRequest) => patchFolderAccess(folderName, request),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['folders', folderName] });
       queryClient.invalidateQueries({ queryKey: ['folders'] });
     },
   });

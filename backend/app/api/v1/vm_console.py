@@ -9,6 +9,7 @@ import websockets
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.core.auth import AUTH_TYPE, validate_oidc_token, validate_k8s_token
+from app.core.groups import is_admin, is_env_member, load_folder, resolve_env
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -17,10 +18,18 @@ logger = logging.getLogger(__name__)
 async def _ws_authenticate(websocket: WebSocket, namespace: str | None = None) -> bool:
     """Authenticate WebSocket connection via token query parameter.
 
-    Returns True if authenticated (or auth disabled), False otherwise.
-    WebSocket connections cannot use HTTP header auth, so the token
-    is passed as a query parameter: ?token=<bearer_token>
-    If namespace is provided, verifies user has access to that namespace.
+    Returns True if authenticated AND authorized, False otherwise (the
+    socket is closed with code 1008 in either failure mode — caller
+    should just `return`).
+
+    WebSocket cannot use HTTP header auth, so the token is passed as a
+    query parameter: `?token=<bearer_token>`.
+
+    Authorization model (when `namespace` is given): the user must be a
+    folder/env member of the namespace's folder.  Global admins always
+    pass.  This is enforced BEFORE the upgrade is accepted — opening a
+    VNC/serial console grants raw guest console access, so we must not
+    fall back to "let K8s sort it out" the way HTTP endpoints can.
     """
     if AUTH_TYPE == "none":
         return True
@@ -40,31 +49,32 @@ async def _ws_authenticate(websocket: WebSocket, namespace: str | None = None) -
         await websocket.close(code=1008, reason="Invalid or expired token")
         return False
 
-    # Verify user has access to the target namespace via RBAC
-    if namespace and hasattr(user, "groups"):
+    # Enforce env_member on the target namespace.  Global admins
+    # bypass — `is_env_member` falls through to is_folder_admin →
+    # is_admin internally, so the explicit early-return is just a
+    # cheap path for the common case.
+    if namespace:
+        if is_admin(user.groups):
+            return True
+
         k8s_client = websocket.app.state.k8s_client
         try:
-            from kubernetes_asyncio.client import AuthorizationV1Api, V1SelfSubjectAccessReview, V1ResourceAttributes, V1SelfSubjectAccessReviewSpec
-            auth_api = AuthorizationV1Api(k8s_client._api_client)
-            review = V1SelfSubjectAccessReview(
-                spec=V1SelfSubjectAccessReviewSpec(
-                    resource_attributes=V1ResourceAttributes(
-                        namespace=namespace,
-                        verb="get",
-                        group="kubevirt.io",
-                        resource="virtualmachineinstances",
-                    )
-                )
-            )
-            # For OIDC users, we check namespace access via labeled namespaces
-            # rather than SAR (which uses the backend SA token, not the user's).
-            # Check if namespace is accessible to user's groups.
-            ns_obj = await k8s_client.core_api.read_namespace(name=namespace)
-            ns_labels = ns_obj.metadata.labels or {}
-            # If namespace has a project label, it's managed — access is OK if user is authenticated
-            # (fine-grained RBAC is enforced by K8s API when the console connects)
+            folder, env = await resolve_env(k8s_client, namespace)
+            folder_meta = await load_folder(k8s_client, folder)
         except Exception as e:
-            logger.warning(f"Namespace access check failed for {namespace}: {e}")
+            # resolve_env / load_folder raise HTTPException 404 when the
+            # namespace isn't a managed env — treat that as forbidden
+            # (we don't expose console for unmanaged namespaces).
+            logger.warning(f"Console authz lookup failed for {namespace}: {e}")
+            await websocket.close(code=1008, reason="Namespace not authorized")
+            return False
+
+        if not is_env_member(user, folder_meta, env):
+            await websocket.close(
+                code=1008,
+                reason="Env member role required to access VM console",
+            )
+            return False
 
     return True
 

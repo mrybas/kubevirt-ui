@@ -186,6 +186,31 @@ auth:
       name: ""
       key: "client-secret"
 
+  # -- Optional readonly LDAP bind used by the folder Access tab's group
+  # autocomplete (`GET /api/v1/ldap/groups?q=...`). Reuse the same Secret
+  # Dex uses for its LDAP connector — point `bindPasswordRef` at the same
+  # secret key. Leave `url` empty to fall back to the bundled LLDAP (when
+  # enabled) or to a degraded mode where the picker returns empty and the
+  # UI falls back to free-text group entry.
+  ldap:
+    # -- LDAP URL, e.g. "ldaps://ipa.example.com:636" or "ldap://ipa:389"
+    url: ""
+    # -- Use STARTTLS on a plain ldap:// connection
+    startTLS: false
+    # -- Bind DN (readonly account)
+    bindDN: ""
+    # -- Bind password — sourced from a Kubernetes Secret
+    bindPasswordRef:
+      name: ""
+      key: "bindPW"
+    # -- Base DN to search for groups, e.g. "cn=groups,cn=accounts,dc=example,dc=com"
+    groupBaseDN: ""
+    # -- LDAP filter template; `{q}` is replaced by the escaped search query.
+    # Default matches FreeIPA's groupOfNames objectClass on the `cn` attribute.
+    groupFilter: "(&(objectClass=groupOfNames)(cn=*{q}*))"
+    # -- Group attribute that holds the human-readable name
+    groupNameAttr: "cn"
+
 # =========================================================================
 # DEX (optional built-in OIDC provider)
 # =========================================================================

@@ -97,6 +97,38 @@ spec:
             - name: LLDAP_LDAP_BASE_DN
               value: {{ .Values.lldap.baseDN | quote }}
             {{- end }}
+            {{- /* External LDAP — Phase 2 group autocomplete for folder Access tab */ -}}
+            {{- with .Values.auth.ldap }}
+            {{- if .url }}
+            - name: LDAP_URL
+              value: {{ .url | quote }}
+            - name: LDAP_USE_STARTTLS
+              value: {{ .startTLS | default false | quote }}
+            {{- if .bindDN }}
+            - name: LDAP_BIND_DN
+              value: {{ .bindDN | quote }}
+            {{- end }}
+            {{- if .bindPasswordRef.name }}
+            - name: LDAP_BIND_PW
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .bindPasswordRef.name }}
+                  key: {{ .bindPasswordRef.key | default "bindPW" }}
+            {{- end }}
+            {{- if .groupBaseDN }}
+            - name: LDAP_GROUP_BASE_DN
+              value: {{ .groupBaseDN | quote }}
+            {{- end }}
+            {{- if .groupFilter }}
+            - name: LDAP_GROUP_FILTER
+              value: {{ .groupFilter | quote }}
+            {{- end }}
+            {{- if .groupNameAttr }}
+            - name: LDAP_GROUP_NAME_ATTR
+              value: {{ .groupNameAttr | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             # -- User-supplied env vars
             {{- range $key, $value := .Values.backend.env }}
             - name: {{ $key }}

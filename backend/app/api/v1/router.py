@@ -33,6 +33,7 @@ from app.api.v1.vm_disks import router as vm_disks_router
 from app.api.v1.vm_network import router as vm_network_router
 from app.api.v1.velero_backups import router as velero_backups_router
 from app.api.v1.vm_snapshots import router as vm_snapshots_router
+from app.api.v1.ldap import router as ldap_router
 
 router = APIRouter()
 
@@ -65,6 +66,7 @@ else:
 router.include_router(teams_router, prefix="/teams", tags=["Teams"])
 router.include_router(users_router, prefix="/users", tags=["Users"])
 router.include_router(groups_router, prefix="/groups", tags=["Groups"])
+router.include_router(ldap_router, prefix="/ldap", tags=["LDAP"])
 
 # VM Templates and Images
 router.include_router(templates_router, prefix="/templates", tags=["VM Templates"])

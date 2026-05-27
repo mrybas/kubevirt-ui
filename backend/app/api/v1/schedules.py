@@ -13,7 +13,7 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.naming import get_display_name, with_synthetic_metadata
 
 router = APIRouter()
@@ -177,7 +177,7 @@ async def list_scheduled_actions(
     request: Request,
     namespace: str,
     vm_name: str | None = None,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_viewer()),
 ) -> list[dict[str, Any]]:
     """List scheduled actions (CronJobs) for VMs in a namespace."""
     k8s_client = request.app.state.k8s_client
@@ -241,7 +241,7 @@ async def create_scheduled_action(
     request: Request,
     namespace: str,
     schedule_request: CreateScheduleRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Create a scheduled action (CronJob) for a VM."""
     k8s_client = request.app.state.k8s_client
@@ -279,7 +279,7 @@ async def delete_scheduled_action(
     request: Request,
     namespace: str,
     name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> None:
     """Delete a scheduled action (CronJob)."""
     k8s_client = request.app.state.k8s_client
@@ -314,7 +314,7 @@ async def update_scheduled_action(
     namespace: str,
     name: str,
     patch_request: PatchScheduleRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Update a scheduled action (suspend/resume or change schedule)."""
     k8s_client = request.app.state.k8s_client
@@ -364,7 +364,7 @@ async def trigger_scheduled_action(
     request: Request,
     namespace: str,
     name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Trigger a scheduled action immediately by creating a Job from the CronJob."""
     k8s_client = request.app.state.k8s_client

@@ -11,7 +11,7 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.groups import get_user_namespaces
 from app.core.kubevirt import get_hotplug_mode
 from app.core.naming import (
@@ -210,7 +210,7 @@ async def list_vms(
 async def get_hotplug_capabilities(
     request: Request,
     namespace: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_viewer()),
 ) -> dict[str, Any]:
     """Return hotplug capabilities based on KubeVirt feature gates."""
     k8s_client = request.app.state.k8s_client
@@ -239,7 +239,12 @@ async def get_hotplug_capabilities(
 
 
 @router.get("/{name}", response_model=VMResponse)
-async def get_vm(request: Request, namespace: str, name: str) -> VMResponse:
+async def get_vm(
+    request: Request,
+    namespace: str,
+    name: str,
+    user: User = Depends(require_env_viewer()),
+) -> VMResponse:
     """Get a specific VirtualMachine."""
     k8s_client = request.app.state.k8s_client
 
@@ -307,7 +312,7 @@ async def get_vm_events(
     request: Request,
     namespace: str,
     name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_viewer()),
 ) -> VMEventsResponse:
     """Get Kubernetes events related to a VM (VM, VMI, and launcher pods)."""
     k8s_client = request.app.state.k8s_client
@@ -372,7 +377,7 @@ async def update_vm(
     namespace: str,
     name: str,
     update_data: VMUpdateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> VMResponse:
     """Update a VirtualMachine's configuration.
     
@@ -491,7 +496,7 @@ async def update_vm_display_name(
     namespace: str,
     name: str,
     update: VMUpdateDisplayNameRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> VMResponse:
     """Update only a VM's display-name annotation and slug label.
 
@@ -549,7 +554,7 @@ async def update_vm_display_name(
 @router.post("", response_model=VMResponse, status_code=status.HTTP_201_CREATED)
 async def create_vm(
     request: Request, namespace: str, vm_request: VMCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> VMResponse:
     """Create a new VirtualMachine.
 
@@ -598,7 +603,7 @@ async def create_vm_from_template(
     request: Request,
     namespace: str,
     vm_request: VMFromTemplateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> VMResponse:
     """Create a VM from a template using dataVolumeTemplates.
     
@@ -991,7 +996,12 @@ async def create_vm_from_template(
 
 
 @router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_vm(request: Request, namespace: str, name: str) -> None:
+async def delete_vm(
+    request: Request,
+    namespace: str,
+    name: str,
+    user: User = Depends(require_env_member()),
+) -> None:
     """Delete a VirtualMachine and its associated snapshots."""
     k8s_client = request.app.state.k8s_client
 
@@ -1036,7 +1046,12 @@ async def delete_vm(request: Request, namespace: str, name: str) -> None:
 
 
 @router.get("/{name}/yaml")
-async def get_vm_yaml(request: Request, namespace: str, name: str) -> dict[str, Any]:
+async def get_vm_yaml(
+    request: Request,
+    namespace: str,
+    name: str,
+    user: User = Depends(require_env_viewer()),
+) -> dict[str, Any]:
     """Get VirtualMachine as raw YAML/JSON."""
     k8s_client = request.app.state.k8s_client
 

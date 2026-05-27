@@ -11,7 +11,8 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_env_member
+from app.core.groups import is_env_member, load_folder, resolve_env
 from app.core.kubevirt import kubevirt_subresource_call
 from app.core.naming import sanitize_display_name, with_synthetic_metadata
 from app.models.vm import VMStatusResponse
@@ -56,7 +57,12 @@ class ResizeVMRequest(BaseModel):
 
 
 @router.post("/{name}/start", response_model=VMStatusResponse)
-async def start_vm(request: Request, namespace: str, name: str) -> VMStatusResponse:
+async def start_vm(
+    request: Request,
+    namespace: str,
+    name: str,
+    user: User = Depends(require_env_member()),
+) -> VMStatusResponse:
     """Start a VirtualMachine."""
     k8s_client = request.app.state.k8s_client
 
@@ -83,6 +89,7 @@ async def stop_vm(
     namespace: str,
     name: str,
     stop_request: StopVMRequest = StopVMRequest(),
+    user: User = Depends(require_env_member()),
 ) -> VMStatusResponse:
     """Stop a VirtualMachine using subresource API.
 
@@ -135,7 +142,12 @@ async def stop_vm(
 
 
 @router.post("/{name}/restart", response_model=VMStatusResponse)
-async def restart_vm(request: Request, namespace: str, name: str) -> VMStatusResponse:
+async def restart_vm(
+    request: Request,
+    namespace: str,
+    name: str,
+    user: User = Depends(require_env_member()),
+) -> VMStatusResponse:
     """Restart a VirtualMachine by deleting its VMI."""
     k8s_client = request.app.state.k8s_client
 
@@ -169,7 +181,7 @@ async def migrate_vm(
     namespace: str,
     name: str,
     migrate_request: MigrateVMRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> VMStatusResponse:
     """Live migrate a running VM to a target node.
 
@@ -292,7 +304,7 @@ async def recreate_vm(
     request: Request,
     namespace: str,
     name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Recreate a VM from its original golden image.
 
@@ -485,11 +497,32 @@ async def clone_vm(
     namespace: str,
     name: str,
     clone_request: CloneVMRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
-    """Clone a VM by duplicating its spec and DataVolumes."""
+    """Clone a VM by duplicating its spec and DataVolumes.
+
+    Authorization: `require_env_member()` on the source namespace covers
+    same-namespace clones.  If `target_namespace` differs from the
+    source, we additionally enforce env_member on the *target* — this
+    closes a privilege-escalation hole where an env_member of folder A
+    could otherwise clone a VM into a namespace they do not own
+    (folder B).
+    """
     k8s_client = request.app.state.k8s_client
     target_ns = clone_request.target_namespace or namespace
+
+    if target_ns != namespace:
+        # Cross-namespace clone — verify env_member on the target too.
+        tgt_folder, tgt_env = await resolve_env(k8s_client, target_ns)
+        tgt_meta = await load_folder(k8s_client, tgt_folder)
+        if not is_env_member(user, tgt_meta, tgt_env):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Cannot clone into '{target_ns}': env member role "
+                    f"required on target environment"
+                ),
+            )
 
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
@@ -598,7 +631,7 @@ async def resize_vm(
     namespace: str,
     name: str,
     resize_request: ResizeVMRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Resize VM CPU and/or memory."""
     k8s_client = request.app.state.k8s_client

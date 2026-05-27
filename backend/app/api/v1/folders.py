@@ -16,7 +16,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client.rest import ApiException
 from kubernetes_asyncio.client import RbacAuthorizationV1Api
 
-from app.core.auth import User, require_auth, require_admin, check_folder_access
+from app.core.auth import (
+    User,
+    require_auth,
+    require_admin,
+    require_folder_admin,
+    check_folder_access,
+)
 
 from app.models.folder import (
     FolderCreateRequest,
@@ -31,6 +37,8 @@ from app.models.folder import (
     FolderAccessEntry,
     FolderAccessListResponse,
     AddFolderAccessRequest,
+    FolderAccessSpec,
+    FolderAccessPatchRequest,
 )
 from app.models.project import ROLE_TO_CLUSTERROLE, CLUSTERROLE_TO_ROLE
 
@@ -138,6 +146,22 @@ def _parse_all_folders(data: dict) -> dict[str, dict]:
         meta["_name"] = name
         folders[name] = meta
     return folders
+
+
+def _build_access_spec(meta: dict) -> FolderAccessSpec | None:
+    """Build the Phase 2 access block from a folder ConfigMap entry.
+
+    Returns None when no `access` block is set — preserves legacy
+    "global admins only" semantics (no breakage for existing folders).
+    """
+    raw = meta.get("access")
+    if not raw:
+        return None
+    try:
+        return FolderAccessSpec(**raw)
+    except Exception as e:  # pragma: no cover — defensive: tolerate malformed data
+        logger.warning(f"Malformed folder access block on '{meta.get('_name')}': {e}")
+        return None
 
 
 def _get_ancestor_chain(folders: dict[str, dict], folder_name: str) -> list[str]:
@@ -345,7 +369,198 @@ async def _get_folder_access_summary(
 
 
 # ---------------------------------------------------------------------------
-# Helpers — RBAC propagation
+# Phase 2 — RoleBindings reconciler (folder access block → K8s)
+# ---------------------------------------------------------------------------
+#
+# Materialises the `access` block of a folder ConfigMap entry into 3
+# managed RoleBindings per env namespace (admin / editor / viewer), with
+# the UNION of folder-level + env_access[env]-level group subjects.
+#
+# Existing Phase 1 RoleBindings (per-subject, name `team-...`) are left
+# alone — both flows coexist during transition.  Phase 2 RBs are
+# identified by `kubevirt-ui.io/access-source=folder-access-block`.
+
+# Fixed RB names — one per role per env namespace.
+RB_NAME_ADMIN   = "kubevirt-ui-folder-admins"
+RB_NAME_MEMBER  = "kubevirt-ui-folder-members"
+RB_NAME_VIEWER  = "kubevirt-ui-folder-viewers"
+
+# Marker label so we never touch RBs created by other systems / Phase 1.
+ACCESS_SOURCE_LABEL = "kubevirt-ui.io/access-source"
+ACCESS_SOURCE_PHASE2 = "folder-access-block"
+
+# RoleRefs (ClusterRole names) — same as ROLE_TO_CLUSTERROLE.
+_RBAC_ROLE_NAMES: list[tuple[str, str, str]] = [
+    # (role, rb_name, cluster_role)
+    ("admin",   RB_NAME_ADMIN,   ROLE_TO_CLUSTERROLE["admin"]),
+    ("member",  RB_NAME_MEMBER,  ROLE_TO_CLUSTERROLE["editor"]),
+    ("viewer",  RB_NAME_VIEWER,  ROLE_TO_CLUSTERROLE["viewer"]),
+]
+
+
+def _collect_subjects(
+    folder_meta: dict, env: str, role: str,
+) -> list[str]:
+    """Union of folder-level + env-level group names for `role` on `env`.
+
+    `role` ∈ {"admin", "member", "viewer"}.  Returned list is sorted and
+    deduplicated so the rendered RoleBinding is stable across reconciles.
+    """
+    access = folder_meta.get("access") or {}
+    folder_groups = access.get(f"{role}s") or []
+    env_access = (access.get("env_access") or {}).get(env) or {}
+    env_groups = env_access.get(f"{role}s") or []
+    merged = set(folder_groups) | set(env_groups)
+    return sorted(g for g in merged if g)
+
+
+def _build_phase2_rb_body(
+    rb_name: str,
+    namespace: str,
+    folder: str,
+    env: str,
+    cluster_role: str,
+    groups: list[str],
+) -> dict:
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {
+            "name": rb_name,
+            "namespace": namespace,
+            "labels": {
+                ACCESS_MANAGED_LABEL: "true",
+                ACCESS_SOURCE_LABEL: ACCESS_SOURCE_PHASE2,
+                ACCESS_FOLDER_LABEL: folder,
+                ENV_ENVIRONMENT_LABEL: env,
+            },
+        },
+        "roleRef": {
+            "kind": "ClusterRole",
+            "name": cluster_role,
+            "apiGroup": "rbac.authorization.k8s.io",
+        },
+        "subjects": [
+            {
+                "kind": "Group",
+                "name": g,
+                "apiGroup": "rbac.authorization.k8s.io",
+            }
+            for g in groups
+        ],
+    }
+
+
+async def _apply_phase2_rb(
+    rbac_api: RbacAuthorizationV1Api,
+    rb_name: str,
+    namespace: str,
+    folder: str,
+    env: str,
+    cluster_role: str,
+    groups: list[str],
+):
+    """Idempotently create or update a Phase 2 RoleBinding.
+
+    Empty subjects → delete the RB if it exists (avoid K8s validation
+    errors on subjects=[] and remove stale access).
+    """
+    if not groups:
+        try:
+            await rbac_api.delete_namespaced_role_binding(
+                name=rb_name, namespace=namespace,
+            )
+            logger.info(f"Deleted empty Phase 2 RB {namespace}/{rb_name}")
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning(f"Failed to delete RB {namespace}/{rb_name}: {e}")
+        return
+
+    body = _build_phase2_rb_body(
+        rb_name, namespace, folder, env, cluster_role, groups,
+    )
+    try:
+        await rbac_api.create_namespaced_role_binding(
+            namespace=namespace, body=body,
+        )
+        logger.info(f"Created Phase 2 RB {namespace}/{rb_name} (subjects={len(groups)})")
+        return
+    except ApiException as e:
+        if e.status != 409:
+            logger.warning(f"Failed to create RB {namespace}/{rb_name}: {e}")
+            return
+
+    # 409 — already exists; replace.  Use replace to overwrite subjects.
+    try:
+        existing = await rbac_api.read_namespaced_role_binding(
+            name=rb_name, namespace=namespace,
+        )
+        # Preserve resourceVersion for optimistic concurrency.
+        body["metadata"]["resourceVersion"] = existing.metadata.resource_version
+        # K8s rejects roleRef updates on RoleBinding; if the existing RB has a
+        # different roleRef we must delete-and-create.
+        if existing.role_ref.name != cluster_role:
+            try:
+                await rbac_api.delete_namespaced_role_binding(
+                    name=rb_name, namespace=namespace,
+                )
+            except ApiException:
+                pass
+            body["metadata"].pop("resourceVersion", None)
+            await rbac_api.create_namespaced_role_binding(
+                namespace=namespace, body=body,
+            )
+        else:
+            await rbac_api.replace_namespaced_role_binding(
+                name=rb_name, namespace=namespace, body=body,
+            )
+        logger.info(f"Updated Phase 2 RB {namespace}/{rb_name} (subjects={len(groups)})")
+    except ApiException as e:
+        logger.warning(f"Failed to update RB {namespace}/{rb_name}: {e}")
+
+
+async def reconcile_folder_rbac(
+    k8s_client: Any, folder: str, folder_meta: dict,
+) -> None:
+    """Reconcile Phase 2 RoleBindings for all env namespaces of a folder.
+
+    Idempotent — safe to call after every access change.  Empty role
+    lists → corresponding RB is deleted.  Existing Phase 1 RBs are not
+    touched (distinguished by the `access-source` label).
+    """
+    rbac_api = await _get_rbac_api(k8s_client)
+    ns_items = await _get_folder_namespaces(k8s_client, folder)
+    if not ns_items:
+        return
+
+    for ns_obj in ns_items:
+        ns_name = ns_obj.metadata.name
+        env = (ns_obj.metadata.labels or {}).get(ENV_ENVIRONMENT_LABEL, ns_name)
+        for role, rb_name, cluster_role in _RBAC_ROLE_NAMES:
+            groups = _collect_subjects(folder_meta, env, role)
+            await _apply_phase2_rb(
+                rbac_api, rb_name, ns_name, folder, env, cluster_role, groups,
+            )
+
+
+async def reconcile_env_rbac(
+    k8s_client: Any, folder: str, env: str, folder_meta: dict,
+) -> None:
+    """Reconcile Phase 2 RoleBindings for a single env namespace.
+
+    Used when one env is added — avoids full-folder churn.
+    """
+    rbac_api = await _get_rbac_api(k8s_client)
+    ns_name = _ns_name(folder, env)
+    for role, rb_name, cluster_role in _RBAC_ROLE_NAMES:
+        groups = _collect_subjects(folder_meta, env, role)
+        await _apply_phase2_rb(
+            rbac_api, rb_name, ns_name, folder, env, cluster_role, groups,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers — RBAC propagation (Phase 1 — kept for backward compat)
 # ---------------------------------------------------------------------------
 
 async def _propagate_folder_access(
@@ -524,6 +739,7 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
             total_storage=_format_storage(total_bytes) if total_bytes > 0 else None,
             teams=teams,
             users=users,
+            access=_build_access_spec(meta),
         )
 
     if flat:
@@ -674,6 +890,7 @@ async def get_folder(request: Request, name: str, user: User = Depends(require_a
         total_storage=_format_storage(total_bytes) if total_bytes > 0 else None,
         teams=teams,
         users=users,
+        access=_build_access_spec(meta),
     )
 
 
@@ -858,6 +1075,10 @@ async def _create_environment_ns(
     # Propagate folder-level access (including ancestors) to new environment
     await _propagate_folder_access(k8s_client, folders, folder_name, ns_name)
 
+    # Phase 2 reconcile — materialise the access block onto the new env.
+    folder_meta = folders.get(folder_name) or {}
+    await reconcile_env_rbac(k8s_client, folder_name, environment, folder_meta)
+
     logger.info(f"Created environment: {ns_name} (folder={folder_name})")
     return FolderEnvironmentResponse(
         name=ns_name,
@@ -879,9 +1100,11 @@ async def _create_environment_ns(
     response_model=FolderEnvironmentResponse,
     status_code=201,
 )
-# TODO Phase 2: relax to require_folder_member (admin OR folder member) once folder-member concept exists
 async def add_environment(
-    request: Request, name: str, env: AddFolderEnvironmentRequest, user: User = Depends(require_admin),
+    request: Request,
+    name: str,
+    env: AddFolderEnvironmentRequest,
+    user: User = Depends(require_folder_admin()),
 ):
     """Add an environment (namespace) to a folder."""
     k8s_client = request.app.state.k8s_client
@@ -898,8 +1121,12 @@ async def add_environment(
 
 
 @router.delete("/{name}/environments/{environment}", status_code=204)
-# TODO Phase 2: relax to require_folder_member (admin OR folder member) once folder-member concept exists
-async def remove_environment(request: Request, name: str, environment: str, user: User = Depends(require_admin)):
+async def remove_environment(
+    request: Request,
+    name: str,
+    environment: str,
+    user: User = Depends(require_folder_admin()),
+):
     """Remove an environment (delete its namespace)."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_folders_configmap(k8s_client)
@@ -1032,7 +1259,10 @@ async def list_folder_access(request: Request, name: str, user: User = Depends(r
 
 @router.post("/{name}/access", response_model=FolderAccessEntry, status_code=201)
 async def add_folder_access(
-    request: Request, name: str, access: AddFolderAccessRequest, user: User = Depends(require_admin),
+    request: Request,
+    name: str,
+    access: AddFolderAccessRequest,
+    user: User = Depends(require_folder_admin()),
 ):
     """Add access to a folder or specific environment."""
     k8s_client = request.app.state.k8s_client
@@ -1149,8 +1379,70 @@ async def add_folder_access(
     )
 
 
+@router.patch("/{name}/access", response_model=FolderAccessSpec)
+async def patch_folder_access(
+    request: Request,
+    name: str,
+    patch: FolderAccessPatchRequest,
+    user: User = Depends(require_folder_admin()),
+) -> FolderAccessSpec:
+    """Patch the Phase 2 access block on a folder (group ACL).
+
+    Any field left `None` is left untouched.  To clear a list, send `[]`.
+    `env_access` is full-replace when provided.
+
+    After persistence, materialises K8s RoleBindings in each env namespace
+    via the reconciler (Task #4 wires this in — for now we just persist
+    the ConfigMap; reconciler.run() is the next hook point).
+    """
+    k8s_client = request.app.state.k8s_client
+    data = await _ensure_folders_configmap(k8s_client)
+    folders = _parse_all_folders(data)
+
+    if name not in folders:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    meta = folders[name]
+    current = meta.get("access") or {}
+
+    # Patch — preserve fields that were not sent (omitted -> keep existing).
+    new_access: dict = {
+        "admins":  list(current.get("admins")  or []),
+        "members": list(current.get("members") or []),
+        "viewers": list(current.get("viewers") or []),
+        "env_access": dict(current.get("env_access") or {}),
+    }
+    if patch.admins is not None:
+        new_access["admins"] = list(patch.admins)
+    if patch.members is not None:
+        new_access["members"] = list(patch.members)
+    if patch.viewers is not None:
+        new_access["viewers"] = list(patch.viewers)
+    if patch.env_access is not None:
+        new_access["env_access"] = {
+            env: spec.model_dump() for env, spec in patch.env_access.items()
+        }
+
+    meta["access"] = new_access
+    save_meta = {k: v for k, v in meta.items() if not k.startswith("_")}
+    await _save_folder_meta(k8s_client, name, save_meta)
+    logger.info(f"Patched access on folder {name} by {user.email}")
+
+    # Materialise into K8s RoleBindings on every env namespace under the folder.
+    # Failures are logged inside the reconciler — the ConfigMap is the
+    # source of truth, so a stale RB will heal on the next reconcile.
+    await reconcile_folder_rbac(k8s_client, name, save_meta)
+
+    return FolderAccessSpec(**new_access)
+
+
 @router.delete("/{name}/access/{binding_id}", status_code=204)
-async def remove_folder_access(request: Request, name: str, binding_id: str, user: User = Depends(require_admin)):
+async def remove_folder_access(
+    request: Request,
+    name: str,
+    binding_id: str,
+    user: User = Depends(require_folder_admin()),
+):
     """Remove access from a folder (deletes binding from all descendant namespaces if folder-scope)."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_folders_configmap(k8s_client)

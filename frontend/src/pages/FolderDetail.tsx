@@ -22,6 +22,7 @@ import {
   Eye,
   Pencil,
   Move,
+  KeyRound,
 } from 'lucide-react';
 import clsx from 'clsx';
 import {
@@ -39,18 +40,20 @@ import {
 } from '../hooks/useFolders';
 import { useTeams } from '../hooks/useProjects';
 import { FolderBreadcrumb } from '../components/folders/FolderBreadcrumb';
+import { FolderAccessTab } from '../components/folders/FolderAccessTab';
 import { CustomSelect } from '../components/common/CustomSelect';
 import { ConfirmDeleteModal } from '../components/common/ConfirmDeleteModal';
 import type { FolderEnvironment, FolderRole } from '../types/folder';
 import { FOLDER_ROLE_LABELS, FOLDER_ROLE_DESCRIPTIONS } from '../types/folder';
 
-type Tab = 'overview' | 'children' | 'environments' | 'members' | 'images' | 'vms';
+type Tab = 'overview' | 'children' | 'environments' | 'members' | 'access' | 'images' | 'vms';
 
 const TABS: { id: Tab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { id: 'overview', label: 'Overview', icon: Folder },
   { id: 'children', label: 'Sub-folders', icon: FolderOpen },
   { id: 'environments', label: 'Environments', icon: Layers },
   { id: 'members', label: 'Members', icon: Users },
+  { id: 'access', label: 'Access', icon: KeyRound },
   { id: 'vms', label: 'VMs', icon: Server },
   { id: 'images', label: 'Images', icon: HardDrive },
 ];
@@ -211,6 +214,7 @@ export default function FolderDetail() {
       )}
       {activeTab === 'environments' && <EnvironmentsTab folder={folder} />}
       {activeTab === 'members' && <MembersTab folderName={folder.name} />}
+      {activeTab === 'access' && <FolderAccessTab folder={folder} />}
       {activeTab === 'vms' && <VMsTab folder={folder} />}
       {activeTab === 'images' && <ImagesTab folder={folder} />}
 

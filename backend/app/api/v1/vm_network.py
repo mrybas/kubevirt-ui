@@ -8,7 +8,7 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -31,7 +31,7 @@ async def list_vm_interfaces(
     request: Request,
     namespace: str,
     name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_viewer()),
 ) -> list[dict[str, Any]]:
     """List network interfaces on a VM, including runtime info from VMI."""
     k8s_client = request.app.state.k8s_client
@@ -152,7 +152,7 @@ async def add_vm_interface(
     namespace: str,
     name: str,
     nic_request: AddNICRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Hotplug a new network interface to a VM."""
     k8s_client = request.app.state.k8s_client
@@ -244,7 +244,7 @@ async def remove_vm_interface(
     namespace: str,
     name: str,
     iface_name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Remove a hotplugged network interface from a VM.
 

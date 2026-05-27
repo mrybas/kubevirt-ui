@@ -8,7 +8,7 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.kubevirt import get_hotplug_mode, kubevirt_subresource_call
 
 router = APIRouter()
@@ -52,7 +52,7 @@ async def attach_disk_to_vm(
     namespace: str,
     name: str,
     attach_request: AttachDiskRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Attach an existing PVC/DataVolume to a VM.
     
@@ -317,7 +317,7 @@ async def create_image_from_vm(
     image_name: str,
     display_name: str | None = None,
     description: str | None = None,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Create a golden image from VM's root disk (VM must be stopped)."""
     k8s_client = request.app.state.k8s_client
@@ -472,6 +472,7 @@ async def get_vm_disks(
     request: Request,
     namespace: str,
     name: str,
+    user: User = Depends(require_env_viewer()),
 ) -> list[DiskDetailResponse]:
     """Get detailed disk information for a VM including sizes from PVCs."""
     k8s_client = request.app.state.k8s_client
@@ -581,7 +582,7 @@ async def resize_vm_disk(
     name: str,
     disk_name: str,
     resize_request: DiskResizeRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> DiskDetailResponse:
     """Resize a VM disk (PVC). Supports online resize if the storage class allows it."""
     k8s_client = request.app.state.k8s_client

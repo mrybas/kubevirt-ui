@@ -6,7 +6,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
-from app.core.auth import User, require_auth
+from app.core.auth import (
+    User,
+    require_auth,
+    require_env_admin,
+    require_env_member,
+    require_env_viewer,
+    require_folder_admin,
+    require_folder_member,
+    require_folder_viewer,
+)
 from app.main import app
 
 
@@ -64,15 +73,36 @@ def fake_user() -> User:
 def client(
     mock_k8s_client: MagicMock, mock_vm_cache: MagicMock, fake_user: User,
 ) -> Iterator[TestClient]:
-    """Create a test client with mocked K8s client, VM cache, and auth bypass."""
+    """Create a test client with mocked K8s client, VM cache, and auth bypass.
+
+    Overrides every Phase 1 + Phase 2 auth dep to short-circuit to
+    `fake_user`.  The Phase 2 deps (`require_env_*`, `require_folder_*`)
+    are `@cache`-decorated factories — calling them in conftest returns
+    the *same* closure that the routes registered, so the override key
+    matches by identity.
+    """
     app.state.k8s_client = mock_k8s_client
     app.state.vm_cache = mock_vm_cache
 
-    async def _override_require_auth() -> User:
+    async def _return_fake_user() -> User:
         return fake_user
 
-    app.dependency_overrides[require_auth] = _override_require_auth
+    # Phase 1 + Phase 2 deps that gate route access.  Each maps to the
+    # same fake_user — tests that need a non-admin user override
+    # `fake_user` itself, not the deps.
+    overrides = {
+        require_auth: _return_fake_user,
+        require_folder_admin(): _return_fake_user,
+        require_folder_member(): _return_fake_user,
+        require_folder_viewer(): _return_fake_user,
+        require_env_admin(): _return_fake_user,
+        require_env_member(): _return_fake_user,
+        require_env_viewer(): _return_fake_user,
+    }
+    for key, fn in overrides.items():
+        app.dependency_overrides[key] = fn
     try:
         yield TestClient(app)
     finally:
-        app.dependency_overrides.pop(require_auth, None)
+        for key in overrides:
+            app.dependency_overrides.pop(key, None)

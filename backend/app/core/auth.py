@@ -4,7 +4,8 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from functools import cache
+from typing import Any, Callable
 
 import httpx
 from fastapi import Depends, HTTPException, Request, status
@@ -212,6 +213,131 @@ async def require_admin(
             detail="Admin role required",
         )
     return user
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — folder/env role deps (factories)
+# ---------------------------------------------------------------------------
+#
+# These return a `Depends`-friendly async callable that:
+#   1. Extracts the folder name (or namespace) from the path param.
+#   2. Loads the parsed folder meta from the ConfigMap.
+#   3. Checks the corresponding role helper from `core.groups`.
+#
+# Folder-level deps gate "folder admin" operations (create env, manage
+# access, etc.); env-level deps gate per-namespace resource writes (VM,
+# disk, snapshot, etc.). All fall through to global admins via is_admin().
+#
+# Empty/missing `access` block on a folder → only global admins pass
+# (legacy "global admins only" behaviour, no breakage).
+
+def _folder_role_dep(
+    role_check: Callable[[User, dict], bool],
+    role_name: str,
+) -> Callable:
+    """Build a FastAPI dep that asserts a folder-level role.
+
+    Reads the folder name from the route's `name` path param (the
+    convention used by every folder endpoint: `/folders/{name}/...`).
+    Declared as a plain `str` so FastAPI binds it from the path.
+    """
+    from app.core.groups import load_folder
+
+    async def dep(
+        request: Request,
+        name: str,
+        user: User = Depends(require_auth),
+    ) -> User:
+        k8s = request.app.state.k8s_client
+        meta = await load_folder(k8s, name)
+        if not role_check(user, meta):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Folder {role_name} role required",
+            )
+        return user
+
+    return dep
+
+
+def _env_role_dep(
+    role_check: Callable[[User, dict, str], bool],
+    role_name: str,
+) -> Callable:
+    """Build a FastAPI dep that asserts an env-level (namespace-scoped) role.
+
+    The dep reads the `namespace` parameter from the route — either path
+    (when the route is `/.../{namespace}/...`) or query (the convention
+    used by VM/disk/snapshot endpoints: `?namespace=foo`).  FastAPI
+    infers source from the route's path template; we declare it as a
+    plain `str` so both work.
+    """
+    from app.core.groups import load_folder, resolve_env
+
+    async def dep(
+        request: Request,
+        namespace: str,
+        user: User = Depends(require_auth),
+    ) -> User:
+        k8s = request.app.state.k8s_client
+        folder, env = await resolve_env(k8s, namespace)
+        meta = await load_folder(k8s, folder)
+        if not role_check(user, meta, env):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Environment {role_name} role required",
+            )
+        return user
+
+    return dep
+
+
+# The six factories below are `@cache`-d so each `require_env_member()` call
+# returns the *same* closure.  Without this, every call site would register
+# a distinct dep, making `app.dependency_overrides[require_env_member()] = ...`
+# in pytest fail to match the one baked into the route signature.
+
+
+@cache
+def require_folder_admin() -> Callable:
+    """Dep factory: user must be folder admin (or global admin) for `{folder}`."""
+    from app.core.groups import is_folder_admin
+    return _folder_role_dep(is_folder_admin, "admin")
+
+
+@cache
+def require_folder_member() -> Callable:
+    """Dep factory: user must be folder member (or higher) for `{folder}`."""
+    from app.core.groups import is_folder_member
+    return _folder_role_dep(is_folder_member, "member")
+
+
+@cache
+def require_folder_viewer() -> Callable:
+    """Dep factory: user must be folder viewer (or higher) for `{folder}`."""
+    from app.core.groups import is_folder_viewer
+    return _folder_role_dep(is_folder_viewer, "viewer")
+
+
+@cache
+def require_env_admin() -> Callable:
+    """Dep factory: user must be env admin (or higher) for `{namespace}`."""
+    from app.core.groups import is_env_admin
+    return _env_role_dep(is_env_admin, "admin")
+
+
+@cache
+def require_env_member() -> Callable:
+    """Dep factory: user must be env member (or higher) for `{namespace}`."""
+    from app.core.groups import is_env_member
+    return _env_role_dep(is_env_member, "member")
+
+
+@cache
+def require_env_viewer() -> Callable:
+    """Dep factory: user must be env viewer (or higher) for `{namespace}`."""
+    from app.core.groups import is_env_viewer
+    return _env_role_dep(is_env_viewer, "viewer")
 
 
 async def validate_k8s_token(request: Request, token: str) -> User | None:

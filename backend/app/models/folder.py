@@ -25,6 +25,49 @@ class FolderQuota(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 — folder-level authorization (group-based access)
+# ---------------------------------------------------------------------------
+
+class FolderEnvAccessSpec(BaseModel):
+    """Env-specific access (union with folder-level access for that env)."""
+
+    admins: list[str] = []     # FreeIPA / OIDC group names
+    members: list[str] = []
+    viewers: list[str] = []
+
+
+class FolderAccessSpec(BaseModel):
+    """Folder-level access block (Phase 2).
+
+    Stored on the folder ConfigMap entry under the `access` key. Empty
+    block (or missing) means the folder is only accessible to global
+    admins (legacy "global admins only" behaviour — no breakage).
+
+    The lists hold group names exactly as they appear in the user's OIDC
+    `groups` claim (no naming convention assumed).
+    """
+
+    admins: list[str] = []
+    members: list[str] = []
+    viewers: list[str] = []
+    # Optional per-env overrides — union with folder-level lists.
+    env_access: dict[str, FolderEnvAccessSpec] = {}
+
+
+class FolderAccessPatchRequest(BaseModel):
+    """Full-replace PATCH body for the folder access block.
+
+    Any field left `None` is left untouched.  To clear a list, send `[]`.
+    `env_access` is full-replace when provided.
+    """
+
+    admins: list[str] | None = None
+    members: list[str] | None = None
+    viewers: list[str] | None = None
+    env_access: dict[str, FolderEnvAccessSpec] | None = None
+
+
+# ---------------------------------------------------------------------------
 # Folder CRUD requests
 # ---------------------------------------------------------------------------
 
@@ -86,9 +129,14 @@ class FolderResponse(BaseModel):
     total_vms: int = 0
     total_storage: str | None = None
 
-    # Access summary
+    # Access summary (Phase 1 — derived from materialized RoleBindings).
     teams: list[str] = []
     users: list[str] = []
+
+    # Access block (Phase 2 — folder + per-env group ACLs from ConfigMap).
+    # `None` here means the folder ConfigMap entry has no `access` block —
+    # legacy "global admins only" behaviour, no breakage.
+    access: FolderAccessSpec | None = None
 
 
 class FolderTreeResponse(BaseModel):

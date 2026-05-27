@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client.rest import ApiException
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.kubevirt import get_hotplug_mode, kubevirt_subresource_call
 from app.core.naming import (
     get_display_name,
@@ -35,7 +35,7 @@ ATTACHED_TO_LABEL = "kubevirt-ui.io/attached-to"
 async def list_persistent_disks(
     namespace: str,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_viewer()),
 ) -> PersistentDiskListResponse:
     """List all persistent disks in a namespace."""
     k8s_client = request.app.state.k8s_client
@@ -122,7 +122,7 @@ async def create_persistent_disk(
     namespace: str,
     disk: PersistentDiskCreate,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> PersistentDisk:
     """Create a new persistent disk."""
     k8s_client = request.app.state.k8s_client
@@ -210,7 +210,7 @@ async def delete_persistent_disk(
     namespace: str,
     name: str,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> None:
     """Delete a persistent disk."""
     k8s_client = request.app.state.k8s_client
@@ -270,7 +270,7 @@ async def attach_disk_to_vm(
     name: str,
     attach_request: AttachDiskRequest,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Attach a persistent disk to a VM.
     
@@ -514,7 +514,7 @@ async def detach_disk_from_vm(
     namespace: str,
     name: str,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Detach a persistent disk from a VM."""
     k8s_client = request.app.state.k8s_client
@@ -708,7 +708,7 @@ async def save_disk_as_image(
     namespace: str,
     name: str,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Clone a disk's PVC as a new image DataVolume for reuse as VM template.
 
@@ -818,7 +818,7 @@ async def list_disk_snapshots(
     namespace: str,
     name: str,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_viewer()),
 ) -> list[dict[str, Any]]:
     """List VolumeSnapshots for a specific PVC."""
     k8s_client = request.app.state.k8s_client
@@ -879,7 +879,7 @@ async def create_disk_snapshot(
     namespace: str,
     name: str,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Create a VolumeSnapshot from a PVC.
 
@@ -976,7 +976,7 @@ async def delete_snapshot(
     namespace: str,
     name: str,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> None:
     """Delete a VolumeSnapshot."""
     k8s_client = request.app.state.k8s_client
@@ -1007,7 +1007,7 @@ async def rollback_snapshot(
     namespace: str,
     name: str,
     request: Request,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
     """Rollback a VolumeSnapshot: stop VM, replace original PVC with snapshot content, start VM."""
     k8s_client = request.app.state.k8s_client
