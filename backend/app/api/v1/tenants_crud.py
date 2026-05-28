@@ -611,24 +611,6 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         #    on retry.
         storage_info: dict[str, str] | None = None
         if req.enable_storage:
-            # T8 follow-up — the kubevirt-csi-driver tenant-CP chart is a
-            # scaffold right now: it ships StorageClass + driver-config
-            # ConfigMap but NOT the controller Deployment + node DaemonSet
-            # (upstream kubevirt/csi-driver only releases kustomize
-            # overlays, no Helm chart). Tenant PVCs will stay Pending
-            # until those manifests are vendored into the chart. Surface
-            # this in backend logs so operators don't silently wonder why
-            # their PVCs never bind.
-            logger.warning(
-                f"Tenant {req.name!r}: enable_storage=True — "
-                "kubevirt-csi-driver chart is scaffold-only at this stage. "
-                "Host-side resources (SA, Secret, Quota, KubevirtCluster "
-                "infraClusterSecretRef) will be created correctly, but the "
-                "tenant CP currently has NO CSI controller Deployment / "
-                "node DaemonSet (upstream ships kustomize only — see "
-                "kubevirt-csi-driver.yaml NOTES.txt). Tenant PVCs will "
-                "remain Pending until those manifests are vendored."
-            )
             storage_info = await create_csi_infrastructure_resources(k8s, req)
 
         # 3. Create CAPI resources + Ingress (passes vpc_info for Multus annotation,
