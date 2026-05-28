@@ -53,6 +53,7 @@ interface NavItem {
   children?: NavItem[];
   end?: boolean; // For exact path matching
   requiresAdmin?: boolean;
+  requiresLldap?: boolean; // Hidden when user_management != "lldap" (external IdP)
 }
 
 const navigation: NavItem[] = [
@@ -109,6 +110,7 @@ const adminNavigation: NavItem[] = [
     name: 'Users',
     href: '/users',
     icon: Users,
+    requiresLldap: true,
     children: [
       { name: 'All Users', href: '/users', icon: Users, end: true },
       { name: 'Groups', href: '/users/groups', icon: Shield },
@@ -264,15 +266,16 @@ function FoldersSidebarSection() {
   );
 }
 
-/** Filter a nav item list so admin-only items are hidden for regular users. */
-function filterNav(items: NavItem[], isAdmin: boolean): NavItem[] {
+/** Filter a nav item list so admin-only and LLDAP-only items are hidden when not applicable. */
+function filterNav(items: NavItem[], isAdmin: boolean, lldapEnabled: boolean): NavItem[] {
+  const include = (item: NavItem) =>
+    (!item.requiresAdmin || isAdmin) &&
+    (!item.requiresLldap || lldapEnabled);
   return items
-    .filter(item => !item.requiresAdmin || isAdmin)
+    .filter(include)
     .map(item => ({
       ...item,
-      children: item.children
-        ? item.children.filter(child => !child.requiresAdmin || isAdmin)
-        : undefined,
+      children: item.children ? item.children.filter(include) : undefined,
     }));
 }
 
@@ -281,7 +284,9 @@ export function Sidebar() {
   const { user, config } = useAuthStore();
   // Treat "no auth" mode as admin so dev environments see everything
   const isAdmin = config?.type === 'none' || (user?.is_admin ?? false);
-  const filteredNavigation = filterNav(navigation, isAdmin);
+  const lldapEnabled = config?.user_management === 'lldap';
+  const filteredNavigation = filterNav(navigation, isAdmin, lldapEnabled);
+  const filteredAdminNavigation = filterNav(adminNavigation, isAdmin, lldapEnabled);
 
   const [collapsed, setCollapsed] = useState(() => {
     // Auto-collapse on mobile regardless of localStorage
@@ -398,7 +403,7 @@ export function Sidebar() {
                   Admin
                 </p>
               )}
-              {adminNavigation
+              {filteredAdminNavigation
                 .filter((item) => item.href !== '/tenants' || features?.enableTenants)
                 .map((item) => (
                   <NavItemComponent key={item.href} item={item} />

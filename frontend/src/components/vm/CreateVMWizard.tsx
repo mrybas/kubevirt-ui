@@ -511,11 +511,16 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   const renderNetworkStep = () => {
     // Include both VPC-backed (s.vpc) and VLAN-backed (s.vlan) subnets for VM attachment.
     // Exclude infrastructure subnets (used for NAT gateway, not VM NICs).
+    // Exclude the kube-ovn built-in system VPC and its system subnets — attaching VMs
+    // to ovn-cluster/join or ovn-cluster/ovn-default breaks cluster networking.
     // VPC subnets may have no namespace (cluster-wide) — those always pass the namespace filter.
     const externalSubnets = (subnets || [])
       .filter((s: any) =>
         (s.vpc || s.vlan) &&
         s.purpose !== 'infrastructure' &&
+        s.vpc !== 'ovn-cluster' &&
+        s.name !== 'join' &&
+        s.name !== 'ovn-default' &&
         (!s.namespace || s.namespace === selectedProject)
       )
       // Sort: VPC-backed first (base infrastructure), then VLAN-backed external
