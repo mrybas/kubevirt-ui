@@ -28,6 +28,7 @@ import {
   useDeleteAnnouncement,
   useBgpSessions,
 } from '../hooks/useBgp';
+import { useSubnets } from '../hooks/useNetwork';
 import { getGatewayConfigExamples, type GatewayConfigExample } from '../api/bgp';
 import type { SpeakerDeployRequest, AnnouncementRequest } from '../types/bgp';
 import { Modal } from '@/components/common/Modal';
@@ -284,6 +285,11 @@ function AnnounceModal({ onClose }: { onClose: () => void }) {
     policy: 'cluster',
   });
   const createAnnouncement = useCreateAnnouncement();
+  const { data: subnets, isLoading: subnetsLoading } = useSubnets();
+  // Filter out the kube-ovn system subnets that operators shouldn't announce
+  const subnetOptions = (subnets || [])
+    .filter((s: any) => s.name !== 'join' && s.name !== 'ovn-default')
+    .sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''));
 
   const set = <K extends keyof AnnouncementRequest>(
     field: K,
@@ -311,7 +317,7 @@ function AnnounceModal({ onClose }: { onClose: () => void }) {
               <button
                 key={t}
                 type="button"
-                onClick={() => set('resource_type', t)}
+                onClick={() => setForm((prev) => ({ ...prev, resource_type: t, resource_name: '' }))}
                 className={clsx(
                   'px-4 py-2 rounded-lg border text-sm font-medium transition-colors capitalize',
                   form.resource_type === t
@@ -325,17 +331,40 @@ function AnnounceModal({ onClose }: { onClose: () => void }) {
           </div>
         </div>
 
-        {/* Resource Name */}
+        {/* Resource Name — dropdown for subnet, free-text otherwise */}
         <div>
-          <label className="block text-sm text-surface-300 mb-1">Resource Name</label>
-          <input
-            type="text"
-            value={form.resource_name}
-            onChange={(e) => set('resource_name', e.target.value)}
-            placeholder="e.g. ovn-default"
-            className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
-            required
-          />
+          <label className="block text-sm text-surface-300 mb-1">
+            {form.resource_type === 'subnet' ? 'Subnet' :
+             form.resource_type === 'eip' ? 'EIP Name' : 'Service Name'}
+          </label>
+          {form.resource_type === 'subnet' ? (
+            <select
+              value={form.resource_name}
+              onChange={(e) => set('resource_name', e.target.value)}
+              className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 text-sm"
+              required
+              disabled={subnetsLoading}
+            >
+              <option value="">
+                {subnetsLoading ? 'Loading…' : (subnetOptions.length ? 'Select a subnet' : 'No subnets available')}
+              </option>
+              {subnetOptions.map((s: any) => (
+                <option key={s.name} value={s.name}>
+                  {s.vpc ? `${s.vpc} / ${s.name}` : s.name}
+                  {s.cidr_block ? ` — ${s.cidr_block}` : ''}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <input
+              type="text"
+              value={form.resource_name}
+              onChange={(e) => set('resource_name', e.target.value)}
+              placeholder={form.resource_type === 'eip' ? 'e.g. my-eip' : 'e.g. my-service'}
+              className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
+              required
+            />
+          )}
         </div>
 
         {/* Namespace (only for services) */}
