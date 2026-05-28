@@ -53,6 +53,8 @@ from app.api.v1.tenants_common import (
     CAPI_VERSION,
     FLUX_HELM_GROUP,
     FLUX_HELM_VERSION,
+    KAMAJI_CP_GROUP,
+    KAMAJI_CP_VERSION,
     KUBEVIRT_INFRA_GROUP,
     KUBEVIRT_INFRA_VERSION,
     OIDC_ISSUER,
@@ -70,8 +72,8 @@ from app.api.v1.tenants_vpc import (
 )
 from app.api.v1.folders import reconcile_namespace_rbac
 
-from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
-from app.api.v1.tenants_capi import _create_capi_resources
+from app.core.constants import KAMAJI_NAMESPACE, KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
+from app.api.v1.tenants_capi import _cleanup_tenant_ingress, _create_capi_resources
 from app.api.v1.tenants_addons import (
     _build_helm_values,
     _build_flux_helmrelease_cr,
@@ -821,10 +823,38 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         # raises HTTPException(400) on race-delete of the VPC, and B2's 502 path
         # also throws HTTPException. Without this catch, those paths would leak
         # an orphan tenant namespace + RBs while still returning a 4xx/5xx.
-        # Cleanup: detach the tenant ns from any VPC it was attached to, then
-        # delete the namespace (cascade deletes everything inside, including
-        # any half-created CAPI resources).
+        # Cleanup, in order:
+        #   1. KamajiControlPlane CR in KAMAJI_NAMESPACE (not covered by tenant
+        #      ns cascade — lives in default VPC).
+        #   2. Per-tenant apiserver Ingress / IngressRouteTCP / HTTPProxy in
+        #      KAMAJI_NAMESPACE (T6 / BUG 2). Without this, a step-6 failure
+        #      after `_create_tenant_apiserver_ingress` succeeded would orphan
+        #      ``<tenant>-api`` in KAMAJI_NAMESPACE and a same-named retry
+        #      would 409 on the ingress object.
+        #   3. Detach the tenant ns from any VPC it was attached to.
+        #   4. Delete the tenant ns (cascade-deletes everything else, including
+        #      any half-created CAPI resources).
         logger.error(f"Failed to create tenant {req.name}: {e}")
+        try:
+            await k8s.custom_api.delete_namespaced_custom_object(
+                group=KAMAJI_CP_GROUP, version=KAMAJI_CP_VERSION,
+                namespace=KAMAJI_NAMESPACE, plural="kamajicontrolplanes",
+                name=req.name,
+            )
+        except ApiException as cleanup_exc:
+            if cleanup_exc.status != 404:
+                logger.warning(
+                    f"Cleanup: failed to delete KamajiControlPlane "
+                    f"{KAMAJI_NAMESPACE}/{req.name}: {cleanup_exc}"
+                )
+        except Exception:
+            pass
+        try:
+            await _cleanup_tenant_ingress(k8s, req.name)
+        except Exception:
+            # Helper already logs per-shape failures; just don't let any
+            # unexpected error mask the original create-tenant exception.
+            pass
         try:
             await detach_tenant_from_folder_vpc(k8s, req.name)
         except Exception:
@@ -869,23 +899,85 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
 
 @router.delete("/{name}", status_code=204)
 async def delete_tenant(request: Request, name: str, user: User = Depends(require_auth)) -> None:
-    """Delete a tenant (delete namespace → cascade delete everything)."""
+    """Delete a tenant.
+
+    Order:
+      1. Delete the ``KamajiControlPlane`` CR from ``KAMAJI_NAMESPACE`` (TCP
+         lives in the default VPC, not the tenant ns, so it is NOT covered by
+         the tenant-ns cascade).
+      1b. Delete the per-tenant apiserver ingress resources from
+         ``KAMAJI_NAMESPACE`` (Ingress / IngressRouteTCP / HTTPProxy named
+         ``<tenant>-api``) — same reason: they live alongside the TCP Service,
+         not in the tenant ns.
+      2. Delete the CAPI ``Cluster`` CR in the tenant ns so CAPI runs its
+         finalizers cleanly (this also drops the cross-ns ref to the TCP CR).
+      3. Detach the tenant ns from its VPC (the VPC CR is cluster-scoped and
+         outlives the ns).
+      4. Delete the tenant ns — cascade-deletes all in-namespace worker
+         resources (KubevirtCluster, MachineSet, KubevirtMachineTemplate,
+         KubeadmConfigTemplate, worker VMs).
+
+    Each step is 404-tolerant so a partially-created tenant can still be
+    cleaned up.
+    """
     k8s = request.app.state.k8s_client
     ns = _tenant_ns(name)
 
     if not await _namespace_exists(k8s, ns):
         raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
 
-    # Detach tenant ns from the folder VPC (cluster-scoped — not cascade-
-    # deleted with the namespace). No-op if the tenant wasn't VPC-attached.
+    # 1. Delete KamajiControlPlane in KAMAJI_NAMESPACE first.
+    try:
+        await k8s.custom_api.delete_namespaced_custom_object(
+            group=KAMAJI_CP_GROUP, version=KAMAJI_CP_VERSION,
+            namespace=KAMAJI_NAMESPACE, plural="kamajicontrolplanes",
+            name=name,
+        )
+        logger.info(
+            f"Deleted KamajiControlPlane {KAMAJI_NAMESPACE}/{name} for tenant {name}"
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            logger.info(
+                f"KamajiControlPlane {KAMAJI_NAMESPACE}/{name} already absent; continuing"
+            )
+        else:
+            logger.warning(
+                f"Failed to delete KamajiControlPlane {KAMAJI_NAMESPACE}/{name}: {exc}"
+            )
+
+    # 1b. Delete per-tenant apiserver ingress resources from KAMAJI_NAMESPACE.
+    #     Shared with the create_tenant rollback path; see
+    #     `_cleanup_tenant_ingress` for the 404-tolerant per-shape logic.
+    await _cleanup_tenant_ingress(k8s, name)
+
+    # 2. Delete the CAPI Cluster CR in the tenant ns so CAPI's finalizers run.
+    try:
+        await k8s.custom_api.delete_namespaced_custom_object(
+            group=CAPI_GROUP, version=CAPI_VERSION,
+            namespace=ns, plural="clusters", name=name,
+        )
+        logger.info(f"Deleted CAPI Cluster {ns}/{name}")
+    except ApiException as exc:
+        if exc.status == 404:
+            logger.info(f"CAPI Cluster {ns}/{name} already absent; continuing")
+        else:
+            logger.warning(f"Failed to delete CAPI Cluster {ns}/{name}: {exc}")
+
+    # 3. Detach tenant ns from the folder VPC (cluster-scoped — not cascade-
+    #    deleted with the namespace). No-op if the tenant wasn't VPC-attached.
     try:
         await detach_tenant_from_folder_vpc(k8s, name)
     except Exception as exc:
         logger.warning(f"Failed to detach tenant {name} from folder VPC: {exc}")
 
+    # 4. Cascade-delete everything else by removing the tenant ns.
     try:
         await k8s.core_api.delete_namespace(name=ns)
     except ApiException as e:
+        if e.status == 404:
+            logger.info(f"Tenant ns {ns} already absent; delete complete")
+            return
         logger.error(f"Failed to delete tenant {name}: {e}")
         raise k8s_error_to_http(e, "tenant operation")
 

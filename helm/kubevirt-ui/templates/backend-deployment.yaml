@@ -134,6 +134,9 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            # -- Kamaji control-plane namespace (where KamajiControlPlane CRs are placed)
+            - name: TENANTS_KAMAJI_NAMESPACE
+              value: {{ .Values.tenants.kamajiNamespace | quote }}
             # -- User-supplied env vars (empty-string values are skipped)
             {{- range $key, $value := .Values.backend.env }}
             {{- if $value }}

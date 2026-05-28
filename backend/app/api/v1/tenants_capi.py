@@ -13,6 +13,7 @@ from fastapi import HTTPException
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 
+from app.core.constants import KAMAJI_NAMESPACE
 from app.models.tenant import TenantCreateRequest
 
 from app.api.v1.tenants_common import (
@@ -76,7 +77,10 @@ def _build_cluster_cr(
     cp_host: str | None = None,
     cp_port: int = 6443,
 ) -> dict[str, Any]:
-    host = cp_host or f"{req.name}.{_tenant_ns(req.name)}.svc.cluster.local"
+    # Placeholder controlPlaneEndpoint host until step 4 of
+    # `_create_capi_resources` patches the Cluster CR with the real TCP
+    # ClusterIP. The TCP Service lives in KAMAJI_NAMESPACE.
+    host = cp_host or f"{req.name}.{KAMAJI_NAMESPACE}.svc.cluster.local"
     return {
         "apiVersion": f"{CAPI_GROUP}/{CAPI_VERSION}",
         "kind": "Cluster",
@@ -101,9 +105,13 @@ def _build_cluster_cr(
                 "services": {"cidrBlocks": [req.service_cidr]},
             },
             "controlPlaneRef": {
+                # KamajiControlPlane lives in KAMAJI_NAMESPACE (default VPC) so
+                # it can reach Postgres + shared Ingress; this is a cross-ns
+                # ObjectReference (supported by CAPI v1beta1).
                 "apiVersion": f"{KAMAJI_CP_GROUP}/{KAMAJI_CP_VERSION}",
                 "kind": "KamajiControlPlane",
                 "name": req.name,
+                "namespace": KAMAJI_NAMESPACE,
             },
             "infrastructureRef": {
                 "apiVersion": f"{KUBEVIRT_INFRA_GROUP}/{KUBEVIRT_INFRA_VERSION}",
@@ -117,11 +125,17 @@ def _build_cluster_cr(
 def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
     """Build KamajiControlPlane CR.
 
-    T4 simplification: tenant ns is attached to the folder's existing VPC
-    (if any) by patching the VPC's `spec.namespaces` — so the TCP pod and
-    workers both land on the same VPC subnet without per-pod Multus / fixed
-    IPs / advertise-address / DNAT plumbing. The previous dual-NIC dance is
-    gone; everything is plain ClusterIP intra-VPC traffic.
+    TCP CR is placed in ``KAMAJI_NAMESPACE`` (default VPC) so it can reach
+    Postgres, the shared cluster Ingress, and other platform services that
+    live in the default VPC. Worker resources (KubevirtCluster, MachineSet,
+    KubevirtMachineTemplate, KubeadmConfigTemplate, worker VMs) remain in
+    the tenant namespace bound to the tenant VPC.
+
+    The TCP → worker path uses the konnectivity tunnel (agent dials out from
+    each worker to the konnectivity-server sidecar on the TCP pod). The
+    worker → TCP path uses the cluster Ingress (TLS passthrough to the TCP
+    Service in ``KAMAJI_NAMESPACE``), so cross-VPC reachability is not
+    required. See decision memo: ``tcp-konnectivity-decision.md``.
     """
     apiserver_extra_args: list[str] = []
     if OIDC_ISSUER and OIDC_ISSUER.startswith("https://"):
@@ -131,8 +145,6 @@ def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
             "--oidc-username-claim=email",
             "--oidc-groups-claim=groups",
         ]
-
-    ns = _tenant_ns(req.name)
 
     pod_labels = {
         "cluster.x-k8s.io/cluster-name": req.name,
@@ -180,7 +192,7 @@ def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
         "kind": "KamajiControlPlane",
         "metadata": {
             "name": req.name,
-            "namespace": ns,
+            "namespace": KAMAJI_NAMESPACE,
         },
         "spec": spec,
     }
@@ -465,12 +477,18 @@ def _build_kubeadm_config_template_cr(
 
 
 def _build_ingress_nginx(req: TenantCreateRequest, host: str) -> dict[str, Any]:
+    # Ingress must live in the same namespace as the backend Service it points
+    # at — Kamaji generates the TCP Service in KAMAJI_NAMESPACE alongside the
+    # KamajiControlPlane CR, so the Ingress lives there too.
     return {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "Ingress",
         "metadata": {
             "name": f"{req.name}-api",
-            "namespace": _tenant_ns(req.name),
+            "namespace": KAMAJI_NAMESPACE,
+            "labels": {
+                "kubevirt-ui.io/tenant": req.name,
+            },
             "annotations": {
                 "nginx.ingress.kubernetes.io/ssl-passthrough": "true",
                 "nginx.ingress.kubernetes.io/backend-protocol": "HTTPS",
@@ -515,12 +533,16 @@ def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str) -> dict[
     # Traefik entryPoint name varies by deployment; default to "websecure"
     # (Traefik's standard HTTPS entry point). Override via env if needed.
     entry_point = os.getenv("TENANTS_TRAEFIK_ENTRYPOINT", "websecure")
+    # Same-ns as the Kamaji-generated TCP Service in KAMAJI_NAMESPACE.
     return {
         "apiVersion": "traefik.io/v1alpha1",
         "kind": "IngressRouteTCP",
         "metadata": {
             "name": f"{req.name}-api",
-            "namespace": _tenant_ns(req.name),
+            "namespace": KAMAJI_NAMESPACE,
+            "labels": {
+                "kubevirt-ui.io/tenant": req.name,
+            },
         },
         "spec": {
             "entryPoints": [entry_point],
@@ -537,12 +559,16 @@ def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str) -> dict[
 
 
 def _build_httpproxy_contour(req: TenantCreateRequest, host: str) -> dict[str, Any]:
+    # Same-ns as the Kamaji-generated TCP Service in KAMAJI_NAMESPACE.
     return {
         "apiVersion": "projectcontour.io/v1",
         "kind": "HTTPProxy",
         "metadata": {
             "name": f"{req.name}-api",
-            "namespace": _tenant_ns(req.name),
+            "namespace": KAMAJI_NAMESPACE,
+            "labels": {
+                "kubevirt-ui.io/tenant": req.name,
+            },
         },
         "spec": {
             "virtualhost": {
@@ -565,9 +591,14 @@ async def _create_tenant_apiserver_ingress(k8s, req: TenantCreateRequest) -> Non
     Dispatches to the right resource shape per ingress controller. All current
     targets require end-to-end TLS passthrough — the tenant apiserver cert is
     served by Kamaji directly and ingress must not terminate.
+
+    The Ingress/IngressRouteTCP/HTTPProxy resource is created in
+    ``KAMAJI_NAMESPACE`` (alongside the Kamaji-generated TCP Service) because
+    ingress backends must be same-ns as the ingress object for all four
+    supported controllers (nginx, haproxy, traefik, contour).
     """
     host = _endpoint_host(req.name)
-    ns = _tenant_ns(req.name)
+    ns = KAMAJI_NAMESPACE
     controller = _ingress_controller()
 
     if "ingress-nginx" in controller:
@@ -613,6 +644,57 @@ async def _create_tenant_apiserver_ingress(k8s, req: TenantCreateRequest) -> Non
     )
 
 
+async def _cleanup_tenant_ingress(k8s, tenant_name: str) -> None:
+    """Best-effort delete of per-tenant apiserver ingress objects.
+
+    The dispatcher in ``_create_tenant_apiserver_ingress`` writes exactly one
+    of three shapes (standard ``Ingress`` for nginx/haproxy, Traefik
+    ``IngressRouteTCP``, or Contour ``HTTPProxy``) named ``<tenant>-api`` into
+    ``KAMAJI_NAMESPACE``. We don't persist which shape was used, so this
+    helper attempts all three and swallows 404s. Used by both
+    ``delete_tenant`` (normal teardown) and the ``create_tenant`` exception
+    handler (partial-failure rollback) — without the latter, a step-6 failure
+    after the ingress is created would orphan ``<tenant>-api`` in
+    ``KAMAJI_NAMESPACE`` and a same-named retry would collide on it.
+
+    All errors other than 404 are logged as warnings, never raised — this is
+    a cleanup path.
+    """
+    ingress_name = f"{tenant_name}-api"
+
+    # Standard Ingress (nginx, haproxy) — typed API.
+    try:
+        networking_api = client.NetworkingV1Api(k8s._api_client)
+        await networking_api.delete_namespaced_ingress(
+            name=ingress_name, namespace=KAMAJI_NAMESPACE,
+        )
+        logger.info(f"Deleted Ingress {KAMAJI_NAMESPACE}/{ingress_name}")
+    except ApiException as exc:
+        if exc.status != 404:
+            logger.warning(
+                f"Failed to delete Ingress {KAMAJI_NAMESPACE}/{ingress_name}: {exc}"
+            )
+
+    # CRD-based shapes — Traefik IngressRouteTCP and Contour HTTPProxy.
+    for group, version, plural, kind in (
+        ("traefik.io", "v1alpha1", "ingressroutetcps", "IngressRouteTCP"),
+        ("projectcontour.io", "v1", "httpproxies", "HTTPProxy"),
+    ):
+        try:
+            await k8s.custom_api.delete_namespaced_custom_object(
+                group=group, version=version,
+                namespace=KAMAJI_NAMESPACE, plural=plural, name=ingress_name,
+            )
+            logger.info(f"Deleted {kind} {KAMAJI_NAMESPACE}/{ingress_name}")
+        except ApiException as exc:
+            # 404 covers both "resource absent" and "CRD not installed" — both
+            # expected, we only ever created one of the three shapes.
+            if exc.status != 404:
+                logger.warning(
+                    f"Failed to delete {kind} {KAMAJI_NAMESPACE}/{ingress_name}: {exc}"
+                )
+
+
 async def _wait_for_tcp_service_ip(
     k8s, name: str, namespace: str, timeout: int = 120,
 ) -> str:
@@ -635,17 +717,21 @@ async def _create_capi_resources(
     k8s, req: TenantCreateRequest,
     storage_info: dict[str, str] | None = None,
 ) -> None:
-    """Create CAPI + Ingress resources in tenant namespace.
+    """Create CAPI + Ingress resources.
 
-    Order: KamajiControlPlane + KubevirtCluster first → wait for TCP service
-    ClusterIP → create Cluster with ClusterIP as controlPlaneEndpoint.
+    KamajiControlPlane is created in ``KAMAJI_NAMESPACE`` (default VPC, shares
+    Postgres + Ingress). Everything else (KubevirtCluster, CAPI Cluster, worker
+    machine resources, Ingress) is created in the tenant namespace bound to
+    the tenant VPC. The CAPI ``Cluster.spec.controlPlaneRef`` carries
+    ``namespace: KAMAJI_NAMESPACE`` so it points across namespaces at the TCP
+    CR.
 
-    T4: VPC binding for the tenant ns is handled out-of-band (caller patches
-    the folder VPC's `spec.namespaces` before this is called), so TCP + workers
-    share the same VPC subnet. No more dual-NIC / fixed-IP / DNAT plumbing.
+    Order: KamajiControlPlane (kamaji-system) + KubevirtCluster (tenant ns)
+    first → wait for the Kamaji-created TCP Service in kamaji-system →
+    create Cluster (tenant ns) with the TCP ClusterIP as controlPlaneEndpoint.
 
     When tenant storage is enabled (storage_info provided):
-      - KubevirtCluster gets `infraClusterSecretRef` so CAPK can speak
+      - KubevirtCluster gets ``infraClusterSecretRef`` so CAPK can speak
         to the host cluster. The storage class is NOT set on the CR
         (CAPK v1alpha1 has no such field); it is plumbed through the
         kubevirt-csi-driver addon chart values instead.
@@ -653,14 +739,17 @@ async def _create_capi_resources(
     custom = k8s.custom_api
     ns = _tenant_ns(req.name)
 
-    # 1. Create infrastructure + control plane providers first
+    # 1. Create infrastructure + control plane providers first.
+    #    KamajiControlPlane lives in KAMAJI_NAMESPACE (default VPC, shares
+    #    Postgres + Ingress); KubevirtCluster lives in the tenant ns.
     pre_resources = [
         (KAMAJI_CP_GROUP, KAMAJI_CP_VERSION, "kamajicontrolplanes", _build_kamaji_cp_cr(req)),
         (KUBEVIRT_INFRA_GROUP, KUBEVIRT_INFRA_VERSION, "kubevirtclusters", _build_kubevirt_cluster_cr(req, storage_info)),
     ]
     for group, version, plural, body in pre_resources:
+        target_ns = body["metadata"]["namespace"]
         await custom.create_namespaced_custom_object(
-            group=group, version=version, namespace=ns, plural=plural, body=body,
+            group=group, version=version, namespace=target_ns, plural=plural, body=body,
         )
 
     # 2. Create CAPI Cluster (needed for TCP to start reconciling)
@@ -671,11 +760,13 @@ async def _create_capi_resources(
         plural="clusters", body=cluster_cr,
     )
 
-    # 3. Wait for TCP service to get ClusterIP (used by CAPI/external access).
-    #    Workers reach apiserver via this ClusterIP — they're in the same VPC
-    #    as the TCP pod (tenant ns is bound to the folder VPC) so ClusterIP
-    #    just works.
-    tcp_ip = await _wait_for_tcp_service_ip(k8s, req.name, ns)
+    # 3. Wait for TCP service to get ClusterIP. Kamaji creates the Service in
+    #    the same namespace as the KamajiControlPlane CR (KAMAJI_NAMESPACE).
+    #    The ClusterIP is reachable from the management cluster (default VPC)
+    #    for CAPI/admin paths; workers reach the apiserver via the cluster
+    #    Ingress (TLS passthrough), and TCP reaches workers via the konnectivity
+    #    tunnel.
+    tcp_ip = await _wait_for_tcp_service_ip(k8s, req.name, KAMAJI_NAMESPACE)
 
     # 4. Patch Cluster controlPlaneEndpoint with the worker-reachable IP
     patch = {
