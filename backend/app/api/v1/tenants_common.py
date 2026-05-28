@@ -69,6 +69,7 @@ async def _ensure_cluster_config(k8s) -> dict[str, Any]:
 
     ip_override = os.getenv("TENANTS_INGRESS_IP")
     class_override = os.getenv("TENANTS_INGRESS_CLASS")
+    domain_override = (os.getenv("TENANTS_INGRESS_DOMAIN") or "").strip()
     cidr_override = os.getenv("TENANTS_MGMT_CIDR")
     vpcdns_forward_override = os.getenv("TENANTS_VPCDNS_FORWARD_DNS")
     vpcdns_vip_override = os.getenv("TENANTS_VPCDNS_VIP")
@@ -180,8 +181,11 @@ async def _ensure_cluster_config(k8s) -> dict[str, Any]:
         )
         vpcdns_vip = _VPCDNS_VIP_FALLBACK
 
+    ingress_domain = domain_override or f"{ingress_ip}.nip.io"
+
     _cluster_config = {
         "ingress_ip": ingress_ip,
+        "ingress_domain": ingress_domain,
         "ingress_class": ingress_class,
         "ingress_controller": ingress_controller,
         "mgmt_cidr": mgmt_cidr,
@@ -190,8 +194,8 @@ async def _ensure_cluster_config(k8s) -> dict[str, Any]:
         "fetched_at": now,
     }
     logger.info(
-        f"Cluster config: ingress_ip={ingress_ip} class={ingress_class} "
-        f"controller={ingress_controller} mgmt_cidr={mgmt_cidr} "
+        f"Cluster config: ingress_ip={ingress_ip} ingress_domain={ingress_domain} "
+        f"class={ingress_class} controller={ingress_controller} mgmt_cidr={mgmt_cidr} "
         f"vpcdns_forward_dns={vpcdns_forward_dns} vpcdns_vip={vpcdns_vip}"
     )
     return _cluster_config
@@ -291,7 +295,14 @@ def _tenant_ns(name: str) -> str:
 
 
 def _endpoint_host(name: str) -> str:
-    return f"{name}.{_require_cluster_config()['ingress_ip']}.nip.io"
+    """External hostname for the tenant kube-apiserver.
+
+    Defaults to ``<name>.<ingress_ip>.nip.io`` (zero-config, public wildcard
+    DNS). Override via ``TENANTS_INGRESS_DOMAIN`` env var to use your own
+    domain — e.g. set to ``clusters.example.com`` and tenants become
+    ``<name>.clusters.example.com``.
+    """
+    return f"{name}.{_require_cluster_config()['ingress_domain']}"
 
 
 def _endpoint_port() -> int:
