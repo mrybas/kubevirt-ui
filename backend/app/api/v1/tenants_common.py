@@ -306,17 +306,27 @@ def _endpoint_host(name: str) -> str:
 
 
 def _endpoint_port() -> int:
-    """External Ingress HTTPS port for the tenant kube-apiserver.
+    """External Ingress passthrough port for the tenant kube-apiserver.
 
-    Defaults to 443 (the entry point where nginx/traefik/contour serve TLS
-    passthrough for tenant apiservers). Override via ``TENANTS_INGRESS_PORT``
-    when the cluster Ingress is exposed on a non-standard port.
+    Defaults to 6443 — matches Kamaji's unified NetworkProfile.Port (which
+    drives the apiserver's `--secure-port` AND the port baked into
+    cluster-info/kubeadm-config). Admin's cluster Ingress controller must
+    expose a TCP-passthrough entry point on this port (e.g. a Traefik
+    entrypoint named `kubeapiserver`, an nginx stream block, a Contour
+    listener) so workers can reach `<advertiseAddress>:<port>`. Override
+    via ``TENANTS_INGRESS_PORT`` only if you've changed Kamaji's default.
+
+    Why not 443: setting this to 443 propagates to NetworkProfile.Port,
+    which propagates to the apiserver container's --secure-port. Modern
+    apiserver images (1.30+) run as uid 65532 and cannot bind privileged
+    ports (<1024) without CAP_NET_BIND_SERVICE — the apiserver pod
+    CrashLoopBackOffs.
     """
-    raw = os.getenv("TENANTS_INGRESS_PORT", "443").strip() or "443"
+    raw = os.getenv("TENANTS_INGRESS_PORT", "6443").strip() or "6443"
     try:
         return int(raw)
     except ValueError:
-        return 443
+        return 6443
 
 
 def _ingress_class() -> str:
