@@ -142,6 +142,24 @@ rules:
       - services/proxy
     verbs: ["get", "list", "watch", "create"]
 
+  # Endpoints — read-only; required by tenants_vpc flow which inspects DNS service
+  # readiness before creating ClusterRole system:vpc-dns.  K8s anti-escalation
+  # rule: the SA must hold every permission it grants, so it needs read access to
+  # the same resources the ClusterRole grants.
+  # (backend/app/api/tenants_vpc.py)
+  - apiGroups: [""]
+    resources:
+      - endpoints
+    verbs: ["get", "list", "watch"]
+
+  # EndpointSlices — same rationale as Endpoints above; system:vpc-dns grants
+  # read access to endpointslices, so the SA must hold it too.
+  # (backend/app/api/tenants_vpc.py)
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs: ["get", "list", "watch"]
+
   # ResourceQuotas / LimitRanges
   - apiGroups: [""]
     resources:
@@ -265,6 +283,20 @@ rules:
       - kubevirt-ui-editor
       - kubevirt-ui-viewer
       - kubevirt-ui-ns-viewer
+    verbs: ["bind"]
+
+  # "bind" for VpcDns ClusterRoles — extends the whitelist above with the two
+  # ClusterRoles created/managed by the tenants_vpc flow.  Without "bind" on
+  # system:vpc-dns / vpc-dns the SA cannot create a ClusterRoleBinding that
+  # references them, even though it holds "create" on clusterrolebindings.
+  # Kept as a separate rule so the VpcDns permission surface is clearly isolated.
+  # (backend/app/api/tenants_vpc.py)
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - clusterroles
+    resourceNames:
+      - "system:vpc-dns"
+      - "vpc-dns"
     verbs: ["bind"]
 
   # Subject access review (permission checks)

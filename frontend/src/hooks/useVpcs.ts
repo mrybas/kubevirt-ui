@@ -15,10 +15,10 @@ import {
 } from '../api/vpcs';
 import type { CreateVpcRequest, AddVpcPeeringRequest, UpdateVpcRoutesRequest } from '../types/vpc';
 
-export function useVpcs() {
+export function useVpcs(params?: { folder?: string; environment?: string }) {
   return useQuery({
-    queryKey: ['vpcs'],
-    queryFn: listVpcs,
+    queryKey: ['vpcs', params?.folder ?? null, params?.environment ?? null],
+    queryFn: () => listVpcs(params),
     refetchInterval: 30000,
   });
 }

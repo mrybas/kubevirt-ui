@@ -58,6 +58,7 @@ services:
       - PYTHONUNBUFFERED=1
       # Auth configuration
       - AUTH_TYPE=oidc
+      - ENABLE_TENANTS=false
       - OIDC_ISSUER=http://192.168.196.1:5556 # Public URL for token validation
       - OIDC_INTERNAL_URL=http://dex:5556 # Internal URL for backend->DEX communication
       - OIDC_CLIENT_ID=kubevirt-ui
@@ -68,8 +69,7 @@ services:
       - LLDAP_ADMIN_USER=admin
       - LLDAP_ADMIN_PASSWORD=admin_password
       - LLDAP_LDAP_BASE_DN=dc=kubevirt,dc=local
-      # Feature flags
-      - ENABLE_TENANTS=false
+      # Feature flags (ENABLE_TENANTS is also set above, kept here for visibility)
     command: uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]

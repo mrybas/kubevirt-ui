@@ -73,6 +73,24 @@ class VpcCreateRequest(BaseModel):
         description="CIDR for default subnet (auto-assigned from 10.{200+N}.0.0/24 if empty)",
     )
     tenant: Optional[str] = Field(None, description="Tenant name to bind this VPC to")
+    # T7 — folder/env scoping. Stamped onto VPC.metadata.labels + default
+    # subnet labels so the tenant-create wizard can list VPCs eligible for
+    # a given (folder, env) pair via a label selector.
+    folder: Optional[str] = Field(
+        None,
+        description=(
+            "Folder this VPC is scoped to. Stamped as "
+            "`kubevirt-ui.io/folder` label. Required when `environment` is set."
+        ),
+    )
+    environment: Optional[str] = Field(
+        None,
+        description=(
+            "Environment within the folder this VPC is scoped to. Stamped as "
+            "`kubevirt-ui.io/environment` label. When omitted, the VPC is "
+            "folder-wide (eligible for all envs under `folder`)."
+        ),
+    )
     namespaces: list[str] = Field(
         default_factory=list,
         description=(
@@ -90,6 +108,14 @@ class VpcCreateRequest(BaseModel):
         default_factory=list,
         description="Initial static routes",
     )
+
+    @model_validator(mode="after")
+    def _env_requires_folder(self) -> "VpcCreateRequest":
+        if self.environment and not self.folder:
+            raise ValueError(
+                "`environment` requires `folder` (an env is always scoped under a folder)"
+            )
+        return self
 
     @field_validator("namespaces")
     @classmethod
@@ -127,6 +153,10 @@ class VpcResponse(BaseModel):
     """Response model for a VPC."""
     name: str
     tenant: Optional[str] = None
+    # T7 — folder/env scoping (sourced from labels). None means the VPC is
+    # not scoped to a specific folder/env (cluster-wide).
+    folder: Optional[str] = None
+    environment: Optional[str] = None
     enable_nat_gateway: bool = False
     default_subnet: Optional[str] = None
     subnets: list[VpcSubnetInfo] = []

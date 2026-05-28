@@ -52,7 +52,7 @@ describe('TenantCreateRequest', () => {
     expect(req.worker_type).toBe('bare_metal');
   });
 
-  it('should accept network_isolation_mode enum (T9 — boolean removed)', () => {
+  it('should accept vpc_name for explicit VPC selection (T8)', () => {
     const req: TenantCreateRequest = {
       name: 'vpc-tenant',
       display_name: 'VPC Tenant',
@@ -67,22 +67,22 @@ describe('TenantCreateRequest', () => {
       service_cidr: '10.96.0.0/12',
       admin_group: 'admins',
       viewer_group: 'viewers',
-      network_isolation_mode: 'isolated_shared_egress',
+      vpc_name: 'team-a-shared',
       folder: 'team-a',
       environment: 'prod',
       addons: [{ addon_id: 'calico', parameters: {} }],
     };
 
-    expect(req.network_isolation_mode).toBe('isolated_shared_egress');
+    expect(req.vpc_name).toBe('team-a-shared');
     expect(req.folder).toBe('team-a');
     expect(req.environment).toBe('prod');
     expect(req.addons).toHaveLength(1);
   });
 
-  it('should accept dedicated egress mode with infra_subnet (T9)', () => {
+  it('should allow vpc_name to be omitted for default cluster network (T8)', () => {
     const req: TenantCreateRequest = {
-      name: 'vpc-gw-tenant',
-      display_name: 'VPC GW Tenant',
+      name: 'default-net-tenant',
+      display_name: 'Default Net Tenant',
       kubernetes_version: 'v1.32.1',
       control_plane_replicas: 1,
       worker_type: 'vm',
@@ -94,13 +94,10 @@ describe('TenantCreateRequest', () => {
       service_cidr: '10.96.0.0/12',
       admin_group: '',
       viewer_group: '',
-      network_isolation_mode: 'isolated_dedicated_egress',
-      infra_subnet: 'infra-vlan111',
       addons: [],
     };
 
-    expect(req.network_isolation_mode).toBe('isolated_dedicated_egress');
-    expect(req.infra_subnet).toBe('infra-vlan111');
+    expect(req.vpc_name).toBeUndefined();
   });
 
   it('should not have worker_image_url field', () => {

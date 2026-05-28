@@ -550,12 +550,30 @@ async def reconcile_env_rbac(
 
     Used when one env is added — avoids full-folder churn.
     """
-    rbac_api = await _get_rbac_api(k8s_client)
     ns_name = _ns_name(folder, env)
+    await reconcile_namespace_rbac(
+        k8s_client, ns_name, folder, env, folder_meta,
+    )
+
+
+async def reconcile_namespace_rbac(
+    k8s_client: Any,
+    namespace: str,
+    folder: str,
+    env: str,
+    folder_meta: dict,
+) -> None:
+    """Reconcile Phase 2 RoleBindings on an arbitrary namespace.
+
+    Same logic as `reconcile_env_rbac`, but lets the caller pass any
+    namespace name (e.g. `tenant-<name>` for T2 — tenant namespaces are
+    not `<folder>-<env>` shaped so `_ns_name` doesn't apply).
+    """
+    rbac_api = await _get_rbac_api(k8s_client)
     for role, rb_name, cluster_role in _RBAC_ROLE_NAMES:
         groups = _collect_subjects(folder_meta, env, role)
         await _apply_phase2_rb(
-            rbac_api, rb_name, ns_name, folder, env, cluster_role, groups,
+            rbac_api, rb_name, namespace, folder, env, cluster_role, groups,
         )
 
 

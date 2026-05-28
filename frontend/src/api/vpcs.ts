@@ -12,8 +12,12 @@ import type {
   UpdateVpcRoutesRequest,
 } from '../types/vpc';
 
-export async function listVpcs(): Promise<VpcListResponse> {
-  return apiRequest<VpcListResponse>('/vpcs');
+export async function listVpcs(params?: { folder?: string; environment?: string }): Promise<VpcListResponse> {
+  const qs = new URLSearchParams();
+  if (params?.folder) qs.set('folder', params.folder);
+  if (params?.environment) qs.set('environment', params.environment);
+  const query = qs.toString();
+  return apiRequest<VpcListResponse>(`/vpcs${query ? `?${query}` : ''}`);
 }
 
 export async function getVpc(name: string): Promise<Vpc> {

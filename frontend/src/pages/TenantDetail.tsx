@@ -5,7 +5,7 @@
  */
 
 import { useState } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, Link } from 'react-router-dom';
 import {
   ArrowLeft,
   CheckCircle,
@@ -24,6 +24,10 @@ import {
   Info,
   Image,
   AlertTriangle,
+  Play,
+  Square,
+  RotateCw,
+  Terminal,
 } from 'lucide-react';
 import {
   useTenant,
@@ -36,11 +40,14 @@ import {
   useTenantImages,
   useDeleteTenantImage,
 } from '../hooks/useTenants';
+import { useVMs, useStartVM, useStopVM, useRestartVM, useDeleteVM } from '../hooks/useVMs';
 import { ConfirmDeleteModal } from '../components/common/ConfirmDeleteModal';
+import { StatusBadge } from '../components/common/StatusBadge';
 import type { TenantAddonStatus, TenantCondition } from '../types/tenant';
 import type { GoldenImage } from '../types/template';
+import type { VM } from '../types/vm';
 
-function StatusBadge({ status }: { status: string }) {
+function TenantStatusBadge({ status }: { status: string }) {
   const config: Record<string, { icon: typeof CheckCircle; color: string }> = {
     Ready: { icon: CheckCircle, color: 'text-emerald-400 bg-emerald-500/10' },
     Provisioning: { icon: Clock, color: 'text-amber-400 bg-amber-500/10' },
@@ -75,7 +82,7 @@ function ConditionRow({ condition }: { condition: TenantCondition }) {
   );
 }
 
-type ActiveTab = 'overview' | 'images';
+type ActiveTab = 'overview' | 'workers' | 'images';
 
 export default function TenantDetail() {
   const { name } = useParams<{ name: string }>();
@@ -185,7 +192,7 @@ export default function TenantDetail() {
               {tenant.name} · {tenant.namespace} · {tenant.kubernetes_version}
             </p>
           </div>
-          <StatusBadge status={tenant.status} />
+          <TenantStatusBadge status={tenant.status} />
         </div>
         <div className="flex items-center gap-2">
           <button onClick={() => refetch()} className="btn-secondary" title="Refresh">
@@ -215,6 +222,20 @@ export default function TenantDetail() {
           Overview
         </button>
         <button
+          onClick={() => setActiveTab('workers')}
+          className={`flex items-center gap-2 pb-3 px-1 text-sm font-medium border-b-2 transition-colors ${
+            activeTab === 'workers'
+              ? 'border-primary-400 text-primary-400'
+              : 'border-transparent text-surface-400 hover:text-surface-200'
+          }`}
+        >
+          <Cpu className="h-4 w-4" />
+          Workers
+          <span className={`px-1.5 py-0.5 rounded-full text-xs ${
+            activeTab === 'workers' ? 'bg-primary-500/20 text-primary-400' : 'bg-surface-700 text-surface-400'
+          }`}>{tenant.worker_count}</span>
+        </button>
+        <button
           onClick={() => { setActiveTab('images'); refetchImages(); }}
           className={`flex items-center gap-2 pb-3 px-1 text-sm font-medium border-b-2 transition-colors ${
             activeTab === 'images'
@@ -231,6 +252,10 @@ export default function TenantDetail() {
           )}
         </button>
       </div>
+
+      {activeTab === 'workers' && (
+        <TenantWorkersTab namespace={tenant.namespace} />
+      )}
 
       {activeTab === 'images' && (
         <TenantImagesTab
@@ -530,6 +555,199 @@ export default function TenantDetail() {
         isDeleting={deleteImageMutation.isPending}
       />
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Workers Tab
+// ---------------------------------------------------------------------------
+
+function TenantWorkersTab({ namespace }: { namespace: string }) {
+  const navigate = useNavigate();
+  const [deleteTarget, setDeleteTarget] = useState<VM | null>(null);
+  const [pendingActions, setPendingActions] = useState<Set<string>>(new Set());
+
+  const { data: vmsData, isLoading, refetch } = useVMs(namespace);
+  const startVM = useStartVM();
+  const stopVM = useStopVM();
+  const restartVM = useRestartVM();
+  const deleteVM = useDeleteVM();
+
+  const vms = vmsData?.items ?? [];
+
+  const vmKey = (vm: VM) => `${vm.namespace}/${vm.name}`;
+  const addPending = (k: string) => setPendingActions(prev => new Set(prev).add(k));
+  const removePending = (k: string) =>
+    setPendingActions(prev => { const s = new Set(prev); s.delete(k); return s; });
+
+  const handleStart = (vm: VM) => {
+    const k = vmKey(vm);
+    addPending(k);
+    startVM.mutate({ namespace: vm.namespace, name: vm.name }, { onSettled: () => removePending(k) });
+  };
+
+  const handleStop = (vm: VM) => {
+    const k = vmKey(vm);
+    addPending(k);
+    stopVM.mutate({ namespace: vm.namespace, name: vm.name }, { onSettled: () => removePending(k) });
+  };
+
+  const handleRestart = (vm: VM) => {
+    const k = vmKey(vm);
+    addPending(k);
+    restartVM.mutate({ namespace: vm.namespace, name: vm.name }, { onSettled: () => removePending(k) });
+  };
+
+  const handleDeleteConfirm = () => {
+    if (!deleteTarget) return;
+    const k = vmKey(deleteTarget);
+    addPending(k);
+    deleteVM.mutate(
+      { namespace: deleteTarget.namespace, name: deleteTarget.name },
+      { onSettled: () => removePending(k) },
+    );
+    setDeleteTarget(null);
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center h-48">
+        <Loader2 className="h-8 w-8 text-primary-400 animate-spin" />
+      </div>
+    );
+  }
+
+  if (vms.length === 0) {
+    return (
+      <div className="card">
+        <div className="card-body text-center py-16">
+          <Server className="h-12 w-12 mx-auto text-surface-600 mb-4" />
+          <h3 className="text-base font-semibold text-surface-100 mb-1">No worker VMs yet</h3>
+          <p className="text-sm text-surface-400">
+            The tenant control plane may still be bootstrapping.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="flex justify-end mb-2">
+        <button onClick={() => refetch()} className="btn-secondary" title="Refresh workers">
+          <RefreshCw className="h-4 w-4" />
+        </button>
+      </div>
+      <div className="card overflow-hidden">
+        <table className="w-full">
+          <thead className="bg-surface-800/50">
+            <tr>
+              <th className="table-header">Name</th>
+              <th className="table-header">Status</th>
+              <th className="table-header">CPU / Memory</th>
+              <th className="table-header">IP Address</th>
+              <th className="table-header">Node</th>
+              <th className="table-header text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-surface-800">
+            {vms.map((vm) => {
+              const k = vmKey(vm);
+              const isPending = pendingActions.has(k);
+              return (
+                <tr key={k} className="hover:bg-surface-800/30">
+                  <td className="table-cell">
+                    <Link
+                      to={`/vms/${vm.namespace}/${vm.name}`}
+                      className="font-medium text-surface-100 hover:text-primary-400"
+                    >
+                      {vm.display_name || vm.name}
+                    </Link>
+                    <p className="text-xs text-surface-500 font-mono">{vm.name}</p>
+                  </td>
+                  <td className="table-cell">
+                    {isPending ? (
+                      <div className="flex items-center gap-2 text-primary-400">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        <span className="text-xs">Processing…</span>
+                      </div>
+                    ) : (
+                      <StatusBadge status={vm.status} />
+                    )}
+                  </td>
+                  <td className="table-cell">
+                    <span className="flex items-center gap-2 text-sm">
+                      <Cpu className="h-3 w-3 text-surface-500" />
+                      {vm.cpu_cores ?? '-'}
+                      <span className="text-surface-500 text-xs">{vm.memory ?? ''}</span>
+                    </span>
+                  </td>
+                  <td className="table-cell">
+                    <span className="text-sm text-surface-300 font-mono">{vm.ip_address ?? '-'}</span>
+                  </td>
+                  <td className="table-cell">
+                    <span className="text-sm text-surface-400">{vm.node ?? '-'}</span>
+                  </td>
+                  <td className="table-cell text-right">
+                    {!isPending && (
+                      <div className="flex items-center justify-end gap-1">
+                        {vm.status === 'Stopped' ? (
+                          <button
+                            onClick={() => handleStart(vm)}
+                            className="p-1.5 rounded-lg text-surface-400 hover:text-emerald-400 hover:bg-emerald-500/10 transition-colors"
+                            title="Start"
+                          >
+                            <Play className="h-4 w-4" />
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => handleStop(vm)}
+                            className="p-1.5 rounded-lg text-surface-400 hover:text-amber-400 hover:bg-amber-500/10 transition-colors"
+                            title="Stop"
+                          >
+                            <Square className="h-4 w-4" />
+                          </button>
+                        )}
+                        <button
+                          onClick={() => handleRestart(vm)}
+                          className="p-1.5 rounded-lg text-surface-400 hover:text-primary-400 hover:bg-primary-500/10 transition-colors"
+                          title="Restart"
+                        >
+                          <RotateCw className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => navigate(`/vms/${vm.namespace}/${vm.name}`)}
+                          className="p-1.5 rounded-lg text-surface-400 hover:text-primary-400 hover:bg-primary-500/10 transition-colors"
+                          title="Console / Details"
+                        >
+                          <Terminal className="h-4 w-4" />
+                        </button>
+                        <button
+                          onClick={() => setDeleteTarget(vm)}
+                          className="p-1.5 rounded-lg text-surface-400 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                          title="Delete"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <ConfirmDeleteModal
+        isOpen={!!deleteTarget}
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={handleDeleteConfirm}
+        resourceName={deleteTarget?.name ?? ''}
+        resourceType="VM"
+        isDeleting={deleteVM.isPending}
+      />
+    </>
   );
 }
 

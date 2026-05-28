@@ -27,7 +27,7 @@ import {
 } from 'lucide-react';
 import { useTenants, useCreateTenant, useDeleteTenant, useAddonCatalog, useDiscovery } from '../hooks/useTenants';
 import { useStorageClasses } from '../hooks/useStorage';
-import { useSubnets } from '../hooks/useNetwork';
+import { useVpcs } from '../hooks/useVpcs';
 import { useFoldersFlat } from '../hooks/useFolders';
 import { useAuthStore } from '../store/auth';
 import type { Tenant, TenantCreateRequest, TenantAddon, AddonComponent } from '../types/tenant';
@@ -97,9 +97,8 @@ interface WizardState {
   // T8 — folder / environment
   folder: string;
   environment: string;
-  // T9 — network isolation mode (backend creates vpc-<name> automatically; no vpc/gateway choice)
-  network_isolation_mode: 'shared' | 'isolated_shared_egress' | 'isolated_dedicated_egress';
-  infra_subnet: string; // only used when mode === isolated_dedicated_egress
+  // Network: VPC selected by user (empty = default cluster network)
+  vpc_name: string;
   // T5 — persistent storage (kubevirt-csi)
   enable_storage: boolean;
   storage_class: string;       // empty = cluster default
@@ -128,8 +127,7 @@ const defaultWizard: WizardState = {
   viewer_group: '',
   folder: '',
   environment: '',
-  network_isolation_mode: 'shared',
-  infra_subnet: '',
+  vpc_name: '',
   // T5 — storage (off by default until kubevirt-csi is bootstrapped)
   // Defaults match backend model (storage_quota_gi: 100, storage_pvc_count: 20)
   enable_storage: false,
@@ -160,18 +158,20 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
   const [secretInput, setSecretInput] = useState('');
   const [imageAutoFilled, setImageAutoFilled] = useState(true); // default worker_image_url is auto-derived
   const [showNetworkBinding, setShowNetworkBinding] = useState(false);
+  const [showCidrSection, setShowCidrSection] = useState(false);
   const { data: catalog } = useAddonCatalog();
   const { data: discovery } = useDiscovery();
-  const { data: subnets } = useSubnets();
+  // VPCs filtered by current folder/env selection (re-fetches when folder/env change)
+  const { data: vpcsData } = useVpcs(
+    form.folder && form.environment
+      ? { folder: form.folder, environment: form.environment }
+      : undefined
+  );
   const { data: foldersData } = useFoldersFlat();
   const { data: storageClassesData } = useStorageClasses();
   const user = useAuthStore(s => s.user);
   const createTenant = useCreateTenant();
 
-  // Infrastructure subnets (for dedicated-egress mode)
-  const infraSubnets = subnets?.filter(s => s.purpose === 'infrastructure') ?? [];
-  // Check if infrastructure subnet exists (needed to enable dedicated egress)
-  const hasInfraSubnet = infraSubnets.length > 0;
   // Storage classes for T5 picker
   const storageClasses = storageClassesData?.items ?? [];
 
@@ -195,10 +195,15 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [form.kubernetes_version]);
 
-  // Reset environment when folder changes
+  // Reset environment + vpc when folder changes
   useEffect(() => {
-    setForm(prev => ({ ...prev, environment: '' }));
-  }, [form.folder]);
+    setForm(prev => ({ ...prev, environment: '', vpc_name: '' }));
+  }, [form.folder]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Reset vpc when environment changes
+  useEffect(() => {
+    setForm(prev => ({ ...prev, vpc_name: '' }));
+  }, [form.environment]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Initialize addon defaults from catalog once it loads
   useEffect(() => {
@@ -265,11 +270,8 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
       // T8: folder / environment
       ...(form.folder ? { folder: form.folder } : {}),
       ...(form.environment ? { environment: form.environment } : {}),
-      // T9: isolation mode; vpc-<name> created automatically; no egress_gateway choice
-      network_isolation_mode: form.network_isolation_mode,
-      ...(form.network_isolation_mode === 'isolated_dedicated_egress'
-        ? { infra_subnet: form.infra_subnet || null }
-        : {}),
+      // Network: explicit VPC choice (empty = default cluster network)
+      ...(form.vpc_name ? { vpc_name: form.vpc_name } : {}),
       ...(form.worker_image_url ? {
         worker_image_url: form.worker_image_url,
         worker_image_source_type: 'registry' as const,
@@ -429,6 +431,76 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                     <p className="text-xs text-amber-400 mt-1">This folder has no environments. Add one in Folders first.</p>
                   )}
                 </div>
+              </div>
+
+              {/* RBAC — DEX group mapping */}
+              <div className="pt-2 border-t border-surface-700/50 space-y-4">
+                <p className="text-xs font-semibold text-surface-400 uppercase tracking-wider">OIDC / RBAC Access</p>
+                <p className="text-xs text-surface-500">
+                  Map DEX groups to Kubernetes RBAC roles inside the tenant cluster.
+                  Leave empty to skip RBAC setup.
+                </p>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm text-surface-300 mb-1">Admin Group (cluster-admin)</label>
+                    <input
+                      type="text"
+                      value={form.admin_group}
+                      placeholder="e.g. tenant-admins"
+                      onChange={e => setForm({ ...form, admin_group: e.target.value })}
+                      className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 placeholder-surface-600"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-surface-300 mb-1">Viewer Group (view)</label>
+                    <input
+                      type="text"
+                      value={form.viewer_group}
+                      placeholder="e.g. tenant-viewers"
+                      onChange={e => setForm({ ...form, viewer_group: e.target.value })}
+                      className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 placeholder-surface-600"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {/* Advanced CIDR — collapsible */}
+              <div className="border border-surface-700 rounded-lg overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setShowCidrSection(v => !v)}
+                  className="w-full flex items-center justify-between px-4 py-3 bg-surface-800 hover:bg-surface-700/50 text-sm text-surface-300 transition-colors"
+                >
+                  <span className="font-medium">Advanced: Pod &amp; Service CIDR</span>
+                  <ChevronDown className={`h-4 w-4 transition-transform ${showCidrSection ? 'rotate-180' : ''}`} />
+                </button>
+                {showCidrSection && (
+                  <div className="p-4 bg-surface-800/50">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-sm text-surface-300 mb-1">Pod CIDR</label>
+                        <input
+                          type="text"
+                          value={form.pod_cidr}
+                          onChange={e => setForm({ ...form, pod_cidr: e.target.value })}
+                          className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm text-surface-300 mb-1">Service CIDR</label>
+                        <input
+                          type="text"
+                          value={form.service_cidr}
+                          onChange={e => setForm({ ...form, service_cidr: e.target.value })}
+                          className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500"
+                        />
+                      </div>
+                    </div>
+                    <p className="text-xs text-surface-500 mt-2">
+                      Default values work for most clusters. Only change if you have overlapping CIDRs.
+                    </p>
+                  </div>
+                )}
               </div>
             </>
           )}
@@ -965,137 +1037,102 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
 
           {step === 3 && (
             <>
-              <div className="grid grid-cols-2 gap-4">
+              <div className="space-y-4">
                 <div>
-                  <label className="block text-sm text-surface-300 mb-1">Pod CIDR</label>
-                  <input
-                    type="text"
-                    value={form.pod_cidr}
-                    onChange={e => setForm({ ...form, pod_cidr: e.target.value })}
-                    className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500"
-                  />
+                  <h3 className="text-sm font-semibold text-surface-200 mb-1">Select VPC for tenant workload</h3>
+                  <p className="text-xs text-surface-500 mb-4">
+                    The tenant namespace will be attached to the selected VPC's overlay.
+                    Choose Default to run on the cluster default network.
+                  </p>
                 </div>
-                <div>
-                  <label className="block text-sm text-surface-300 mb-1">Service CIDR</label>
-                  <input
-                    type="text"
-                    value={form.service_cidr}
-                    onChange={e => setForm({ ...form, service_cidr: e.target.value })}
-                    className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500"
-                  />
-                </div>
-              </div>
 
-              {/* T9: Network Isolation — 3-mode radio */}
-              <div className="mt-4">
-                <h3 className="text-sm font-semibold text-surface-200 mb-2">Network Isolation</h3>
-                <div className="space-y-2">
-                  {([
-                    {
-                      mode: 'shared' as const,
-                      label: 'Shared',
-                      description: 'Tenant lives in the cluster\'s default network. Workers get internet via the cluster gateway. Simplest, no isolation.',
-                      disabled: false,
-                    },
-                    {
-                      mode: 'isolated_shared_egress' as const,
-                      label: 'Isolated VPC, shared egress',
-                      description: 'Tenant has its own VPC and isolated CIDR. Internet egress routes through the cluster\'s default network (no extra setup).',
-                      disabled: false,
-                    },
-                    {
-                      mode: 'isolated_dedicated_egress' as const,
-                      label: 'Isolated VPC, dedicated egress',
-                      description: 'Tenant has its own VPC and uses a Kube-OVN EgressGateway bound to an infrastructure VLAN subnet. Requires advanced network setup.',
-                      disabled: !hasInfraSubnet,
-                    },
-                  ] as const).map(({ mode, label, description, disabled }) => (
-                    <label
-                      key={mode}
-                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
-                        form.network_isolation_mode === mode
-                          ? 'border-primary-500 bg-primary-500/10'
-                          : disabled
-                            ? 'border-surface-700/50 bg-surface-800/50 opacity-50 cursor-not-allowed'
-                            : 'border-surface-700 bg-surface-800 hover:border-surface-600'
-                      }`}
-                    >
+                {!form.folder || !form.environment ? (
+                  <div className="flex items-start gap-3 p-4 bg-surface-800/60 border border-surface-700/50 rounded-lg">
+                    <Info className="h-4 w-4 text-surface-400 shrink-0 mt-0.5" />
+                    <p className="text-xs text-surface-400">
+                      Select folder and environment first (in the Basics step) to see available VPCs.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {/* Default option */}
+                    <label className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                      form.vpc_name === ''
+                        ? 'border-primary-500 bg-primary-500/10'
+                        : 'border-surface-700 bg-surface-800 hover:border-surface-600'
+                    }`}>
                       <input
                         type="radio"
-                        name="network_isolation_mode"
-                        value={mode}
-                        checked={form.network_isolation_mode === mode}
-                        disabled={disabled}
-                        onChange={() => !disabled && setForm({ ...form, network_isolation_mode: mode })}
+                        name="vpc_name"
+                        value=""
+                        checked={form.vpc_name === ''}
+                        onChange={() => setForm({ ...form, vpc_name: '' })}
                         className="mt-0.5 h-4 w-4 border-surface-600 bg-surface-700 text-primary-500 focus:ring-primary-500"
                       />
                       <div>
-                        <p className={`text-sm font-medium ${form.network_isolation_mode === mode ? 'text-primary-300' : 'text-surface-200'}`}>
-                          {label}
-                          {mode === 'isolated_dedicated_egress' && !hasInfraSubnet && (
-                            <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-500">
-                              Requires infrastructure subnet
-                            </span>
-                          )}
+                        <p className={`text-sm font-medium ${form.vpc_name === '' ? 'text-primary-300' : 'text-surface-200'}`}>
+                          Default cluster network
+                          <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-400">(no VPC isolation)</span>
                         </p>
-                        <p className="text-xs text-surface-500 mt-0.5">{description}</p>
+                        <p className="text-xs text-surface-500 mt-0.5">
+                          Tenant namespace runs on the cluster overlay. Internet egress via the cluster gateway.
+                        </p>
                       </div>
                     </label>
-                  ))}
-                </div>
 
-                {/* Infrastructure subnet — only shown for dedicated egress */}
-                {form.network_isolation_mode === 'isolated_dedicated_egress' && (
-                  <div className="mt-3">
-                    <label className="block text-sm text-surface-300 mb-1">Infrastructure Subnet</label>
-                    <select
-                      value={form.infra_subnet}
-                      onChange={e => setForm({ ...form, infra_subnet: e.target.value })}
-                      className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 text-sm"
-                    >
-                      <option value="">Select infra subnet…</option>
-                      {infraSubnets.map(s => (
-                        <option key={s.name} value={s.name}>
-                          {s.name} ({s.cidr_block})
-                        </option>
-                      ))}
-                    </select>
+                    {/* VPCs from API filtered by folder/env */}
+                    {(vpcsData?.items ?? []).length === 0 ? (
+                      <div className="flex items-start gap-3 p-3 bg-surface-800/50 border border-surface-700/50 rounded-lg">
+                        <Info className="h-4 w-4 text-surface-500 shrink-0 mt-0.5" />
+                        <p className="text-xs text-surface-500">
+                          No VPCs scoped to <span className="font-mono text-surface-400">{form.folder}/{form.environment}</span>.
+                          Ask an admin to label a VPC with this folder/environment.
+                        </p>
+                      </div>
+                    ) : (
+                      (vpcsData?.items ?? []).map(vpc => (
+                        <label
+                          key={vpc.name}
+                          className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                            form.vpc_name === vpc.name
+                              ? 'border-primary-500 bg-primary-500/10'
+                              : 'border-surface-700 bg-surface-800 hover:border-surface-600'
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name="vpc_name"
+                            value={vpc.name}
+                            checked={form.vpc_name === vpc.name}
+                            onChange={() => setForm({ ...form, vpc_name: vpc.name })}
+                            className="mt-0.5 h-4 w-4 border-surface-600 bg-surface-700 text-primary-500 focus:ring-primary-500"
+                          />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className={`text-sm font-medium font-mono ${form.vpc_name === vpc.name ? 'text-primary-300' : 'text-surface-200'}`}>
+                                {vpc.name}
+                              </p>
+                              {vpc.folder && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary-500/10 text-primary-400">
+                                  {vpc.folder}{vpc.environment ? `/${vpc.environment}` : ''}
+                                </span>
+                              )}
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded ${vpc.ready ? 'bg-emerald-500/10 text-emerald-400' : 'bg-amber-500/10 text-amber-400'}`}>
+                                {vpc.ready ? 'Ready' : 'Pending'}
+                              </span>
+                            </div>
+                            {(vpc.subnets ?? []).length > 0 && (
+                              <p className="text-xs text-surface-500 mt-0.5">
+                                {vpc.subnets.map(s => s.cidr_block).join(', ')}
+                              </p>
+                            )}
+                          </div>
+                        </label>
+                      ))
+                    )}
                   </div>
                 )}
-
               </div>
-
-              {/* RBAC — DEX group mapping */}
-              <div className="mt-4">
-                <h3 className="text-sm font-semibold text-surface-200 mb-2">OIDC / RBAC Access</h3>
-                <p className="text-xs text-surface-500 mb-3">
-                  Map DEX groups to Kubernetes RBAC roles inside the tenant cluster.
-                  Leave empty to skip RBAC setup.
-                </p>
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm text-surface-300 mb-1">Admin Group (cluster-admin)</label>
-                    <input
-                      type="text"
-                      value={form.admin_group}
-                      placeholder="e.g. tenant-admins"
-                      onChange={e => setForm({ ...form, admin_group: e.target.value })}
-                      className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 placeholder-surface-600"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm text-surface-300 mb-1">Viewer Group (view)</label>
-                    <input
-                      type="text"
-                      value={form.viewer_group}
-                      placeholder="e.g. tenant-viewers"
-                      onChange={e => setForm({ ...form, viewer_group: e.target.value })}
-                      className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 placeholder-surface-600"
-                    />
-                  </div>
-                </div>
-              </div>
-
             </>
           )}
 
@@ -1194,27 +1231,14 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                       <span className="text-surface-200 font-mono">{form.pod_cidr}</span>
                       <span className="text-surface-500">Service CIDR</span>
                       <span className="text-surface-200 font-mono">{form.service_cidr}</span>
-                      <span className="text-surface-500">Isolation</span>
+                      <span className="text-surface-500">VPC</span>
                       <span className="text-surface-200">
-                        {form.network_isolation_mode === 'shared' && 'Shared'}
-                        {form.network_isolation_mode === 'isolated_shared_egress' && 'Isolated VPC, shared egress'}
-                        {form.network_isolation_mode === 'isolated_dedicated_egress' && 'Isolated VPC, dedicated egress'}
+                        {form.vpc_name ? (
+                          <span className="font-mono text-primary-300">{form.vpc_name}</span>
+                        ) : (
+                          <span className="text-surface-400">Default cluster network</span>
+                        )}
                       </span>
-                      {form.network_isolation_mode !== 'shared' && (
-                        <>
-                          <span className="text-surface-500">VPC</span>
-                          <span className="text-surface-200 font-mono">
-                            vpc-{form.name || '…'}
-                            <span className="ml-1 text-surface-500">(will be created)</span>
-                          </span>
-                        </>
-                      )}
-                      {form.network_isolation_mode === 'isolated_dedicated_egress' && form.infra_subnet && (
-                        <>
-                          <span className="text-surface-500">Infra Subnet</span>
-                          <span className="text-surface-200 font-mono">{form.infra_subnet}</span>
-                        </>
-                      )}
                       {form.worker_network_binding === 'masquerade' && (
                         <>
                           <span className="text-surface-500">Net Binding</span>

@@ -18,6 +18,7 @@ import {
 } from 'lucide-react';
 import { useVpcs, useCreateVpc, useDeleteVpc } from '../hooks/useVpcs';
 import { useNamespaces } from '../hooks/useNamespaces';
+import { useFoldersFlat } from '../hooks/useFolders';
 import type { Vpc } from '../types/vpc';
 import { DataTable, type Column } from '@/components/common/DataTable';
 import type { MenuItem } from '@/components/common/KebabMenu';
@@ -62,7 +63,14 @@ export default function VPCs({
       header: 'Name',
       sortable: true,
       accessor: (vpc) => (
-        <span className="font-medium text-surface-100">{vpc.name}</span>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className="font-medium text-surface-100">{vpc.name}</span>
+          {vpc.folder && (
+            <span className="px-1.5 py-0.5 text-[11px] font-medium rounded bg-primary-500/10 text-primary-400">
+              {vpc.folder}{vpc.environment ? `/${vpc.environment}` : ''}
+            </span>
+          )}
+        </div>
       ),
     },
     {
@@ -193,10 +201,17 @@ function CreateVpcModal({ onClose }: { onClose: () => void }) {
   const [name, setName] = useState('');
   const [cidr, setCidr] = useState('');
   const [selectedNamespaces, setSelectedNamespaces] = useState<string[]>([]);
+  const [folder, setFolder] = useState('');
+  const [environment, setEnvironment] = useState('');
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState('');
   const createVpc = useCreateVpc();
   const { data: namespacesData } = useNamespaces();
+  const { data: foldersData } = useFoldersFlat();
+
+  const allFolders = foldersData?.items ?? [];
+  const selectedFolder = allFolders.find(f => f.name === folder);
+  const folderEnvironments = selectedFolder?.environments ?? [];
 
   // Only show namespaces the backend will accept — kubevirt-ui.io/managed=true
   const userNamespaces = useMemo(() => {
@@ -215,6 +230,11 @@ function CreateVpcModal({ onClose }: { onClose: () => void }) {
 
   const canCreate = name.length > 0;
 
+  const handleFolderChange = (f: string) => {
+    setFolder(f);
+    setEnvironment(''); // reset env when folder changes
+  };
+
   const handleCreate = async () => {
     setIsCreating(true);
     setError('');
@@ -223,6 +243,8 @@ function CreateVpcModal({ onClose }: { onClose: () => void }) {
         name,
         ...(cidr ? { subnet_cidr: cidr } : {}),
         ...(selectedNamespaces.length > 0 ? { namespaces: selectedNamespaces } : {}),
+        ...(folder ? { folder } : {}),
+        ...(environment ? { environment } : {}),
       });
       onClose();
     } catch (e: unknown) {
@@ -255,6 +277,52 @@ function CreateVpcModal({ onClose }: { onClose: () => void }) {
               autoFocus
             />
           </div>
+          {/* Folder scope (optional) */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-medium text-surface-300 mb-1">
+                Folder scope
+                <span className="ml-1 font-normal text-surface-500">(optional)</span>
+              </label>
+              <select
+                value={folder}
+                onChange={(e) => handleFolderChange(e.target.value)}
+                className="w-full px-3 py-2 bg-surface-700 border border-surface-600 rounded-lg text-surface-100 text-sm focus:outline-none focus:border-primary-500"
+              >
+                <option value="">Unscoped (global / admin-only)</option>
+                {allFolders.map(f => (
+                  <option key={f.name} value={f.name}>
+                    {f.display_name || f.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-surface-300 mb-1">
+                Environment scope
+                <span className="ml-1 font-normal text-surface-500">(optional)</span>
+              </label>
+              <select
+                value={environment}
+                onChange={(e) => setEnvironment(e.target.value)}
+                disabled={!folder}
+                className="w-full px-3 py-2 bg-surface-700 border border-surface-600 rounded-lg text-surface-100 text-sm focus:outline-none focus:border-primary-500 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <option value="">{folder ? 'All environments' : 'Select folder first'}</option>
+                {folderEnvironments.map(env => (
+                  <option key={env.environment} value={env.environment}>
+                    {env.environment}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+          {folder && !environment && (
+            <p className="text-xs text-surface-500 -mt-2">
+              Without an environment, this VPC will be available to all environments in <span className="font-medium text-surface-400">{folder}</span>.
+            </p>
+          )}
+
           <div>
             <label className="block text-sm font-medium text-surface-300 mb-1">Subnet CIDR</label>
             <input

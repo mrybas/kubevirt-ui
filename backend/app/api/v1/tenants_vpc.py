@@ -1,532 +1,191 @@
-"""VPC lifecycle management for tenants.
+"""VPC binding for tenants (T7 — explicit label-based selection).
 
-Creates and deletes isolated VPCs with Kube-OVN, including subnets,
-NADs, NetworkPolicies, egress gateway attachment, and VpcDns.
+The tenant create flow does NOT provision per-tenant VPCs. Instead, when the
+caller supplies an explicit `vpc_name`, that VPC's `spec.namespaces` is
+patched to include the new tenant namespace. The caller (tenant CRUD layer)
+is responsible for validating that the chosen VPC is scoped to the same
+folder/env as the tenant via the VPC's `kubevirt-ui.io/folder` +
+`kubevirt-ui.io/environment` labels.
+
+T4 had an auto-derive lookup (find VPC whose `spec.namespaces` contains the
+env namespace) — gone, because kube-ovn allows a namespace in at most one
+VPC, so the lookup couldn't represent "multiple eligible VPCs for one env".
+Label-based selection lets admins create N VPCs scoped to (folder, env) and
+expose them to the wizard as a dropdown.
 """
 
-import json
 import logging
-from typing import Any
 
-from kubernetes_asyncio import client
+from fastapi import HTTPException
 from kubernetes_asyncio.client import ApiException
 
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 
-from app.api.v1.tenants_common import (
-    TENANT_NS_PREFIX,
-    _mgmt_cidr_drop,
-    _vpcdns_forward_dns,
-    _vpcdns_vip,
-)
+from app.api.v1.tenants_common import TENANT_NS_PREFIX
 
 logger = logging.getLogger(__name__)
 
 
-async def _ensure_vpcdns_prerequisites(k8s, kubeovn_ns: str) -> None:
-    """Ensure shared VpcDns prerequisites exist (idempotent).
+async def attach_tenant_to_vpc(k8s, vpc_name: str, tenant_name: str) -> None:
+    """Append `tenant-<tenant_name>` to the named VPC's `spec.namespaces`.
 
-    Creates ServiceAccount, ClusterRole, ClusterRoleBinding, CoreDNS ConfigMap,
-    NAD in default namespace, and vpc-dns-config ConfigMap.
-    These are shared across all tenants — created once, never deleted per-tenant.
+    The caller must have already validated that the VPC is appropriate for
+    the tenant (folder/env labels match). This function only handles the
+    patch — it doesn't re-check labels.
+
+    Raises HTTPException(400) if the VPC doesn't exist. Idempotent: if the
+    tenant ns is already in the list, the patch is skipped.
+
+    B3 (T9): uses JSON-patch `add /spec/namespaces/-` (append) instead of a
+    merge-patch on the whole array. Merge-patch on a list REPLACES the
+    entire array — two concurrent attaches would race and the second writer
+    would clobber the first's append. JSON-patch's `add /-` is server-side
+    append and avoids the read-modify-write window entirely.
     """
-    rbac_api = client.RbacAuthorizationV1Api(k8s._api_client)
-
-    # 1. ServiceAccount vpc-dns in kube-ovn namespace
-    try:
-        await k8s.core_api.read_namespaced_service_account(name="vpc-dns", namespace=kubeovn_ns)
-    except ApiException as e:
-        if e.status == 404:
-            sa = client.V1ServiceAccount(
-                metadata=client.V1ObjectMeta(name="vpc-dns", namespace=kubeovn_ns),
-            )
-            await k8s.core_api.create_namespaced_service_account(namespace=kubeovn_ns, body=sa)
-            logger.info(f"Created ServiceAccount vpc-dns in {kubeovn_ns}")
-        else:
-            raise
-
-    # 2. ClusterRole system:vpc-dns
-    try:
-        await rbac_api.read_cluster_role(name="system:vpc-dns")
-    except ApiException as e:
-        if e.status == 404:
-            cr = client.V1ClusterRole(
-                metadata=client.V1ObjectMeta(
-                    name="system:vpc-dns",
-                    labels={"kubernetes.io/bootstrapping": "rbac-defaults"},
-                ),
-                rules=[
-                    client.V1PolicyRule(
-                        api_groups=[""],
-                        resources=["endpoints", "services", "pods", "namespaces"],
-                        verbs=["list", "watch"],
-                    ),
-                    client.V1PolicyRule(
-                        api_groups=["discovery.k8s.io"],
-                        resources=["endpointslices"],
-                        verbs=["list", "watch"],
-                    ),
-                ],
-            )
-            await rbac_api.create_cluster_role(body=cr)
-            logger.info("Created ClusterRole system:vpc-dns")
-        else:
-            raise
-
-    # 3. ClusterRoleBinding vpc-dns
-    try:
-        await rbac_api.read_cluster_role_binding(name="vpc-dns")
-    except ApiException as e:
-        if e.status == 404:
-            crb = client.V1ClusterRoleBinding(
-                metadata=client.V1ObjectMeta(
-                    name="vpc-dns",
-                    labels={"kubernetes.io/bootstrapping": "rbac-defaults"},
-                    annotations={"rbac.authorization.kubernetes.io/autoupdate": "true"},
-                ),
-                role_ref=client.V1RoleRef(
-                    api_group="rbac.authorization.k8s.io",
-                    kind="ClusterRole",
-                    name="system:vpc-dns",
-                ),
-                subjects=[
-                    client.RbacV1Subject(
-                        kind="ServiceAccount",
-                        name="vpc-dns",
-                        namespace=kubeovn_ns,
-                    ),
-                ],
-            )
-            await rbac_api.create_cluster_role_binding(body=crb)
-            logger.info("Created ClusterRoleBinding vpc-dns")
-        else:
-            raise
-
-    # 4. ConfigMap vpc-dns-corefile in kube-ovn namespace
-    try:
-        await k8s.core_api.read_namespaced_config_map(name="vpc-dns-corefile", namespace=kubeovn_ns)
-    except ApiException as e:
-        if e.status == 404:
-            corefile = (
-                ".:53 {\n"
-                "    errors\n"
-                "    health {\n"
-                "      lameduck 5s\n"
-                "    }\n"
-                "    ready\n"
-                "    kubernetes cluster.local in-addr.arpa ip6.arpa {\n"
-                "      pods insecure\n"
-                "      fallthrough in-addr.arpa ip6.arpa\n"
-                "    }\n"
-                "    prometheus :9153\n"
-                f"    forward . {_vpcdns_forward_dns()} {{\n"
-                "      prefer_udp\n"
-                "    }\n"
-                "    cache 30\n"
-                "    loop\n"
-                "    reload\n"
-                "    loadbalance\n"
-                "}\n"
-            )
-            cm = client.V1ConfigMap(
-                metadata=client.V1ObjectMeta(name="vpc-dns-corefile", namespace=kubeovn_ns),
-                data={"Corefile": corefile},
-            )
-            await k8s.core_api.create_namespaced_config_map(namespace=kubeovn_ns, body=cm)
-            logger.info(f"Created ConfigMap vpc-dns-corefile in {kubeovn_ns}")
-        else:
-            raise
-
-    # 5. NAD ovn-nad in default namespace
-    try:
-        await k8s.custom_api.get_namespaced_custom_object(
-            group="k8s.cni.cncf.io", version="v1",
-            namespace="default", plural="network-attachment-definitions",
-            name="ovn-nad",
-        )
-    except ApiException as e:
-        if e.status == 404:
-            nad = {
-                "apiVersion": "k8s.cni.cncf.io/v1",
-                "kind": "NetworkAttachmentDefinition",
-                "metadata": {"name": "ovn-nad", "namespace": "default"},
-                "spec": {
-                    "config": json.dumps({
-                        "cniVersion": "0.3.0",
-                        "type": "kube-ovn",
-                        "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
-                        "provider": "ovn-nad.default.ovn",
-                    }),
-                },
-            }
-            await k8s.custom_api.create_namespaced_custom_object(
-                group="k8s.cni.cncf.io", version="v1",
-                namespace="default", plural="network-attachment-definitions",
-                body=nad,
-            )
-            logger.info("Created NAD ovn-nad in default namespace")
-        else:
-            raise
-
-    # 6. ConfigMap vpc-dns-config in kube-ovn namespace
-    try:
-        await k8s.core_api.read_namespaced_config_map(name="vpc-dns-config", namespace=kubeovn_ns)
-    except ApiException as e:
-        if e.status == 404:
-            cm = client.V1ConfigMap(
-                metadata=client.V1ObjectMeta(name="vpc-dns-config", namespace=kubeovn_ns),
-                data={
-                    "enable-vpc-dns": "true",
-                    "coredns-vip": _vpcdns_vip(),
-                    "nad-name": "ovn-nad",
-                    "nad-provider": "ovn-nad.default.ovn",
-                },
-            )
-            await k8s.core_api.create_namespaced_config_map(namespace=kubeovn_ns, body=cm)
-            logger.info(f"Created ConfigMap vpc-dns-config in {kubeovn_ns}")
-        else:
-            raise
-
-    logger.info("VpcDns prerequisites verified/created")
-
-
-async def _create_vpcdns_for_tenant(k8s, tenant_name: str, vpc_name: str, subnet_name: str) -> None:
-    """Create a VpcDns CR for a tenant VPC."""
-    vpcdns_name = f"vpc-dns-{tenant_name}"
-    vpcdns_manifest = {
-        "apiVersion": f"{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}",
-        "kind": "VpcDns",
-        "metadata": {
-            "name": vpcdns_name,
-            "labels": {
-                "kubevirt-ui.io/managed": "true",
-                "kubevirt-ui.io/tenant": tenant_name,
-            },
-        },
-        "spec": {
-            "vpc": vpc_name,
-            "subnet": subnet_name,
-            "replicas": 2,
-        },
-    }
-    await k8s.custom_api.create_cluster_custom_object(
-        group=KUBEOVN_API_GROUP,
-        version=KUBEOVN_API_VERSION,
-        plural="vpc-dnses",
-        body=vpcdns_manifest,
-    )
-    logger.info(f"Created VpcDns {vpcdns_name} for VPC {vpc_name}")
-
-
-async def _delete_vpcdns_for_tenant(k8s, tenant_name: str) -> None:
-    """Delete VpcDns CR for a tenant (shared resources are NOT deleted)."""
-    vpcdns_name = f"vpc-dns-{tenant_name}"
-    try:
-        await k8s.custom_api.delete_cluster_custom_object(
-            group=KUBEOVN_API_GROUP,
-            version=KUBEOVN_API_VERSION,
-            plural="vpc-dnses",
-            name=vpcdns_name,
-        )
-        logger.info(f"Deleted VpcDns {vpcdns_name}")
-    except ApiException as e:
-        if e.status != 404:
-            logger.warning(f"Failed to delete VpcDns {vpcdns_name}: {e}")
-
-
-async def _get_ovn_default_gateway(k8s) -> str | None:
-    """Return the gateway IP of the cluster's `ovn-default` subnet, if present.
-
-    Used by the `isolated_shared_egress` tenant networking mode (T3) to
-    program a static route 0.0.0.0/0 → ovn-default gateway, so an isolated
-    VPC still uses the host's underlay for internet egress without standing
-    up dedicated EgressGateway pods.
-    """
-    try:
-        subnet = await k8s.custom_api.get_cluster_custom_object(
-            group=KUBEOVN_API_GROUP,
-            version=KUBEOVN_API_VERSION,
-            plural="subnets",
-            name="ovn-default",
-        )
-    except ApiException as e:
-        if e.status == 404:
-            logger.warning("ovn-default subnet not found — shared egress route not added")
-            return None
-        raise
-    return (subnet.get("spec") or {}).get("gateway")
-
-
-async def _create_tenant_vpc(
-    k8s,
-    tenant_name: str,
-    mode: str = "isolated_dedicated_egress",
-    infra_subnet: str | None = None,
-) -> dict[str, str]:
-    """Create an isolated VPC for tenant networking (Architecture C: dual-NIC).
-
-    Architecture C: TCP pod gets dual-NIC via Multus:
-      - eth0: ovn-default (management — reaches CoreDNS, CNPG, CAPI)
-      - net1: tenant VPC subnet (workers connect here)
-
-    Creates: VPC → Subnet → NAD → NetworkPolicy → egress wiring.
-    Egress wiring depends on `mode` (T3):
-      - "isolated_shared_egress":    program a static route 0.0.0.0/0 →
-                                     ovn-default subnet gateway on the VPC.
-                                     No EgressGateway pods.
-      - "isolated_dedicated_egress": attach to EgressGateway pods bound to
-                                     `infra_subnet` (provider VLAN). Hub-and-
-                                     spoke VPC peering provides SNAT.
-    Returns dict with vpc_name, subnet_name, nad_name, cidr for caller use.
-    """
-    from app.api.v1.network import create_nad_for_subnet, get_nad_provider
-    from app.api.v1.egress_gateway import attach_tenant_to_gateway
-    from app.core.allocators import allocate_vpc_cidr
-
-    cidr, gateway = await allocate_vpc_cidr(k8s)
-    vpc_name = f"vpc-{tenant_name}"
-    subnet_name = f"{vpc_name}-default"
     tenant_ns = f"{TENANT_NS_PREFIX}{tenant_name}"
-    nad_name = subnet_name  # NAD name matches subnet for clarity
 
-    labels = {
-        "kubevirt-ui.io/managed": "true",
-        "kubevirt-ui.io/tenant": tenant_name,
-    }
-
-    # 1. Create VPC (routes will be added by egress gateway attach)
-    vpc_spec: dict[str, Any] = {}
-
-    vpc_manifest = {
-        "apiVersion": f"{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}",
-        "kind": "Vpc",
-        "metadata": {"name": vpc_name, "labels": labels},
-        "spec": vpc_spec,
-    }
-    await k8s.custom_api.create_cluster_custom_object(
-        group=KUBEOVN_API_GROUP,
-        version=KUBEOVN_API_VERSION,
-        plural="vpcs",
-        body=vpc_manifest,
-    )
-
-    # 2. Create default subnet in VPC
-    #    provider must match NAD: {nad_name}.{namespace}.ovn
-    provider = get_nad_provider(nad_name, tenant_ns)
-    # ACL rules: allow intra-VPC + VpcDns, block host mgmt + all RFC1918
-    # (mgmt CIDR is autodiscovered from Node InternalIPs, redundant under
-    # RFC1918 but kept for explicit blocking + future non-RFC1918 setups).
-    acls = [
-        {"action": "allow-related", "direction": "from-lport",
-         "match": f"ip4.src == {cidr} && ip4.dst == {cidr}", "priority": 3000},
-        {"action": "allow-related", "direction": "from-lport",
-         "match": f"ip4.src == {cidr} && ip4.dst == {_vpcdns_vip()}", "priority": 2500},
-    ]
-    mgmt_cidr = _mgmt_cidr_drop()
-    if mgmt_cidr:
-        acls.append({
-            "action": "drop", "direction": "from-lport",
-            "match": f"ip4.src == {cidr} && ip4.dst == {mgmt_cidr}", "priority": 2000,
-        })
-    acls.extend([
-        {"action": "drop", "direction": "from-lport",
-         "match": f"ip4.src == {cidr} && ip4.dst == 10.0.0.0/8", "priority": 1999},
-        {"action": "drop", "direction": "from-lport",
-         "match": f"ip4.src == {cidr} && ip4.dst == 172.16.0.0/12", "priority": 1998},
-        {"action": "drop", "direction": "from-lport",
-         "match": f"ip4.src == {cidr} && ip4.dst == 192.168.0.0/16", "priority": 1997},
-        {"action": "allow-related", "direction": "from-lport",
-         "match": f"ip4.src == {cidr}", "priority": 1000},
-    ])
-
-    # Reserve fixed IP for TCP pod (gateway + 1) — must be excluded from DHCP pool
-    # so VpcDns pods don't claim it before the TCP deployment starts.
-    gw_parts = gateway.split(".")
-    fixed_ip = f"{gw_parts[0]}.{gw_parts[1]}.{gw_parts[2]}.{int(gw_parts[3]) + 1}"
-
-    subnet_manifest = {
-        "apiVersion": f"{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}",
-        "kind": "Subnet",
-        "metadata": {"name": subnet_name, "labels": labels},
-        "spec": {
-            "protocol": "IPv4",
-            "cidrBlock": cidr,
-            "gateway": gateway,
-            "vpc": vpc_name,
-            "provider": provider,
-            "enableDHCP": True,
-            "natOutgoing": False,
-            "excludeIps": [fixed_ip],
-            "acls": acls,
-        },
-    }
-    await k8s.custom_api.create_cluster_custom_object(
-        group=KUBEOVN_API_GROUP,
-        version=KUBEOVN_API_VERSION,
-        plural="subnets",
-        body=subnet_manifest,
-    )
-
-    # 3. Create NAD in tenant namespace — Multus uses this to attach net1
-    await create_nad_for_subnet(k8s, nad_name, tenant_ns)
-
-    # 4. NetworkPolicy: isolate tenant from other tenants, allow infra namespaces
-    network_policy = {
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "NetworkPolicy",
-        "metadata": {
-            "name": f"{tenant_name}-isolation",
-            "namespace": tenant_ns,
-            "labels": labels,
-        },
-        "spec": {
-            "podSelector": {},
-            "policyTypes": ["Ingress"],
-            "ingress": [
-                {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": tenant_ns}}}]},
-                {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "o0-cnpg"}}}]},
-                {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "o0-kamaji"}}}]},
-                {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "kube-system"}}}]},
-                {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "o0-capi"}}}]},
-                {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "flux-system"}}}]},
-                {"from": [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "o0-ingress-nginx"}}}]},
-            ],
-        },
-    }
-    networking_api = client.NetworkingV1Api(k8s._api_client)
-    await networking_api.create_namespaced_network_policy(
-        namespace=tenant_ns,
-        body=network_policy,
-    )
-
-    # 5. Egress wiring — depends on mode (T3).
-    if mode == "isolated_shared_egress":
-        # Share the host's underlay for egress: program a default route
-        # pointing at ovn-default's gateway. No EgressGateway pods needed.
-        ovn_default_gw = await _get_ovn_default_gateway(k8s)
-        if not ovn_default_gw:
-            logger.warning(
-                f"VPC {vpc_name} mode=isolated_shared_egress but ovn-default "
-                "gateway is unknown — egress will not work"
-            )
-        else:
-            patch = {
-                "spec": {
-                    "staticRoutes": [
-                        {
-                            "cidr": "0.0.0.0/0",
-                            "nextHopIP": ovn_default_gw,
-                            "policy": "policyDst",
-                        }
-                    ],
-                }
-            }
-            await k8s.custom_api.patch_cluster_custom_object(
-                group=KUBEOVN_API_GROUP,
-                version=KUBEOVN_API_VERSION,
-                plural="vpcs",
-                name=vpc_name,
-                body=patch,
-                _content_type="application/merge-patch+json",
-            )
-            logger.info(
-                f"VPC {vpc_name}: programmed shared-egress default route → "
-                f"{ovn_default_gw} (ovn-default gateway)"
-            )
-    else:
-        # mode == "isolated_dedicated_egress": EgressGateway pods over infra_subnet.
-        # gateway_name=None means "find a gateway bound to the requested infra_subnet";
-        # the helper falls back to the cluster's default egress gateway if so.
-        # (infra_subnet selection happens inside attach_tenant_to_gateway via labels.)
-        gw_result = await attach_tenant_to_gateway(
-            k8s, gateway_name=None,
-            tenant_vpc_name=vpc_name, tenant_subnet_name=subnet_name,
-            tenant_cidr=cidr,
-        )
-        if gw_result:
-            logger.info(
-                f"Attached VPC {vpc_name} to egress gateway "
-                f"(transit IP: {gw_result.transit_ip})"
-            )
-        else:
-            logger.warning(
-                f"No egress gateway found — VPC {vpc_name} will have no "
-                "external connectivity"
-            )
-
-    # 6. Set up VpcDns — in-cluster DNS resolution for VMs in VPC
-    from app.api.v1.network import _find_kubeovn_namespace
-    kubeovn_ns = await _find_kubeovn_namespace(k8s)
-    await _ensure_vpcdns_prerequisites(k8s, kubeovn_ns)
-    await _create_vpcdns_for_tenant(k8s, tenant_name, vpc_name, subnet_name)
-
-    logger.info(f"Created VPC {vpc_name} with subnet {subnet_name} ({cidr}), NAD in {tenant_ns}, fixed TCP IP {fixed_ip}")
-    return {
-        "vpc_name": vpc_name,
-        "subnet_name": subnet_name,
-        "nad_name": nad_name,
-        "cidr": cidr,
-        "fixed_ip": fixed_ip,
-        "provider": provider,
-    }
-
-
-async def _delete_tenant_vpc(k8s, tenant_name: str) -> None:
-    """Delete VPC resources associated with a tenant.
-
-    Order matters due to finalizers:
-    VpcDns → detach from egress gateway → Subnets → VPC
-    Shared resources (RBAC, ConfigMaps) are NOT deleted.
-    """
-    from app.api.v1.egress_gateway import (
-        detach_tenant_from_gateway, _find_gateway_for_vpc,
-    )
-
-    vpc_name = f"vpc-{tenant_name}"
-    subnet_name = f"{vpc_name}-default"
-    label_sel = f"kubevirt-ui.io/tenant={tenant_name}"
-
-    # Delete VpcDns CR first (before subnets/VPC)
-    await _delete_vpcdns_for_tenant(k8s, tenant_name)
-
-    # Detach from egress gateway (removes peering, routes, policies)
-    gateway_name = await _find_gateway_for_vpc(k8s, vpc_name)
-    if gateway_name:
-        try:
-            await detach_tenant_from_gateway(k8s, gateway_name, vpc_name, subnet_name)
-        except Exception as e:
-            logger.warning(f"Failed to detach VPC {vpc_name} from egress gateway: {e}")
-
-    # Delete subnets
     try:
-        result = await k8s.custom_api.list_cluster_custom_object(
-            group=KUBEOVN_API_GROUP,
-            version=KUBEOVN_API_VERSION,
-            plural="subnets",
-            label_selector=label_sel,
-        )
-        for item in result.get("items", []):
-            try:
-                await k8s.custom_api.delete_cluster_custom_object(
-                    group=KUBEOVN_API_GROUP,
-                    version=KUBEOVN_API_VERSION,
-                    plural="subnets",
-                    name=item["metadata"]["name"],
-                )
-            except ApiException:
-                pass
-    except ApiException:
-        pass
-
-    # Delete VPC
-    try:
-        await k8s.custom_api.delete_cluster_custom_object(
+        vpc = await k8s.custom_api.get_cluster_custom_object(
             group=KUBEOVN_API_GROUP,
             version=KUBEOVN_API_VERSION,
             plural="vpcs",
             name=vpc_name,
         )
-        logger.info(f"Deleted VPC {vpc_name} for tenant {tenant_name}")
     except ApiException as e:
-        if e.status != 404:
-            logger.warning(f"Failed to delete VPC {vpc_name}: {e}")
+        if e.status == 404:
+            raise HTTPException(
+                status_code=400,
+                detail=f"VPC '{vpc_name}' does not exist",
+            ) from e
+        raise
+
+    current = (vpc.get("spec") or {}).get("namespaces") or []
+    if tenant_ns in current:
+        logger.info(
+            f"Tenant ns {tenant_ns!r} already in VPC {vpc_name!r}.namespaces — no patch"
+        )
+        return
+
+    # JSON-patch: append to spec.namespaces (or initialise the array if absent).
+    # Without the conditional init step, `add /spec/namespaces/-` would 422 when
+    # the VPC was created without an explicit namespaces field.
+    patch_ops: list[dict] = []
+    if (vpc.get("spec") or {}).get("namespaces") is None:
+        patch_ops.append({"op": "add", "path": "/spec/namespaces", "value": []})
+    patch_ops.append({"op": "add", "path": "/spec/namespaces/-", "value": tenant_ns})
+
+    await k8s.custom_api.patch_cluster_custom_object(
+        group=KUBEOVN_API_GROUP,
+        version=KUBEOVN_API_VERSION,
+        plural="vpcs",
+        name=vpc_name,
+        body=patch_ops,
+        _content_type="application/json-patch+json",
+    )
+    logger.info(
+        f"Attached tenant ns {tenant_ns!r} to VPC {vpc_name!r} "
+        f"(was {len(current)} ns)"
+    )
+
+
+async def detach_tenant_from_folder_vpc(k8s, tenant_name: str) -> None:
+    """Remove `tenant-<name>` from any VPC's `spec.namespaces`.
+
+    Inverse of `attach_tenant_to_vpc` — run on tenant delete so the VPC
+    doesn't keep stale namespace bindings after the tenant ns is cascade-
+    deleted. Iterates every managed VPC because we don't track which one
+    the tenant attached to in tenant metadata (and historically multiple
+    VPCs could theoretically reference the ns).
+
+    Idempotent + best-effort: per-VPC failures are logged but never raised.
+
+    B3 (T9): uses JSON-patch with a `test` op so the removal is safe against
+    concurrent attaches reordering `spec.namespaces`. If the element at the
+    computed index isn't the tenant ns by the time the patch lands, the
+    apiserver rejects the test op (422) and we retry from a fresh GET. With
+    a small retry cap to avoid unbounded loops in pathological cases.
+    """
+    tenant_ns = f"{TENANT_NS_PREFIX}{tenant_name}"
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP,
+            version=KUBEOVN_API_VERSION,
+            plural="vpcs",
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return  # CRD not installed → nothing to detach
+        logger.warning(f"Failed to list VPCs while detaching tenant {tenant_name}: {e}")
+        return
+
+    for vpc in result.get("items", []):
+        spec_ns = (vpc.get("spec") or {}).get("namespaces") or []
+        if tenant_ns not in spec_ns:
+            continue
+        vpc_name = vpc["metadata"]["name"]
+        await _detach_with_retry(k8s, vpc_name, tenant_ns, initial_spec_ns=spec_ns)
+
+
+async def _detach_with_retry(
+    k8s, vpc_name: str, tenant_ns: str,
+    initial_spec_ns: list[str],
+    max_attempts: int = 5,
+) -> None:
+    """JSON-patch remove with test-op guard; refresh on 422 (test failed).
+
+    Each iteration: locate `tenant_ns` in the array, emit
+      [{"op":"test","path":"/spec/namespaces/<idx>","value":tenant_ns},
+       {"op":"remove","path":"/spec/namespaces/<idx>"}]
+    A 422 from the apiserver means the index shifted under us — re-GET and
+    retry. After `max_attempts` we give up with a warning.
+    """
+    spec_ns = initial_spec_ns
+    for attempt in range(max_attempts):
+        try:
+            idx = spec_ns.index(tenant_ns)
+        except ValueError:
+            return  # already gone — concurrent detach won the race
+        patch_ops = [
+            {"op": "test", "path": f"/spec/namespaces/{idx}", "value": tenant_ns},
+            {"op": "remove", "path": f"/spec/namespaces/{idx}"},
+        ]
+        try:
+            await k8s.custom_api.patch_cluster_custom_object(
+                group=KUBEOVN_API_GROUP,
+                version=KUBEOVN_API_VERSION,
+                plural="vpcs",
+                name=vpc_name,
+                body=patch_ops,
+                _content_type="application/json-patch+json",
+            )
+            logger.info(
+                f"Detached tenant ns {tenant_ns!r} from VPC {vpc_name!r}"
+            )
+            return
+        except ApiException as e:
+            # 422 → test op failed (index shifted); 409 → resourceVersion stale.
+            # Both are retryable by re-reading.
+            if e.status not in (409, 422):
+                logger.warning(
+                    f"Failed to detach tenant ns {tenant_ns!r} from VPC {vpc_name!r}: {e}"
+                )
+                return
+            try:
+                vpc = await k8s.custom_api.get_cluster_custom_object(
+                    group=KUBEOVN_API_GROUP,
+                    version=KUBEOVN_API_VERSION,
+                    plural="vpcs",
+                    name=vpc_name,
+                )
+                spec_ns = (vpc.get("spec") or {}).get("namespaces") or []
+            except ApiException as ge:
+                if ge.status == 404:
+                    return  # VPC vanished — nothing to detach
+                logger.warning(
+                    f"Failed to re-read VPC {vpc_name!r} during detach retry: {ge}"
+                )
+                return
+    logger.warning(
+        f"Gave up detaching {tenant_ns!r} from VPC {vpc_name!r} "
+        f"after {max_attempts} retries — manual cleanup may be required"
+    )

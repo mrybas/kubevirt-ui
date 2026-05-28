@@ -356,10 +356,18 @@ async def _create_namespace(
     `folder` + `environment`, when provided, are stamped as
     `kubevirt-ui.io/folder` and `kubevirt-ui.io/environment` labels — wires
     the tenant into Phase 2 folder-level authz (resolve_env, is_env_*).
+
+    `kubevirt-ui.io/enabled=true` is also stamped so the namespace shows up
+    in `get_user_namespaces` — this is what makes worker VMs in
+    `tenant-<name>` visible in the main /vms list for users who have
+    folder/env access (T2).
     """
     labels: dict[str, str] = {
         "kubevirt-ui.io/tenant": tenant_name,
         "kubevirt-ui.io/managed": "true",
+        # Enables the namespace to be enumerated by get_user_namespaces (T2)
+        # — without this, worker VMs are invisible to non-admin users in /vms.
+        "kubevirt-ui.io/enabled": "true",
         "kubevirt-ui.io/worker-type": worker_type,
         # Kamaji control-plane pods + KubeVirt VMs need elevated privileges
         "pod-security.kubernetes.io/enforce": "privileged",

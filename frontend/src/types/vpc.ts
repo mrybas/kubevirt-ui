@@ -36,6 +36,9 @@ export interface Vpc {
   namespaces: string[];
   ready: boolean;
   conditions: Record<string, unknown>[];
+  // Label-based scoping (T7 — populated from kubevirt-ui.io/folder + /environment labels)
+  folder?: string | null;
+  environment?: string | null;
 }
 
 export interface VpcListResponse {
@@ -48,6 +51,9 @@ export interface CreateVpcRequest {
   subnet_cidr?: string;
   enable_nat_gateway?: boolean;
   namespaces?: string[];
+  // Optional folder/env scope — backend stamps kubevirt-ui.io/folder + /environment labels
+  folder?: string;
+  environment?: string;
 }
 
 export interface AddVpcPeeringRequest {

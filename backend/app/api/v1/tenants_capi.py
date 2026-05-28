@@ -5,7 +5,6 @@ KubevirtMachineTemplate, KubeadmConfigTemplate, and Ingress CRs.
 """
 
 import asyncio
-import json
 import logging
 import os
 from typing import Any
@@ -115,16 +114,14 @@ def _build_cluster_cr(
     }
 
 
-def _build_kamaji_cp_cr(
-    req: TenantCreateRequest,
-    vpc_info: dict[str, str] | None = None,
-) -> dict[str, Any]:
+def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
     """Build KamajiControlPlane CR.
 
-    Args:
-        req: Tenant creation request.
-        vpc_info: If network_isolation is enabled, dict with nad_name etc.
-                  Used to add Multus annotation for dual-NIC (eth0=mgmt, net1=VPC).
+    T4 simplification: tenant ns is attached to the folder's existing VPC
+    (if any) by patching the VPC's `spec.namespaces` — so the TCP pod and
+    workers both land on the same VPC subnet without per-pod Multus / fixed
+    IPs / advertise-address / DNAT plumbing. The previous dual-NIC dance is
+    gone; everything is plain ClusterIP intra-VPC traffic.
     """
     apiserver_extra_args: list[str] = []
     if OIDC_ISSUER and OIDC_ISSUER.startswith("https://"):
@@ -134,40 +131,17 @@ def _build_kamaji_cp_cr(
             "--oidc-username-claim=email",
             "--oidc-groups-claim=groups",
         ]
-    if vpc_info:
-        # Advertise VPC IP so kubelet.conf, cluster-info, etc. all use it.
-        # Without this, Kamaji advertises the ClusterIP which is unreachable
-        # from workers in the isolated VPC subnet.
-        apiserver_extra_args.append(f"--advertise-address={vpc_info['fixed_ip']}")
 
     ns = _tenant_ns(req.name)
 
-    # Pod metadata: labels always, annotations when VPC isolation is enabled
     pod_labels = {
         "cluster.x-k8s.io/cluster-name": req.name,
         "cluster.x-k8s.io/role": "control-plane",
     }
-    pod_annotations: dict[str, str] = {}
-    if vpc_info:
-        # Multus dual-NIC: attach TCP pod to tenant VPC subnet via NAD
-        nad_name = vpc_info["nad_name"]
-        provider = vpc_info["provider"]
-        fixed_ip = vpc_info["fixed_ip"]
-        pod_annotations["k8s.v1.cni.cncf.io/networks"] = json.dumps([
-            {"name": nad_name, "namespace": ns}
-        ])
-        # Pin net1 IP via Kube-OVN annotation — workers connect to this IP
-        pod_annotations[f"{provider}.kubernetes.io/ip_address"] = fixed_ip
-
     pod_additional_metadata: dict[str, Any] = {"labels": pod_labels}
-    if pod_annotations:
-        pod_additional_metadata["annotations"] = pod_annotations
-
-    # VPC mode: single TCP replica (fixed VPC IP can't be shared across replicas)
-    cp_replicas = 1 if vpc_info else req.control_plane_replicas
 
     spec: dict[str, Any] = {
-        "replicas": cp_replicas,
+        "replicas": req.control_plane_replicas,
         "version": req.kubernetes_version,
         "dataStoreName": "default",
         "addons": {
@@ -192,13 +166,10 @@ def _build_kamaji_cp_cr(
         },
         "network": {
             "serviceType": "ClusterIP",
-            "certSANs": [_endpoint_host(req.name)] + ([vpc_info["fixed_ip"]] if vpc_info else []),
+            "certSANs": [_endpoint_host(req.name)],
         },
         "deployment": {
             "podAdditionalMetadata": pod_additional_metadata,
-            # Recreate strategy required when VPC IP is pinned — RollingUpdate
-            # causes deadlock (new pod can't get pinned IP while old pod has it)
-            **({"strategy": {"type": "Recreate"}} if vpc_info else {}),
         },
     }
     if apiserver_extra_args:
@@ -300,19 +271,17 @@ def _build_machine_deployment_cr(req: TenantCreateRequest) -> dict[str, Any]:
 def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, Any]:
     ns = _tenant_ns(req.name)
 
-    # When network isolation is enabled, annotate the VM pod to land in the
-    # tenant's VPC subnet instead of the default ovn-default subnet.
     pod_annotations: dict[str, str] = {}
-    if req.network_isolation:
-        vpc_name = f"vpc-{req.name}"
-        subnet_name = f"{vpc_name}-default"
-        pod_annotations["ovn.kubernetes.io/logical_switch"] = subnet_name
 
     # T1 — stamp tenant label on every KubevirtMachine so a future
     # "Tenant > Workers" tab can filter VMs by tenant. Inherited by the
     # underlying VirtualMachine via KubevirtMachineTemplate.
+    # T2 — also stamp folder + environment so worker VMs match the same
+    # label-selector filters as project/env-scoped VMs in the /vms list.
     pod_labels: dict[str, str] = {
         "kubevirt-ui.io/tenant": req.name,
+        "kubevirt-ui.io/folder": req.folder,
+        "kubevirt-ui.io/environment": req.environment,
     }
 
     # T6 — default 'bridge' so guests report their real OVN IP. Masquerade
@@ -347,9 +316,6 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
                                     **({"annotations": pod_annotations} if pod_annotations else {}),
                                 },
                                 "spec": {
-                                    # VPC mode: override DNS since kube-dns ClusterIP
-                                    # is unreachable from the VPC subnet
-                                    **({"dnsPolicy": "None", "dnsConfig": {"nameservers": [_vpcdns_vip()]}} if req.network_isolation else {}),
                                     # Forward imagePullSecrets to kubelet so the
                                     # worker containerDisk can be pulled from a
                                     # private registry. Secrets themselves must
@@ -409,17 +375,16 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
 
 def _build_kubeadm_config_template_cr(
     req: TenantCreateRequest,
-    dnat_cluster_ip: str = "",
-    dnat_vpc_ip: str = "",
 ) -> dict[str, Any]:
     """Build KubeadmConfigTemplate CR.
 
-    Container disk has all packages pre-baked (containerd, kubelet, kubeadm, kubectl,
-    CNI plugins). Only need: DNS fix + kubeadm join config.
+    Container disk has all packages pre-baked (containerd, kubelet, kubeadm,
+    kubectl, CNI plugins). Only need: storage prep + DNS fix + kubeadm join.
 
-    When VPC isolation is enabled, adds iptables DNAT rule so workers can reach
-    the apiserver. Kamaji advertises the ClusterIP (unreachable from VPC), so
-    we redirect it to the TCP pod's fixed net1 (VPC) IP before kubeadm runs.
+    T4: previously this function injected an iptables DNAT rule to redirect
+    the apiserver ClusterIP → TCP pod's fixed VPC IP when isolation was on.
+    Tenant ns is now bound to the folder VPC directly (TCP + workers share
+    one subnet), so ClusterIP traffic just works and the DNAT hack is gone.
     """
     pre_commands = [
         # --- Storage: mount emptyDisk (/dev/vdb) for containerd + kubelet ---
@@ -448,15 +413,6 @@ def _build_kubeadm_config_template_cr(
         f"sed -i 's/^#\\?FallbackDNS=.*/FallbackDNS={_vpcdns_vip()}/' /etc/systemd/resolved.conf",
         "systemctl restart systemd-resolved",
     ]
-    if dnat_cluster_ip and dnat_vpc_ip:
-
-        # DNAT: redirect apiserver ClusterIP → TCP pod's VPC IP
-        # Kamaji sets kube-apiserver --advertise-address to ClusterIP, so kubeadm
-        # on the worker will try to reach it after initial bootstrap token discovery.
-        pre_commands.append(
-            f"iptables -t nat -A OUTPUT -d {dnat_cluster_ip}/32 -p tcp --dport 6443"
-            f" -j DNAT --to-destination {dnat_vpc_ip}:6443"
-        )
 
     return {
         "apiVersion": "bootstrap.cluster.x-k8s.io/v1beta1",
@@ -481,29 +437,6 @@ def _build_kubeadm_config_template_cr(
                                 "/var/lib/kubelet/config.yaml > /tmp/kubelet-config-clean.yaml\n"
                                 "  mv /tmp/kubelet-config-clean.yaml /var/lib/kubelet/config.yaml\n"
                                 "fi\n"
-                                + (
-                                    f"# Ensure kubelet kubeconfig points to VPC IP (not ClusterIP)\n"
-                                    f"if [ -f /etc/kubernetes/kubelet.conf ]; then\n"
-                                    f"  sed -i 's|https://{dnat_cluster_ip}:6443|https://{dnat_vpc_ip}:6443|g' /etc/kubernetes/kubelet.conf\n"
-                                    f"  # Pre-create Node object to prevent CSI plugin FATAL race condition.\n"
-                                    f"  # In K8s 1.30, CSI initialization has a ~1.5s timeout to find the Node.\n"
-                                    f"  # If kubelet hasn't registered the node yet, CSI kills the process.\n"
-                                    f"  NODENAME=$(hostname)\n"
-                                    f"  if ! kubectl --kubeconfig=/etc/kubernetes/kubelet.conf get node $NODENAME > /dev/null 2>&1; then\n"
-                                    f"    cat <<NODEEOF | kubectl --kubeconfig=/etc/kubernetes/kubelet.conf create -f - 2>/dev/null || true\n"
-                                    f"apiVersion: v1\n"
-                                    f"kind: Node\n"
-                                    f"metadata:\n"
-                                    f"  name: $NODENAME\n"
-                                    f"  labels:\n"
-                                    f"    kubernetes.io/hostname: $NODENAME\n"
-                                    f"    kubernetes.io/os: linux\n"
-                                    f"    kubernetes.io/arch: amd64\n"
-                                    f"NODEEOF\n"
-                                    f"  fi\n"
-                                    f"fi\n"
-                                    if dnat_cluster_ip and dnat_vpc_ip else ""
-                                )
                             ),
                         },
                         {
@@ -700,7 +633,6 @@ async def _wait_for_tcp_service_ip(
 
 async def _create_capi_resources(
     k8s, req: TenantCreateRequest,
-    vpc_info: dict[str, str] | None = None,
     storage_info: dict[str, str] | None = None,
 ) -> None:
     """Create CAPI + Ingress resources in tenant namespace.
@@ -708,10 +640,9 @@ async def _create_capi_resources(
     Order: KamajiControlPlane + KubevirtCluster first → wait for TCP service
     ClusterIP → create Cluster with ClusterIP as controlPlaneEndpoint.
 
-    When VPC isolation is enabled (vpc_info provided):
-      - TCP pod gets Multus dual-NIC (eth0=mgmt, net1=VPC)
-      - Workers use TCP's net1 (VPC) IP as controlPlaneEndpoint
-      - External/CAPI access still uses ClusterIP service
+    T4: VPC binding for the tenant ns is handled out-of-band (caller patches
+    the folder VPC's `spec.namespaces` before this is called), so TCP + workers
+    share the same VPC subnet. No more dual-NIC / fixed-IP / DNAT plumbing.
 
     When tenant storage is enabled (storage_info provided):
       - KubevirtCluster gets `infraClusterSecretRef` so CAPK can speak
@@ -724,7 +655,7 @@ async def _create_capi_resources(
 
     # 1. Create infrastructure + control plane providers first
     pre_resources = [
-        (KAMAJI_CP_GROUP, KAMAJI_CP_VERSION, "kamajicontrolplanes", _build_kamaji_cp_cr(req, vpc_info)),
+        (KAMAJI_CP_GROUP, KAMAJI_CP_VERSION, "kamajicontrolplanes", _build_kamaji_cp_cr(req)),
         (KUBEVIRT_INFRA_GROUP, KUBEVIRT_INFRA_VERSION, "kubevirtclusters", _build_kubevirt_cluster_cr(req, storage_info)),
     ]
     for group, version, plural, body in pre_resources:
@@ -740,25 +671,17 @@ async def _create_capi_resources(
         plural="clusters", body=cluster_cr,
     )
 
-    # 3. Wait for TCP service to get ClusterIP (used by CAPI/external access)
+    # 3. Wait for TCP service to get ClusterIP (used by CAPI/external access).
+    #    Workers reach apiserver via this ClusterIP — they're in the same VPC
+    #    as the TCP pod (tenant ns is bound to the folder VPC) so ClusterIP
+    #    just works.
     tcp_ip = await _wait_for_tcp_service_ip(k8s, req.name, ns)
 
-    # 4. Determine controlPlaneEndpoint for workers
-    #    - Without VPC: workers use ClusterIP (same ovn-default network)
-    #    - With VPC: workers use TCP pod's fixed net1 (VPC) IP
-    #      The fixed IP is pre-allocated and pinned via Kube-OVN annotation,
-    #      and certSANs already include it from KCP creation.
-    if vpc_info:
-        worker_endpoint_ip = vpc_info["fixed_ip"]
-        logger.info(f"VPC mode: workers will use fixed net1 IP {worker_endpoint_ip} for {req.name}")
-    else:
-        worker_endpoint_ip = tcp_ip
-
-    # 5. Patch Cluster controlPlaneEndpoint with the worker-reachable IP
+    # 4. Patch Cluster controlPlaneEndpoint with the worker-reachable IP
     patch = {
         "spec": {
             "controlPlaneEndpoint": {
-                "host": worker_endpoint_ip,
+                "host": tcp_ip,
                 "port": 6443,
             },
         },
@@ -768,18 +691,11 @@ async def _create_capi_resources(
         plural="clusters", name=req.name, body=patch,
         _content_type="application/merge-patch+json",
     )
-    logger.info(f"Patched Cluster {req.name} controlPlaneEndpoint to {worker_endpoint_ip}:6443")
+    logger.info(f"Patched Cluster {req.name} controlPlaneEndpoint to {tcp_ip}:6443")
 
-    # 6. Create VM worker resources (skip for bare_metal)
-    #    When VPC is enabled, pass ClusterIP for DNAT rule in preKubeadmCommands:
-    #    Kamaji advertises ClusterIP as apiserver address, but workers on VPC
-    #    can't reach it — DNAT redirects ClusterIP:6443 → VPC_IP:6443.
+    # 5. Create VM worker resources (skip for bare_metal)
     if req.worker_type == "vm":
-        kubeadm_cr = _build_kubeadm_config_template_cr(
-            req,
-            dnat_cluster_ip=tcp_ip if vpc_info else "",
-            dnat_vpc_ip=worker_endpoint_ip if vpc_info else "",
-        )
+        kubeadm_cr = _build_kubeadm_config_template_cr(req)
         vm_resources = [
             (CAPI_GROUP, CAPI_VERSION, "machinedeployments", _build_machine_deployment_cr(req)),
             (KUBEVIRT_INFRA_GROUP, KUBEVIRT_INFRA_VERSION, "kubevirtmachinetemplates", _build_kubevirt_machine_template_cr(req)),
@@ -790,7 +706,7 @@ async def _create_capi_resources(
                 group=group, version=version, namespace=ns, plural=plural, body=body,
             )
 
-    # 7. Expose tenant kube-apiserver externally with TLS passthrough.
+    # 6. Expose tenant kube-apiserver externally with TLS passthrough.
     #    Resource shape depends on the ingress controller (nginx Ingress vs
     #    Traefik IngressRouteTCP vs Contour HTTPProxy).
     await _create_tenant_apiserver_ingress(k8s, req)

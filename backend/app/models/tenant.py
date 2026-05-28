@@ -11,7 +11,7 @@ import logging
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -130,28 +130,20 @@ class TenantCreateRequest(BaseModel):
     admin_group: str = ""  # DEX group → cluster-admin in tenant
     viewer_group: str = ""  # DEX group → view role in tenant
 
-    # T3 — Network isolation modes:
-    #   "shared":                     no VPC; tenant ns lands in ovn-default.
-    #                                 Internet egress via cluster default.
-    #                                 This is the default for our setup.
-    #   "isolated_shared_egress":     VPC + subnet, but static route 0.0.0.0/0 →
-    #                                 ovn-default gateway IP so the tenant uses
-    #                                 the host's underlay for egress.
-    #                                 NO infra_subnet required.
-    #   "isolated_dedicated_egress":  VPC + subnet + EgressGateway pods bound
-    #                                 to infra_subnet (provider VLAN). REQUIRES
-    #                                 infra_subnet to be a real Kube-OVN subnet
-    #                                 labeled kubevirt-ui.io/purpose=infrastructure.
-    network_isolation_mode: Literal[
-        "shared",
-        "isolated_shared_egress",
-        "isolated_dedicated_egress",
-    ] = "shared"
-    infra_subnet: str | None = Field(
-        None,
+    # T7 — Explicit VPC selection. The admin creates VPCs scoped to
+    # (folder, env) via `kubevirt-ui.io/folder` + `kubevirt-ui.io/environment`
+    # labels; the wizard renders an `GET /vpcs?folder=&environment=` dropdown
+    # and posts the chosen name here. The backend validates that the named
+    # VPC carries matching labels before patching its `spec.namespaces`.
+    #
+    # Omitted (None) → the tenant runs on the cluster default overlay (no VPC
+    # attachment, no isolation).
+    vpc_name: str | None = Field(
+        default=None,
         description=(
-            "Infrastructure subnet for dedicated egress. "
-            "Required iff network_isolation_mode == 'isolated_dedicated_egress'."
+            "Optional VPC to attach the tenant namespace to. Must be a managed "
+            "VPC scoped to the same folder/env as the tenant. When omitted, "
+            "the tenant runs on the cluster default overlay."
         ),
     )
 
@@ -209,16 +201,6 @@ class TenantCreateRequest(BaseModel):
             )
         return v
 
-    @field_validator("infra_subnet")
-    @classmethod
-    def _normalize_blank_infra_subnet(cls, v: str | None) -> str | None:
-        # Treat "" the same as None so the wizard's empty-string default
-        # collapses to None for the dedicated-egress validator below.
-        if v is None:
-            return None
-        stripped = v.strip()
-        return stripped or None
-
     @field_validator("storage_class")
     @classmethod
     def _normalize_blank_storage_class(cls, v: str | None) -> str | None:
@@ -230,30 +212,6 @@ class TenantCreateRequest(BaseModel):
             return None
         stripped = v.strip()
         return stripped or None
-
-    @model_validator(mode="after")
-    def _check_infra_subnet_required(self) -> "TenantCreateRequest":
-        if self.network_isolation_mode == "isolated_dedicated_egress" and not self.infra_subnet:
-            raise ValueError(
-                "infra_subnet is required when network_isolation_mode is "
-                "'isolated_dedicated_egress'"
-            )
-        # Shared / shared_egress modes don't use infra_subnet; null it out so
-        # downstream code can rely on "set ⇒ dedicated egress".
-        if self.network_isolation_mode != "isolated_dedicated_egress":
-            self.infra_subnet = None
-        return self
-
-    @property
-    def network_isolation(self) -> bool:
-        """Back-compat alias: True iff a VPC needs to be provisioned for the tenant.
-
-        Internal callers that read tenant networking should switch to checking
-        `network_isolation_mode` directly. Kept so any legacy template / chart
-        that imports the request still works.
-        """
-        return self.network_isolation_mode != "shared"
-
 
 class TenantScaleRequest(BaseModel):
     """Request to scale tenant workers."""

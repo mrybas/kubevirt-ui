@@ -22,7 +22,13 @@ from app.core.constants import (
     KUBEOVN_SYSTEM_VPC as SYSTEM_VPC_NAME,
 )
 from app.core.errors import k8s_error_to_http
-from app.core.groups import get_user_namespaces, is_admin
+from app.core.groups import (
+    get_user_namespaces,
+    is_admin,
+    is_env_viewer,
+    is_folder_viewer,
+    load_folders,
+)
 from app.models.vpc import (
     VpcCreateRequest,
     VpcListResponse,
@@ -65,6 +71,10 @@ def _parse_vpc(item: dict[str, Any]) -> VpcResponse:
     return VpcResponse(
         name=metadata.get("name", ""),
         tenant=labels.get("kubevirt-ui.io/tenant"),
+        # T7 — surface folder/env scope from labels so the wizard can render
+        # them on the dropdown without re-fetching label dicts client-side.
+        folder=labels.get("kubevirt-ui.io/folder"),
+        environment=labels.get("kubevirt-ui.io/environment"),
         enable_nat_gateway=spec.get("enableExternal", False),
         default_subnet=status.get("defaultLogicalSwitch"),
         namespaces=spec.get("namespaces", []),
@@ -133,13 +143,32 @@ async def _get_vpc_peerings(k8s, vpc_name: str) -> list[VpcPeeringInfo]:
 # ============================================================================
 
 @router.get("", response_model=VpcListResponse)
-async def list_vpcs(request: Request, tenant: str | None = None, user: User = Depends(require_auth)) -> VpcListResponse:
-    """List all VPCs, optionally filtered by tenant.
+async def list_vpcs(
+    request: Request,
+    tenant: str | None = None,
+    folder: str | None = None,
+    environment: str | None = None,
+    user: User = Depends(require_auth),
+) -> VpcListResponse:
+    """List all VPCs, optionally filtered by tenant or folder/env scope.
 
     Non-admin users see only VPCs bound to namespaces they have folder/env
     access to. The built-in ``ovn-cluster`` system VPC is always excluded for
     non-admins.
+
+    T7 — `folder` / `environment` query params drive the tenant-create wizard
+    dropdown. A VPC matches when:
+      - `folder == folder` AND
+      - (`environment == environment` OR the VPC has no env label set —
+        a folder-wide VPC is eligible for every env under its folder)
+    `environment` alone (without `folder`) is rejected as ambiguous.
     """
+    if environment and not folder:
+        raise HTTPException(
+            status_code=400,
+            detail="`environment` requires `folder` (an env is always scoped under a folder)",
+        )
+
     k8s = request.app.state.k8s_client
 
     try:
@@ -163,11 +192,46 @@ async def list_vpcs(request: Request, tenant: str | None = None, user: User = De
         vpc.subnets = await _get_vpc_subnets(k8s, vpc.name)
         vpcs.append(vpc)
 
+    # T7 — folder/env filter applied AFTER fetch (label selector with OR semantics
+    # over the env label isn't expressible in K8s field selectors; in-memory is fine).
+    if folder:
+        vpcs = [v for v in vpcs if v.folder == folder]
+    if environment:
+        # Match exact env OR folder-wide VPC (no env label).
+        vpcs = [v for v in vpcs if v.environment == environment or not v.environment]
+
     if not is_admin(user.groups):
+        # B4 (T9): a folder-scoped VPC that was just created has an empty
+        # `spec.namespaces` (no tenants attached yet), so the namespace-
+        # overlap filter alone would hide the VPC from the folder admin who
+        # is supposed to pick it in the wizard. OR-in a label-based check
+        # against the folder access machinery: folder-viewer sees folder-wide
+        # VPCs, env-viewer sees env-scoped VPCs.
         user_ns = set(await get_user_namespaces(k8s, user))
+        try:
+            folders_map = await load_folders(k8s)
+        except HTTPException as e:
+            # 404 → no folders configured yet → no label-based access; fall
+            # back to ns-overlap only. Other errors bubble up.
+            if e.status_code == 404:
+                folders_map = {}
+            else:
+                raise
+
+        def _label_accessible(v: VpcResponse) -> bool:
+            if not v.folder:
+                return False  # unlabeled VPC — admin-only via existing filter
+            folder_meta = folders_map.get(v.folder)
+            if not folder_meta:
+                return False  # folder no longer exists or unparseable meta
+            if v.environment is None:
+                return is_folder_viewer(user, folder_meta)
+            return is_env_viewer(user, folder_meta, v.environment)
+
         vpcs = [
             v for v in vpcs
-            if v.name != SYSTEM_VPC_NAME and (set(v.namespaces or []) & user_ns)
+            if v.name != SYSTEM_VPC_NAME
+            and ((set(v.namespaces or []) & user_ns) or _label_accessible(v))
         ]
 
     return VpcListResponse(items=vpcs, total=len(vpcs))
@@ -226,6 +290,12 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     labels: dict[str, str] = {"kubevirt-ui.io/managed": "true"}
     if data.tenant:
         labels["kubevirt-ui.io/tenant"] = data.tenant
+    # T7 — folder/env scoping. Stamped on VPC + default subnet so the
+    # tenant-create wizard can filter by `GET /api/v1/vpcs?folder=&environment=`.
+    if data.folder:
+        labels["kubevirt-ui.io/folder"] = data.folder
+    if data.environment:
+        labels["kubevirt-ui.io/environment"] = data.environment
 
     # Build VPC spec
     vpc_spec: dict[str, Any] = {
@@ -395,6 +465,8 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     return VpcResponse(
         name=data.name,
         tenant=data.tenant,
+        folder=data.folder,
+        environment=data.environment,
         enable_nat_gateway=data.enable_nat_gateway,
         default_subnet=default_subnet_name,
         subnets=[VpcSubnetInfo(

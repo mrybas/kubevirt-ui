@@ -64,7 +64,13 @@ from app.api.v1.tenants_common import (
     _namespace_exists,
     _create_namespace,
 )
-from app.api.v1.tenants_vpc import _create_tenant_vpc, _delete_tenant_vpc
+from app.api.v1.tenants_vpc import (
+    attach_tenant_to_vpc,
+    detach_tenant_from_folder_vpc,
+)
+from app.api.v1.folders import reconcile_namespace_rbac
+
+from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.api.v1.tenants_capi import _create_capi_resources
 from app.api.v1.tenants_addons import (
     _build_helm_values,
@@ -587,6 +593,45 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             detail=f"Tenant '{req.name}' already exists",
         )
 
+    # T7 — Validate vpc_name BEFORE creating the namespace, so a bad choice
+    # fails fast without rolling back any cluster state. The VPC must:
+    #   1. exist
+    #   2. carry kubevirt-ui.io/folder == req.folder
+    #   3. carry kubevirt-ui.io/environment == req.environment, OR be
+    #      folder-wide (no env label, eligible for every env under folder)
+    if req.vpc_name:
+        try:
+            vpc_cr = await k8s.custom_api.get_cluster_custom_object(
+                group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+                plural="vpcs", name=req.vpc_name,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"VPC '{req.vpc_name}' does not exist",
+                ) from e
+            raise k8s_error_to_http(e, "VPC lookup")
+        vpc_labels = (vpc_cr.get("metadata") or {}).get("labels") or {}
+        vpc_folder = vpc_labels.get("kubevirt-ui.io/folder")
+        vpc_env = vpc_labels.get("kubevirt-ui.io/environment")
+        if vpc_folder != req.folder:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"VPC '{req.vpc_name}' is not scoped to folder "
+                    f"'{req.folder}' (VPC folder label: {vpc_folder!r})"
+                ),
+            )
+        if vpc_env and vpc_env != req.environment:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"VPC '{req.vpc_name}' is not scoped to environment "
+                    f"'{req.environment}' (VPC env label: {vpc_env!r})"
+                ),
+            )
+
     try:
         # 1. Create namespace, stamping folder/env labels so the tenant
         #    automatically participates in Phase 2 folder-level authz.
@@ -595,14 +640,43 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             folder=req.folder, environment=req.environment,
         )
 
-        # 2. Create VPC BEFORE CAPI resources (NAD must exist when TCP pod starts)
-        vpc_info: dict[str, str] | None = None
-        if req.network_isolation:
-            vpc_info = await _create_tenant_vpc(
-                k8s, req.name,
-                mode=req.network_isolation_mode,
-                infra_subnet=req.infra_subnet,
+        # 1b. T2 — materialise folder Phase 2 RoleBindings on the tenant ns
+        #     so users with folder/env access can see worker VMs in /vms.
+        #     Safe to call even when the access block is empty (reconciler
+        #     deletes empty RBs).
+        try:
+            await reconcile_namespace_rbac(
+                k8s, ns, req.folder, req.environment, folder_meta,
             )
+        except Exception as exc:
+            logger.warning(
+                f"Failed to reconcile folder RBAC on tenant ns {ns}: {exc}"
+            )
+
+        # 2. T7 — Attach tenant ns to the chosen VPC (validated above).
+        #    When req.vpc_name is None the tenant runs on the cluster default
+        #    overlay — no VPC attachment, no isolation.
+        #
+        #    B2 (T9): the user explicitly requested this VPC, so if the patch
+        #    fails we must NOT silently 201 the tenant with no isolation —
+        #    re-raise as 502 so the outer cleanup path tears down the
+        #    half-created namespace + RBs. `attach_tenant_to_vpc` itself
+        #    raises HTTPException(400) when the VPC has been deleted between
+        #    our validation and this call (race) — that propagates as-is.
+        if req.vpc_name:
+            try:
+                await attach_tenant_to_vpc(k8s, req.vpc_name, req.name)
+            except ApiException as exc:
+                logger.error(
+                    f"Failed to attach tenant ns {ns} to VPC {req.vpc_name}: {exc}"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"Could not attach tenant to VPC '{req.vpc_name}': "
+                        f"{exc.reason or exc}"
+                    ),
+                ) from exc
 
         # 2b. Provision host-side kubevirt-csi resources BEFORE CAPI:
         #    KubevirtCluster.spec.infraClusterSecretRef must point at an
@@ -613,9 +687,8 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         if req.enable_storage:
             storage_info = await create_csi_infrastructure_resources(k8s, req)
 
-        # 3. Create CAPI resources + Ingress (passes vpc_info for Multus annotation,
-        #    storage_info for KubevirtCluster infraClusterSecretRef).
-        await _create_capi_resources(k8s, req, vpc_info, storage_info)
+        # 3. Create CAPI resources + Ingress.
+        await _create_capi_resources(k8s, req, storage_info)
 
         # 4. Create addon resources (Flux HelmRelease CRs)
         catalog = await _get_addon_catalog(k8s)
@@ -680,19 +753,29 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             ],
         )
 
-    except (ApiException, RuntimeError) as e:
+    except (ApiException, RuntimeError, HTTPException) as e:
+        # B1 (T9): HTTPException must trigger cleanup too — `attach_tenant_to_vpc`
+        # raises HTTPException(400) on race-delete of the VPC, and B2's 502 path
+        # also throws HTTPException. Without this catch, those paths would leak
+        # an orphan tenant namespace + RBs while still returning a 4xx/5xx.
+        # Cleanup: detach the tenant ns from any VPC it was attached to, then
+        # delete the namespace (cascade deletes everything inside, including
+        # any half-created CAPI resources).
         logger.error(f"Failed to create tenant {req.name}: {e}")
-        # Cleanup: try to delete cluster-scoped resources + namespace (cascade)
         try:
-            await _delete_tenant_vpc(k8s, req.name)
+            await detach_tenant_from_folder_vpc(k8s, req.name)
         except Exception:
             pass
         try:
             await k8s.core_api.delete_namespace(name=ns)
         except Exception:
             pass
-        logger.error(f"Failed to create tenant: {e}")
-        raise HTTPException(status_code=500, detail="Failed to create tenant")
+        # Preserve the original HTTPException (its status code + detail) so the
+        # caller sees the actual failure mode; only wrap unexpected
+        # ApiException/RuntimeError into a generic 500.
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail="Failed to create tenant") from e
 
 
 @router.get("/{name}", response_model=TenantResponse)
@@ -730,11 +813,12 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
     if not await _namespace_exists(k8s, ns):
         raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
 
-    # Clean up cluster-scoped resources (not cascade-deleted with namespace)
+    # Detach tenant ns from the folder VPC (cluster-scoped — not cascade-
+    # deleted with the namespace). No-op if the tenant wasn't VPC-attached.
     try:
-        await _delete_tenant_vpc(k8s, name)
+        await detach_tenant_from_folder_vpc(k8s, name)
     except Exception as exc:
-        logger.warning(f"Failed to clean up VPC for tenant {name}: {exc}")
+        logger.warning(f"Failed to detach tenant {name} from folder VPC: {exc}")
 
     try:
         await k8s.core_api.delete_namespace(name=ns)
