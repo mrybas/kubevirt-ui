@@ -215,7 +215,34 @@ def _build_kamaji_cp_cr(
     }
 
 
-def _build_kubevirt_cluster_cr(req: TenantCreateRequest) -> dict[str, Any]:
+def _build_kubevirt_cluster_cr(
+    req: TenantCreateRequest,
+    storage_info: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Build the KubevirtCluster CR.
+
+    When `storage_info` is provided (tenant storage enabled), wires up
+    `spec.infraClusterSecretRef` so CAPK / kubevirt-csi can authenticate
+    against the host cluster.
+
+    The CAPI Provider KubeVirt v1alpha1 `KubevirtClusterSpec` defines
+    exactly four fields: `controlPlaneEndpoint`, `controlPlaneServiceTemplate`,
+    `sshKeys`, `infraClusterSecretRef`. There is **no**
+    `infraClusterStorageClassName` field on the spec — the apiserver
+    silently drops unknown fields, so emitting it would be a no-op lie.
+    Tenant storage class plumbing goes through the kubevirt-csi-driver
+    chart values instead (`storageClasses[].infraStorageClassName`,
+    wired via the `INFRA_STORAGE_CLASS_NAME` addon param in
+    `create_tenant`). See:
+    https://github.com/kubernetes-sigs/cluster-api-provider-kubevirt/blob/main/api/v1alpha1/kubevirtcluster_types.go
+    """
+    spec: dict[str, Any] = {}
+    if storage_info:
+        spec["infraClusterSecretRef"] = {
+            "name": storage_info["secret_name"],
+            "namespace": storage_info["secret_namespace"],
+        }
+
     return {
         "apiVersion": f"{KUBEVIRT_INFRA_GROUP}/{KUBEVIRT_INFRA_VERSION}",
         "kind": "KubevirtCluster",
@@ -230,7 +257,7 @@ def _build_kubevirt_cluster_cr(req: TenantCreateRequest) -> dict[str, Any]:
                 "cluster.x-k8s.io/managed-by": "kamaji",
             },
         },
-        "spec": {},
+        "spec": spec,
     }
 
 
@@ -674,6 +701,7 @@ async def _wait_for_tcp_service_ip(
 async def _create_capi_resources(
     k8s, req: TenantCreateRequest,
     vpc_info: dict[str, str] | None = None,
+    storage_info: dict[str, str] | None = None,
 ) -> None:
     """Create CAPI + Ingress resources in tenant namespace.
 
@@ -684,6 +712,12 @@ async def _create_capi_resources(
       - TCP pod gets Multus dual-NIC (eth0=mgmt, net1=VPC)
       - Workers use TCP's net1 (VPC) IP as controlPlaneEndpoint
       - External/CAPI access still uses ClusterIP service
+
+    When tenant storage is enabled (storage_info provided):
+      - KubevirtCluster gets `infraClusterSecretRef` so CAPK can speak
+        to the host cluster. The storage class is NOT set on the CR
+        (CAPK v1alpha1 has no such field); it is plumbed through the
+        kubevirt-csi-driver addon chart values instead.
     """
     custom = k8s.custom_api
     ns = _tenant_ns(req.name)
@@ -691,7 +725,7 @@ async def _create_capi_resources(
     # 1. Create infrastructure + control plane providers first
     pre_resources = [
         (KAMAJI_CP_GROUP, KAMAJI_CP_VERSION, "kamajicontrolplanes", _build_kamaji_cp_cr(req, vpc_info)),
-        (KUBEVIRT_INFRA_GROUP, KUBEVIRT_INFRA_VERSION, "kubevirtclusters", _build_kubevirt_cluster_cr(req)),
+        (KUBEVIRT_INFRA_GROUP, KUBEVIRT_INFRA_VERSION, "kubevirtclusters", _build_kubevirt_cluster_cr(req, storage_info)),
     ]
     for group, version, plural, body in pre_resources:
         await custom.create_namespaced_custom_object(

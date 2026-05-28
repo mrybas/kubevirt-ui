@@ -93,12 +93,19 @@ rules:
       - persistentvolumes
     verbs: ["get", "list", "watch"]
 
-  # ServiceAccounts — create for tenant clusters and kubeconfig generation
+  # ServiceAccounts — full CRUD for managing kubevirt-csi SA in tenant namespaces
+  # (T3: creates ServiceAccount `kubevirt-csi` in tenant-<name> namespace)
   - apiGroups: [""]
     resources:
       - serviceaccounts
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # ServiceAccount token — TokenRequest to mint short-lived kubeconfig tokens
+  # (T3: calls serviceaccounts/token subresource to generate kubeconfig credentials)
+  - apiGroups: [""]
+    resources:
       - serviceaccounts/token
-    verbs: ["get", "list", "watch", "create"]
+    verbs: ["create"]
 
   # PVCs — full CRUD for disk management
   - apiGroups: [""]
@@ -112,11 +119,13 @@ rules:
       - configmaps
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
-  # Secrets — read for kubeconfig download, TLS
+  # Secrets — full CRUD; read for kubeconfig download/TLS,
+  # write for creating `infra-cluster-credentials` Secret in tenant-<name> namespace
+  # (T3: stores generated kubeconfig as a Secret so kubevirt-csi can consume it)
   - apiGroups: [""]
     resources:
       - secrets
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # Events, Pods (read-only for monitoring / console)
   - apiGroups: [""]

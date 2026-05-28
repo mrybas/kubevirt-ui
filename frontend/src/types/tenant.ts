@@ -64,6 +64,11 @@ export interface TenantCreateRequest {
   worker_image_pull_secrets?: string[];
   // Network binding (T11 — field name matches backend T6)
   worker_network_binding?: 'bridge' | 'masquerade';
+  // Storage (T5 — kubevirt-csi persistent storage for workers)
+  enable_storage?: boolean;
+  storage_class?: string;       // empty string = cluster default
+  storage_quota_gi?: number;
+  storage_pvc_count?: number;
   addons: TenantAddon[];
 }
 

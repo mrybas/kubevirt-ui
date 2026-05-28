@@ -22,9 +22,11 @@ import {
   Cpu,
   Eye,
   Trash2,
-  AlertTriangle,
+  HardDrive,
+  Info,
 } from 'lucide-react';
 import { useTenants, useCreateTenant, useDeleteTenant, useAddonCatalog, useDiscovery } from '../hooks/useTenants';
+import { useStorageClasses } from '../hooks/useStorage';
 import { useSubnets } from '../hooks/useNetwork';
 import { useFoldersFlat } from '../hooks/useFolders';
 import { useAuthStore } from '../store/auth';
@@ -98,6 +100,11 @@ interface WizardState {
   // T9 — network isolation mode (backend creates vpc-<name> automatically; no vpc/gateway choice)
   network_isolation_mode: 'shared' | 'isolated_shared_egress' | 'isolated_dedicated_egress';
   infra_subnet: string; // only used when mode === isolated_dedicated_egress
+  // T5 — persistent storage (kubevirt-csi)
+  enable_storage: boolean;
+  storage_class: string;       // empty = cluster default
+  storage_quota_gi: number;
+  storage_pvc_count: number;
   selectedAddons: Record<string, boolean>;
   addonParams: Record<string, Record<string, string>>;
 }
@@ -123,6 +130,12 @@ const defaultWizard: WizardState = {
   environment: '',
   network_isolation_mode: 'shared',
   infra_subnet: '',
+  // T5 — storage (off by default until kubevirt-csi is bootstrapped)
+  // Defaults match backend model (storage_quota_gi: 100, storage_pvc_count: 20)
+  enable_storage: false,
+  storage_class: '',
+  storage_quota_gi: 100,
+  storage_pvc_count: 20,
   selectedAddons: {},
   addonParams: {},
 };
@@ -151,6 +164,7 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
   const { data: discovery } = useDiscovery();
   const { data: subnets } = useSubnets();
   const { data: foldersData } = useFoldersFlat();
+  const { data: storageClassesData } = useStorageClasses();
   const user = useAuthStore(s => s.user);
   const createTenant = useCreateTenant();
 
@@ -158,6 +172,8 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
   const infraSubnets = subnets?.filter(s => s.purpose === 'infrastructure') ?? [];
   // Check if infrastructure subnet exists (needed to enable dedicated egress)
   const hasInfraSubnet = infraSubnets.length > 0;
+  // Storage classes for T5 picker
+  const storageClasses = storageClassesData?.items ?? [];
 
   // Folder list — admins see all, non-admins see folders where they're listed
   const allFolders = foldersData?.items ?? [];
@@ -264,6 +280,13 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
       // T11: network binding (omit if default bridge)
       ...(form.worker_network_binding !== 'bridge' ? {
         worker_network_binding: form.worker_network_binding,
+      } : {}),
+      // T5: persistent storage (omit entirely when disabled)
+      ...(form.enable_storage ? {
+        enable_storage: true,
+        storage_class: form.storage_class || undefined,
+        storage_quota_gi: form.storage_quota_gi,
+        storage_pvc_count: form.storage_pvc_count,
       } : {}),
       addons,
     };
@@ -412,16 +435,28 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
 
           {step === 1 && (
             <>
-              {/* T11: Storage warning banner */}
-              <div className="flex gap-3 p-3 bg-amber-900/10 border border-amber-700/40 rounded-lg">
-                <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
-                <p className="text-xs text-amber-300/90 leading-relaxed">
-                  <strong>Persistent storage for tenant workers is not yet supported</strong> in this release.
-                  Workers will boot from the container disk image without persistent volumes.
-                  Use this for stateless workloads or proof-of-concept clusters.
-                  Persistent storage via kubevirt-csi is planned for the next release.
-                </p>
-              </div>
+              {/* T6: Storage banner — context-sensitive */}
+              {form.enable_storage ? (
+                <div className="flex gap-3 p-3 bg-emerald-900/10 border border-emerald-700/40 rounded-lg">
+                  <CheckCircle className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5" />
+                  <p className="text-xs text-emerald-300/90 leading-relaxed">
+                    <strong>Persistent storage via kubevirt-csi enabled.</strong>{' '}
+                    Workers can request PVCs backed by the host cluster&apos;s{' '}
+                    <span className="font-mono text-emerald-200">
+                      {form.storage_class || '(cluster default)'}
+                    </span>{' '}
+                    storage class.
+                  </p>
+                </div>
+              ) : (
+                <div className="flex gap-3 p-3 bg-surface-800/60 border border-surface-700/50 rounded-lg">
+                  <Info className="h-4 w-4 text-surface-400 shrink-0 mt-0.5" />
+                  <p className="text-xs text-surface-400 leading-relaxed">
+                    Without persistent storage, workers boot from the container disk only.
+                    Toggle <strong className="text-surface-300">Enable persistent storage</strong> below for PVCs.
+                  </p>
+                </div>
+              )}
 
               {/* Worker Type */}
               <div>
@@ -674,6 +709,97 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                         </div>
                       </label>
                     ))}
+                  </div>
+                )}
+              </div>
+
+              {/* T5: Persistent storage (kubevirt-csi) */}
+              <div className="pt-2 border-t border-surface-700/50 space-y-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <HardDrive className="h-4 w-4 text-surface-400" />
+                    <span className="text-sm font-medium text-surface-200">
+                      Enable persistent storage (via kubevirt-csi)
+                    </span>
+                  </div>
+                  {/* Toggle switch */}
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={form.enable_storage}
+                    onClick={() => setForm({ ...form, enable_storage: !form.enable_storage })}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2 focus:ring-offset-surface-900 ${
+                      form.enable_storage ? 'bg-primary-600' : 'bg-surface-600'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                        form.enable_storage ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {form.enable_storage && (
+                  <div className="space-y-4 pl-6">
+                    {/* StorageClass picker */}
+                    <div>
+                      <label className="block text-sm text-surface-300 mb-1">Storage Class</label>
+                      <select
+                        value={form.storage_class}
+                        onChange={e => setForm({ ...form, storage_class: e.target.value })}
+                        className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 text-sm"
+                      >
+                        <option value="">(cluster default)</option>
+                        {storageClasses.map(sc => (
+                          <option key={sc.name} value={sc.name}>
+                            {sc.name}
+                            {sc.is_default ? ' (default)' : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <p className="text-xs text-surface-500 mt-1">
+                        Storage class used for worker PVCs. Leave blank to use the cluster default.
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-4">
+                      {/* Total storage quota */}
+                      <div>
+                        <label className="block text-sm text-surface-300 mb-1">
+                          Total Storage Quota (Gi)
+                        </label>
+                        <input
+                          type="number"
+                          value={form.storage_quota_gi}
+                          onChange={e =>
+                            setForm({ ...form, storage_quota_gi: parseInt(e.target.value) || 1 })
+                          }
+                          min={1}
+                          max={10000}
+                          className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500"
+                        />
+                        <p className="text-xs text-surface-500 mt-1">Max total GiB across all PVCs (up to 10 000)</p>
+                      </div>
+
+                      {/* Max PVC count */}
+                      <div>
+                        <label className="block text-sm text-surface-300 mb-1">
+                          Max PVC Count
+                        </label>
+                        <input
+                          type="number"
+                          value={form.storage_pvc_count}
+                          onChange={e =>
+                            setForm({ ...form, storage_pvc_count: parseInt(e.target.value) || 1 })
+                          }
+                          min={1}
+                          max={200}
+                          className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500"
+                        />
+                        <p className="text-xs text-surface-500 mt-1">Max PVCs tenant can create (up to 200)</p>
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>
@@ -1035,6 +1161,27 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                         <>
                           <span className="text-surface-500">Pull Secrets</span>
                           <span className="text-surface-200">{form.worker_image_pull_secrets.join(', ')}</span>
+                        </>
+                      )}
+                      {/* T5: Storage */}
+                      <span className="text-surface-500">Storage</span>
+                      {form.enable_storage ? (
+                        <span className="text-emerald-400 flex items-center gap-1">
+                          <CheckCircle className="h-3 w-3" /> kubevirt-csi
+                        </span>
+                      ) : (
+                        <span className="text-surface-400">Disabled</span>
+                      )}
+                      {form.enable_storage && (
+                        <>
+                          <span className="text-surface-500">Storage Class</span>
+                          <span className="text-surface-200 font-mono">
+                            {form.storage_class || '(cluster default)'}
+                          </span>
+                          <span className="text-surface-500">Quota</span>
+                          <span className="text-surface-200">{form.storage_quota_gi} Gi</span>
+                          <span className="text-surface-500">Max PVCs</span>
+                          <span className="text-surface-200">{form.storage_pvc_count}</span>
                         </>
                       )}
                     </div>

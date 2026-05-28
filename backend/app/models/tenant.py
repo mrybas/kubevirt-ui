@@ -160,6 +160,39 @@ class TenantCreateRequest(BaseModel):
     # Override with 'masquerade' for CNIs where bridge live-migration is iffy.
     worker_network_binding: Literal["bridge", "masquerade"] = "bridge"
 
+    # --- Tenant persistent storage (kubevirt-csi pattern) -----------------
+    # When enable_storage=True the tenant create flow provisions:
+    #   - host-side SA `kubevirt-csi` + scoped Role/RoleBinding in tenant ns
+    #   - host-side Secret `infra-cluster-credentials` with a kubeconfig that
+    #     points at the host apiserver and authenticates as the SA
+    #   - KubevirtCluster.spec.infraClusterSecretRef + infraClusterStorageClassName
+    #     (so CAPK / kubevirt-csi can speak to the host cluster)
+    #   - ResourceQuota in the tenant ns capping aggregate PVC count + GiB
+    #   - kubevirt-csi-driver HelmRelease auto-added to the tenant CP addons
+    #
+    # quota fields are only meaningful when enable_storage=True; when False
+    # they are accepted but ignored (avoids forcing the wizard to gate them).
+    enable_storage: bool = Field(
+        default=False,
+        description="Provision kubevirt-csi for tenant persistent storage via host CDI",
+    )
+    storage_class: str | None = Field(
+        default=None,
+        description="Host StorageClass to back tenant DataVolumes (None = cluster default)",
+    )
+    storage_quota_gi: int = Field(
+        default=100,
+        ge=1,
+        le=10000,
+        description="ResourceQuota for tenant ns total storage requests (GiB)",
+    )
+    storage_pvc_count: int = Field(
+        default=20,
+        ge=1,
+        le=200,
+        description="ResourceQuota for tenant ns total PVC count",
+    )
+
     addons: list[TenantAddon] = Field(default_factory=list)
 
     @field_validator("kubernetes_version")
@@ -181,6 +214,18 @@ class TenantCreateRequest(BaseModel):
     def _normalize_blank_infra_subnet(cls, v: str | None) -> str | None:
         # Treat "" the same as None so the wizard's empty-string default
         # collapses to None for the dedicated-egress validator below.
+        if v is None:
+            return None
+        stripped = v.strip()
+        return stripped or None
+
+    @field_validator("storage_class")
+    @classmethod
+    def _normalize_blank_storage_class(cls, v: str | None) -> str | None:
+        # Same trick as infra_subnet — wizard sends "" when the user picks
+        # "cluster default"; collapse to None so the create flow has one shape
+        # to branch on (None ⇒ omit infraClusterStorageClassName on KvCluster
+        # which makes CAPK pick the cluster default SC).
         if v is None:
             return None
         stripped = v.strip()

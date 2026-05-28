@@ -61,22 +61,24 @@ def _build_helm_values(
                 values.setdefault("alloy", {}).setdefault("alloy", {}).setdefault("configMap", {})["content"] = alloy_config
         return values
 
-    # Handle linstor-cluster — piraeus chart in CSI-only mode
-    if component.id in ("linstor-cluster", "linstor-csi"):
-        linstor_api = user_params.get("LINSTOR_API_URL", "")
-        storage_pool = user_params.get("STORAGE_POOL", "")
-        replica_count = user_params.get("REPLICA_COUNT", "2")
-        lc = values.setdefault("linstor-cluster", {})
-        if linstor_api:
-            lc.setdefault("linstorCluster", {}).setdefault(
-                "externalController", {}
-            )["url"] = linstor_api
-        sc_list = lc.get("storageClasses", [{}])
-        if sc_list:
-            sc_params = sc_list[0].setdefault("parameters", {})
-            if storage_pool:
-                sc_params["linstor.csi.linbit.com/storagePool"] = storage_pool
-            sc_params["linstor.csi.linbit.com/autoPlace"] = replica_count
+    # Handle kubevirt-csi-driver — set infraClusterNamespace + infraStorageClassName
+    # from the tenant's storage params. The host-side resources (SA, Role,
+    # Secret with kubeconfig) are created by `tenants_storage`, this just
+    # wires the tenant-CP chart values to point at them.
+    if component.id == "kubevirt-csi-driver":
+        infra_ns = user_params.get("INFRA_CLUSTER_NAMESPACE", "")
+        infra_sc = user_params.get("INFRA_STORAGE_CLASS_NAME", "")
+        if infra_ns:
+            values["infraClusterNamespace"] = infra_ns
+        if infra_sc:
+            sc_list = values.setdefault("storageClasses", [{}])
+            if sc_list:
+                sc_list[0]["infraStorageClassName"] = infra_sc
+        # Make sure secretRef matches the host-side secret name we use in
+        # tenants_storage (`infra-cluster-credentials`).
+        values.setdefault("infraClusterKubeconfigSecret", {})
+        values["infraClusterKubeconfigSecret"].setdefault("name", "infra-cluster-credentials")
+        values["infraClusterKubeconfigSecret"].setdefault("key", "kubeconfig")
         return values
 
     # Generic: no special handling needed (e.g. calico uses defaults as-is)
