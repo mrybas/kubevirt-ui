@@ -120,6 +120,21 @@ export default function CLIAccess() {
           </button>
         </PageTitle>
 
+        {/* Fallback API URL warning */}
+        {data.api_url_source === 'fallback' && (
+          <div className="flex items-start gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3">
+            <AlertTriangle className="h-5 w-5 text-amber-400 mt-0.5 shrink-0" />
+            <div className="text-sm leading-relaxed">
+              <p className="font-medium text-amber-300 mb-0.5">
+                This kubeconfig points at the cluster's internal API URL (<code className="font-mono text-amber-200 text-xs">kubernetes.default.svc</code>) and may not be reachable from outside the cluster.
+              </p>
+              <p className="text-amber-400/80">
+                Ask your administrator to set <code className="font-mono text-amber-200 text-xs">KUBE_API_EXTERNAL_URL</code> on the backend or publish the <code className="font-mono text-amber-200 text-xs">kube-public/cluster-info</code> ConfigMap.
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Info cards */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="card card-body flex items-start gap-3">

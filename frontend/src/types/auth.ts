@@ -47,4 +47,5 @@ export interface KubeconfigResponse {
   server: string;
   username: string;
   auth_type: string;
+  api_url_source: 'env' | 'cluster-info' | 'fallback';
 }

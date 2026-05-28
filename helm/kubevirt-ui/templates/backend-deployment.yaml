@@ -97,6 +97,11 @@ spec:
             - name: LLDAP_LDAP_BASE_DN
               value: {{ .Values.lldap.baseDN | quote }}
             {{- end }}
+            {{- /* Kubeconfig generation — external API server URL override */ -}}
+            {{- if and .Values.auth.kubeconfig .Values.auth.kubeconfig.externalApiUrl }}
+            - name: KUBE_API_EXTERNAL_URL
+              value: {{ .Values.auth.kubeconfig.externalApiUrl | quote }}
+            {{- end }}
             {{- /* External LDAP — Phase 2 group autocomplete for folder Access tab */ -}}
             {{- with .Values.auth.ldap }}
             {{- if .url }}

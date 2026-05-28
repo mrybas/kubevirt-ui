@@ -211,6 +211,15 @@ auth:
     # -- Group attribute that holds the human-readable name
     groupNameAttr: "cn"
 
+  # -- Kubeconfig generation (CLI Access page)
+  kubeconfig:
+    # -- Externally-reachable Kubernetes API server URL stamped into the
+    # generated kubeconfig (e.g. "https://k8s.example.com:6443" or a Talos
+    # VIP). When empty the backend falls back to reading the
+    # `kube-public/cluster-info` ConfigMap, then to
+    # `https://kubernetes.default.svc:443` (which won't work from outside).
+    externalApiUrl: ""
+
 # =========================================================================
 # DEX (optional built-in OIDC provider)
 # =========================================================================

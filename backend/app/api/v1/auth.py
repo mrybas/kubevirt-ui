@@ -213,6 +213,11 @@ class KubeconfigResponse(BaseModel):
     server: str
     username: str
     auth_type: str
+    # Where the `server:` URL came from: "env" (KUBE_API_EXTERNAL_URL),
+    # "cluster-info" (kube-public/cluster-info ConfigMap), or "fallback"
+    # (kubernetes.default.svc — likely unreachable from outside; frontend
+    # should surface a banner prompting the admin to fix).
+    api_url_source: str
 
 
 class KubeconfigTokensRequest(BaseModel):
@@ -441,12 +446,19 @@ async def get_kubeconfig(
     """
     import yaml
     from app.core.auth import AUTH_TYPE
+    from app.core.kube_api_url import discover_external_api_url
 
     k8s_client = request.app.state.k8s_client
 
-    # Get cluster API server URL from the loaded configuration
+    # In-cluster URL — used as the TokenRequest audience (the apiserver
+    # validates tokens against its own self-identity, not the external URL)
+    # and as a sanity-check / fallback comparison.
     k8s_config = k8s_client._api_client.configuration
-    server = k8s_config.host
+    internal_server = k8s_config.host
+
+    # Externally-reachable URL — what we stamp into the kubeconfig so the
+    # downloaded file actually works from the user's machine.
+    server, api_url_source = await discover_external_api_url(k8s_client)
     cluster_name = "kubevirt-cluster"
 
     # Get CA data if available
@@ -469,13 +481,32 @@ async def get_kubeconfig(
     username = user.email or user.username
     variants: list[KubeconfigVariant] = []
 
+    # Stamp a warning into the kubeconfig when we couldn't determine the
+    # external URL — the file will deploy but won't work from outside.
+    def _stamp(rendered: str) -> str:
+        if api_url_source != "fallback":
+            return rendered
+        warning = (
+            "# WARNING: server URL below is the in-cluster default and is\n"
+            "# likely unreachable from outside the cluster.\n"
+            "# To fix, do ONE of:\n"
+            "#   1. Set KUBE_API_EXTERNAL_URL env on the kubevirt-ui backend\n"
+            "#      (helm: auth.kubeconfig.externalApiUrl), OR\n"
+            "#   2. Publish the kube-public/cluster-info ConfigMap\n"
+            "#      (kubeadm/Talos do this automatically).\n"
+        )
+        return warning + rendered
+
     # --- Variant 1 (primary): ServiceAccount token ---
     # Always works because it uses K8s-native authentication
     try:
         sa_name = _sanitize_sa_name(username)
         sa_token = await _ensure_service_account(
             k8s_client, sa_name, username, user.groups,
-            api_server_url=server,
+            # Audience MUST match the apiserver's self-identity (in-cluster
+            # URL) — using the external URL here would produce tokens the
+            # apiserver rejects with "audiences not accepted".
+            api_server_url=internal_server,
         )
 
         # Set default namespace for non-admin users
@@ -540,7 +571,7 @@ async def get_kubeconfig(
             id="sa-token",
             label="ServiceAccount Token",
             description="Works immediately. Uses a K8s-native ServiceAccount token (~72h expiry).",
-            kubeconfig=yaml.dump(sa_kubeconfig, default_flow_style=False, sort_keys=False),
+            kubeconfig=_stamp(yaml.dump(sa_kubeconfig, default_flow_style=False, sort_keys=False)),
             instructions=sa_instructions,
         ))
     except Exception as e:
@@ -589,7 +620,7 @@ async def get_kubeconfig(
             id="oidc-renew",
             label="OIDC (auto-renewing)",
             description="Requires K8s API server OIDC. Tokens refresh automatically.",
-            kubeconfig=yaml.dump(oidc_renew_kubeconfig, default_flow_style=False, sort_keys=False),
+            kubeconfig=_stamp(yaml.dump(oidc_renew_kubeconfig, default_flow_style=False, sort_keys=False)),
             instructions=oidc_renew_instructions,
         ))
 
@@ -639,7 +670,7 @@ async def get_kubeconfig(
             id="oidc-exec",
             label="kubelogin (exec plugin)",
             description="Requires kubelogin install + K8s OIDC. Authenticates via browser, never expires.",
-            kubeconfig=yaml.dump(oidc_kubeconfig, default_flow_style=False, sort_keys=False),
+            kubeconfig=_stamp(yaml.dump(oidc_kubeconfig, default_flow_style=False, sort_keys=False)),
             instructions=oidc_instructions,
         ))
 
@@ -655,6 +686,7 @@ async def get_kubeconfig(
         server=server,
         username=username,
         auth_type=AUTH_TYPE,
+        api_url_source=api_url_source,
     )
 
 

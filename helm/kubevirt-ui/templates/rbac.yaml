@@ -240,6 +240,24 @@ rules:
       - clusterrolebindings
     verbs: ["create", "update", "patch", "delete"]
 
+  # "bind" verb — required to create ClusterRoleBindings that reference any of the
+  # listed ClusterRoles.  Without it Kubernetes rejects the CRB with a 403 even
+  # though the SA already has "create" on clusterrolebindings.  This is the
+  # privilege-escalation-prevention mechanism: a principal cannot grant permissions
+  # it does not itself possess, so it must explicitly hold "bind" on the target
+  # ClusterRole.
+  # Ref: https://kubernetes.io/docs/reference/access-authn-authz/rbac/#privilege-escalation-prevention-and-bootstrapping
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources:
+      - clusterroles
+    resourceNames:
+      - cluster-admin
+      - kubevirt-ui-admin
+      - kubevirt-ui-editor
+      - kubevirt-ui-viewer
+      - kubevirt-ui-ns-viewer
+    verbs: ["bind"]
+
   # Subject access review (permission checks)
   - apiGroups: ["authorization.k8s.io"]
     resources:
