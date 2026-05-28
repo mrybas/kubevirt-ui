@@ -350,6 +350,7 @@ async def _create_namespace(
     worker_type: str = "vm",
     folder: str | None = None,
     environment: str | None = None,
+    logical_switch: str | None = None,
 ) -> None:
     """Create a tenant namespace.
 
@@ -361,6 +362,15 @@ async def _create_namespace(
     in `get_user_namespaces` — this is what makes worker VMs in
     `tenant-<name>` visible in the main /vms list for users who have
     folder/env access (T2).
+
+    `logical_switch`, when provided, is stamped as the
+    `ovn.kubernetes.io/logical_switch` annotation BEFORE the namespace POST.
+    This pre-stamp is race-resistant: it gets the annotation in place before
+    kube-ovn-controller has a chance to observe the new namespace and
+    default-claim it to ovn-default. Without this, pods/VMs born in the ns
+    land on the cluster default overlay (10.16.0.0/16) even when the tenant
+    is attached to a VPC. When `None` (e.g. vpc_name=None, or VPC has no
+    default subnet), no annotation is stamped → tenant falls back to overlay.
     """
     labels: dict[str, str] = {
         "kubevirt-ui.io/tenant": tenant_name,
@@ -379,7 +389,14 @@ async def _create_namespace(
         labels["kubevirt-ui.io/folder"] = folder
     if environment:
         labels["kubevirt-ui.io/environment"] = environment
+    annotations: dict[str, str] = {}
+    if logical_switch:
+        annotations["ovn.kubernetes.io/logical_switch"] = logical_switch
     body = client.V1Namespace(
-        metadata=client.V1ObjectMeta(name=ns, labels=labels),
+        metadata=client.V1ObjectMeta(
+            name=ns,
+            labels=labels,
+            annotations=annotations or None,
+        ),
     )
     await k8s.core_api.create_namespace(body=body)

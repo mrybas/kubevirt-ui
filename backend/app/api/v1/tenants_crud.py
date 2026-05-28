@@ -599,6 +599,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
     #   2. carry kubevirt-ui.io/folder == req.folder
     #   3. carry kubevirt-ui.io/environment == req.environment, OR be
     #      folder-wide (no env label, eligible for every env under folder)
+    logical_switch: str | None = None
     if req.vpc_name:
         try:
             vpc_cr = await k8s.custom_api.get_cluster_custom_object(
@@ -632,12 +633,74 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                 ),
             )
 
+        # Resolve the VPC's default subnet so we can pre-stamp the
+        # `ovn.kubernetes.io/logical_switch` annotation on the tenant ns.
+        # Without this annotation, kube-ovn-controller observes the new ns
+        # before our subsequent attach_tenant_to_vpc patch and claims it for
+        # ovn-default → worker pods/VMs come up on 10.16.0.0/16 instead of
+        # the VPC subnet.
+        subnet_list_failed = False
+        try:
+            subnet_list = await k8s.custom_api.list_cluster_custom_object(
+                group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+                plural="subnets",
+            )
+        except ApiException as exc:
+            logger.warning(
+                f"Failed to list subnets while resolving default for VPC "
+                f"{req.vpc_name!r}: {exc}. Tenant will fall back to cluster "
+                "default overlay."
+            )
+            subnet_list = {"items": []}
+            subnet_list_failed = True
+        default_subnets = [
+            s for s in subnet_list.get("items", [])
+            if (s.get("spec") or {}).get("vpc") == req.vpc_name
+            and (s.get("spec") or {}).get("default") is True
+        ]
+        if len(default_subnets) == 1:
+            logical_switch = (
+                (default_subnets[0].get("metadata") or {}).get("name")
+            )
+        elif len(default_subnets) == 0:
+            # Skip the misleading "VPC has no default subnet" WARN when we
+            # never managed to list subnets in the first place — the list-
+            # failure WARN above already covered that path.
+            if not subnet_list_failed:
+                logger.warning(
+                    f"VPC {req.vpc_name!r} has no default subnet "
+                    "(spec.default=true). Tenant ns will not be pre-stamped "
+                    "with ovn.kubernetes.io/logical_switch — worker pods/VMs "
+                    "will likely land on the cluster default overlay instead "
+                    "of the VPC subnet. Admin should mark one subnet of the "
+                    "VPC as default and re-create the tenant (or manually "
+                    "patch the tenant ns annotation + recycle the pods)."
+                )
+        else:
+            # >1 default subnet — kube-ovn allows only one per VPC but
+            # be defensive: deterministic pick + WARN.
+            names = sorted(
+                ((s.get("metadata") or {}).get("name") or "")
+                for s in default_subnets
+            )
+            logical_switch = names[0]
+            logger.warning(
+                f"VPC {req.vpc_name!r} has multiple default subnets "
+                f"({names!r}); kube-ovn only allows one. Picking "
+                f"{logical_switch!r} (sorted-first) for the tenant ns "
+                "annotation. Admin should reconcile this."
+            )
+
     try:
         # 1. Create namespace, stamping folder/env labels so the tenant
         #    automatically participates in Phase 2 folder-level authz.
+        #    `logical_switch` (resolved above from the VPC's default subnet)
+        #    pre-stamps the ovn.kubernetes.io/logical_switch annotation so
+        #    kube-ovn-controller doesn't claim the ns for ovn-default.
         await _create_namespace(
             k8s, ns, req.name, req.worker_type,
             folder=req.folder, environment=req.environment,
+            logical_switch=logical_switch,
         )
 
         # 1b. T2 — materialise folder Phase 2 RoleBindings on the tenant ns

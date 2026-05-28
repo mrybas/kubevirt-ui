@@ -337,6 +337,15 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             "cidrBlock": cidr,
             "gateway": gateway,
             "vpc": data.name,
+            # Marks this subnet as the VPC's default — kube-ovn-controller
+            # routes any namespace joining the VPC (without an explicit
+            # ovn.kubernetes.io/logical_switch annotation) to this subnet.
+            # Without this, tenants bound to the VPC land on the cluster
+            # default overlay (10.16.0.0/16) instead of the VPC subnet.
+            # Only set on the create-with-VPC default subnet — secondary
+            # subnets added later via /subnets endpoints remain non-default
+            # unless an admin explicitly promotes them.
+            "default": True,
             "enableDHCP": True,
             "natOutgoing": data.enable_nat_gateway,
             **({"namespaces": bind_namespaces} if bind_namespaces else {}),
