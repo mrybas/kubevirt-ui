@@ -66,6 +66,8 @@ interface WizardState {
   worker_vcpu: number;
   worker_memory: string;
   worker_disk: string;
+  worker_image_url: string;
+  worker_image_pull_secrets: string[];
   pod_cidr: string;
   service_cidr: string;
   admin_group: string;
@@ -86,6 +88,8 @@ const defaultWizard: WizardState = {
   worker_vcpu: 2,
   worker_memory: '2Gi',
   worker_disk: '20Gi',
+  worker_image_url: '',
+  worker_image_pull_secrets: [],
   pod_cidr: '10.244.0.0/16',
   service_cidr: '10.96.0.0/12',
   admin_group: '',
@@ -96,9 +100,22 @@ const defaultWizard: WizardState = {
   addonParams: {},
 };
 
+const containerDiskPresets = [
+  { name: 'Ubuntu 22.04', url: 'quay.io/containerdisks/ubuntu:22.04' },
+  { name: 'Ubuntu 24.04', url: 'quay.io/containerdisks/ubuntu:24.04' },
+  { name: 'Fedora 39', url: 'quay.io/containerdisks/fedora:39' },
+  { name: 'CentOS Stream 9', url: 'quay.io/containerdisks/centos-stream:9' },
+  { name: 'Cirros (test)', url: 'quay.io/kubevirt/cirros-container-disk-demo' },
+];
+
+/** DNS-1123 label: lowercase alphanumeric + hyphen, ≤63 chars, start/end alphanumeric */
+const isDns1123Label = (s: string): boolean =>
+  /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(s);
+
 function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<WizardState>(defaultWizard);
+  const [secretInput, setSecretInput] = useState('');
   const { data: catalog } = useAddonCatalog();
   const { data: discovery } = useDiscovery();
   const { data: subnets } = useSubnets();
@@ -172,6 +189,13 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
       viewer_group: form.viewer_group,
       network_isolation: form.network_isolation || undefined,
       egress_gateway: form.egress_gateway || undefined,
+      ...(form.worker_image_url ? {
+        worker_image_url: form.worker_image_url,
+        worker_image_source_type: 'registry' as const,
+      } : {}),
+      ...(form.worker_image_pull_secrets.length > 0 ? {
+        worker_image_pull_secrets: form.worker_image_pull_secrets,
+      } : {}),
       addons,
     };
 
@@ -351,6 +375,116 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                   Total resources: <span className="text-primary-400 font-medium">{form.worker_count} VMs</span> ×{' '}
                   <span className="text-primary-400 font-medium">{form.worker_vcpu} vCPU</span>,{' '}
                   <span className="text-primary-400 font-medium">{form.worker_memory} RAM</span>
+                </p>
+              </div>
+
+              {/* Worker Container Image (OCI containerDisk) */}
+              <div className="space-y-2">
+                <label className="block text-sm text-surface-300">
+                  Worker Image URL
+                  <span className="ml-1 text-surface-500 font-normal">(optional — OCI containerDisk)</span>
+                </label>
+                <input
+                  type="text"
+                  value={form.worker_image_url}
+                  onChange={e => setForm({ ...form, worker_image_url: e.target.value })}
+                  placeholder="quay.io/containerdisks/ubuntu:22.04"
+                  className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
+                />
+                <div>
+                  <p className="text-xs text-surface-500 mb-1.5">Quick-fill presets:</p>
+                  <div className="flex flex-wrap gap-2">
+                    {containerDiskPresets.map((preset) => (
+                      <button
+                        key={preset.name}
+                        type="button"
+                        onClick={() => setForm({ ...form, worker_image_url: preset.url })}
+                        className={`px-3 py-1.5 text-xs rounded-md border transition-colors ${
+                          form.worker_image_url === preset.url
+                            ? 'border-primary-500 bg-primary-500/10 text-primary-300'
+                            : 'border-surface-700 bg-surface-800 text-surface-400 hover:border-surface-600 hover:text-surface-300'
+                        }`}
+                      >
+                        {preset.name}
+                      </button>
+                    ))}
+                    {form.worker_image_url && !containerDiskPresets.some(p => p.url === form.worker_image_url) && (
+                      <span className="px-3 py-1.5 text-xs rounded-md border border-surface-600 bg-surface-800 text-surface-400 italic">
+                        Custom URL
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Image Pull Secrets */}
+              <div className="space-y-2">
+                <label className="block text-sm text-surface-300">Image Pull Secrets</label>
+                {/* Existing secrets chips */}
+                {form.worker_image_pull_secrets.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5 mb-1">
+                    {form.worker_image_pull_secrets.map((secret) => (
+                      <span
+                        key={secret}
+                        className="inline-flex items-center gap-1 px-2 py-1 bg-primary-500/10 border border-primary-500/30 text-primary-300 rounded-md text-xs font-mono"
+                      >
+                        {secret}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setForm({
+                              ...form,
+                              worker_image_pull_secrets: form.worker_image_pull_secrets.filter(s => s !== secret),
+                            })
+                          }
+                          className="ml-0.5 text-primary-400 hover:text-primary-200 transition-colors"
+                          aria-label={`Remove ${secret}`}
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {/* Input for adding a new secret */}
+                <input
+                  type="text"
+                  value={secretInput}
+                  onChange={e => {
+                    // Strip commas live — comma triggers add
+                    const val = e.target.value.replace(/,/g, '');
+                    setSecretInput(val);
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' || e.key === ',') {
+                      e.preventDefault();
+                      const trimmed = secretInput.trim();
+                      if (trimmed && isDns1123Label(trimmed) && !form.worker_image_pull_secrets.includes(trimmed)) {
+                        setForm({ ...form, worker_image_pull_secrets: [...form.worker_image_pull_secrets, trimmed] });
+                      }
+                      setSecretInput('');
+                    } else if (e.key === 'Backspace' && secretInput === '' && form.worker_image_pull_secrets.length > 0) {
+                      // Remove last chip on backspace when input is empty
+                      setForm({
+                        ...form,
+                        worker_image_pull_secrets: form.worker_image_pull_secrets.slice(0, -1),
+                      });
+                    }
+                  }}
+                  placeholder={form.worker_image_pull_secrets.length === 0 ? 'my-registry-secret (Enter or comma to add)' : 'Add another…'}
+                  className={`w-full px-3 py-2 bg-surface-800 border rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none text-sm font-mono ${
+                    secretInput && !isDns1123Label(secretInput)
+                      ? 'border-red-500/60 focus:border-red-500'
+                      : 'border-surface-700 focus:border-primary-500'
+                  }`}
+                />
+                {secretInput && !isDns1123Label(secretInput) && (
+                  <p className="text-xs text-red-400">
+                    Must be lowercase alphanumeric + hyphens, start/end with alphanumeric, ≤63 chars
+                  </p>
+                )}
+                <p className="text-xs text-surface-500">
+                  Secrets must already exist in the tenant namespace; admin creates them.
                 </p>
               </div>
             </>
@@ -667,6 +801,20 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                       <span className="text-surface-200">{form.worker_memory}</span>
                       <span className="text-surface-500">Disk</span>
                       <span className="text-surface-200">{form.worker_disk}</span>
+                      {form.worker_image_url && (
+                        <>
+                          <span className="text-surface-500">Image</span>
+                          <span className="text-surface-200 font-mono truncate" title={form.worker_image_url}>
+                            {form.worker_image_url}
+                          </span>
+                        </>
+                      )}
+                      {form.worker_image_pull_secrets.length > 0 && (
+                        <>
+                          <span className="text-surface-500">Pull Secrets</span>
+                          <span className="text-surface-200">{form.worker_image_pull_secrets.join(', ')}</span>
+                        </>
+                      )}
                     </div>
                   </div>
 

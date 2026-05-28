@@ -96,6 +96,11 @@ class TenantCreateRequest(BaseModel):
     worker_image_os_type: str = "linux"
     worker_image_display_name: str = ""
 
+    # Names of pre-existing imagePullSecret Secrets in the tenant namespace.
+    # Admin creates the Secrets out-of-band; we only stamp the references onto
+    # the worker VM pod template so kubelet can pull the worker containerDisk.
+    worker_image_pull_secrets: list[str] = Field(default_factory=list)
+
     pod_cidr: str = "10.244.0.0/16"
     service_cidr: str = "10.96.0.0/12"
     admin_group: str = ""  # DEX group → cluster-admin in tenant

@@ -1,5 +1,6 @@
 """Shared constants and helpers for tenant management."""
 
+import ipaddress
 import logging
 import os
 import time
@@ -31,9 +32,12 @@ KUBEVIRT_INFRA_VERSION = "v1alpha1"
 FLUX_HELM_GROUP = "helm.toolkit.fluxcd.io"
 FLUX_HELM_VERSION = "v2"
 
-# VpcDns configuration — VIP from Service CIDR (NOT from VPC subnet)
-VPCDNS_VIP = "10.96.0.200"
-VPCDNS_FORWARD_DNS = "10.96.0.10"  # kube-dns ClusterIP (Talos uses this)
+# VpcDns hardcoded fallbacks — used only when autodiscovery fails AND no env override.
+# These match Talos defaults (service CIDR 10.96.0.0/12). Override per cluster via:
+#   TENANTS_VPCDNS_FORWARD_DNS  (kube-dns ClusterIP)
+#   TENANTS_VPCDNS_VIP          (free IP in service CIDR for VpcDns VIP)
+_VPCDNS_VIP_FALLBACK = "10.96.0.200"
+_VPCDNS_FORWARD_DNS_FALLBACK = "10.96.0.10"
 
 # OIDC defaults (can be overridden by env)
 OIDC_ISSUER = os.getenv("OIDC_ISSUER", "")
@@ -66,6 +70,8 @@ async def _ensure_cluster_config(k8s) -> dict[str, Any]:
     ip_override = os.getenv("TENANTS_INGRESS_IP")
     class_override = os.getenv("TENANTS_INGRESS_CLASS")
     cidr_override = os.getenv("TENANTS_MGMT_CIDR")
+    vpcdns_forward_override = os.getenv("TENANTS_VPCDNS_FORWARD_DNS")
+    vpcdns_vip_override = os.getenv("TENANTS_VPCDNS_VIP")
 
     ingress_class = class_override
     ingress_controller = "unknown"
@@ -142,18 +148,130 @@ async def _ensure_cluster_config(k8s) -> dict[str, Any]:
             logger.warning(f"Failed to autodiscover mgmt CIDR from Nodes: {e}")
             mgmt_cidr = None
 
+    vpcdns_forward_dns = vpcdns_forward_override
+    if not vpcdns_forward_dns:
+        vpcdns_forward_dns = await _discover_kube_dns_clusterip(k8s)
+    if not vpcdns_forward_dns:
+        logger.warning(
+            "VpcDns forward DNS could not be autodiscovered (kube-dns/coredns Service "
+            f"not found in kube-system); falling back to {_VPCDNS_FORWARD_DNS_FALLBACK}. "
+            "Override via TENANTS_VPCDNS_FORWARD_DNS env var."
+        )
+        vpcdns_forward_dns = _VPCDNS_FORWARD_DNS_FALLBACK
+
+    vpcdns_vip = vpcdns_vip_override
+    if not vpcdns_vip:
+        service_cidr = await _discover_service_cidr(k8s)
+        if service_cidr:
+            try:
+                net = ipaddress.ip_network(service_cidr, strict=False)
+                # Replace the last octet of the network address with 200.
+                # For IPv4 service CIDRs like 10.96.0.0/12 → 10.96.0.200.
+                octets = str(net.network_address).split(".")
+                if len(octets) == 4:
+                    vpcdns_vip = f"{octets[0]}.{octets[1]}.{octets[2]}.200"
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Could not parse service CIDR {service_cidr!r}: {e}")
+    if not vpcdns_vip:
+        logger.warning(
+            "VpcDns VIP could not be autodiscovered (service CIDR not found via "
+            f"kubeadm-config or kube-apiserver pod args); falling back to {_VPCDNS_VIP_FALLBACK}. "
+            "Override via TENANTS_VPCDNS_VIP env var."
+        )
+        vpcdns_vip = _VPCDNS_VIP_FALLBACK
+
     _cluster_config = {
         "ingress_ip": ingress_ip,
         "ingress_class": ingress_class,
         "ingress_controller": ingress_controller,
         "mgmt_cidr": mgmt_cidr,
+        "vpcdns_forward_dns": vpcdns_forward_dns,
+        "vpcdns_vip": vpcdns_vip,
         "fetched_at": now,
     }
     logger.info(
         f"Cluster config: ingress_ip={ingress_ip} class={ingress_class} "
-        f"controller={ingress_controller} mgmt_cidr={mgmt_cidr}"
+        f"controller={ingress_controller} mgmt_cidr={mgmt_cidr} "
+        f"vpcdns_forward_dns={vpcdns_forward_dns} vpcdns_vip={vpcdns_vip}"
     )
     return _cluster_config
+
+
+async def _discover_kube_dns_clusterip(k8s) -> str | None:
+    """Look up cluster DNS ClusterIP, trying kube-dns then coredns."""
+    for svc_name in ("kube-dns", "coredns"):
+        try:
+            svc = await k8s.core_api.read_namespaced_service(
+                name=svc_name, namespace="kube-system",
+            )
+            ip = svc.spec.cluster_ip if svc.spec else None
+            if ip and ip not in ("None", ""):
+                return ip
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning(f"Error reading kube-system/{svc_name} Service: {e}")
+    return None
+
+
+async def _discover_service_cidr(k8s) -> str | None:
+    """Discover service CIDR from kubeadm-config ConfigMap, then kube-apiserver Pod args."""
+    # Try 1: kube-system/kubeadm-config ConfigMap
+    try:
+        cm = await k8s.core_api.read_namespaced_config_map(
+            name="kubeadm-config", namespace="kube-system",
+        )
+    except ApiException as e:
+        if e.status != 404:
+            logger.warning(f"Error reading kube-system/kubeadm-config ConfigMap: {e}")
+    else:
+        # Parse separately so YAML/shape errors fall through to Try 2 instead
+        # of being swallowed by the outer ApiException-only handler.
+        try:
+            cluster_cfg_raw = (cm.data or {}).get("ClusterConfiguration", "")
+            if cluster_cfg_raw:
+                cluster_cfg = yaml.safe_load(cluster_cfg_raw)
+                if isinstance(cluster_cfg, dict):
+                    subnet = (cluster_cfg.get("networking") or {}).get("serviceSubnet")
+                    if subnet:
+                        return subnet
+                else:
+                    logger.warning(
+                        "kubeadm-config ClusterConfiguration parsed to "
+                        f"{type(cluster_cfg).__name__}, expected dict; falling through"
+                    )
+        except (yaml.YAMLError, AttributeError, TypeError) as e:
+            logger.warning(f"kubeadm-config malformed, falling through: {e}")
+
+    # Try 2: any kube-apiserver Pod's --service-cluster-ip-range= arg.
+    # Try multiple label selectors — distros disagree on conventions:
+    #   kubeadm:    component=kube-apiserver
+    #   Talos/k0s:  k8s-app=kube-apiserver
+    #   some CP:    tier=control-plane,k8s-app=kube-apiserver
+    selectors = (
+        "component=kube-apiserver",
+        "k8s-app=kube-apiserver",
+        "tier=control-plane,k8s-app=kube-apiserver",
+    )
+    for selector in selectors:
+        try:
+            pods = await k8s.core_api.list_namespaced_pod(
+                namespace="kube-system",
+                label_selector=selector,
+            )
+        except ApiException as e:
+            logger.warning(f"Error listing kube-apiserver pods (selector={selector!r}): {e}")
+            continue
+        if not pods.items:
+            continue
+        for pod in pods.items:
+            for container in (pod.spec.containers or []) if pod.spec else []:
+                # Args may live in `command` or `args` depending on manifest
+                tokens = list(container.command or []) + list(container.args or [])
+                for tok in tokens:
+                    if tok.startswith("--service-cluster-ip-range="):
+                        return tok.split("=", 1)[1]
+
+    return None
 
 
 def _require_cluster_config() -> dict[str, Any]:
@@ -186,6 +304,14 @@ def _ingress_controller() -> str:
 
 def _mgmt_cidr_drop() -> str | None:
     return _require_cluster_config()["mgmt_cidr"]
+
+
+def _vpcdns_forward_dns() -> str:
+    return _require_cluster_config()["vpcdns_forward_dns"]
+
+
+def _vpcdns_vip() -> str:
+    return _require_cluster_config()["vpcdns_vip"]
 
 
 async def _get_addon_catalog(k8s) -> AddonCatalog:

@@ -82,7 +82,14 @@ The chart deploys the following components:
 | `backend.env.LOG_LEVEL` | Log level | `INFO` |
 | `backend.env.CORS_ORIGINS` | Allowed CORS origins (comma-separated) | `""` |
 | `backend.env.ENABLE_TENANTS` | Enable multi-tenant mode | `"false"` |
+| `backend.env.TENANTS_VPCDNS_FORWARD_DNS` | kube-dns/coredns Service ClusterIP override (tenant VPC DNS) | `""` |
+| `backend.env.TENANTS_VPCDNS_VIP` | VPC DNS VIP within service CIDR (default: `<service-cidr>.200`) | `""` |
+| `backend.env.TENANTS_KONNECTIVITY_PROXY_IMAGE` | Konnectivity proxy-server image override | `""` |
+| `backend.env.TENANTS_KONNECTIVITY_AGENT_IMAGE` | Konnectivity proxy-agent image override | `""` |
+| `backend.env.TENANTS_DEFAULT_WORKER_IMAGE` | OCI containerDisk image for tenant worker VMs | `""` |
 | `backend.envFrom` | Extra env sources (secretRef/configMapRef) | `[]` |
+
+> ⚠️ Env values must be quoted strings (e.g. `ENABLE_TENANTS: "false"`, not `false`). Unquoted YAML booleans/numbers are stripped by the deployment template.
 
 ### Frontend
 

@@ -23,14 +23,29 @@ from app.api.v1.tenants_common import (
     KAMAJI_CP_VERSION,
     KUBEVIRT_INFRA_GROUP,
     KUBEVIRT_INFRA_VERSION,
-    VPCDNS_VIP,
     OIDC_ISSUER,
     OIDC_CLIENT_ID,
     _tenant_ns,
     _endpoint_host,
     _ingress_class,
     _ingress_controller,
+    _vpcdns_vip,
 )
+
+# Konnectivity image overrides — defaults match upstream Kamaji defaults.
+# Override for air-gapped clusters via env (e.g. mirror.internal/kas-network-proxy/...).
+_DEFAULT_KONNECTIVITY_PROXY_IMAGE = "registry.k8s.io/kas-network-proxy/proxy-server"
+_DEFAULT_KONNECTIVITY_AGENT_IMAGE = "registry.k8s.io/kas-network-proxy/proxy-agent"
+
+
+def _konnectivity_proxy_image() -> str:
+    # `or` so an empty env value (e.g. `export TENANTS_KONNECTIVITY_PROXY_IMAGE=""`)
+    # falls back to the default rather than producing an empty image string.
+    return os.getenv("TENANTS_KONNECTIVITY_PROXY_IMAGE") or _DEFAULT_KONNECTIVITY_PROXY_IMAGE
+
+
+def _konnectivity_agent_image() -> str:
+    return os.getenv("TENANTS_KONNECTIVITY_AGENT_IMAGE") or _DEFAULT_KONNECTIVITY_AGENT_IMAGE
 
 logger = logging.getLogger(__name__)
 
@@ -161,13 +176,13 @@ def _build_kamaji_cp_cr(
             "konnectivity": {
                 "server": {
                     "port": 8132,
-                    "image": "registry.k8s.io/kas-network-proxy/proxy-server",
+                    "image": _konnectivity_proxy_image(),
                     "resources": {
                         "requests": {"cpu": "50m", "memory": "64Mi"},
                     },
                 },
                 "agent": {
-                    "image": "registry.k8s.io/kas-network-proxy/proxy-agent",
+                    "image": _konnectivity_agent_image(),
                 },
             },
         },
@@ -289,7 +304,15 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
                                 "spec": {
                                     # VPC mode: override DNS since kube-dns ClusterIP
                                     # is unreachable from the VPC subnet
-                                    **({"dnsPolicy": "None", "dnsConfig": {"nameservers": [VPCDNS_VIP]}} if req.network_isolation else {}),
+                                    **({"dnsPolicy": "None", "dnsConfig": {"nameservers": [_vpcdns_vip()]}} if req.network_isolation else {}),
+                                    # Forward imagePullSecrets to kubelet so the
+                                    # worker containerDisk can be pulled from a
+                                    # private registry. Secrets themselves must
+                                    # already exist in the tenant namespace.
+                                    **(
+                                        {"imagePullSecrets": [{"name": s} for s in req.worker_image_pull_secrets]}
+                                        if req.worker_image_pull_secrets else {}
+                                    ),
                                     "domain": {
                                         "cpu": {"cores": req.worker_vcpu},
                                         "memory": {"guest": req.worker_memory},
@@ -382,7 +405,7 @@ def _build_kubeadm_config_template_cr(
         "systemctl daemon-reload",
         # DNS fix: set primary DNS to 8.8.8.8 (reachable via OVN SNAT), VpcDns VIP as fallback
         "sed -i 's/^#\\?DNS=.*/DNS=8.8.8.8/' /etc/systemd/resolved.conf",
-        f"sed -i 's/^#\\?FallbackDNS=.*/FallbackDNS={VPCDNS_VIP}/' /etc/systemd/resolved.conf",
+        f"sed -i 's/^#\\?FallbackDNS=.*/FallbackDNS={_vpcdns_vip()}/' /etc/systemd/resolved.conf",
         "systemctl restart systemd-resolved",
     ]
     if dnat_cluster_ip and dnat_vpc_ip:

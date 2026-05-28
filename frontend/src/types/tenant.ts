@@ -53,6 +53,9 @@ export interface TenantCreateRequest {
   viewer_group: string;
   network_isolation?: boolean;
   egress_gateway?: string;
+  worker_image_url?: string;
+  worker_image_source_type?: 'http' | 'registry';
+  worker_image_pull_secrets?: string[];
   addons: TenantAddon[];
 }
 

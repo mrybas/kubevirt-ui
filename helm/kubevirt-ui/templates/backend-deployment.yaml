@@ -134,10 +134,12 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
-            # -- User-supplied env vars
+            # -- User-supplied env vars (empty-string values are skipped)
             {{- range $key, $value := .Values.backend.env }}
+            {{- if $value }}
             - name: {{ $key }}
               value: {{ $value | quote }}
+            {{- end }}
             {{- end }}
           {{- with .Values.backend.envFrom }}
           envFrom:

@@ -15,9 +15,9 @@ from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 
 from app.api.v1.tenants_common import (
     TENANT_NS_PREFIX,
-    VPCDNS_VIP,
-    VPCDNS_FORWARD_DNS,
     _mgmt_cidr_drop,
+    _vpcdns_forward_dns,
+    _vpcdns_vip,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,7 +119,7 @@ async def _ensure_vpcdns_prerequisites(k8s, kubeovn_ns: str) -> None:
                 "      fallthrough in-addr.arpa ip6.arpa\n"
                 "    }\n"
                 "    prometheus :9153\n"
-                f"    forward . {VPCDNS_FORWARD_DNS} {{\n"
+                f"    forward . {_vpcdns_forward_dns()} {{\n"
                 "      prefer_udp\n"
                 "    }\n"
                 "    cache 30\n"
@@ -177,7 +177,7 @@ async def _ensure_vpcdns_prerequisites(k8s, kubeovn_ns: str) -> None:
                 metadata=client.V1ObjectMeta(name="vpc-dns-config", namespace=kubeovn_ns),
                 data={
                     "enable-vpc-dns": "true",
-                    "coredns-vip": VPCDNS_VIP,
+                    "coredns-vip": _vpcdns_vip(),
                     "nad-name": "ovn-nad",
                     "nad-provider": "ovn-nad.default.ovn",
                 },
@@ -286,7 +286,7 @@ async def _create_tenant_vpc(k8s, tenant_name: str) -> dict[str, str]:
         {"action": "allow-related", "direction": "from-lport",
          "match": f"ip4.src == {cidr} && ip4.dst == {cidr}", "priority": 3000},
         {"action": "allow-related", "direction": "from-lport",
-         "match": f"ip4.src == {cidr} && ip4.dst == {VPCDNS_VIP}", "priority": 2500},
+         "match": f"ip4.src == {cidr} && ip4.dst == {_vpcdns_vip()}", "priority": 2500},
     ]
     mgmt_cidr = _mgmt_cidr_drop()
     if mgmt_cidr:

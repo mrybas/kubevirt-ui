@@ -34,6 +34,17 @@ backend:
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as
     # a fallback if the Deployment is not found in this namespace.
     KUBE_OVN_NAMESPACE: "kube-ovn"
+    # -- Tenant-stack overrides — all optional, backend autodetects/defaults when unset
+    # kube-dns/coredns Service ClusterIP override
+    TENANTS_VPCDNS_FORWARD_DNS: ""
+    # VPC DNS VIP within service CIDR (default: <service-cidr>.200)
+    TENANTS_VPCDNS_VIP: ""
+    # Default: registry.k8s.io/kas-network-proxy/proxy-server
+    TENANTS_KONNECTIVITY_PROXY_IMAGE: ""
+    # Default: registry.k8s.io/kas-network-proxy/proxy-agent
+    TENANTS_KONNECTIVITY_AGENT_IMAGE: ""
+    # OCI containerDisk image for tenant worker VMs
+    TENANTS_DEFAULT_WORKER_IMAGE: ""
 
   # -- Extra env vars from secrets/configmaps
   envFrom: []
