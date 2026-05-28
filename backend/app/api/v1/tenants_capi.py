@@ -593,7 +593,12 @@ def _build_ingress_haproxy(req: TenantCreateRequest, host: str) -> dict[str, Any
 def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str) -> dict[str, Any]:
     # Traefik entryPoint name varies by deployment; default to "websecure"
     # (Traefik's standard HTTPS entry point). Override via env if needed.
-    entry_point = os.getenv("TENANTS_TRAEFIK_ENTRYPOINT", "websecure")
+    # Default to the dedicated `kubeapiserver` entry point (port 6443),
+    # provisioned by k8s-bootstrap's Traefik HelmRelease values for TCP
+    # passthrough to tenant Kamaji control planes. Override only if your
+    # cluster's Traefik install uses a different name (e.g. `websecure`
+    # on legacy 443-only setups; works only with tenant kube < 1.30).
+    entry_point = os.getenv("TENANTS_TRAEFIK_ENTRYPOINT", "kubeapiserver")
     # Same-ns as the Kamaji-generated TCP Service in the tenant ns.
     return {
         "apiVersion": "traefik.io/v1alpha1",
