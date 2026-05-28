@@ -66,14 +66,10 @@ from app.api.v1.tenants_common import (
     _namespace_exists,
     _create_namespace,
 )
-from app.api.v1.tenants_vpc import (
-    attach_tenant_to_vpc,
-    detach_tenant_from_folder_vpc,
-)
 from app.api.v1.folders import reconcile_namespace_rbac
 
-from app.core.constants import KAMAJI_NAMESPACE, KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
-from app.api.v1.tenants_capi import _cleanup_tenant_ingress, _create_capi_resources
+from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
+from app.api.v1.tenants_capi import _create_capi_resources, _restore_tenant_vpc_subnet_provider
 from app.api.v1.tenants_addons import (
     _build_helm_values,
     _build_flux_helmrelease_cr,
@@ -601,7 +597,12 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
     #   2. carry kubevirt-ui.io/folder == req.folder
     #   3. carry kubevirt-ui.io/environment == req.environment, OR be
     #      folder-wide (no env label, eligible for every env under folder)
-    logical_switch: str | None = None
+    #
+    # The tenant ns is NOT attached to the VPC (CAPI webhook forbids cross-ns
+    # controlPlaneRef → TCP must live in the tenant ns, and TCP needs default-
+    # overlay reachability to Postgres + Ingress). Worker VMs join the tenant
+    # VPC via per-VM Multus NAD (see T2). VPC validation here still matters:
+    # T2 needs vpc_name to resolve the VPC's default subnet for NAD wiring.
     if req.vpc_name:
         try:
             vpc_cr = await k8s.custom_api.get_cluster_custom_object(
@@ -635,74 +636,14 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                 ),
             )
 
-        # Resolve the VPC's default subnet so we can pre-stamp the
-        # `ovn.kubernetes.io/logical_switch` annotation on the tenant ns.
-        # Without this annotation, kube-ovn-controller observes the new ns
-        # before our subsequent attach_tenant_to_vpc patch and claims it for
-        # ovn-default → worker pods/VMs come up on 10.16.0.0/16 instead of
-        # the VPC subnet.
-        subnet_list_failed = False
-        try:
-            subnet_list = await k8s.custom_api.list_cluster_custom_object(
-                group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
-                plural="subnets",
-            )
-        except ApiException as exc:
-            logger.warning(
-                f"Failed to list subnets while resolving default for VPC "
-                f"{req.vpc_name!r}: {exc}. Tenant will fall back to cluster "
-                "default overlay."
-            )
-            subnet_list = {"items": []}
-            subnet_list_failed = True
-        default_subnets = [
-            s for s in subnet_list.get("items", [])
-            if (s.get("spec") or {}).get("vpc") == req.vpc_name
-            and (s.get("spec") or {}).get("default") is True
-        ]
-        if len(default_subnets) == 1:
-            logical_switch = (
-                (default_subnets[0].get("metadata") or {}).get("name")
-            )
-        elif len(default_subnets) == 0:
-            # Skip the misleading "VPC has no default subnet" WARN when we
-            # never managed to list subnets in the first place — the list-
-            # failure WARN above already covered that path.
-            if not subnet_list_failed:
-                logger.warning(
-                    f"VPC {req.vpc_name!r} has no default subnet "
-                    "(spec.default=true). Tenant ns will not be pre-stamped "
-                    "with ovn.kubernetes.io/logical_switch — worker pods/VMs "
-                    "will likely land on the cluster default overlay instead "
-                    "of the VPC subnet. Admin should mark one subnet of the "
-                    "VPC as default and re-create the tenant (or manually "
-                    "patch the tenant ns annotation + recycle the pods)."
-                )
-        else:
-            # >1 default subnet — kube-ovn allows only one per VPC but
-            # be defensive: deterministic pick + WARN.
-            names = sorted(
-                ((s.get("metadata") or {}).get("name") or "")
-                for s in default_subnets
-            )
-            logical_switch = names[0]
-            logger.warning(
-                f"VPC {req.vpc_name!r} has multiple default subnets "
-                f"({names!r}); kube-ovn only allows one. Picking "
-                f"{logical_switch!r} (sorted-first) for the tenant ns "
-                "annotation. Admin should reconcile this."
-            )
-
     try:
         # 1. Create namespace, stamping folder/env labels so the tenant
         #    automatically participates in Phase 2 folder-level authz.
-        #    `logical_switch` (resolved above from the VPC's default subnet)
-        #    pre-stamps the ovn.kubernetes.io/logical_switch annotation so
-        #    kube-ovn-controller doesn't claim the ns for ovn-default.
+        #    Tenant ns lives on the cluster default overlay — no
+        #    ovn.kubernetes.io/logical_switch pre-stamp, no VPC attach.
         await _create_namespace(
             k8s, ns, req.name, req.worker_type,
             folder=req.folder, environment=req.environment,
-            logical_switch=logical_switch,
         )
 
         # 1b. T2 — materialise folder Phase 2 RoleBindings on the tenant ns
@@ -717,31 +658,6 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             logger.warning(
                 f"Failed to reconcile folder RBAC on tenant ns {ns}: {exc}"
             )
-
-        # 2. T7 — Attach tenant ns to the chosen VPC (validated above).
-        #    When req.vpc_name is None the tenant runs on the cluster default
-        #    overlay — no VPC attachment, no isolation.
-        #
-        #    B2 (T9): the user explicitly requested this VPC, so if the patch
-        #    fails we must NOT silently 201 the tenant with no isolation —
-        #    re-raise as 502 so the outer cleanup path tears down the
-        #    half-created namespace + RBs. `attach_tenant_to_vpc` itself
-        #    raises HTTPException(400) when the VPC has been deleted between
-        #    our validation and this call (race) — that propagates as-is.
-        if req.vpc_name:
-            try:
-                await attach_tenant_to_vpc(k8s, req.vpc_name, req.name)
-            except ApiException as exc:
-                logger.error(
-                    f"Failed to attach tenant ns {ns} to VPC {req.vpc_name}: {exc}"
-                )
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        f"Could not attach tenant to VPC '{req.vpc_name}': "
-                        f"{exc.reason or exc}"
-                    ),
-                ) from exc
 
         # 2b. Provision host-side kubevirt-csi resources BEFORE CAPI:
         #    KubevirtCluster.spec.infraClusterSecretRef must point at an
@@ -819,44 +735,19 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         )
 
     except (ApiException, RuntimeError, HTTPException) as e:
-        # B1 (T9): HTTPException must trigger cleanup too — `attach_tenant_to_vpc`
-        # raises HTTPException(400) on race-delete of the VPC, and B2's 502 path
-        # also throws HTTPException. Without this catch, those paths would leak
-        # an orphan tenant namespace + RBs while still returning a 4xx/5xx.
-        # Cleanup, in order:
-        #   1. KamajiControlPlane CR in KAMAJI_NAMESPACE (not covered by tenant
-        #      ns cascade — lives in default VPC).
-        #   2. Per-tenant apiserver Ingress / IngressRouteTCP / HTTPProxy in
-        #      KAMAJI_NAMESPACE (T6 / BUG 2). Without this, a step-6 failure
-        #      after `_create_tenant_apiserver_ingress` succeeded would orphan
-        #      ``<tenant>-api`` in KAMAJI_NAMESPACE and a same-named retry
-        #      would 409 on the ingress object.
-        #   3. Detach the tenant ns from any VPC it was attached to.
-        #   4. Delete the tenant ns (cascade-deletes everything else, including
-        #      any half-created CAPI resources).
+        # B1 (T9): HTTPException must trigger cleanup too. Cleanup is now
+        # trivial — every cluster-level CR (KamajiControlPlane, Cluster,
+        # KubevirtCluster, MachineDeployment, KubevirtMachineTemplate,
+        # KubeadmConfigTemplate, per-tenant Ingress) lives in the tenant
+        # namespace, so a single ns delete cascades the entire tree. No VPC
+        # detach (no attach was made), no explicit KCP / Ingress delete.
         logger.error(f"Failed to create tenant {req.name}: {e}")
         try:
-            await k8s.custom_api.delete_namespaced_custom_object(
-                group=KAMAJI_CP_GROUP, version=KAMAJI_CP_VERSION,
-                namespace=KAMAJI_NAMESPACE, plural="kamajicontrolplanes",
-                name=req.name,
-            )
-        except ApiException as cleanup_exc:
-            if cleanup_exc.status != 404:
-                logger.warning(
-                    f"Cleanup: failed to delete KamajiControlPlane "
-                    f"{KAMAJI_NAMESPACE}/{req.name}: {cleanup_exc}"
-                )
-        except Exception:
-            pass
-        try:
-            await _cleanup_tenant_ingress(k8s, req.name)
-        except Exception:
-            # Helper already logs per-shape failures; just don't let any
-            # unexpected error mask the original create-tenant exception.
-            pass
-        try:
-            await detach_tenant_from_folder_vpc(k8s, req.name)
+            # M3 (T7): symmetric to delete_tenant — restore VPC subnet
+            # provider before dropping the ns so next create on same VPC
+            # doesn't hit M2's 409 with an orphan provider string left
+            # over from this aborted attempt.
+            await _restore_tenant_vpc_subnet_provider(k8s, req.name)
         except Exception:
             pass
         try:
@@ -901,24 +792,23 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
 async def delete_tenant(request: Request, name: str, user: User = Depends(require_auth)) -> None:
     """Delete a tenant.
 
-    Order:
-      1. Delete the ``KamajiControlPlane`` CR from ``KAMAJI_NAMESPACE`` (TCP
-         lives in the default VPC, not the tenant ns, so it is NOT covered by
-         the tenant-ns cascade).
-      1b. Delete the per-tenant apiserver ingress resources from
-         ``KAMAJI_NAMESPACE`` (Ingress / IngressRouteTCP / HTTPProxy named
-         ``<tenant>-api``) — same reason: they live alongside the TCP Service,
-         not in the tenant ns.
-      2. Delete the CAPI ``Cluster`` CR in the tenant ns so CAPI runs its
-         finalizers cleanly (this also drops the cross-ns ref to the TCP CR).
-      3. Detach the tenant ns from its VPC (the VPC CR is cluster-scoped and
-         outlives the ns).
-      4. Delete the tenant ns — cascade-deletes all in-namespace worker
-         resources (KubevirtCluster, MachineSet, KubevirtMachineTemplate,
-         KubeadmConfigTemplate, worker VMs).
+    All cluster-level CRs (KamajiControlPlane, Cluster, KubevirtCluster,
+    MachineDeployment, KubevirtMachineTemplate, KubeadmConfigTemplate, the
+    per-tenant apiserver Ingress/IngressRouteTCP/HTTPProxy, and any T2
+    Multus NAD) live in the tenant namespace, so the ns cascade catches
+    every in-namespace object.
 
-    Each step is 404-tolerant so a partially-created tenant can still be
-    cleaned up.
+    Order:
+      1. Best-effort delete of the CAPI ``Cluster`` CR so CAPI runs its
+         finalizers cleanly (the ns cascade would catch it too, but giving
+         CAPI a head start avoids 30s+ stuck-in-Terminating cycles).
+      2. Restore the tenant VPC default subnet's ``spec.provider`` back to
+         ``"ovn"`` (M1 — T5). The ns cascade drops the NAD but does NOT
+         touch the cluster-scoped Subnet whose provider we patched during
+         create; without this step the VPC stays "tenant-bound" and
+         generic pods can't bind to it. Best-effort; logs and continues
+         on failure so a stuck VPC subnet doesn't block tenant removal.
+      3. Delete the tenant ns — cascade does the rest.
     """
     k8s = request.app.state.k8s_client
     ns = _tenant_ns(name)
@@ -926,32 +816,9 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
     if not await _namespace_exists(k8s, ns):
         raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
 
-    # 1. Delete KamajiControlPlane in KAMAJI_NAMESPACE first.
-    try:
-        await k8s.custom_api.delete_namespaced_custom_object(
-            group=KAMAJI_CP_GROUP, version=KAMAJI_CP_VERSION,
-            namespace=KAMAJI_NAMESPACE, plural="kamajicontrolplanes",
-            name=name,
-        )
-        logger.info(
-            f"Deleted KamajiControlPlane {KAMAJI_NAMESPACE}/{name} for tenant {name}"
-        )
-    except ApiException as exc:
-        if exc.status == 404:
-            logger.info(
-                f"KamajiControlPlane {KAMAJI_NAMESPACE}/{name} already absent; continuing"
-            )
-        else:
-            logger.warning(
-                f"Failed to delete KamajiControlPlane {KAMAJI_NAMESPACE}/{name}: {exc}"
-            )
-
-    # 1b. Delete per-tenant apiserver ingress resources from KAMAJI_NAMESPACE.
-    #     Shared with the create_tenant rollback path; see
-    #     `_cleanup_tenant_ingress` for the 404-tolerant per-shape logic.
-    await _cleanup_tenant_ingress(k8s, name)
-
-    # 2. Delete the CAPI Cluster CR in the tenant ns so CAPI's finalizers run.
+    # 1. Best-effort delete of the CAPI Cluster CR — lets CAPI finalizers run
+    #    before the ns cascade yanks everything out from under them. 404-
+    #    tolerant: a partial-create may have skipped this step.
     try:
         await k8s.custom_api.delete_namespaced_custom_object(
             group=CAPI_GROUP, version=CAPI_VERSION,
@@ -964,14 +831,11 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
         else:
             logger.warning(f"Failed to delete CAPI Cluster {ns}/{name}: {exc}")
 
-    # 3. Detach tenant ns from the folder VPC (cluster-scoped — not cascade-
-    #    deleted with the namespace). No-op if the tenant wasn't VPC-attached.
-    try:
-        await detach_tenant_from_folder_vpc(k8s, name)
-    except Exception as exc:
-        logger.warning(f"Failed to detach tenant {name} from folder VPC: {exc}")
+    # 2. Restore VPC default subnet's spec.provider back to "ovn" (M1 — T5).
+    #    Best-effort: helper logs and swallows per-subnet failures.
+    await _restore_tenant_vpc_subnet_provider(k8s, name)
 
-    # 4. Cascade-delete everything else by removing the tenant ns.
+    # 3. Cascade-delete everything else by removing the tenant ns.
     try:
         await k8s.core_api.delete_namespace(name=ns)
     except ApiException as e:

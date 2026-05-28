@@ -1,7 +1,5 @@
 """Shared Kubernetes API constants and helpers."""
 
-import os
-
 # KubeVirt CRD coordinates
 KUBEVIRT_API_GROUP = "kubevirt.io"
 KUBEVIRT_API_VERSION = "v1"
@@ -31,15 +29,6 @@ LABEL_PREFIX = "kubevirt-ui.io"
 
 # System namespace
 SYSTEM_NAMESPACE = "kubevirt-ui-system"
-
-# Kamaji control plane namespace.
-# All KamajiControlPlane CRs (and their auto-generated TCP Services) live here
-# so they share the default VPC with Postgres/Ingress/shared platform services.
-# Worker resources stay in per-tenant namespaces (tenant VPC). Workers reach the
-# TCP apiserver via the cluster Ingress; the TCP→worker path is the konnectivity
-# tunnel (agent-initiated outbound HTTPS from each worker).
-# Override via env when Kamaji is installed in a non-default namespace.
-KAMAJI_NAMESPACE = os.getenv("TENANTS_KAMAJI_NAMESPACE", "kamaji-system")
 
 # Kube-OVN system networking — default cluster VPC + system subnets that
 # non-admin users must never see. Filtered out of VPC/Subnet list responses.

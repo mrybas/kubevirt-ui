@@ -19,6 +19,7 @@ import {
   useCreateSubnet,
 } from '../../hooks/useNetwork';
 import { useCreateVpc } from '../../hooks/useVpcs';
+import { useFoldersFlat } from '../../hooks/useFolders';
 import { listNodes } from '../../api/cluster';
 import { useNamespaces } from '../../hooks/useNamespaces';
 import type { ProviderNetwork, Vlan } from '../../types/network';
@@ -31,7 +32,7 @@ interface CreateNetworkWizardProps {
   existingVlan?: Vlan;               // Skip provider + VLAN creation steps
 }
 
-type NetworkType = 'external' | 'overlay' | 'vpc';
+type NetworkType = 'external' | 'vpc';
 type InterfaceMode = 'dedicated' | 'single-nic';
 
 interface WizardState {
@@ -61,6 +62,8 @@ interface WizardState {
   vpcEnableNat: boolean;
   vpcEnablePeering: boolean;
   vpcNamespaces: string[];
+  vpcFolder: string;
+  vpcEnvironment: string;
 }
 
 const initialState: WizardState = {
@@ -84,6 +87,8 @@ const initialState: WizardState = {
   vpcEnableNat: true,
   vpcEnablePeering: true,
   vpcNamespaces: [],
+  vpcFolder: '',
+  vpcEnvironment: '',
 };
 
 // Helper to convert IP to number for comparison
@@ -225,7 +230,12 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
 
   // Fetch available namespaces for the subnet
   const { data: namespacesData } = useNamespaces();
-  
+  const { data: foldersData } = useFoldersFlat();
+
+  const allFolders = foldersData?.items ?? [];
+  const selectedFolder = allFolders.find(f => f.name === state.vpcFolder);
+  const folderEnvironments = selectedFolder?.environments ?? [];
+
   // Only show namespaces the backend will accept — kubevirt-ui.io/managed=true
   const userNamespaces = useMemo(() => {
     if (!namespacesData?.items) return [];
@@ -260,15 +270,6 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
       description: 'Connect VMs directly to your physical network',
       icon: Globe,
       color: 'emerald',
-    },
-    {
-      id: 'overlay' as const,
-      title: 'Overlay Network',
-      description: 'Private isolated network for a namespace',
-      icon: Layers,
-      color: 'primary',
-      disabled: true,
-      comingSoon: true,
     },
     {
       id: 'vpc' as const,
@@ -381,6 +382,10 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
           setError('Subnet CIDR must be in CIDR notation (e.g. 10.100.0.0/24)');
           return false;
         }
+        if (state.vpcEnvironment && !state.vpcFolder) {
+          setError('Environment scope requires a folder scope. Pick a folder or clear the environment.');
+          return false;
+        }
         break;
     }
     return true;
@@ -398,6 +403,8 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
         subnet_cidr: state.vpcSubnetCidr || undefined,
         enable_nat_gateway: state.vpcEnableNat,
         ...(state.vpcNamespaces.length > 0 ? { namespaces: state.vpcNamespaces } : {}),
+        ...(state.vpcFolder ? { folder: state.vpcFolder } : {}),
+        ...(state.vpcEnvironment ? { environment: state.vpcEnvironment } : {}),
       });
       // TODO: if peering enabled, create peering with ovn-cluster (default VPC)
       onClose();
@@ -490,38 +497,24 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                 return (
                   <button
                     key={type.id}
-                    onClick={() => !type.disabled && setState((s) => ({ ...s, type: type.id }))}
-                    disabled={type.disabled}
+                    onClick={() => setState((s) => ({ ...s, type: type.id }))}
                     className={`p-4 rounded-lg border-2 text-left transition-all ${
-                      type.disabled
-                        ? 'border-surface-700 opacity-50 cursor-not-allowed'
-                        : isSelected
+                      isSelected
                         ? `${colorClasses[type.color]!} border-opacity-100`
                         : 'border-surface-700 hover:border-surface-600'
                     }`}
                   >
                     <div className="flex items-start gap-4">
                       <div
-                        className={`rounded-lg p-3 ${
-                          type.disabled
-                            ? 'bg-surface-700 text-surface-500'
-                            : colorClasses[type.color]!.split(' ').slice(0, 2).join(' ')
-                        }`}
+                        className={`rounded-lg p-3 ${colorClasses[type.color]!.split(' ').slice(0, 2).join(' ')}`}
                       >
                         <Icon className="h-6 w-6" />
                       </div>
                       <div className="flex-1">
-                        <div className="flex items-center gap-2">
-                          <h4 className="font-medium text-surface-100">{type.title}</h4>
-                          {type.comingSoon && (
-                            <span className="text-xs px-2 py-0.5 rounded-full bg-surface-700 text-surface-400">
-                              Coming Soon
-                            </span>
-                          )}
-                        </div>
+                        <h4 className="font-medium text-surface-100">{type.title}</h4>
                         <p className="text-sm text-surface-400 mt-1">{type.description}</p>
                       </div>
-                      {isSelected && !type.disabled && (
+                      {isSelected && (
                         <CheckCircle className="h-5 w-5 text-emerald-400" />
                       )}
                     </div>
@@ -1123,6 +1116,42 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                 />
                 <p className="text-xs text-surface-500 mt-1">Lowercase letters, numbers, hyphens only</p>
               </div>
+
+              {/* Folder / Environment scope — required for tenant wizard VPC discovery */}
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-sm font-medium text-surface-200 mb-2">
+                    Folder
+                    <span className="text-surface-500 font-normal ml-1">(optional — leave empty for global VPC)</span>
+                  </label>
+                  <CustomSelect
+                    value={state.vpcFolder}
+                    onChange={(v) => setState((s) => ({ ...s, vpcFolder: v, vpcEnvironment: '' }))}
+                    options={[
+                      { value: '', label: '(none — global)' },
+                      ...allFolders.map(f => ({ value: f.name, label: f.name })),
+                    ]}
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-surface-200 mb-2">
+                    Environment
+                    <span className="text-surface-500 font-normal ml-1">(optional — applies to all envs of folder)</span>
+                  </label>
+                  <CustomSelect
+                    value={state.vpcEnvironment}
+                    onChange={(v) => setState((s) => ({ ...s, vpcEnvironment: v }))}
+                    options={[
+                      { value: '', label: state.vpcFolder ? '(all environments)' : 'Select a folder first' },
+                      ...folderEnvironments.map(e => ({ value: e.name, label: e.name })),
+                    ]}
+                    disabled={!state.vpcFolder}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-surface-500">
+                Folder/environment scope determines which tenants see this VPC in the Tenant create wizard. Unscoped (global) VPCs are admin-only.
+              </p>
 
               <div>
                 <label className="block text-sm font-medium text-surface-200 mb-2">

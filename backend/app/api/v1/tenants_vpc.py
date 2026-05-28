@@ -1,5 +1,19 @@
 """VPC binding for tenants (T7 — explicit label-based selection).
 
+.. note:: As of 2026.05.28 (CAPI cross-ns controlPlaneRef revert) the
+   default tenant create / delete paths NO LONGER attach the tenant ns
+   to a VPC. The CAPI v1beta1 webhook
+   ``validation.cluster.cluster.x-k8s.io`` rejects
+   ``Cluster.spec.controlPlaneRef.namespace != metadata.namespace``, so the
+   KamajiControlPlane and CAPI Cluster CRs must share a namespace, and that
+   namespace must reach Postgres + the shared Ingress — i.e. it must live
+   on the cluster default overlay. Worker VMs get tenant VPC isolation via
+   per-VM Multus NAD instead (see T2).
+
+   These functions are retained for potential admin-driven debugging and
+   are not currently called from `tenants_crud.create_tenant` /
+   `tenants_crud.delete_tenant`.
+
 The tenant create flow does NOT provision per-tenant VPCs. Instead, when the
 caller supplies an explicit `vpc_name`, that VPC's `spec.namespaces` is
 patched to include the new tenant namespace. The caller (tenant CRUD layer)

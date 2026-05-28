@@ -138,16 +138,6 @@ ingress:
     #     - kubevirt-ui.local
 
 # =========================================================================
-# Tenants (Cluster-API / Kamaji tenant cluster management)
-# =========================================================================
-tenants:
-  # -- Namespace where Kamaji installs its control-plane CRDs (TenantControlPlane /
-  # KamajiControlPlane CRs are placed here when ENABLE_TENANTS=true).
-  # This namespace is created by the Kamaji installation, NOT by this chart.
-  # Kamaji must be installed before this chart when tenant management is enabled.
-  kamajiNamespace: "kamaji-system"
-
-# =========================================================================
 # RBAC
 # =========================================================================
 rbac:
