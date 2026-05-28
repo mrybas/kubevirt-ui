@@ -28,6 +28,7 @@ from app.api.v1.tenants_common import (
     OIDC_CLIENT_ID,
     _tenant_ns,
     _endpoint_host,
+    _endpoint_port,
     _ingress_class,
     _ingress_controller,
     _vpcdns_vip,
@@ -76,13 +77,15 @@ def _resolve_worker_container_disk_image(req: TenantCreateRequest) -> str:
 def _build_cluster_cr(
     req: TenantCreateRequest,
     cp_host: str | None = None,
-    cp_port: int = 6443,
+    cp_port: int | None = None,
 ) -> dict[str, Any]:
-    # Placeholder controlPlaneEndpoint host until step 4 of
-    # `_create_capi_resources` patches the Cluster CR with the real TCP
-    # ClusterIP. The TCP Service lives in the tenant namespace alongside the
-    # KamajiControlPlane CR.
-    host = cp_host or f"{req.name}.{_tenant_ns(req.name)}.svc.cluster.local"
+    # Workers join the tenant kube-apiserver via the cluster Ingress (TLS
+    # passthrough at the configured Ingress HTTPS port). The ClusterIP of the
+    # Kamaji-managed TCP Service is NOT reachable from the tenant VPC, so we
+    # bake the external Ingress endpoint into controlPlaneEndpoint from the
+    # start; that matches Kamaji's certSANs and avoids the previous patch.
+    host = cp_host or _endpoint_host(req.name)
+    port = cp_port if cp_port is not None else _endpoint_port()
     return {
         "apiVersion": f"{CAPI_GROUP}/{CAPI_VERSION}",
         "kind": "Cluster",
@@ -100,7 +103,7 @@ def _build_cluster_cr(
         "spec": {
             "controlPlaneEndpoint": {
                 "host": host,
-                "port": cp_port,
+                "port": port,
             },
             "clusterNetwork": {
                 "pods": {"cidrBlocks": [req.pod_cidr]},
@@ -1068,37 +1071,21 @@ async def _create_capi_resources(
             group=group, version=version, namespace=target_ns, plural=plural, body=body,
         )
 
-    # 2. Create CAPI Cluster (needed for TCP to start reconciling)
-    #    Use service DNS initially — will be patched with ClusterIP once available
+    # 2. Create CAPI Cluster with the external Ingress endpoint baked in.
+    #    Workers join via cluster Ingress (TLS passthrough), so
+    #    controlPlaneEndpoint already points at the nip.io hostname:443 —
+    #    no later patch with the unreachable TCP ClusterIP needed.
     cluster_cr = _build_cluster_cr(req)
     await custom.create_namespaced_custom_object(
         group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
         plural="clusters", body=cluster_cr,
     )
 
-    # 3. Wait for TCP service to get ClusterIP. Kamaji creates the Service in
-    #    the same namespace as the KamajiControlPlane CR (the tenant ns).
-    #    The ClusterIP is reachable from the management cluster (tenant ns
-    #    lives on the default overlay) for CAPI/admin paths; workers reach
-    #    the apiserver via the cluster Ingress (TLS passthrough), and TCP
-    #    reaches workers via the konnectivity tunnel.
-    tcp_ip = await _wait_for_tcp_service_ip(k8s, req.name, ns)
-
-    # 4. Patch Cluster controlPlaneEndpoint with the worker-reachable IP
-    patch = {
-        "spec": {
-            "controlPlaneEndpoint": {
-                "host": tcp_ip,
-                "port": 6443,
-            },
-        },
-    }
-    await custom.patch_namespaced_custom_object(
-        group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
-        plural="clusters", name=req.name, body=patch,
-        _content_type="application/merge-patch+json",
-    )
-    logger.info(f"Patched Cluster {req.name} controlPlaneEndpoint to {tcp_ip}:6443")
+    # 3. Wait for TCP Service to be created by Kamaji (smoke check that the
+    #    KamajiControlPlane controller reconciled our CR). Return value is
+    #    unused — the Cluster CR already carries the correct external
+    #    endpoint and certSANs cover the same hostname.
+    await _wait_for_tcp_service_ip(k8s, req.name, ns)
 
     # 5. Create VM worker resources (skip for bare_metal)
     if req.worker_type == "vm":

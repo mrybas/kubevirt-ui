@@ -294,6 +294,20 @@ def _endpoint_host(name: str) -> str:
     return f"{name}.{_require_cluster_config()['ingress_ip']}.nip.io"
 
 
+def _endpoint_port() -> int:
+    """External Ingress HTTPS port for the tenant kube-apiserver.
+
+    Defaults to 443 (the entry point where nginx/traefik/contour serve TLS
+    passthrough for tenant apiservers). Override via ``TENANTS_INGRESS_PORT``
+    when the cluster Ingress is exposed on a non-standard port.
+    """
+    raw = os.getenv("TENANTS_INGRESS_PORT", "443").strip() or "443"
+    try:
+        return int(raw)
+    except ValueError:
+        return 443
+
+
 def _ingress_class() -> str:
     return _require_cluster_config()["ingress_class"]
 
