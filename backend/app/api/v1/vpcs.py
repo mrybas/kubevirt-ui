@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
-from app.api.v1.tenants_common import _tenant_ns
+from app.api.v1.tenants_common import _ensure_cluster_config, _tenant_ns, _vpcdns_vip
 from app.core.allocators import allocate_vpc_cidr
 from app.core.auth import User, require_auth, require_admin
 from app.core.constants import (
@@ -31,6 +31,9 @@ from app.core.groups import (
 )
 from app.models.vpc import (
     VpcCreateRequest,
+    VpcDnsResponse,
+    VpcDnsStatus,
+    VpcDnsUpdateRequest,
     VpcListResponse,
     VpcPeeringCreateRequest,
     VpcPeeringInfo,
@@ -113,6 +116,74 @@ async def _get_vpc_subnets(k8s, vpc_name: str) -> list[VpcSubnetInfo]:
                 used_ips=st.get("v4usingIPs", 0),
             ))
     return subnets
+
+
+async def _ensure_vpc_dns(
+    k8s, vpc_name: str, subnet_name: str, *, swallow: bool = True,
+) -> None:
+    """Create the per-VPC VpcDns CR if it doesn't already exist.
+
+    Per kube-ovn 1.16 docs (vpc/vpc-internal-dns/) a VpcDns is a per-VPC
+    DNS deployment that forwards to cluster CoreDNS via the cluster-wide
+    shared coredns-vip (autodiscovered, exposed via
+    ``tenants_common._vpcdns_vip``). The VIP is consumed by workloads in
+    the VPC via the subnet's ``spec.dhcpV4Options.dns_server`` (set in
+    ``create_vpc`` at subnet creation time — separate from this call).
+
+    Prereqs the upstream chart bakes in (k8s-bootstrap is expected to
+    ensure-exist): the ``vpc-dns-config`` ConfigMap in ``kube-ovn`` ns
+    and the ``ovn-nad`` NAD in ``default`` ns. If they're missing the
+    VpcDns CR still creates but the VpcDns controller leaves the
+    deployment NotReady — admin can fix prereqs and the controller
+    reconciles. We don't pre-flight check here.
+
+    409 (already exists) is ALWAYS treated as success — the helper is
+    idempotent. Other failures depend on ``swallow``:
+
+    - ``swallow=True`` (default, used by VPC create-time auto-call):
+      logged as a warning and SWALLOWED. VPC create still succeeds; the
+      admin can manually create the VpcDns later via the explicit
+      recreate endpoint.
+    - ``swallow=False`` (used by the explicit recreate endpoint): the
+      `ApiException` PROPAGATES so the caller can surface a 502 to the
+      admin — they explicitly asked us to (re)create it, so silent
+      failure would mislead them into thinking it worked.
+    """
+    body = {
+        "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",
+        "kind": "VpcDns",
+        "metadata": {
+            "name": f"{vpc_name}-dns",
+            "labels": {
+                "kubevirt-ui.io/managed": "true",
+                "kubevirt-ui.io/vpc": vpc_name,
+            },
+        },
+        "spec": {
+            "vpc": vpc_name,
+            "subnet": subnet_name,
+        },
+    }
+    try:
+        await k8s.custom_api.create_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+            plural="vpc-dnses", body=body,
+        )
+        logger.info(f"Created VpcDns {vpc_name}-dns for VPC {vpc_name!r}")
+    except ApiException as e:
+        if e.status == 409:
+            return  # idempotent
+        if swallow:
+            logger.warning(
+                f"VpcDns auto-create for VPC {vpc_name!r} failed: {e}; "
+                "admin may need manual setup. Workloads will still get an "
+                "IP via the subnet's dhcpV4Options but DNS resolution via "
+                "the VPC-internal DNS forwarder will not work."
+            )
+            return
+        # swallow=False — propagate so the caller can surface a real
+        # error to the user instead of pretending success.
+        raise
 
 
 async def _get_vpc_peerings(k8s, vpc_name: str) -> list[VpcPeeringInfo]:
@@ -242,8 +313,19 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     """Create a VPC with a default subnet.
 
     If subnet_cidr is not provided, auto-allocates a /24 from 10.{200+N}.0.0/24.
+
+    Also auto-creates a per-VPC VpcDns CR (forwards to cluster CoreDNS via
+    the cluster-wide ``coredns-vip``) and stamps the VIP into the default
+    subnet's ``spec.dhcpV4Options.dns_server`` so workloads get DNS via
+    standard DHCP — no webhook, no cloud-init munging. Mirrors the solo-VM
+    DNS path. If VpcDns provisioning fails (e.g. upstream prereqs missing)
+    the VPC is still created and the failure is logged; admin can recover.
     """
     k8s = request.app.state.k8s_client
+
+    # Required for `_vpcdns_vip()` below — populates the cluster-config cache
+    # (autodiscovers the kube-dns ClusterIP + the VpcDns shared VIP).
+    await _ensure_cluster_config(k8s)
 
     if data.subnet_cidr:
         cidr = data.subnet_cidr
@@ -328,6 +410,20 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
 
     # Create default subnet
     default_subnet_name = f"{data.name}-default"
+
+    # dhcpV4Options is what kube-ovn pushes to workloads via DHCP.
+    # `dns_server` here is the cluster-wide VpcDns VIP (autodiscovered) —
+    # the same VIP every per-VPC VpcDns instance listens on via the OVN
+    # switch LB. Pods/VMs in the VPC ask DHCP, get this DNS server, and
+    # resolve via the local VpcDns deployment which forwards to cluster
+    # CoreDNS. Set at subnet creation time (avoids post-patch races with
+    # the kube-ovn controller observing the new subnet).
+    vpcdns_vip = _vpcdns_vip()
+    dhcp_v4 = (
+        f"lease_time=3600,router={gateway},"
+        f"server_id={gateway},dns_server={vpcdns_vip}"
+    )
+
     subnet_manifest: dict[str, Any] = {
         "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",
         "kind": "Subnet",
@@ -347,6 +443,7 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             # unless an admin explicitly promotes them.
             "default": True,
             "enableDHCP": True,
+            "dhcpV4Options": dhcp_v4,
             "natOutgoing": data.enable_nat_gateway,
             **({"namespaces": bind_namespaces} if bind_namespaces else {}),
         },
@@ -368,6 +465,11 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
         except ApiException:
             pass
         raise k8s_error_to_http(e, "VPC operation")
+
+    # Auto-create per-VPC VpcDns. Best-effort: failures are logged but the
+    # VPC create still succeeds — admin can manually create the VpcDns CR
+    # later (workloads will lack VPC-internal DNS resolution until then).
+    await _ensure_vpc_dns(k8s, data.name, default_subnet_name)
 
     # Set up OVN NAT if enabled
     if data.enable_nat_gateway:
@@ -523,6 +625,18 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
             await _cleanup_ovn_gateway(k8s, name)
         except Exception as e:
             logger.warning(f"Failed to cleanup OVN NAT for VPC {name}: {e}")
+
+    # Delete the per-VPC VpcDns CR (created at VPC create time). 404 is
+    # tolerated (older VPCs predate the auto-create, or admin already
+    # removed it).
+    try:
+        await k8s.custom_api.delete_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+            plural="vpc-dnses", name=f"{name}-dns",
+        )
+    except ApiException as e:
+        if e.status != 404:
+            logger.warning(f"Failed to delete VpcDns {name}-dns: {e}")
 
     # Delete peerings first
     peerings = await _get_vpc_peerings(k8s, name)
@@ -707,3 +821,292 @@ async def update_vpc_routes(
         raise k8s_error_to_http(e, "VPC operation")
 
     return data.static_routes
+
+
+# ============================================================================
+# VpcDns (per-VPC DNS forwarder) — T6
+# ============================================================================
+
+def _parse_vpc_dns(item: dict[str, Any], coredns_vip: str) -> VpcDnsResponse:
+    """Parse a VpcDns CR into VpcDnsResponse, deriving the status phase.
+
+    Phase derivation:
+      - ``ready``   — Active condition is True OR status.active > 0
+      - ``error``   — any condition has type containing 'Failure'/'Error'
+                       with status True, OR reason ~= 'Failed'/'Error'
+      - ``pending`` — CR exists, has no terminal condition yet
+    Surfaces the latest condition's message when present so the UI can
+    show actionable detail (missing prereqs CM, NAD, etc.).
+    """
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {}) or {}
+    status_dict = item.get("status", {}) or {}
+
+    active = int(status_dict.get("active") or 0)
+    conditions = status_dict.get("conditions") or []
+    latest_msg: str | None = None
+    phase = "pending"
+    error_seen = False
+    for cond in conditions:
+        ctype = (cond.get("type") or "")
+        cstatus = (cond.get("status") or "")
+        creason = (cond.get("reason") or "")
+        cmsg = cond.get("message")
+        if cmsg:
+            latest_msg = cmsg
+        if cstatus == "True" and (
+            "Failure" in ctype or "Error" in ctype
+            or "Failed" in creason or "Error" in creason
+        ):
+            error_seen = True
+        if ctype == "Active" and cstatus == "True":
+            phase = "ready"
+
+    if error_seen and phase != "ready":
+        phase = "error"
+    if phase == "pending" and active > 0:
+        phase = "ready"
+
+    return VpcDnsResponse(
+        name=metadata.get("name", ""),
+        vpc=spec.get("vpc", ""),
+        subnet=spec.get("subnet", ""),
+        # kube-ovn VpcDns defaults to 1 replica when unset.
+        replicas=int(spec.get("replicas") or 1),
+        coredns_vip=coredns_vip,
+        status=VpcDnsStatus(
+            phase=phase,
+            active_pods=active,
+            message=latest_msg,
+        ),
+    )
+
+
+async def _get_vpc_dns_cr(k8s, vpc_name: str) -> dict[str, Any]:
+    """Read the VpcDns CR for a VPC; raise HTTPException(404) if absent.
+
+    Centralized so the three CRUD endpoints handle the not-found case
+    consistently. CR name convention `<vpc>-dns` matches what
+    `_ensure_vpc_dns` writes at VPC create time (T2).
+    """
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+            plural="vpc-dnses", name=f"{vpc_name}-dns",
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No VpcDns CR for VPC '{vpc_name}' (expected name "
+                    f"'{vpc_name}-dns'). The VPC may pre-date the T2 auto-"
+                    "create flow, or auto-create failed at VPC create time. "
+                    "POST /vpcs/{vpc_name}/dns/recreate to provision one."
+                ),
+            ) from e
+        raise k8s_error_to_http(e, "VpcDns lookup")
+
+
+async def _vpc_exists(k8s, vpc_name: str) -> bool:
+    """Quick existence check — used to fail-fast on a bad VPC path param."""
+    try:
+        await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+            plural="vpcs", name=vpc_name,
+        )
+        return True
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        raise k8s_error_to_http(e, "VPC lookup")
+
+
+@router.get("/{vpc_name}/dns", response_model=VpcDnsResponse)
+async def get_vpc_dns(
+    request: Request, vpc_name: str,
+    user: User = Depends(require_admin),
+) -> VpcDnsResponse:
+    """Read the per-VPC DNS deployment config and reconciliation status.
+
+    Returns 404 when the VPC exists but the VpcDns CR doesn't — caller
+    can POST `/dns/recreate` to provision one. Returns 404 with a
+    different detail when the VPC itself doesn't exist.
+    """
+    k8s = request.app.state.k8s_client
+    await _ensure_cluster_config(k8s)
+
+    if not await _vpc_exists(k8s, vpc_name):
+        raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
+
+    cr = await _get_vpc_dns_cr(k8s, vpc_name)
+    return _parse_vpc_dns(cr, coredns_vip=_vpcdns_vip())
+
+
+@router.patch("/{vpc_name}/dns", response_model=VpcDnsResponse)
+async def update_vpc_dns(
+    request: Request, vpc_name: str, data: VpcDnsUpdateRequest,
+    user: User = Depends(require_admin),
+) -> VpcDnsResponse:
+    """Patch the VpcDns spec.
+
+    Idempotent merge-patch. Only fields explicitly provided are patched —
+    omitting `subnet` leaves the current binding intact; omitting
+    `replicas` leaves the current count intact. When `subnet` is given,
+    it must exist and belong to the same VPC (validated against the
+    Subnet CR's `spec.vpc`).
+    """
+    k8s = request.app.state.k8s_client
+    await _ensure_cluster_config(k8s)
+
+    if not await _vpc_exists(k8s, vpc_name):
+        raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
+
+    # 404-validate the CR upfront so we don't half-validate `subnet` for a
+    # VPC that hasn't even got a VpcDns yet.
+    await _get_vpc_dns_cr(k8s, vpc_name)
+
+    spec_patch: dict[str, Any] = {}
+    if data.subnet is not None:
+        # Validate subnet exists + belongs to this VPC.
+        try:
+            subnet_cr = await k8s.custom_api.get_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+                plural="subnets", name=data.subnet,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Subnet '{data.subnet}' does not exist",
+                ) from e
+            raise k8s_error_to_http(e, "Subnet lookup")
+        subnet_vpc = (subnet_cr.get("spec") or {}).get("vpc")
+        if subnet_vpc != vpc_name:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Subnet '{data.subnet}' belongs to VPC {subnet_vpc!r}, "
+                    f"not '{vpc_name}'"
+                ),
+            )
+        spec_patch["subnet"] = data.subnet
+    if data.replicas is not None:
+        # Pydantic Field(ge=1) already enforces >= 1.
+        spec_patch["replicas"] = data.replicas
+
+    if spec_patch:
+        try:
+            await k8s.custom_api.patch_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+                plural="vpc-dnses", name=f"{vpc_name}-dns",
+                body={"spec": spec_patch},
+                _content_type="application/merge-patch+json",
+            )
+        except ApiException as e:
+            raise k8s_error_to_http(e, "VpcDns patch")
+
+    # Re-read so the response carries the post-patch spec + latest status.
+    cr = await _get_vpc_dns_cr(k8s, vpc_name)
+    return _parse_vpc_dns(cr, coredns_vip=_vpcdns_vip())
+
+
+@router.post("/{vpc_name}/dns/recreate", response_model=VpcDnsResponse)
+async def recreate_vpc_dns(
+    request: Request, vpc_name: str,
+    user: User = Depends(require_admin),
+) -> VpcDnsResponse:
+    """Recovery path: delete the VpcDns CR and recreate it bound to the
+    VPC's default subnet.
+
+    Returns the freshly-created `VpcDnsResponse` so the UI can re-render
+    the DNS tab without an extra GET round-trip (matches the contract
+    coded into the frontend's T7 DNS-tab implementation).
+
+    Useful when:
+      - VPC pre-dates the T2 auto-create (404 from GET /dns).
+      - VpcDns reconciliation stuck in error and a clean re-create might
+        recover (e.g. stale references after a subnet rename).
+
+    Idempotent in the sense that if the CR is already absent, we still
+    call `_ensure_vpc_dns` to create it. Spec recreated with the VPC's
+    default subnet (we look it up by `spec.vpc == vpc_name` +
+    `spec.default == True`) — admin can re-bind to a different subnet
+    via PATCH afterwards.
+    """
+    k8s = request.app.state.k8s_client
+    await _ensure_cluster_config(k8s)
+
+    if not await _vpc_exists(k8s, vpc_name):
+        raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
+
+    # 1. Delete current CR (404 tolerated).
+    try:
+        await k8s.custom_api.delete_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+            plural="vpc-dnses", name=f"{vpc_name}-dns",
+        )
+        logger.info(f"Deleted VpcDns {vpc_name}-dns (recreate)")
+    except ApiException as e:
+        if e.status != 404:
+            logger.warning(f"Failed to delete VpcDns {vpc_name}-dns: {e}")
+            raise k8s_error_to_http(e, "VpcDns delete")
+
+    # 2. Resolve the VPC's default subnet for re-binding.
+    try:
+        subnet_list = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+            plural="subnets",
+        )
+    except ApiException as e:
+        raise k8s_error_to_http(e, "Subnet list")
+    default_subnets = [
+        (s.get("metadata") or {}).get("name") or ""
+        for s in subnet_list.get("items", [])
+        if (s.get("spec") or {}).get("vpc") == vpc_name
+        and (s.get("spec") or {}).get("default") is True
+    ]
+    default_subnets = [n for n in default_subnets if n]
+    if not default_subnets:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"VPC '{vpc_name}' has no default subnet; cannot recreate "
+                "VpcDns. Mark a subnet as `spec.default=true` first, or "
+                "PATCH the VpcDns to point at a specific subnet."
+            ),
+        )
+    if len(default_subnets) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"VPC '{vpc_name}' has multiple default subnets "
+                f"({sorted(default_subnets)!r}); reconcile before recreate."
+            ),
+        )
+    subnet_name = default_subnets[0]
+
+    # 3. Recreate via the same helper used at VPC create time, but with
+    #    `swallow=False` so non-409 ApiException PROPAGATES — the admin
+    #    explicitly clicked Recreate, so we must not pretend success on a
+    #    silent failure. The wrap below converts kube API errors to 502
+    #    with the underlying error in the detail.
+    try:
+        await _ensure_vpc_dns(k8s, vpc_name, subnet_name, swallow=False)
+    except ApiException as e:
+        raise k8s_error_to_http(e, f"recreate VpcDns for VPC '{vpc_name}'")
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to recreate VpcDns for VPC '{vpc_name}': {e}",
+        ) from e
+
+    # 4. Read back the new CR and return so the UI can update its tab
+    #    without an extra GET. If the read genuinely returns 404, that
+    #    means the create silently failed AFTER our explicit recreate
+    #    succeeded (shouldn't happen with swallow=False above, but if
+    #    it does — e.g. an admission webhook stripped the CR after
+    #    creation — let the 404 propagate so the admin sees a real
+    #    error instead of a misleading "pending" placeholder.
+    cr = await _get_vpc_dns_cr(k8s, vpc_name)
+    return _parse_vpc_dns(cr, coredns_vip=_vpcdns_vip())

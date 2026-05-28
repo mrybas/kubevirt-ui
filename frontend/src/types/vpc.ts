@@ -69,6 +69,30 @@ export interface UpdateVpcRoutesRequest {
 }
 
 // ---------------------------------------------------------------------------
+// VpcDns
+// ---------------------------------------------------------------------------
+
+export interface VpcDnsStatus {
+  phase: 'ready' | 'pending' | 'error' | 'absent';
+  active_pods: number;
+  message: string | null;
+}
+
+export interface VpcDns {
+  name: string;
+  vpc: string;
+  subnet: string;
+  replicas: number;
+  coredns_vip: string;
+  status: VpcDnsStatus;
+}
+
+export interface UpdateVpcDnsRequest {
+  subnet?: string;
+  replicas?: number;
+}
+
+// ---------------------------------------------------------------------------
 // SecurityGroup
 // ---------------------------------------------------------------------------
 

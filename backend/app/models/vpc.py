@@ -189,6 +189,74 @@ class VpcStaticRoutesUpdateRequest(BaseModel):
 
 
 # ============================================================================
+# VpcDns Models (T6 — per-VPC DNS forwarder)
+# ============================================================================
+
+class VpcDnsStatus(BaseModel):
+    """Reconciliation status of a per-VPC DNS deployment.
+
+    `phase`:
+      - ``ready``: VpcDns deployment has at least one active pod and the
+        Active condition is True.
+      - ``pending``: CR exists but pods aren't running yet.
+      - ``error``: a condition reports a non-recoverable error.
+      - ``absent``: no VpcDns CR exists for the VPC (auto-create failed,
+        or admin pre-dates T2 auto-create). The handler returns 404 in
+        this case, so callers won't normally see this value.
+    """
+    phase: str = Field(
+        "absent",
+        description="ready / pending / error / absent",
+    )
+    active_pods: int = Field(
+        0,
+        description="Number of active VpcDns deployment pods",
+    )
+    message: Optional[str] = Field(
+        None,
+        description="Status message (typically from the latest Active condition)",
+    )
+
+
+class VpcDnsResponse(BaseModel):
+    """Response model for a VpcDns CR.
+
+    `coredns_vip` is the cluster-wide shared VIP every VpcDns instance
+    listens on (autodiscovered from the cluster config — see
+    ``tenants_common._vpcdns_vip``). The VIP is consumed by VPC workloads
+    via the subnet's ``spec.dhcpV4Options.dns_server``; surfacing it here
+    lets the UI show admins what DNS IP pods will receive.
+    """
+    name: str = Field(..., description="VpcDns CR name (always `<vpc>-dns`)")
+    vpc: str
+    subnet: str
+    replicas: int = Field(1, description="Desired VpcDns deployment replicas")
+    coredns_vip: str = Field(
+        ...,
+        description="Cluster-wide shared VIP that every VpcDns instance listens on",
+    )
+    status: VpcDnsStatus = Field(default_factory=VpcDnsStatus)
+
+
+class VpcDnsUpdateRequest(BaseModel):
+    """Request to patch a VpcDns CR.
+
+    All fields optional; only provided fields are patched. `subnet` (if
+    provided) must exist and belong to the VPC — validated server-side.
+    `replicas` must be >= 1.
+    """
+    subnet: Optional[str] = Field(
+        None,
+        description="Subnet within the VPC the VpcDns deployment binds to",
+    )
+    replicas: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Desired VpcDns deployment replicas (>= 1)",
+    )
+
+
+# ============================================================================
 # SecurityGroup Models
 # ============================================================================
 

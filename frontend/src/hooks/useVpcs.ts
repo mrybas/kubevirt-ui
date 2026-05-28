@@ -12,8 +12,12 @@ import {
   removeVpcPeering,
   getVpcRoutes,
   updateVpcRoutes,
+  getVpcDns,
+  updateVpcDns,
+  recreateVpcDns,
 } from '../api/vpcs';
-import type { CreateVpcRequest, AddVpcPeeringRequest, UpdateVpcRoutesRequest } from '../types/vpc';
+import type { CreateVpcRequest, AddVpcPeeringRequest, UpdateVpcRoutesRequest, UpdateVpcDnsRequest } from '../types/vpc';
+import { ApiError } from '../api/client';
 
 export function useVpcs(params?: { folder?: string; environment?: string }) {
   return useQuery({
@@ -85,6 +89,39 @@ export function useUpdateVpcRoutes(name: string) {
     mutationFn: (request: UpdateVpcRoutesRequest) => updateVpcRoutes(name, request),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['vpcs', name, 'routes'] });
+    },
+  });
+}
+
+export function useVpcDns(vpcName: string | undefined) {
+  return useQuery({
+    queryKey: ['vpcs', vpcName, 'dns'],
+    queryFn: () => getVpcDns(vpcName!),
+    enabled: !!vpcName,
+    retry: (failureCount, error) => {
+      // Don't retry on 404 — absent VpcDns is a valid state, not a transient error
+      if (error instanceof ApiError && error.status === 404) return false;
+      return failureCount < 3;
+    },
+  });
+}
+
+export function useUpdateVpcDns(vpcName: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (request: UpdateVpcDnsRequest) => updateVpcDns(vpcName, request),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['vpcs', vpcName, 'dns'] });
+    },
+  });
+}
+
+export function useRecreateVpcDns(vpcName: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => recreateVpcDns(vpcName),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['vpcs', vpcName, 'dns'] });
     },
   });
 }

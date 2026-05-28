@@ -10,6 +10,8 @@ import type {
   AddVpcPeeringRequest,
   VpcRoutesResponse,
   UpdateVpcRoutesRequest,
+  VpcDns,
+  UpdateVpcDnsRequest,
 } from '../types/vpc';
 
 export async function listVpcs(params?: { folder?: string; environment?: string }): Promise<VpcListResponse> {
@@ -46,4 +48,16 @@ export async function getVpcRoutes(name: string): Promise<VpcRoutesResponse> {
 
 export async function updateVpcRoutes(name: string, request: UpdateVpcRoutesRequest): Promise<VpcRoutesResponse> {
   return apiRequest<VpcRoutesResponse>(`/vpcs/${name}/routes`, { method: 'PUT', body: request });
+}
+
+export async function getVpcDns(vpcName: string): Promise<VpcDns> {
+  return apiRequest<VpcDns>(`/vpcs/${vpcName}/dns`);
+}
+
+export async function updateVpcDns(vpcName: string, request: UpdateVpcDnsRequest): Promise<VpcDns> {
+  return apiRequest<VpcDns>(`/vpcs/${vpcName}/dns`, { method: 'PATCH', body: request });
+}
+
+export async function recreateVpcDns(vpcName: string): Promise<VpcDns> {
+  return apiRequest<VpcDns>(`/vpcs/${vpcName}/dns/recreate`, { method: 'POST' });
 }

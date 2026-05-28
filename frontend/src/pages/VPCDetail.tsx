@@ -2,7 +2,7 @@
  * VPC Detail Page — tabs: Overview, Subnets, Peerings, Routes
  */
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
   Network,
@@ -14,19 +14,24 @@ import {
   GitMerge,
   Route,
   Layers,
+  Server,
+  AlertCircle,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes } from '../hooks/useVpcs';
+import { useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes, useVpcDns, useUpdateVpcDns, useRecreateVpcDns } from '../hooks/useVpcs';
 import { useEgressGateways, useDetachVpc } from '../hooks/useEgressGateways';
-import type { VpcRoute } from '../types/vpc';
+import { ApiError } from '../api/client';
+import { notify } from '../store/notifications';
+import type { VpcRoute, VpcSubnet, UpdateVpcDnsRequest } from '../types/vpc';
 
-type Tab = 'overview' | 'subnets' | 'peerings' | 'routes';
+type Tab = 'overview' | 'subnets' | 'peerings' | 'routes' | 'dns';
 
 const TABS: { id: Tab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { id: 'overview', label: 'Overview', icon: Network },
   { id: 'subnets', label: 'Subnets', icon: Layers },
   { id: 'peerings', label: 'Peerings', icon: GitMerge },
   { id: 'routes', label: 'Static Routes', icon: Route },
+  { id: 'dns', label: 'DNS', icon: Server },
 ];
 
 export default function VPCDetail() {
@@ -161,6 +166,7 @@ export default function VPCDetail() {
       {activeTab === 'subnets' && <SubnetsTab vpc={vpc} />}
       {activeTab === 'peerings' && <PeeringsTab vpc={vpc} />}
       {activeTab === 'routes' && <RoutesTab vpcName={vpc.name} />}
+      {activeTab === 'dns' && <DnsTab vpcName={vpc.name} subnets={vpc.subnets} />}
 
       {showDeleteModal && (
         <DeleteVpcModal
@@ -520,6 +526,241 @@ function RoutesTab({ vpcName }: { vpcName: string }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// DnsTab
+// ---------------------------------------------------------------------------
+
+function DnsTab({ vpcName, subnets }: { vpcName: string; subnets: VpcSubnet[] }) {
+  const { data: dns, isLoading, error } = useVpcDns(vpcName);
+  const updateDns = useUpdateVpcDns(vpcName);
+  const recreateDns = useRecreateVpcDns(vpcName);
+
+  const [subnet, setSubnet] = useState('');
+  const [replicas, setReplicas] = useState(1);
+  const [showRecreateModal, setShowRecreateModal] = useState(false);
+
+  // Sync form state when data loads
+  useEffect(() => {
+    if (dns) {
+      setSubnet(dns.subnet);
+      setReplicas(dns.replicas);
+    }
+  }, [dns]);
+
+  const isDirty = dns ? (subnet !== dns.subnet || replicas !== dns.replicas) : false;
+
+  const handleSave = async () => {
+    const req: UpdateVpcDnsRequest = {};
+    if (dns && subnet !== dns.subnet) req.subnet = subnet;
+    if (dns && replicas !== dns.replicas) req.replicas = replicas;
+    try {
+      await updateDns.mutateAsync(req);
+      notify.success('DNS configuration saved');
+    } catch (e) {
+      notify.error('Failed to update DNS', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleRecreate = async () => {
+    setShowRecreateModal(false);
+    try {
+      await recreateDns.mutateAsync();
+      notify.success('VpcDns recreated');
+    } catch (e) {
+      notify.error('Failed to recreate VpcDns', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex justify-center py-8">
+        <div className="w-6 h-6 border-2 border-primary-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  // 404 — VpcDns was not auto-created (legacy VPC or creation failure)
+  if (error instanceof ApiError && error.status === 404) {
+    return (
+      <div className="flex flex-col items-center justify-center h-48 text-surface-400">
+        <Server className="w-10 h-10 mb-3 opacity-50" />
+        <p className="text-sm mb-1">DNS not configured for this VPC</p>
+        <p className="text-xs text-surface-500 mb-4">VpcDns CR was not auto-created (legacy VPC or provisioning failure)</p>
+        <button
+          onClick={() => handleRecreate()}
+          disabled={recreateDns.isPending}
+          className="btn-primary text-sm"
+        >
+          {recreateDns.isPending ? 'Creating...' : 'Create VpcDns'}
+        </button>
+      </div>
+    );
+  }
+
+  // Other error (network, 5xx, etc.)
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-48 text-surface-400">
+        <AlertCircle className="w-10 h-10 mb-3 text-red-400 opacity-70" />
+        <p className="text-sm">Failed to load DNS config</p>
+        <p className="text-xs text-red-400 mt-1">{error.message}</p>
+      </div>
+    );
+  }
+
+  if (!dns) return null;
+
+  const phaseStyles: Record<string, { dot: string; badge: string; label: string }> = {
+    ready:   { dot: 'bg-emerald-500', badge: 'bg-emerald-500/20 text-emerald-400', label: 'Ready' },
+    pending: { dot: 'bg-amber-500',   badge: 'bg-amber-500/20 text-amber-400',     label: 'Pending' },
+    error:   { dot: 'bg-red-500',     badge: 'bg-red-500/20 text-red-400',         label: 'Error' },
+    absent:  { dot: 'bg-surface-500', badge: 'bg-surface-500/20 text-surface-400', label: 'Absent' },
+  };
+  const phase = phaseStyles[dns.status.phase] ?? phaseStyles.pending;
+
+  return (
+    <div className="space-y-4">
+      {/* Header card */}
+      <div className="card">
+        <div className="card-body space-y-3">
+          <h3 className="font-medium text-surface-100">VpcDns</h3>
+          <div className="space-y-2 text-sm">
+            <div className="flex justify-between">
+              <span className="text-surface-400">Name</span>
+              <span className="text-surface-200 font-mono">{dns.name}</span>
+            </div>
+            <div className="flex justify-between items-center">
+              <span className="text-surface-400">Status</span>
+              <span className={clsx('flex items-center gap-1.5 text-xs px-2 py-0.5 rounded-full', phase.badge)}>
+                <span className={clsx('w-1.5 h-1.5 rounded-full', phase.dot)} />
+                {phase.label}
+              </span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-surface-400">CoreDNS VIP</span>
+              <span className="text-surface-200 font-mono">{dns.coredns_vip || '—'}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-surface-400">Active Pods</span>
+              <span className="text-surface-200">{dns.status.active_pods}</span>
+            </div>
+            {dns.status.message && (
+              <p className="text-xs text-amber-400 pt-1">{dns.status.message}</p>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Spec card */}
+      <div className="card">
+        <div className="card-body space-y-4">
+          <h3 className="font-medium text-surface-100">Configuration</h3>
+          <div className="space-y-3">
+            <div>
+              <label className="block text-sm text-surface-400 mb-1">Subnet</label>
+              <select
+                value={subnet}
+                onChange={(e) => setSubnet(e.target.value)}
+                disabled={subnets.length <= 1}
+                className="input w-full text-sm font-mono"
+              >
+                {subnets.map((s) => (
+                  <option key={s.name} value={s.name}>
+                    {s.name} ({s.cidr_block})
+                  </option>
+                ))}
+                {/* Fallback: current subnet not in the VPC's subnet list */}
+                {!subnets.some((s) => s.name === subnet) && subnet && (
+                  <option value={subnet}>{subnet}</option>
+                )}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm text-surface-400 mb-1">Replicas</label>
+              <input
+                type="number"
+                min={1}
+                max={5}
+                value={replicas}
+                onChange={(e) => setReplicas(Math.max(1, Math.min(5, parseInt(e.target.value) || 1)))}
+                className="input w-28 text-sm"
+              />
+            </div>
+          </div>
+          <div className="flex items-center gap-2 pt-1">
+            <button
+              onClick={handleSave}
+              disabled={!isDirty || updateDns.isPending}
+              className="btn-primary text-sm"
+            >
+              {updateDns.isPending ? 'Saving...' : 'Save'}
+            </button>
+            <button
+              onClick={() => setShowRecreateModal(true)}
+              className="text-sm px-3 py-1.5 text-red-400 hover:text-red-300 hover:bg-red-500/10 rounded-lg transition-colors"
+            >
+              Recreate
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {showRecreateModal && (
+        <RecreateVpcDnsModal
+          dnsName={dns.name}
+          onConfirm={handleRecreate}
+          onCancel={() => setShowRecreateModal(false)}
+          isPending={recreateDns.isPending}
+        />
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RecreateVpcDnsModal
+// ---------------------------------------------------------------------------
+
+function RecreateVpcDnsModal({
+  dnsName,
+  onConfirm,
+  onCancel,
+  isPending,
+}: {
+  dnsName: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+  isPending: boolean;
+}) {
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+      <div className="bg-surface-800 border border-surface-700 rounded-xl w-full max-w-sm mx-4 shadow-2xl p-5">
+        <div className="w-12 h-12 bg-amber-900/30 rounded-full flex items-center justify-center mx-auto mb-4">
+          <RefreshCw className="w-6 h-6 text-amber-400" />
+        </div>
+        <h2 className="text-lg font-semibold text-surface-100 text-center mb-2">Recreate VpcDns</h2>
+        <p className="text-sm text-surface-400 text-center mb-4">
+          This will delete and recreate{' '}
+          <strong className="font-mono text-surface-200">{dnsName}</strong>.{' '}
+          DNS resolution in this VPC will be briefly interrupted.
+        </p>
+        <div className="flex gap-3">
+          <button onClick={onCancel} disabled={isPending} className="flex-1 btn-secondary">
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={isPending}
+            className="flex-1 px-4 py-2 bg-amber-600 hover:bg-amber-500 disabled:bg-surface-700 disabled:text-surface-500 text-white rounded-lg transition-colors"
+          >
+            {isPending ? 'Recreating...' : 'Recreate'}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
