@@ -4,7 +4,7 @@ import asyncio
 import json
 import logging
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from kubernetes_asyncio import client
@@ -63,23 +63,29 @@ class VMFromTemplateRequest(BaseModel):
 
     display_name: str = Field(..., min_length=1, max_length=100)
     template_name: str
-    
+
     # Optional overrides
     cpu_cores: int | None = None
     memory: str | None = None
     disk_size: str | None = None
-    
+
     # Cloud-init
     ssh_key: str | None = None
     password: str | None = None
     user_data: str | None = None
-    
+
     # Network configuration (Kube-OVN)
     # Single NIC (backward compat)
     network: VMNetworkRequest | None = None
     # Multiple NICs — if set, takes priority over `network`
     networks: list[VMNetworkRequest] | None = None
-    
+
+    # T6 — Primary-NIC binding. Default 'bridge' so guests see their real
+    # OVN/Kube-OVN IP (masquerade → QEMU SLIRP hides it behind 10.0.2.x and
+    # breaks multicast). Override with 'masquerade' on CNIs where bridge
+    # live-migration is iffy.
+    network_binding: Literal["bridge", "masquerade"] = "bridge"
+
     # Start immediately
     start: bool = True
 
@@ -869,9 +875,11 @@ async def create_vm_from_template(
                     iface_specs.append({"name": iface_name, "bridge": {}})
                     has_bridge = True
                 else:
-                    # VPC overlay: default pod network + masquerade. The
-                    # logical_switch annotation (stamped below) steers the
-                    # primary OVN interface to this subnet's logical switch.
+                    # VPC overlay: default pod network. Bind defaults to
+                    # `bridge` (T6) so the guest reports its real OVN IP;
+                    # masquerade is the legacy opt-out. The logical_switch
+                    # annotation (stamped below) steers the primary OVN
+                    # interface to this subnet's logical switch.
                     # Secondary VPC NICs would need per-subnet NADs wrapping
                     # the OVN CNI — out of scope for now.
                     if idx != 0:
@@ -884,7 +892,14 @@ async def create_vm_from_template(
                         )
                     iface_name = "default"
                     net_specs.append({"name": iface_name, "pod": {}})
-                    iface_specs.append({"name": iface_name, "masquerade": {}})
+                    vpc_binding = (
+                        "masquerade"
+                        if vm_request.network_binding == "masquerade"
+                        else "bridge"
+                    )
+                    iface_specs.append({"name": iface_name, vpc_binding: {}})
+                    if vpc_binding == "bridge":
+                        has_bridge = True
 
                 if nic.static_ip:
                     static_ips.append(nic.static_ip)

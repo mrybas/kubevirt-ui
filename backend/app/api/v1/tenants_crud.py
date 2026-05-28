@@ -14,6 +14,15 @@ from kubernetes_asyncio.client import ApiException
 
 from app.core.auth import User, require_auth
 from app.core.errors import k8s_error_to_http
+from app.core.groups import (
+    ENV_ENVIRONMENT_LABEL,
+    ENV_FOLDER_LABEL,
+    is_admin,
+    is_env_viewer,
+    is_folder_admin,
+    load_folder,
+    resolve_env,
+)
 from app.core.naming import (
     DISPLAY_NAME_ANNOTATION,
     SLUG_LABEL,
@@ -450,7 +459,16 @@ async def list_tenants(
     per_page: int = Query(50, ge=1, le=200),
     user: User = Depends(require_auth),
 ) -> TenantListResponse:
-    """List all tenants (CAPI Clusters in tenant-* namespaces)."""
+    """List all tenants (CAPI Clusters in tenant-* namespaces).
+
+    Authorization (T2):
+      - global admins see every tenant
+      - everyone else only sees tenants whose namespace has
+        kubevirt-ui.io/folder + kubevirt-ui.io/environment labels referring
+        to a folder/env where the user has at least viewer access
+        (is_env_viewer). Tenants without folder/env labels are legacy
+        (pre-T1) → admin-only.
+    """
     k8s = request.app.state.k8s_client
     await _ensure_cluster_config(k8s)
 
@@ -462,8 +480,43 @@ async def list_tenants(
             label_selector="kubevirt-ui.io/tenant",
         )
 
+        clusters = result.get("items", [])
+
+        # T2 — non-admin path: resolve folder/env per tenant ns and filter to
+        # those the user can at least view. We do this BEFORE enrichment so
+        # we never pay the MachineDeployment list cost for tenants the user
+        # can't see anyway.
+        if not is_admin(user.groups):
+            try:
+                # load_folders raises 404 if the folders CM doesn't exist; in
+                # that case no non-admin can see any tenant.
+                from app.core.groups import load_folders
+                folders_map = await load_folders(k8s)
+            except HTTPException as e:
+                if e.status_code == 404:
+                    folders_map = {}
+                else:
+                    raise
+
+            filtered: list[dict[str, Any]] = []
+            for cluster in clusters:
+                ns_name = cluster.get("metadata", {}).get("namespace", "")
+                if not ns_name:
+                    continue
+                try:
+                    folder_name, env_name = await resolve_env(k8s, ns_name)
+                except HTTPException:
+                    # legacy / unlabeled — admin-only
+                    continue
+                folder_meta = folders_map.get(folder_name)
+                if not folder_meta:
+                    continue
+                if is_env_viewer(user, folder_meta, env_name):
+                    filtered.append(cluster)
+            clusters = filtered
+
         items = []
-        for cluster in result.get("items", []):
+        for cluster in clusters:
             tenant = _parse_tenant_response(cluster)
             tenant = await _enrich_with_workers(k8s, tenant)
             items.append(tenant)
@@ -493,6 +546,32 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
     await _ensure_cluster_config(k8s)
     ns = _tenant_ns(req.name)
 
+    # T1 — validate folder/env exist + caller has folder_admin (or global admin).
+    # We don't run the namespace check below until folder/env are confirmed; this
+    # guarantees we never partially-create a tenant on bad metadata.
+    folder_meta = await load_folder(k8s, req.folder)  # 404 if missing
+    folder_envs = folder_meta.get("environments") or []
+    # Tolerate both shapes: list[str] (legacy) and list[dict{"name": str}].
+    env_names: list[str] = [
+        e if isinstance(e, str) else (e.get("name") or e.get("environment") or "")
+        for e in folder_envs
+    ]
+    if req.environment not in env_names:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Environment '{req.environment}' does not exist in folder "
+                f"'{req.folder}'. Known envs: {env_names!r}"
+            ),
+        )
+    if not is_folder_admin(user, folder_meta):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"User does not have folder_admin access on folder '{req.folder}'"
+            ),
+        )
+
     # Check if already exists
     if await _namespace_exists(k8s, ns):
         raise HTTPException(
@@ -501,13 +580,21 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         )
 
     try:
-        # 1. Create namespace
-        await _create_namespace(k8s, ns, req.name, req.worker_type)
+        # 1. Create namespace, stamping folder/env labels so the tenant
+        #    automatically participates in Phase 2 folder-level authz.
+        await _create_namespace(
+            k8s, ns, req.name, req.worker_type,
+            folder=req.folder, environment=req.environment,
+        )
 
         # 2. Create VPC BEFORE CAPI resources (NAD must exist when TCP pod starts)
         vpc_info: dict[str, str] | None = None
         if req.network_isolation:
-            vpc_info = await _create_tenant_vpc(k8s, req.name)
+            vpc_info = await _create_tenant_vpc(
+                k8s, req.name,
+                mode=req.network_isolation_mode,
+                infra_subnet=req.infra_subnet,
+            )
 
         # 3. Create CAPI resources + Ingress (passes vpc_info for Multus annotation)
         await _create_capi_resources(k8s, req, vpc_info)

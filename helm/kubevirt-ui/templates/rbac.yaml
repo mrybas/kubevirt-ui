@@ -334,6 +334,36 @@ rules:
       - helmreleases
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
+  # -----------------------------------------------------------------------
+  # IngressClasses — read-only; needed to auto-detect the default ingress
+  # controller when TENANTS_INGRESS_CLASS env var is not set.
+  # (tenants_common.py: list_ingress_class / read_ingress_class)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - ingressclasses
+    verbs: ["get", "list", "watch"]
+
+  # -----------------------------------------------------------------------
+  # Traefik IngressRouteTCP — TCP passthrough routes for tenant API servers.
+  # Created/deleted per-tenant when ingress controller is Traefik.
+  # (tenants_capi.py: _create_tenant_apiserver_ingress → traefik branch)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["traefik.io"]
+    resources:
+      - ingressroutetcps
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
+  # Contour HTTPProxy — TLS-passthrough proxies for tenant API servers.
+  # Created/deleted per-tenant when ingress controller is Contour.
+  # (tenants_capi.py: _create_tenant_apiserver_ingress → contour branch)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["projectcontour.io"]
+    resources:
+      - httpproxies
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

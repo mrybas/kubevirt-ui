@@ -17,14 +17,17 @@ import {
   X,
   ChevronRight,
   ChevronLeft,
+  ChevronDown,
   Server,
   Cpu,
   Eye,
   Trash2,
+  AlertTriangle,
 } from 'lucide-react';
 import { useTenants, useCreateTenant, useDeleteTenant, useAddonCatalog, useDiscovery } from '../hooks/useTenants';
 import { useSubnets } from '../hooks/useNetwork';
-import { useEgressGateways } from '../hooks/useEgressGateways';
+import { useFoldersFlat } from '../hooks/useFolders';
+import { useAuthStore } from '../store/auth';
 import type { Tenant, TenantCreateRequest, TenantAddon, AddonComponent } from '../types/tenant';
 import { WizardStepIndicator } from '../components/common/WizardStepIndicator';
 import { DataTable, type Column } from '@/components/common/DataTable';
@@ -54,7 +57,23 @@ function TenantStatusBadge({ status }: { status: string }) {
 // Create Tenant Wizard
 // ---------------------------------------------------------------------------
 
-const K8S_VERSIONS = ['v1.32.0', 'v1.31.5', 'v1.31.0', 'v1.30.0'];
+// Real tags confirmed on quay.io/capk/* (see T10)
+const K8S_VERSIONS = ['v1.34.1', 'v1.33.5', 'v1.32.1', 'v1.31.5', 'v1.30.1', 'v1.29.5'];
+
+const CAPK_URL_RE = /^quay\.io\/capk\/ubuntu-\d{4}-container-disk:/;
+
+function isCapkUrl(url: string): boolean {
+  return CAPK_URL_RE.test(url);
+}
+
+/** Derive the canonical CAPK worker image URL from a Kubernetes version string. */
+function deriveCapkUrl(version: string): string {
+  const match = version.match(/^v1\.(\d+)\./);
+  if (!match) return '';
+  const minor = parseInt(match[1]!, 10);
+  const ubuntuTag = minor <= 30 ? '2204' : '2404';
+  return `quay.io/capk/ubuntu-${ubuntuTag}-container-disk:${version}`;
+}
 
 interface WizardState {
   name: string;
@@ -68,12 +87,17 @@ interface WizardState {
   worker_disk: string;
   worker_image_url: string;
   worker_image_pull_secrets: string[];
+  worker_network_binding: 'bridge' | 'masquerade'; // T11
   pod_cidr: string;
   service_cidr: string;
   admin_group: string;
   viewer_group: string;
-  network_isolation: boolean;
-  egress_gateway: string; // gateway name or '' for none
+  // T8 — folder / environment
+  folder: string;
+  environment: string;
+  // T9 — network isolation mode (backend creates vpc-<name> automatically; no vpc/gateway choice)
+  network_isolation_mode: 'shared' | 'isolated_shared_egress' | 'isolated_dedicated_egress';
+  infra_subnet: string; // only used when mode === isolated_dedicated_egress
   selectedAddons: Record<string, boolean>;
   addonParams: Record<string, Record<string, string>>;
 }
@@ -81,31 +105,36 @@ interface WizardState {
 const defaultWizard: WizardState = {
   name: '',
   display_name: '',
-  kubernetes_version: 'v1.30.0',
+  kubernetes_version: 'v1.32.1', // matches latest confirmed CAPK tag (T10)
   control_plane_replicas: 2,
   worker_type: 'vm',
   worker_count: 2,
   worker_vcpu: 2,
   worker_memory: '2Gi',
   worker_disk: '20Gi',
-  worker_image_url: '',
+  worker_image_url: deriveCapkUrl('v1.32.1'), // auto-derived on load
   worker_image_pull_secrets: [],
+  worker_network_binding: 'bridge',
   pod_cidr: '10.244.0.0/16',
   service_cidr: '10.96.0.0/12',
   admin_group: '',
   viewer_group: '',
-  network_isolation: false,
-  egress_gateway: '',
+  folder: '',
+  environment: '',
+  network_isolation_mode: 'shared',
+  infra_subnet: '',
   selectedAddons: {},
   addonParams: {},
 };
 
-const containerDiskPresets = [
-  { name: 'Ubuntu 22.04', url: 'quay.io/containerdisks/ubuntu:22.04' },
-  { name: 'Ubuntu 24.04', url: 'quay.io/containerdisks/ubuntu:24.04' },
-  { name: 'Fedora 39', url: 'quay.io/containerdisks/fedora:39' },
-  { name: 'CentOS Stream 9', url: 'quay.io/containerdisks/centos-stream:9' },
-  { name: 'Cirros (test)', url: 'quay.io/kubevirt/cirros-container-disk-demo' },
+// Real CAPK tags — confirmed available on quay.io/capk (T10)
+const capkPresets = [
+  { name: 'Ubuntu 22.04 / k8s 1.29.5', url: 'quay.io/capk/ubuntu-2204-container-disk:v1.29.5' },
+  { name: 'Ubuntu 22.04 / k8s 1.30.1', url: 'quay.io/capk/ubuntu-2204-container-disk:v1.30.1' },
+  { name: 'Ubuntu 24.04 / k8s 1.31.5', url: 'quay.io/capk/ubuntu-2404-container-disk:v1.31.5' },
+  { name: 'Ubuntu 24.04 / k8s 1.32.1', url: 'quay.io/capk/ubuntu-2404-container-disk:v1.32.1' },
+  { name: 'Ubuntu 24.04 / k8s 1.33.5', url: 'quay.io/capk/ubuntu-2404-container-disk:v1.33.5' },
+  { name: 'Ubuntu 24.04 / k8s 1.34.1', url: 'quay.io/capk/ubuntu-2404-container-disk:v1.34.1' },
 ];
 
 /** DNS-1123 label: lowercase alphanumeric + hyphen, ≤63 chars, start/end alphanumeric */
@@ -116,14 +145,44 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<WizardState>(defaultWizard);
   const [secretInput, setSecretInput] = useState('');
+  const [imageAutoFilled, setImageAutoFilled] = useState(true); // default worker_image_url is auto-derived
+  const [showNetworkBinding, setShowNetworkBinding] = useState(false);
   const { data: catalog } = useAddonCatalog();
   const { data: discovery } = useDiscovery();
   const { data: subnets } = useSubnets();
-  const { data: egressGatewaysData } = useEgressGateways();
+  const { data: foldersData } = useFoldersFlat();
+  const user = useAuthStore(s => s.user);
   const createTenant = useCreateTenant();
 
-  // Check if infrastructure subnet exists (required for VPC network isolation)
-  const hasInfraSubnet = subnets?.some(s => s.purpose === 'infrastructure') ?? false;
+  // Infrastructure subnets (for dedicated-egress mode)
+  const infraSubnets = subnets?.filter(s => s.purpose === 'infrastructure') ?? [];
+  // Check if infrastructure subnet exists (needed to enable dedicated egress)
+  const hasInfraSubnet = infraSubnets.length > 0;
+
+  // Folder list — admins see all, non-admins see folders where they're listed
+  const allFolders = foldersData?.items ?? [];
+  const visibleFolders = user?.is_admin
+    ? allFolders
+    : allFolders.filter(f => f.users.includes(user?.username ?? ''));
+
+  // Environments from selected folder
+  const selectedFolder = allFolders.find(f => f.name === form.folder);
+  const folderEnvironments = selectedFolder?.environments ?? [];
+
+  // Autoderive worker_image_url when kubernetes_version changes (T10)
+  useEffect(() => {
+    const derived = deriveCapkUrl(form.kubernetes_version);
+    if (derived && (form.worker_image_url === '' || isCapkUrl(form.worker_image_url))) {
+      setForm(prev => ({ ...prev, worker_image_url: derived }));
+      setImageAutoFilled(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [form.kubernetes_version]);
+
+  // Reset environment when folder changes
+  useEffect(() => {
+    setForm(prev => ({ ...prev, environment: '' }));
+  }, [form.folder]);
 
   // Initialize addon defaults from catalog once it loads
   useEffect(() => {
@@ -187,14 +246,24 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
       service_cidr: form.service_cidr,
       admin_group: form.admin_group,
       viewer_group: form.viewer_group,
-      network_isolation: form.network_isolation || undefined,
-      egress_gateway: form.egress_gateway || undefined,
+      // T8: folder / environment
+      ...(form.folder ? { folder: form.folder } : {}),
+      ...(form.environment ? { environment: form.environment } : {}),
+      // T9: isolation mode; vpc-<name> created automatically; no egress_gateway choice
+      network_isolation_mode: form.network_isolation_mode,
+      ...(form.network_isolation_mode === 'isolated_dedicated_egress'
+        ? { infra_subnet: form.infra_subnet || null }
+        : {}),
       ...(form.worker_image_url ? {
         worker_image_url: form.worker_image_url,
         worker_image_source_type: 'registry' as const,
       } : {}),
       ...(form.worker_image_pull_secrets.length > 0 ? {
         worker_image_pull_secrets: form.worker_image_pull_secrets,
+      } : {}),
+      // T11: network binding (omit if default bridge)
+      ...(form.worker_network_binding !== 'bridge' ? {
+        worker_network_binding: form.worker_network_binding,
       } : {}),
       addons,
     };
@@ -204,7 +273,12 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
   };
 
   const canNext = () => {
-    if (step === 0) return form.name.length > 0 && form.display_name.length > 0;
+    if (step === 0) {
+      if (!form.name || !form.display_name) return false;
+      if (!form.folder) return false; // T8: folder required
+      if (!form.environment) return false; // T8: environment required
+      return true;
+    }
     if (step === 1) {
       if (form.worker_count <= 0) return false;
       return true;
@@ -285,11 +359,70 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                   ))}
                 </div>
               </div>
+
+              {/* T8: Folder + Environment */}
+              <div className="pt-2 border-t border-surface-700/50 space-y-4">
+                <p className="text-xs font-semibold text-surface-400 uppercase tracking-wider">Folder &amp; Environment</p>
+                <div>
+                  <label className="block text-sm text-surface-300 mb-1">
+                    Folder <span className="text-red-400">*</span>
+                  </label>
+                  <select
+                    value={form.folder}
+                    onChange={e => setForm({ ...form, folder: e.target.value })}
+                    className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500"
+                  >
+                    <option value="">Select folder…</option>
+                    {visibleFolders.map(f => (
+                      <option key={f.name} value={f.name}>
+                        {f.display_name || f.name}
+                        {f.path.length > 0 ? ` (${f.path.join(' / ')})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                  {visibleFolders.length === 0 && (
+                    <p className="text-xs text-amber-400 mt-1">No folders available. Ask an admin to create one.</p>
+                  )}
+                </div>
+                <div>
+                  <label className="block text-sm text-surface-300 mb-1">
+                    Environment <span className="text-red-400">*</span>
+                  </label>
+                  <select
+                    value={form.environment}
+                    onChange={e => setForm({ ...form, environment: e.target.value })}
+                    disabled={!form.folder}
+                    className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <option value="">{form.folder ? 'Select environment…' : 'Select a folder first'}</option>
+                    {folderEnvironments.map(env => (
+                      <option key={env.environment} value={env.environment}>
+                        {env.environment}
+                        {env.name !== env.environment ? ` (${env.name})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                  {form.folder && folderEnvironments.length === 0 && (
+                    <p className="text-xs text-amber-400 mt-1">This folder has no environments. Add one in Folders first.</p>
+                  )}
+                </div>
+              </div>
             </>
           )}
 
           {step === 1 && (
             <>
+              {/* T11: Storage warning banner */}
+              <div className="flex gap-3 p-3 bg-amber-900/10 border border-amber-700/40 rounded-lg">
+                <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+                <p className="text-xs text-amber-300/90 leading-relaxed">
+                  <strong>Persistent storage for tenant workers is not yet supported</strong> in this release.
+                  Workers will boot from the container disk image without persistent volumes.
+                  Use this for stateless workloads or proof-of-concept clusters.
+                  Persistent storage via kubevirt-csi is planned for the next release.
+                </p>
+              </div>
+
               {/* Worker Type */}
               <div>
                 <label className="block text-sm text-surface-300 mb-2">Worker Type</label>
@@ -378,27 +511,43 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                 </p>
               </div>
 
-              {/* Worker Container Image (OCI containerDisk) */}
+              {/* T10: Worker Container Image (CAPK OCI disk) */}
               <div className="space-y-2">
                 <label className="block text-sm text-surface-300">
                   Worker Image URL
-                  <span className="ml-1 text-surface-500 font-normal">(optional — OCI containerDisk)</span>
+                  <span className="ml-1 text-surface-500 font-normal">(CAPK container disk)</span>
                 </label>
                 <input
                   type="text"
                   value={form.worker_image_url}
-                  onChange={e => setForm({ ...form, worker_image_url: e.target.value })}
-                  placeholder="quay.io/containerdisks/ubuntu:22.04"
+                  onChange={e => {
+                    const val = e.target.value;
+                    setForm({ ...form, worker_image_url: val });
+                    // If user types a custom non-capk URL, clear the auto-fill flag
+                    if (val !== '' && !isCapkUrl(val)) {
+                      setImageAutoFilled(false);
+                    }
+                  }}
+                  placeholder="quay.io/capk/ubuntu-2404-container-disk:v1.32.1"
                   className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
                 />
+                {imageAutoFilled && form.worker_image_url && (
+                  <p className="text-xs text-emerald-400 flex items-center gap-1">
+                    <CheckCircle className="h-3 w-3" />
+                    Auto-filled from Kubernetes version
+                  </p>
+                )}
                 <div>
-                  <p className="text-xs text-surface-500 mb-1.5">Quick-fill presets:</p>
+                  <p className="text-xs text-surface-500 mb-1.5">CAPK presets (quay.io/capk):</p>
                   <div className="flex flex-wrap gap-2">
-                    {containerDiskPresets.map((preset) => (
+                    {capkPresets.map((preset) => (
                       <button
                         key={preset.name}
                         type="button"
-                        onClick={() => setForm({ ...form, worker_image_url: preset.url })}
+                        onClick={() => {
+                          setForm({ ...form, worker_image_url: preset.url });
+                          setImageAutoFilled(false);
+                        }}
                         className={`px-3 py-1.5 text-xs rounded-md border transition-colors ${
                           form.worker_image_url === preset.url
                             ? 'border-primary-500 bg-primary-500/10 text-primary-300'
@@ -408,7 +557,7 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                         {preset.name}
                       </button>
                     ))}
-                    {form.worker_image_url && !containerDiskPresets.some(p => p.url === form.worker_image_url) && (
+                    {form.worker_image_url && !capkPresets.some(p => p.url === form.worker_image_url) && (
                       <span className="px-3 py-1.5 text-xs rounded-md border border-surface-600 bg-surface-800 text-surface-400 italic">
                         Custom URL
                       </span>
@@ -486,6 +635,47 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                 <p className="text-xs text-surface-500">
                   Secrets must already exist in the tenant namespace; admin creates them.
                 </p>
+              </div>
+
+              {/* T11: Network binding (advanced) */}
+              <div className="border border-surface-700 rounded-lg overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setShowNetworkBinding(v => !v)}
+                  className="w-full flex items-center justify-between px-4 py-3 bg-surface-800 hover:bg-surface-700/50 text-sm text-surface-300 transition-colors"
+                >
+                  <span className="font-medium">Network binding (advanced)</span>
+                  <ChevronDown className={`h-4 w-4 transition-transform ${showNetworkBinding ? 'rotate-180' : ''}`} />
+                </button>
+                {showNetworkBinding && (
+                  <div className="p-4 bg-surface-800/50 space-y-3">
+                    {(['bridge', 'masquerade'] as const).map(mode => (
+                      <label key={mode} className="flex items-start gap-3 cursor-pointer group">
+                        <input
+                          type="radio"
+                          name="worker_network_binding"
+                          value={mode}
+                          checked={form.worker_network_binding === mode}
+                          onChange={() => setForm({ ...form, worker_network_binding: mode })}
+                          className="mt-0.5 h-4 w-4 border-surface-600 bg-surface-700 text-primary-500 focus:ring-primary-500"
+                        />
+                        <div>
+                          <p className="text-sm font-medium text-surface-200 group-hover:text-surface-100">
+                            {mode === 'bridge' ? 'Bridge' : 'Masquerade'}
+                            {mode === 'bridge' && (
+                              <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400">default, recommended</span>
+                            )}
+                          </p>
+                          <p className="text-xs text-surface-500 mt-0.5">
+                            {mode === 'bridge'
+                              ? 'Worker guests see the real pod CIDR IP. Required for multi-cast and consistent IP reporting.'
+                              : 'QEMU SLIRP NAT inside guest. Worker guest sees 10.0.2.x; pod CIDR IP is masqueraded. Choose this only if you have a specific CNI compatibility requirement.'}
+                          </p>
+                        </div>
+                      </label>
+                    ))}
+                  </div>
+                )}
               </div>
             </>
           )}
@@ -670,63 +860,83 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                 </div>
               </div>
 
-              {/* Network Isolation */}
-              <div className={`mt-4 flex items-center justify-between p-4 bg-surface-800 rounded-lg border ${
-                hasInfraSubnet ? 'border-surface-700' : 'border-surface-700/50 opacity-60'
-              }`}>
-                <div>
-                  <h3 className="text-sm font-semibold text-surface-200">Network Isolation (VPC)</h3>
-                  <p className="text-xs text-surface-500 mt-1">
-                    {hasInfraSubnet
-                      ? 'Create a dedicated VPC for this tenant. Worker VMs will be isolated in their own network.'
-                      : 'Requires an infrastructure subnet for VPC NAT gateway. Create one in Networks first.'}
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  disabled={!hasInfraSubnet}
-                  onClick={() => hasInfraSubnet && setForm({ ...form, network_isolation: !form.network_isolation })}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    !hasInfraSubnet ? 'bg-surface-700 cursor-not-allowed' :
-                    form.network_isolation ? 'bg-primary-500' : 'bg-surface-600'
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                      form.network_isolation ? 'translate-x-6' : 'translate-x-1'
-                    }`}
-                  />
-                </button>
-              </div>
-
-              {/* Egress Gateway */}
-              <div className="mt-4 p-4 bg-surface-800 rounded-lg border border-surface-700">
-                <div className="flex items-start justify-between mb-2">
-                  <div>
-                    <h3 className="text-sm font-semibold text-surface-200">Egress Gateway</h3>
-                    <p className="text-xs text-surface-500 mt-1">
-                      Route internet traffic from this tenant's VPC through a shared egress gateway.
-                      Leave as "None" for no internet access.
-                    </p>
-                  </div>
-                </div>
-                <select
-                  value={form.egress_gateway}
-                  onChange={e => setForm({ ...form, egress_gateway: e.target.value })}
-                  className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 text-sm"
-                >
-                  <option value="">None (no internet)</option>
-                  {(egressGatewaysData?.items ?? []).map(gw => (
-                    <option key={gw.name} value={gw.name}>
-                      {gw.name} — {gw.ready ? 'Ready' : 'Not Ready'} ({gw.replicas} replicas)
-                    </option>
+              {/* T9: Network Isolation — 3-mode radio */}
+              <div className="mt-4">
+                <h3 className="text-sm font-semibold text-surface-200 mb-2">Network Isolation</h3>
+                <div className="space-y-2">
+                  {([
+                    {
+                      mode: 'shared' as const,
+                      label: 'Shared',
+                      description: 'Tenant lives in the cluster\'s default network. Workers get internet via the cluster gateway. Simplest, no isolation.',
+                      disabled: false,
+                    },
+                    {
+                      mode: 'isolated_shared_egress' as const,
+                      label: 'Isolated VPC, shared egress',
+                      description: 'Tenant has its own VPC and isolated CIDR. Internet egress routes through the cluster\'s default network (no extra setup).',
+                      disabled: false,
+                    },
+                    {
+                      mode: 'isolated_dedicated_egress' as const,
+                      label: 'Isolated VPC, dedicated egress',
+                      description: 'Tenant has its own VPC and uses a Kube-OVN EgressGateway bound to an infrastructure VLAN subnet. Requires advanced network setup.',
+                      disabled: !hasInfraSubnet,
+                    },
+                  ] as const).map(({ mode, label, description, disabled }) => (
+                    <label
+                      key={mode}
+                      className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                        form.network_isolation_mode === mode
+                          ? 'border-primary-500 bg-primary-500/10'
+                          : disabled
+                            ? 'border-surface-700/50 bg-surface-800/50 opacity-50 cursor-not-allowed'
+                            : 'border-surface-700 bg-surface-800 hover:border-surface-600'
+                      }`}
+                    >
+                      <input
+                        type="radio"
+                        name="network_isolation_mode"
+                        value={mode}
+                        checked={form.network_isolation_mode === mode}
+                        disabled={disabled}
+                        onChange={() => !disabled && setForm({ ...form, network_isolation_mode: mode })}
+                        className="mt-0.5 h-4 w-4 border-surface-600 bg-surface-700 text-primary-500 focus:ring-primary-500"
+                      />
+                      <div>
+                        <p className={`text-sm font-medium ${form.network_isolation_mode === mode ? 'text-primary-300' : 'text-surface-200'}`}>
+                          {label}
+                          {mode === 'isolated_dedicated_egress' && !hasInfraSubnet && (
+                            <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-500">
+                              Requires infrastructure subnet
+                            </span>
+                          )}
+                        </p>
+                        <p className="text-xs text-surface-500 mt-0.5">{description}</p>
+                      </div>
+                    </label>
                   ))}
-                </select>
-                {(egressGatewaysData?.items ?? []).length === 0 && (
-                  <p className="text-xs text-surface-500 mt-1">
-                    No egress gateways available. Create one in Network → Egress Gateways first.
-                  </p>
+                </div>
+
+                {/* Infrastructure subnet — only shown for dedicated egress */}
+                {form.network_isolation_mode === 'isolated_dedicated_egress' && (
+                  <div className="mt-3">
+                    <label className="block text-sm text-surface-300 mb-1">Infrastructure Subnet</label>
+                    <select
+                      value={form.infra_subnet}
+                      onChange={e => setForm({ ...form, infra_subnet: e.target.value })}
+                      className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 text-sm"
+                    >
+                      <option value="">Select infra subnet…</option>
+                      {infraSubnets.map(s => (
+                        <option key={s.name} value={s.name}>
+                          {s.name} ({s.cidr_block})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                 )}
+
               </div>
 
               {/* RBAC — DEX group mapping */}
@@ -785,6 +995,18 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                       <span className="text-surface-200">{form.kubernetes_version}</span>
                       <span className="text-surface-500">Control Plane</span>
                       <span className="text-surface-200">{form.control_plane_replicas} replicas</span>
+                      {form.folder && (
+                        <>
+                          <span className="text-surface-500">Folder</span>
+                          <span className="text-surface-200">{form.folder}</span>
+                        </>
+                      )}
+                      {form.environment && (
+                        <>
+                          <span className="text-surface-500">Environment</span>
+                          <span className="text-surface-200">{form.environment}</span>
+                        </>
+                      )}
                     </div>
                   </div>
 
@@ -826,9 +1048,32 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                       <span className="text-surface-500">Service CIDR</span>
                       <span className="text-surface-200 font-mono">{form.service_cidr}</span>
                       <span className="text-surface-500">Isolation</span>
-                      <span className="text-surface-200">{form.network_isolation ? 'VPC (isolated)' : 'Shared'}</span>
-                      <span className="text-surface-500">Egress Gateway</span>
-                      <span className="text-surface-200">{form.egress_gateway || 'None'}</span>
+                      <span className="text-surface-200">
+                        {form.network_isolation_mode === 'shared' && 'Shared'}
+                        {form.network_isolation_mode === 'isolated_shared_egress' && 'Isolated VPC, shared egress'}
+                        {form.network_isolation_mode === 'isolated_dedicated_egress' && 'Isolated VPC, dedicated egress'}
+                      </span>
+                      {form.network_isolation_mode !== 'shared' && (
+                        <>
+                          <span className="text-surface-500">VPC</span>
+                          <span className="text-surface-200 font-mono">
+                            vpc-{form.name || '…'}
+                            <span className="ml-1 text-surface-500">(will be created)</span>
+                          </span>
+                        </>
+                      )}
+                      {form.network_isolation_mode === 'isolated_dedicated_egress' && form.infra_subnet && (
+                        <>
+                          <span className="text-surface-500">Infra Subnet</span>
+                          <span className="text-surface-200 font-mono">{form.infra_subnet}</span>
+                        </>
+                      )}
+                      {form.worker_network_binding === 'masquerade' && (
+                        <>
+                          <span className="text-surface-500">Net Binding</span>
+                          <span className="text-surface-200">Masquerade</span>
+                        </>
+                      )}
                       {form.admin_group && (
                         <>
                           <span className="text-surface-500">Admin Group</span>

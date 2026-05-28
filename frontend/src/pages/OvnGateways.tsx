@@ -80,10 +80,9 @@ function StatusBadge({ ready }: { ready: boolean }) {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_CREATE_FORM: CreateOvnGatewayRequest = {
-  name: '',
   vpc_name: '',
   subnet_name: '',
-  external_subnet: '',
+  infra_subnet: '',
   auto_snat: true,
 };
 
@@ -115,23 +114,19 @@ function CreateOvnGatewayModal({
     value: CreateOvnGatewayRequest[K],
   ) => setForm((prev) => ({ ...prev, [field]: value }));
 
-  const isValid = form.name.length > 0 && form.vpc_name.length > 0 && form.subnet_name.length > 0;
+  const isValid = form.vpc_name.length > 0 && form.subnet_name.length > 0;
 
   return (
     <Modal isOpen onClose={onClose} title="Create OVN Gateway" size="lg">
       <form onSubmit={handleSubmit} className="space-y-4">
-        {/* Name */}
-        <div>
-          <label className="block text-sm text-surface-300 mb-1">Name</label>
-          <input
-            type="text"
-            value={form.name}
-            onChange={(e) => set('name', e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
-            placeholder="my-ovn-gateway"
-            className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
-            required
-          />
-        </div>
+        {/* Gateway label (derived by backend from vpc_name — not a user input) */}
+        {form.vpc_name && (
+          <div className="flex items-center gap-2 px-3 py-2 bg-surface-800/50 border border-surface-700 rounded-lg">
+            <span className="text-xs text-surface-400">Gateway:</span>
+            <span className="font-mono text-sm text-primary-300">gw-{form.vpc_name}</span>
+            <span className="text-xs text-surface-500">(name assigned by backend)</span>
+          </div>
+        )}
 
         {/* VPC */}
         <div>
@@ -171,21 +166,21 @@ function CreateOvnGatewayModal({
           </div>
         )}
 
-        {/* External Subnet */}
+        {/* Infrastructure Subnet */}
         <div>
           <label className="block text-sm text-surface-300 mb-1">
-            External Subnet{' '}
-            <Tooltip text="Infrastructure VLAN subnet for the EIP. Leave empty to auto-detect.">
+            Infrastructure Subnet{' '}
+            <Tooltip text="Infrastructure VLAN subnet for EIP allocation. Leave empty — backend will auto-detect.">
               <span className="text-surface-500 cursor-help text-xs ml-1">[?]</span>
             </Tooltip>
           </label>
           {externalSubnets.length > 0 ? (
             <select
-              value={form.external_subnet ?? ''}
-              onChange={(e) => set('external_subnet', e.target.value)}
+              value={form.infra_subnet ?? ''}
+              onChange={(e) => set('infra_subnet', e.target.value)}
               className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 text-sm"
             >
-              <option value="">Auto-detect...</option>
+              <option value="">Auto-detect from cluster...</option>
               {externalSubnets.map((s) => (
                 <option key={s.name} value={s.name}>
                   {s.name} ({s.cidr})
@@ -195,8 +190,8 @@ function CreateOvnGatewayModal({
           ) : (
             <input
               type="text"
-              value={form.external_subnet ?? ''}
-              onChange={(e) => set('external_subnet', e.target.value)}
+              value={form.infra_subnet ?? ''}
+              onChange={(e) => set('infra_subnet', e.target.value)}
               placeholder="Leave empty to auto-detect"
               className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
             />
@@ -790,7 +785,7 @@ export default function OvnGateways() {
     },
     {
       key: 'external_subnet',
-      header: 'External Subnet',
+      header: 'Infra Subnet',
       hideOnMobile: true,
       accessor: (gw) => (
         <span className="font-mono text-surface-300">{gw.external_subnet || '-'}</span>

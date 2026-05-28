@@ -51,11 +51,19 @@ export interface TenantCreateRequest {
   service_cidr: string;
   admin_group: string;
   viewer_group: string;
-  network_isolation?: boolean;
-  egress_gateway?: string;
+  // Folder / environment binding (T8 — confirmed field names from backend T1)
+  folder?: string;      // required by backend when using folder model; optional here for compat
+  environment?: string; // required by backend when folder is set
+  // Network isolation (T9 — backend T3 contract: network_isolation boolean removed)
+  // Backend always creates vpc-<name> for isolated tenants; no vpc_name / egress_gateway choice
+  network_isolation_mode?: 'shared' | 'isolated_shared_egress' | 'isolated_dedicated_egress';
+  infra_subnet?: string | null; // required (non-null) iff mode == isolated_dedicated_egress
+  // Worker image (T10)
   worker_image_url?: string;
   worker_image_source_type?: 'http' | 'registry';
   worker_image_pull_secrets?: string[];
+  // Network binding (T11 — field name matches backend T6)
+  worker_network_binding?: 'bridge' | 'masquerade';
   addons: TenantAddon[];
 }
 

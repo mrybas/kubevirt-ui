@@ -7,9 +7,13 @@ Architecture:
   - Addon catalog read from ConfigMap `tenant-addon-catalog`
 """
 
+import logging
+import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +83,27 @@ class TenantCreateRequest(BaseModel):
         pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
     )
     display_name: str = Field(..., min_length=1, max_length=128)
-    kubernetes_version: str = "v1.30.0"
+
+    # Phase 2 folder/env binding (T1).
+    # Required so tenants participate in folder-level authz (resolve_env →
+    # folder/env → is_env_viewer per tenant). Validated at create time.
+    folder: str = Field(
+        ...,
+        min_length=1,
+        description="Folder name this tenant belongs to (must exist in folders ConfigMap)",
+    )
+    environment: str = Field(
+        ...,
+        min_length=1,
+        description="Environment name within the folder (must exist as a folder env)",
+    )
+
+    # CAPK image tags actually published on quay.io/capk:
+    #   ubuntu-2204-container-disk: v1.27.14, v1.28.10, v1.29.5, v1.30.1
+    #   ubuntu-2404-container-disk: v1.31.5, v1.32.1, v1.33.5, v1.34.1
+    # v1.30.1 is the most recent 2204 line and works with the broadest set of
+    # addons in the catalog.
+    kubernetes_version: str = "v1.30.1"
     control_plane_replicas: int = Field(default=2, ge=1, le=3)
 
     # Worker type: "vm" creates KubeVirt VMs, "bare_metal" skips VM resources
@@ -105,11 +129,85 @@ class TenantCreateRequest(BaseModel):
     service_cidr: str = "10.96.0.0/12"
     admin_group: str = ""  # DEX group → cluster-admin in tenant
     viewer_group: str = ""  # DEX group → view role in tenant
-    network_isolation: bool = Field(
-        default=False,
-        description="Create isolated VPC for this tenant (Kube-OVN VPC + Subnet + peering to default)"
+
+    # T3 — Network isolation modes:
+    #   "shared":                     no VPC; tenant ns lands in ovn-default.
+    #                                 Internet egress via cluster default.
+    #                                 This is the default for our setup.
+    #   "isolated_shared_egress":     VPC + subnet, but static route 0.0.0.0/0 →
+    #                                 ovn-default gateway IP so the tenant uses
+    #                                 the host's underlay for egress.
+    #                                 NO infra_subnet required.
+    #   "isolated_dedicated_egress":  VPC + subnet + EgressGateway pods bound
+    #                                 to infra_subnet (provider VLAN). REQUIRES
+    #                                 infra_subnet to be a real Kube-OVN subnet
+    #                                 labeled kubevirt-ui.io/purpose=infrastructure.
+    network_isolation_mode: Literal[
+        "shared",
+        "isolated_shared_egress",
+        "isolated_dedicated_egress",
+    ] = "shared"
+    infra_subnet: str | None = Field(
+        None,
+        description=(
+            "Infrastructure subnet for dedicated egress. "
+            "Required iff network_isolation_mode == 'isolated_dedicated_egress'."
+        ),
     )
+
+    # T6 — Worker NIC binding: default 'bridge' so guests see their real
+    # OVN/Kube-OVN IP (masquerade hides it behind QEMU SLIRP's 10.0.2.x).
+    # Override with 'masquerade' for CNIs where bridge live-migration is iffy.
+    worker_network_binding: Literal["bridge", "masquerade"] = "bridge"
+
     addons: list[TenantAddon] = Field(default_factory=list)
+
+    @field_validator("kubernetes_version")
+    @classmethod
+    def _warn_on_nonstandard_version(cls, v: str) -> str:
+        # Not blocking — quay.io/capk tags evolve and validating against the
+        # live list is too brittle. Just log a warning so operators notice
+        # typos like "1.30" or "v1.30" without trailing patch.
+        if not re.match(r"^v\d+\.\d+\.\d+$", v):
+            logger.warning(
+                "kubernetes_version %r does not match the expected "
+                "'vMAJOR.MINOR.PATCH' shape; CAPK image pull will likely fail",
+                v,
+            )
+        return v
+
+    @field_validator("infra_subnet")
+    @classmethod
+    def _normalize_blank_infra_subnet(cls, v: str | None) -> str | None:
+        # Treat "" the same as None so the wizard's empty-string default
+        # collapses to None for the dedicated-egress validator below.
+        if v is None:
+            return None
+        stripped = v.strip()
+        return stripped or None
+
+    @model_validator(mode="after")
+    def _check_infra_subnet_required(self) -> "TenantCreateRequest":
+        if self.network_isolation_mode == "isolated_dedicated_egress" and not self.infra_subnet:
+            raise ValueError(
+                "infra_subnet is required when network_isolation_mode is "
+                "'isolated_dedicated_egress'"
+            )
+        # Shared / shared_egress modes don't use infra_subnet; null it out so
+        # downstream code can rely on "set ⇒ dedicated egress".
+        if self.network_isolation_mode != "isolated_dedicated_egress":
+            self.infra_subnet = None
+        return self
+
+    @property
+    def network_isolation(self) -> bool:
+        """Back-compat alias: True iff a VPC needs to be provisioned for the tenant.
+
+        Internal callers that read tenant networking should switch to checking
+        `network_isolation_mode` directly. Kept so any legacy template / chart
+        that imports the request still works.
+        """
+        return self.network_isolation_mode != "shared"
 
 
 class TenantScaleRequest(BaseModel):

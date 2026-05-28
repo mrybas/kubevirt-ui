@@ -234,15 +234,49 @@ async def _delete_vpcdns_for_tenant(k8s, tenant_name: str) -> None:
             logger.warning(f"Failed to delete VpcDns {vpcdns_name}: {e}")
 
 
-async def _create_tenant_vpc(k8s, tenant_name: str) -> dict[str, str]:
+async def _get_ovn_default_gateway(k8s) -> str | None:
+    """Return the gateway IP of the cluster's `ovn-default` subnet, if present.
+
+    Used by the `isolated_shared_egress` tenant networking mode (T3) to
+    program a static route 0.0.0.0/0 → ovn-default gateway, so an isolated
+    VPC still uses the host's underlay for internet egress without standing
+    up dedicated EgressGateway pods.
+    """
+    try:
+        subnet = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_API_GROUP,
+            version=KUBEOVN_API_VERSION,
+            plural="subnets",
+            name="ovn-default",
+        )
+    except ApiException as e:
+        if e.status == 404:
+            logger.warning("ovn-default subnet not found — shared egress route not added")
+            return None
+        raise
+    return (subnet.get("spec") or {}).get("gateway")
+
+
+async def _create_tenant_vpc(
+    k8s,
+    tenant_name: str,
+    mode: str = "isolated_dedicated_egress",
+    infra_subnet: str | None = None,
+) -> dict[str, str]:
     """Create an isolated VPC for tenant networking (Architecture C: dual-NIC).
 
     Architecture C: TCP pod gets dual-NIC via Multus:
       - eth0: ovn-default (management — reaches CoreDNS, CNPG, CAPI)
       - net1: tenant VPC subnet (workers connect here)
 
-    Creates: VPC → Subnet → NAD → NetworkPolicy → attach to egress gateway.
-    Egress gateway provides SNAT via macvlan + VPC peering (hub-and-spoke).
+    Creates: VPC → Subnet → NAD → NetworkPolicy → egress wiring.
+    Egress wiring depends on `mode` (T3):
+      - "isolated_shared_egress":    program a static route 0.0.0.0/0 →
+                                     ovn-default subnet gateway on the VPC.
+                                     No EgressGateway pods.
+      - "isolated_dedicated_egress": attach to EgressGateway pods bound to
+                                     `infra_subnet` (provider VLAN). Hub-and-
+                                     spoke VPC peering provides SNAT.
     Returns dict with vpc_name, subnet_name, nad_name, cidr for caller use.
     """
     from app.api.v1.network import create_nad_for_subnet, get_nad_provider
@@ -365,17 +399,60 @@ async def _create_tenant_vpc(k8s, tenant_name: str) -> dict[str, str]:
         body=network_policy,
     )
 
-    # 5. Attach to egress gateway for external connectivity (SNAT via macvlan)
-    #    Uses hub-and-spoke VPC peering — gateway_name=None finds default gateway
-    gw_result = await attach_tenant_to_gateway(
-        k8s, gateway_name=None,
-        tenant_vpc_name=vpc_name, tenant_subnet_name=subnet_name,
-        tenant_cidr=cidr,
-    )
-    if gw_result:
-        logger.info(f"Attached VPC {vpc_name} to egress gateway (transit IP: {gw_result.transit_ip})")
+    # 5. Egress wiring — depends on mode (T3).
+    if mode == "isolated_shared_egress":
+        # Share the host's underlay for egress: program a default route
+        # pointing at ovn-default's gateway. No EgressGateway pods needed.
+        ovn_default_gw = await _get_ovn_default_gateway(k8s)
+        if not ovn_default_gw:
+            logger.warning(
+                f"VPC {vpc_name} mode=isolated_shared_egress but ovn-default "
+                "gateway is unknown — egress will not work"
+            )
+        else:
+            patch = {
+                "spec": {
+                    "staticRoutes": [
+                        {
+                            "cidr": "0.0.0.0/0",
+                            "nextHopIP": ovn_default_gw,
+                            "policy": "policyDst",
+                        }
+                    ],
+                }
+            }
+            await k8s.custom_api.patch_cluster_custom_object(
+                group=KUBEOVN_API_GROUP,
+                version=KUBEOVN_API_VERSION,
+                plural="vpcs",
+                name=vpc_name,
+                body=patch,
+                _content_type="application/merge-patch+json",
+            )
+            logger.info(
+                f"VPC {vpc_name}: programmed shared-egress default route → "
+                f"{ovn_default_gw} (ovn-default gateway)"
+            )
     else:
-        logger.warning(f"No egress gateway found — VPC {vpc_name} will have no external connectivity")
+        # mode == "isolated_dedicated_egress": EgressGateway pods over infra_subnet.
+        # gateway_name=None means "find a gateway bound to the requested infra_subnet";
+        # the helper falls back to the cluster's default egress gateway if so.
+        # (infra_subnet selection happens inside attach_tenant_to_gateway via labels.)
+        gw_result = await attach_tenant_to_gateway(
+            k8s, gateway_name=None,
+            tenant_vpc_name=vpc_name, tenant_subnet_name=subnet_name,
+            tenant_cidr=cidr,
+        )
+        if gw_result:
+            logger.info(
+                f"Attached VPC {vpc_name} to egress gateway "
+                f"(transit IP: {gw_result.transit_ip})"
+            )
+        else:
+            logger.warning(
+                f"No egress gateway found — VPC {vpc_name} will have no "
+                "external connectivity"
+            )
 
     # 6. Set up VpcDns — in-cluster DNS resolution for VMs in VPC
     from app.api.v1.network import _find_kubeovn_namespace

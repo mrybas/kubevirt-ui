@@ -496,19 +496,53 @@ async def create_ovn_gateway(
     if existing:
         raise HTTPException(status_code=409, detail=f"OVN NAT already enabled for VPC '{vpc_name}'")
 
-    # 1. Validate infra subnet
-    try:
-        infra = await k8s.custom_api.get_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
-            plural="subnets", name=data.infra_subnet,
-        )
-    except ApiException as e:
-        if e.status == 404:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Infrastructure subnet '{data.infra_subnet}' not found",
+    # 1. Resolve infra subnet — explicit, or T16 autodetect.
+    if data.infra_subnet:
+        try:
+            infra = await k8s.custom_api.get_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+                plural="subnets", name=data.infra_subnet,
             )
-        raise k8s_error_to_http(e, "reading infrastructure subnet")
+        except ApiException as e:
+            if e.status == 404:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Infrastructure subnet '{data.infra_subnet}' not found",
+                )
+            raise k8s_error_to_http(e, "reading infrastructure subnet")
+    else:
+        try:
+            result = await k8s.custom_api.list_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+                plural="subnets",
+                label_selector="kubevirt-ui.io/purpose=infrastructure",
+            )
+        except ApiException as e:
+            raise k8s_error_to_http(e, "listing infrastructure subnets")
+        candidates = result.get("items", [])
+        if len(candidates) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "No infrastructure subnet found. Create one (label "
+                    "kubevirt-ui.io/purpose=infrastructure) or specify "
+                    "infra_subnet explicitly."
+                ),
+            )
+        if len(candidates) > 1:
+            names = sorted(c["metadata"]["name"] for c in candidates)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Multiple infrastructure subnets exist: {names}. "
+                    "Specify infra_subnet explicitly."
+                ),
+            )
+        infra = candidates[0]
+        logger.info(
+            "Auto-detected infra_subnet=%s for OVN gateway on VPC %s",
+            infra["metadata"]["name"], vpc_name,
+        )
 
     infra_subnet_name = infra["metadata"]["name"]
     infra_gateway = infra.get("spec", {}).get("gateway", "")

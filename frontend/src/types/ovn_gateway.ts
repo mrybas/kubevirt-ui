@@ -60,10 +60,11 @@ export interface OvnGatewayListResponse {
 }
 
 export interface CreateOvnGatewayRequest {
-  name: string;
+  // name is NOT sent — backend derives gateway name from vpc_name
   vpc_name: string;
   subnet_name: string;
-  external_subnet?: string;
+  /** Infra-VLAN subnet for EIP allocation. Empty = backend auto-detects (T16). */
+  infra_subnet?: string;
   eip_address?: string;
   shared_eip?: string;
   auto_snat: boolean;

@@ -16,14 +16,19 @@ class OvnGatewayCreateRequest(BaseModel):
     """Request to enable OVN NAT for a VPC.
 
     The gateway is identified by vpc_name — one OVN NAT config per VPC.
-    infra_subnet is required because auto-detection may not find a subnet
-    labeled kubevirt-ui.io/purpose=infrastructure on all clusters.
+    `infra_subnet` is optional: when omitted, the backend auto-detects a
+    subnet labeled `kubevirt-ui.io/purpose=infrastructure`. The handler
+    returns an explicit 400 if zero or >1 candidates exist (T16).
     """
     vpc_name: str = Field(..., description="VPC to enable OVN NAT for")
     subnet_name: str = Field(..., description="VPC subnet to SNAT")
-    infra_subnet: str = Field(
-        ...,
-        description="Infrastructure subnet name (e.g. 'alv111') — VLAN-backed subnet for external connectivity",
+    infra_subnet: Optional[str] = Field(
+        None,
+        description=(
+            "Infrastructure subnet name (e.g. 'alv111') — VLAN-backed subnet "
+            "for external connectivity. Leave empty to auto-detect a subnet "
+            "labeled kubevirt-ui.io/purpose=infrastructure."
+        ),
     )
     eip_address: Optional[str] = Field(
         None,

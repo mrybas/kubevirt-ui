@@ -41,9 +41,16 @@ export function useCreateOvnGateway() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (request: CreateOvnGatewayRequest) => createOvnGateway(request),
-    onSuccess: () => {
+    onSuccess: (data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['ovn-gateways'] });
-      notify.success('OVN gateway created successfully');
+      // If caller left infra_subnet empty, surface the auto-detected value (T16)
+      const resolvedSubnet = data.external_subnet;
+      const wasAutoDetected = !variables.infra_subnet && resolvedSubnet;
+      notify.success(
+        wasAutoDetected
+          ? `OVN gateway created — auto-detected infra subnet: ${resolvedSubnet}`
+          : 'OVN gateway created successfully',
+      );
     },
     onError: (err: Error) => {
       notify.error(err.message || 'Failed to create OVN gateway');

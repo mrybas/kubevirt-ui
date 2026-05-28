@@ -343,20 +343,35 @@ async def _namespace_exists(k8s, ns: str) -> bool:
         raise
 
 
-async def _create_namespace(k8s, ns: str, tenant_name: str, worker_type: str = "vm") -> None:
+async def _create_namespace(
+    k8s,
+    ns: str,
+    tenant_name: str,
+    worker_type: str = "vm",
+    folder: str | None = None,
+    environment: str | None = None,
+) -> None:
+    """Create a tenant namespace.
+
+    `folder` + `environment`, when provided, are stamped as
+    `kubevirt-ui.io/folder` and `kubevirt-ui.io/environment` labels — wires
+    the tenant into Phase 2 folder-level authz (resolve_env, is_env_*).
+    """
+    labels: dict[str, str] = {
+        "kubevirt-ui.io/tenant": tenant_name,
+        "kubevirt-ui.io/managed": "true",
+        "kubevirt-ui.io/worker-type": worker_type,
+        # Kamaji control-plane pods + KubeVirt VMs need elevated privileges
+        "pod-security.kubernetes.io/enforce": "privileged",
+        "pod-security.kubernetes.io/enforce-version": "latest",
+        "pod-security.kubernetes.io/warn": "privileged",
+        "pod-security.kubernetes.io/audit": "privileged",
+    }
+    if folder:
+        labels["kubevirt-ui.io/folder"] = folder
+    if environment:
+        labels["kubevirt-ui.io/environment"] = environment
     body = client.V1Namespace(
-        metadata=client.V1ObjectMeta(
-            name=ns,
-            labels={
-                "kubevirt-ui.io/tenant": tenant_name,
-                "kubevirt-ui.io/managed": "true",
-                "kubevirt-ui.io/worker-type": worker_type,
-                # Kamaji control-plane pods + KubeVirt VMs need elevated privileges
-                "pod-security.kubernetes.io/enforce": "privileged",
-                "pod-security.kubernetes.io/enforce-version": "latest",
-                "pod-security.kubernetes.io/warn": "privileged",
-                "pod-security.kubernetes.io/audit": "privileged",
-            },
-        )
+        metadata=client.V1ObjectMeta(name=ns, labels=labels),
     )
     await k8s.core_api.create_namespace(body=body)

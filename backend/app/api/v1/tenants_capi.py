@@ -281,6 +281,23 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
         subnet_name = f"{vpc_name}-default"
         pod_annotations["ovn.kubernetes.io/logical_switch"] = subnet_name
 
+    # T1 — stamp tenant label on every KubevirtMachine so a future
+    # "Tenant > Workers" tab can filter VMs by tenant. Inherited by the
+    # underlying VirtualMachine via KubevirtMachineTemplate.
+    pod_labels: dict[str, str] = {
+        "kubevirt-ui.io/tenant": req.name,
+    }
+
+    # T6 — default 'bridge' so guests report their real OVN IP. Masquerade
+    # hides it behind QEMU SLIRP's 10.0.2.x. worker_network_binding=masquerade
+    # is the legacy escape hatch for CNIs where bridge live-migration is iffy.
+    nic_binding = "masquerade" if req.worker_network_binding == "masquerade" else "bridge"
+    primary_iface: dict[str, Any] = {"name": "default", nic_binding: {}}
+    # bridge binding requires the kubevirt.io/allow-pod-bridge-network-live-migration
+    # pod annotation to permit live migration on a pod-network bridge interface.
+    if nic_binding == "bridge":
+        pod_annotations["kubevirt.io/allow-pod-bridge-network-live-migration"] = "true"
+
     return {
         "apiVersion": f"{KUBEVIRT_INFRA_GROUP}/{KUBEVIRT_INFRA_VERSION}",
         "kind": "KubevirtMachineTemplate",
@@ -299,6 +316,7 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
                             "runStrategy": "Always",
                             "template": {
                                 "metadata": {
+                                    "labels": pod_labels,
                                     **({"annotations": pod_annotations} if pod_annotations else {}),
                                 },
                                 "spec": {
@@ -318,12 +336,7 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
                                         "memory": {"guest": req.worker_memory},
                                         "devices": {
                                             "networkInterfaceMultiqueue": True,
-                                            "interfaces": [
-                                                {
-                                                    "name": "default",
-                                                    "masquerade": {},
-                                                }
-                                            ],
+                                            "interfaces": [primary_iface],
                                             "disks": [
                                                 {
                                                     "name": "root",
