@@ -1143,7 +1143,13 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                     onChange={(v) => setState((s) => ({ ...s, vpcEnvironment: v }))}
                     options={[
                       { value: '', label: state.vpcFolder ? '(all environments)' : 'Select a folder first' },
-                      ...folderEnvironments.map(e => ({ value: e.name, label: e.name })),
+                      // Use `e.environment` (short name: "dev") NOT `e.name`
+                      // (full namespace: "<folder>-<env>"). Backend labels VPCs
+                      // with `kubevirt-ui.io/environment=<short>`, and tenant
+                      // wizard filters by the same short value. Passing the
+                      // full namespace here would tag the VPC with a label
+                      // value tenants never match against.
+                      ...folderEnvironments.map(e => ({ value: e.environment, label: e.environment })),
                     ]}
                     disabled={!state.vpcFolder}
                   />
