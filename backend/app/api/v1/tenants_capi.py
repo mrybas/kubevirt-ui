@@ -27,7 +27,6 @@ from app.api.v1.tenants_common import (
     OIDC_CLIENT_ID,
     _tenant_ns,
     _endpoint_host,
-    _endpoint_port,
     _ingress_class,
     _ingress_controller,
     _vpc_dns_cloud_init_files,
@@ -76,15 +75,19 @@ def _resolve_worker_container_disk_image(req: TenantCreateRequest) -> str:
 def _build_cluster_cr(
     req: TenantCreateRequest,
     cp_host: str | None = None,
-    cp_port: int | None = None,
 ) -> dict[str, Any]:
-    # Workers join the tenant kube-apiserver via the cluster Ingress (TLS
-    # passthrough at the configured Ingress HTTPS port). The ClusterIP of the
-    # Kamaji-managed TCP Service is NOT reachable from the tenant VPC, so we
-    # bake the external Ingress endpoint into controlPlaneEndpoint from the
-    # start; that matches Kamaji's certSANs and avoids the previous patch.
+    # The one place we tell workers how to reach the tenant kube-apiserver:
+    # the cluster's existing 443 Ingress entry point (TLS/SNI passthrough).
+    # Kamaji's own defaults handle everything pod-side / Service-side; we
+    # don't override apiserver port, Service port, certSANs, or anything
+    # else that would force port juggling.
+    #
+    # Caveat: after kubeadm-join discovery succeeds against this endpoint,
+    # the worker rewrites kubelet.conf from `kube-public/cluster-info`,
+    # which Kamaji writes with the TCP Service ClusterIP — not reachable
+    # from custom VPCs. Admin patches the two ConfigMaps manually per
+    # tenant for now; see PLAN-REVERT-CP-PORTS.md choice α.
     host = cp_host or _endpoint_host(req.name)
-    port = cp_port if cp_port is not None else _endpoint_port()
     return {
         "apiVersion": f"{CAPI_GROUP}/{CAPI_VERSION}",
         "kind": "Cluster",
@@ -102,20 +105,11 @@ def _build_cluster_cr(
         "spec": {
             "controlPlaneEndpoint": {
                 "host": host,
-                "port": port,
+                "port": 443,
             },
             "clusterNetwork": {
                 "pods": {"cidrBlocks": [req.pod_cidr]},
                 "services": {"cidrBlocks": [req.service_cidr]},
-                # No apiServerPort here. Kamaji's NetworkProfile.Port is
-                # unified — it drives both the kube-apiserver container's
-                # `--secure-port` AND the port baked into cluster-info /
-                # kubeadm-config. Setting it to 443 would CrashLoop the
-                # apiserver on 1.30+ (uid 65532 can't bind privileged ports);
-                # leaving it at Kamaji's default 6443 means workers connect
-                # to `<advertiseAddress>:6443`. Admin's cluster Ingress
-                # must therefore expose a TCP-passthrough entry point on
-                # 6443 (Traefik entrypoint, nginx stream, etc.).
             },
             "controlPlaneRef": {
                 # KamajiControlPlane lives in the same tenant namespace —
@@ -198,20 +192,15 @@ def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
             "preferredAddressTypes": ["InternalIP", "ExternalIP"],
         },
         "network": {
+            # Kamaji defaults: apiserver listens on 6443, Service exposes
+            # 6443. We don't override `serviceAddress` (NodePort/VIP-only
+            # field — useless under ClusterIP) or `advertiseAddress`
+            # (companion port can't be 443 without crashing apiserver
+            # 1.30+; admin patches kube-public/cluster-info manually per
+            # tenant — see PLAN-REVERT-CP-PORTS.md choice α). The single
+            # `certSANs` entry below makes the Ingress hostname valid in
+            # the apiserver cert so workers don't trip TLS on join.
             "serviceType": "ClusterIP",
-            # Workers join via the cluster Ingress (TLS passthrough on
-            # `<advertiseAddress>:<endpoint port>`). The CAPI wrapper provider
-            # v0.19.0+ propagates `advertiseAddress` to the underlying
-            # TenantControlPlane.spec.networkProfile.advertiseAddress (Kamaji
-            # 26.3.6+, PR clastix/kamaji#1111), which Kamaji writes into the
-            # tenant-side artefacts: kubeadm ControlPlaneEndpoint, cluster-info,
-            # and admin.conf. `serviceAddress` stays as the management-side
-            # address used for CAPI's cluster-cache and status reporting.
-            # Both are auto-included in the API server certificate SANs by the
-            # provider, so an explicit `certSANs` entry is no longer required
-            # — kept for back-compat with older Kamaji rebuilds.
-            "serviceAddress": _endpoint_host(req.name),
-            "advertiseAddress": _endpoint_host(req.name),
             "certSANs": [_endpoint_host(req.name)],
         },
         "deployment": {
@@ -601,12 +590,12 @@ def _build_ingress_haproxy(req: TenantCreateRequest, host: str) -> dict[str, Any
 def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str) -> dict[str, Any]:
     # Traefik entryPoint name varies by deployment; default to "websecure"
     # (Traefik's standard HTTPS entry point). Override via env if needed.
-    # Default to the dedicated `kubeapiserver` entry point (port 6443),
-    # provisioned by k8s-bootstrap's Traefik HelmRelease values for TCP
-    # passthrough to tenant Kamaji control planes. Override only if your
-    # cluster's Traefik install uses a different name (e.g. `websecure`
-    # on legacy 443-only setups; works only with tenant kube < 1.30).
-    entry_point = os.getenv("TENANTS_TRAEFIK_ENTRYPOINT", "kubeapiserver")
+    # Workers reach the tenant apiserver via the cluster's standard 443
+    # Traefik entry point with TLS/SNI passthrough — same listener every
+    # other HTTPS ingress uses. The env var stays as an override hatch
+    # for clusters whose Traefik install names this entry point
+    # differently.
+    entry_point = os.getenv("TENANTS_TRAEFIK_ENTRYPOINT", "websecure")
     # Same-ns as the Kamaji-generated TCP Service in the tenant ns.
     return {
         "apiVersion": "traefik.io/v1alpha1",
