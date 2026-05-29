@@ -6,6 +6,7 @@ Dedicated VPC router covering:
   - Static route management
 """
 
+import json
 import logging
 from typing import Any
 
@@ -118,6 +119,192 @@ async def _get_vpc_subnets(k8s, vpc_name: str) -> list[VpcSubnetInfo]:
     return subnets
 
 
+async def _discover_coredns_pod_ips(k8s) -> list[str]:
+    """List CoreDNS pod IPs in kube-system.
+
+    Used to populate the VpcDns `Corefile` so cluster.local resolution
+    works for pods in custom VPCs. VpcDns's secondary NIC only has a
+    `10.96.0.1/32` route into the default cluster overlay (kube-ovn-controller
+    sets this — not configurable yet), so it can reach the apiserver but
+    NOT the kube-dns ClusterIP `10.96.0.10`. Forwarding to the actual
+    CoreDNS pod IPs (same `ovn-default` switch as the secondary NIC) works.
+
+    Fragile: a CoreDNS rescheduling silently breaks the chain. The
+    explicit `recreate_vpc_dns` API endpoint re-runs this discovery and
+    refreshes the ConfigMap.
+    """
+    try:
+        pods = await k8s.core_api.list_namespaced_pod(
+            namespace="kube-system",
+            label_selector="k8s-app=kube-dns",
+        )
+    except ApiException as exc:
+        logger.warning(f"Failed to list CoreDNS pods for VpcDns Corefile: {exc}")
+        return []
+    return [
+        p.status.pod_ip for p in pods.items
+        if p.status and p.status.pod_ip and p.status.phase == "Running"
+    ]
+
+
+def _build_vpc_dns_corefile(coredns_pod_ips: list[str]) -> str:
+    """Split Corefile: cluster.local + reverse zones → CoreDNS pod IPs; rest → public.
+
+    Without the cluster.local stanza VpcDns forwards everything to 8.8.8.8
+    and Service DNS inside a custom VPC silently returns NXDOMAIN. With
+    the stanza, pods in any VPC can resolve `kubernetes.default.svc`,
+    `*.svc.cluster.local`, etc.
+    """
+    if coredns_pod_ips:
+        cluster_targets = " ".join(coredns_pod_ips)
+    else:
+        # No CoreDNS pods discovered — fall back to a stub that fails fast
+        # rather than silently mis-resolving via 8.8.8.8.
+        cluster_targets = "10.96.0.10"
+    return (
+        "cluster.local:53 in-addr.arpa:53 ip6.arpa:53 {\n"
+        "    errors\n"
+        "    cache 30\n"
+        f"    forward . {cluster_targets} {{\n"
+        "        prefer_udp\n"
+        "        policy round_robin\n"
+        "    }\n"
+        "    reload\n"
+        "    loadbalance\n"
+        "}\n"
+        ".:53 {\n"
+        "    errors\n"
+        "    health\n"
+        "    ready\n"
+        "    forward . 8.8.8.8 8.8.4.4 {\n"
+        "        prefer_udp\n"
+        "    }\n"
+        "    cache 30\n"
+        "    loop\n"
+        "    reload\n"
+        "    loadbalance\n"
+        "}\n"
+    )
+
+
+async def _ensure_vpc_dns_prereqs(k8s) -> None:
+    """Idempotently create the cluster-wide resources that VpcDns expects.
+
+    kube-ovn upstream lets the operator define these manually; we automate
+    them at first VPC create so the user doesn't have to apply YAML by hand.
+    Run from `_ensure_vpc_dns` (auto-create path) AND from the recreate
+    endpoint (so Corefile pod IPs refresh when admin clicks Recreate).
+
+    Resources:
+      - NetworkAttachmentDefinition `ovn-nad` in `default` ns — secondary
+        NIC bridge into the default cluster overlay.
+      - ConfigMap `vpc-dns-config` in kube-ovn ns — gates the VpcDns
+        controller (`enable-vpc-dns: true`) and tells it which NAD + VIP
+        to use.
+      - ConfigMap `vpc-dns-corefile` in kube-ovn ns — CoreDNS Corefile
+        mounted by the per-VPC VpcDns Deployment. Re-rendered each call
+        with currently-running CoreDNS pod IPs.
+
+    The matching ServiceAccount `vpc-dns` in the kube-ovn ns is shipped
+    by k8s-bootstrap (static infrastructure, no runtime data).
+    """
+    from app.api.v1.network import _find_kubeovn_namespace
+    kubeovn_ns = await _find_kubeovn_namespace(k8s)
+    vip = _vpcdns_vip()
+    labels = {"kubevirt-ui.io/managed": "true"}
+
+    # 1. NetworkAttachmentDefinition (default ns, shared across VPCs)
+    nad_body = {
+        "apiVersion": "k8s.cni.cncf.io/v1",
+        "kind": "NetworkAttachmentDefinition",
+        "metadata": {"name": "ovn-nad", "namespace": "default", "labels": labels},
+        "spec": {
+            "config": json.dumps({
+                "cniVersion": "0.3.1",
+                "type": "kube-ovn",
+                "server_socket": "/run/openvswitch/kube-ovn-daemon.sock",
+                "provider": "ovn-nad.default.ovn",
+            }),
+        },
+    }
+    try:
+        await k8s.custom_api.create_namespaced_custom_object(
+            group="k8s.cni.cncf.io", version="v1", namespace="default",
+            plural="network-attachment-definitions", body=nad_body,
+        )
+        logger.info("Created VpcDns prereq NAD default/ovn-nad")
+    except ApiException as e:
+        if e.status != 409:
+            logger.warning(f"VpcDns NAD ensure failed: {e}")
+
+    # 2. ConfigMap vpc-dns-config (static gate config — create-if-missing)
+    cm_config = client_v1_configmap(
+        name="vpc-dns-config",
+        namespace=kubeovn_ns,
+        labels=labels,
+        data={
+            "coredns-vip": vip,
+            "enable-vpc-dns": "true",
+            "nad-name": "ovn-nad",
+            "nad-provider": "ovn-nad.default.ovn",
+        },
+    )
+    try:
+        await k8s.core_api.create_namespaced_config_map(
+            namespace=kubeovn_ns, body=cm_config,
+        )
+        logger.info(f"Created VpcDns prereq ConfigMap {kubeovn_ns}/vpc-dns-config")
+    except ApiException as e:
+        if e.status != 409:
+            logger.warning(f"VpcDns config CM ensure failed: {e}")
+
+    # 3. ConfigMap vpc-dns-corefile — rebuild each call so pod-IP forwards
+    # track current CoreDNS pods. Create-or-replace; idempotent when no IPs
+    # changed.
+    coredns_ips = await _discover_coredns_pod_ips(k8s)
+    corefile = _build_vpc_dns_corefile(coredns_ips)
+    cm_corefile = client_v1_configmap(
+        name="vpc-dns-corefile",
+        namespace=kubeovn_ns,
+        labels=labels,
+        data={"Corefile": corefile},
+    )
+    try:
+        await k8s.core_api.create_namespaced_config_map(
+            namespace=kubeovn_ns, body=cm_corefile,
+        )
+        logger.info(
+            f"Created VpcDns prereq ConfigMap {kubeovn_ns}/vpc-dns-corefile "
+            f"(CoreDNS targets: {coredns_ips or ['10.96.0.10 fallback']})"
+        )
+    except ApiException as e:
+        if e.status == 409:
+            try:
+                await k8s.core_api.patch_namespaced_config_map(
+                    name="vpc-dns-corefile", namespace=kubeovn_ns,
+                    body={"data": {"Corefile": corefile}},
+                )
+                logger.info(
+                    f"Refreshed VpcDns Corefile (CoreDNS targets: "
+                    f"{coredns_ips or ['10.96.0.10 fallback']})"
+                )
+            except ApiException as patch_exc:
+                logger.warning(f"VpcDns corefile CM patch failed: {patch_exc}")
+        else:
+            logger.warning(f"VpcDns corefile CM create failed: {e}")
+
+
+def client_v1_configmap(*, name: str, namespace: str, labels: dict, data: dict) -> dict:
+    """Tiny helper for ConfigMap bodies — avoids importing V1ConfigMap from
+    kubernetes_asyncio just for two callsites."""
+    return {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": name, "namespace": namespace, "labels": labels},
+        "data": data,
+    }
+
+
 async def _ensure_vpc_dns(
     k8s, vpc_name: str, subnet_name: str, *, swallow: bool = True,
 ) -> None:
@@ -149,6 +336,19 @@ async def _ensure_vpc_dns(
       admin — they explicitly asked us to (re)create it, so silent
       failure would mislead them into thinking it worked.
     """
+    # Provision cluster-wide prereqs (NAD + 2 ConfigMaps with autodiscovered
+    # values) before creating the CR — VpcDns controller no-ops without them.
+    # Idempotent: safe to call from both the VPC create flow and the
+    # explicit recreate endpoint. Errors here are non-fatal (admin can
+    # debug the partial state); they just reduce the chance VpcDns reaches
+    # ACTIVE on first reconcile.
+    try:
+        await _ensure_vpc_dns_prereqs(k8s)
+    except Exception as exc:
+        logger.warning(
+            f"VpcDns prereq ensure for VPC {vpc_name!r} hit a non-fatal error: {exc}"
+        )
+
     body = {
         "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",
         "kind": "VpcDns",
