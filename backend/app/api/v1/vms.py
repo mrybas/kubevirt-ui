@@ -6,6 +6,7 @@ import logging
 import uuid
 from typing import Any, Literal
 
+import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
@@ -21,6 +22,63 @@ from app.core.naming import (
     with_synthetic_metadata,
 )
 from app.api.v1.cluster import get_cluster_settings
+from app.api.v1.tenants_common import (
+    _ensure_cluster_config,
+    _is_namespace_vpc_bound,
+    _vpc_dns_cloud_init_files,
+)
+
+
+def _merge_vpc_dns_into_cloud_init(cloud_init_data: str | None) -> str:
+    """Merge a VpcDns `write_files` block into a cloud-init #cloud-config doc.
+
+    Strategy:
+    - Empty input → emit a minimal #cloud-config with only the VpcDns block.
+    - Existing #cloud-config YAML → parse, deep-merge `write_files` +
+      `bootcmd`, serialize back.
+    - Non-YAML (shell script, MIME multipart, etc.) → can't safely
+      deep-merge, prepend a separate #cloud-config part via MIME-multipart.
+      cloud-init concatenates parts at first-boot, so both run.
+    """
+    dns_block: dict[str, Any] = {
+        "write_files": _vpc_dns_cloud_init_files(),
+        "bootcmd": ["systemctl restart systemd-resolved || true"],
+    }
+
+    if not cloud_init_data or not cloud_init_data.strip():
+        return "#cloud-config\n" + yaml.safe_dump(dns_block, sort_keys=False)
+
+    stripped = cloud_init_data.lstrip()
+    if stripped.startswith("#cloud-config"):
+        body = stripped.split("\n", 1)[1] if "\n" in stripped else ""
+        try:
+            parsed = yaml.safe_load(body) or {}
+        except yaml.YAMLError:
+            parsed = None
+        if isinstance(parsed, dict):
+            # Append our write_files / bootcmd to existing arrays, preserving
+            # user-supplied entries (e.g. ssh_authorized_keys, password).
+            existing_files = parsed.get("write_files") or []
+            parsed["write_files"] = list(existing_files) + dns_block["write_files"]
+            existing_bootcmd = parsed.get("bootcmd") or []
+            parsed["bootcmd"] = list(existing_bootcmd) + dns_block["bootcmd"]
+            return "#cloud-config\n" + yaml.safe_dump(parsed, sort_keys=False)
+
+    # Non-parseable / non-cloud-config input → fall back to MIME-multipart so
+    # the original userData still runs unchanged alongside our DNS bootstrap.
+    boundary = "VPCDNS"
+    return (
+        f"Content-Type: multipart/mixed; boundary=\"{boundary}\"\n"
+        "MIME-Version: 1.0\n\n"
+        f"--{boundary}\n"
+        "Content-Type: text/cloud-config; charset=utf-8\n\n"
+        "#cloud-config\n"
+        + yaml.safe_dump(dns_block, sort_keys=False)
+        + f"\n--{boundary}\n"
+        "Content-Type: text/x-shellscript; charset=utf-8\n\n"
+        + cloud_init_data.rstrip()
+        + f"\n--{boundary}--\n"
+    )
 from app.models.vm import (
     VMCreateRequest,
     VMListResponse,
@@ -746,7 +804,23 @@ async def create_vm_from_template(
                 cloud_config += f"\nchpasswd:\n  expire: false\npassword: {vm_request.password}\n"
             
             cloud_init_data = cloud_config
-        
+
+        # VpcDns injection: VMs whose namespace is bound to a kube-ovn VPC
+        # can't reach the default cluster CoreDNS (10.96.0.x). VpcDns has
+        # a cluster-wide VIP that OVN SwitchLB routes to a VpcDns pod in
+        # the same VPC. Inject the override via cloud-init so first-boot
+        # /etc/resolv.conf points at VpcDns + 8.8.8.8 fallback. No-op for
+        # VMs in the default overlay (CoreDNS works there).
+        try:
+            await _ensure_cluster_config(k8s_client)
+            if await _is_namespace_vpc_bound(k8s_client, namespace):
+                cloud_init_data = _merge_vpc_dns_into_cloud_init(cloud_init_data)
+        except Exception as exc:
+            logger.warning(
+                "VpcDns cloud-init injection skipped for %s/%s: %s",
+                namespace, vm_request.name, exc,
+            )
+
         # 5. Build VM manifest
         # cpu_cores = real cores for scheduler (limits/requests)
         # vcpu = virtual CPUs visible to the VM (domain.cpu.cores)

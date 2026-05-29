@@ -30,7 +30,7 @@ from app.api.v1.tenants_common import (
     _endpoint_port,
     _ingress_class,
     _ingress_controller,
-    _vpcdns_vip,
+    _vpc_dns_cloud_init_files,
 )
 
 # Konnectivity image overrides — defaults match upstream Kamaji defaults.
@@ -474,9 +474,8 @@ def _build_kubeadm_config_template_cr(
         # Install a systemd drop-in that strips unknown fields before kubelet starts.
         # systemd daemon-reload to pick up kubelet config fix drop-in (written via files)
         "systemctl daemon-reload",
-        # DNS fix: set primary DNS to 8.8.8.8 (reachable via OVN SNAT), VpcDns VIP as fallback
-        "sed -i 's/^#\\?DNS=.*/DNS=8.8.8.8/' /etc/systemd/resolved.conf",
-        f"sed -i 's/^#\\?FallbackDNS=.*/FallbackDNS={_vpcdns_vip()}/' /etc/systemd/resolved.conf",
+        # VpcDns: pick up the resolved.conf override written via `files` (see
+        # below) before kubelet / containerd start resolving cluster.local.
         "systemctl restart systemd-resolved",
     ]
 
@@ -514,6 +513,15 @@ def _build_kubeadm_config_template_cr(
                                 "ExecStartPre=/usr/local/bin/fix-kubelet-config.sh\n"
                             ),
                         },
+                        # VpcDns: VPC-overlay workers can't reach default
+                        # cluster CoreDNS — override resolved.conf + resolv.conf
+                        # to point at the VpcDns VIP (cluster-wide, OVN-routed
+                        # to a VpcDns pod in the same VPC) with 8.8.8.8 as
+                        # fallback via the VPC NAT gateway. The
+                        # `systemctl restart systemd-resolved` in
+                        # preKubeadmCommands picks up these overrides before
+                        # kubeadm join starts talking to the apiserver.
+                        *_vpc_dns_cloud_init_files(),
                     ],
                     "preKubeadmCommands": pre_commands,
                     "joinConfiguration": {
