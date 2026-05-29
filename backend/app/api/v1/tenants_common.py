@@ -10,7 +10,13 @@ import yaml
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 
-from app.core.constants import CAPI_API_GROUP, CAPI_API_VERSION, KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
+from app.core.constants import (
+    CAPI_API_GROUP,
+    CAPI_API_VERSION,
+    KUBEOVN_API_GROUP,
+    KUBEOVN_API_VERSION,
+    KUBEOVN_SYSTEM_SUBNETS,
+)
 from app.models.tenant import AddonCatalog, AddonComponent
 
 logger = logging.getLogger(__name__)
@@ -395,28 +401,36 @@ def _vpc_dns_cloud_init_files() -> list[dict[str, Any]]:
 
 
 async def _is_namespace_vpc_bound(k8s, namespace: str) -> bool:
-    """True if the namespace appears in any `Vpc.spec.namespaces`.
+    """True if the namespace lives on a non-default kube-ovn switch.
 
-    O(N) over Vpcs but typical cluster has tens, not thousands; result is
-    cheap enough to call per VM create. Returns False on any K8s error so
-    DNS injection becomes opt-out under failure (a wrong-DNS VM in default
-    overlay is recoverable; a no-DNS VM in VPC isn't).
+    Reads `ns.metadata.annotations["ovn.kubernetes.io/logical_switch"]` —
+    the same annotation kube-ovn-controller honours for pod placement, and
+    the one our VPC-create / tenant-create flows actually stamp. Anything
+    other than a system subnet (`ovn-default`, `join`) means the namespace
+    is on a custom subnet — almost always a VPC overlay where the cluster
+    CoreDNS ClusterIP isn't routable, so DNS must be injected.
+
+    We do NOT consult `Vpc.spec.namespaces` here. That field is only
+    populated when the VPC POST explicitly lists `namespaces:` / `tenant:`
+    — VPCs created via the UI without bound namespaces leave it empty,
+    yet pods/VMs still land on the VPC overlay via the ns annotation.
+
+    Returns False on K8s errors so DNS injection becomes opt-out under
+    failure (a wrong-DNS VM in default overlay is recoverable; a no-DNS
+    VM in a VPC isn't, but a 404/permission error is also non-actionable
+    here — fail open rather than blocking VM create).
     """
     try:
-        result = await k8s.custom_api.list_cluster_custom_object(
-            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="vpcs",
-        )
+        ns_obj = await k8s.core_api.read_namespace(name=namespace)
     except ApiException as exc:
         logger.warning(
-            "Failed to list Vpcs while checking VPC binding for ns %r: %s",
+            "Failed to read namespace %r while checking VPC binding: %s",
             namespace, exc,
         )
         return False
-    for vpc in result.get("items", []):
-        ns_list = (vpc.get("spec") or {}).get("namespaces") or []
-        if namespace in ns_list:
-            return True
-    return False
+    annotations = (ns_obj.metadata.annotations or {})
+    switch = annotations.get("ovn.kubernetes.io/logical_switch")
+    return bool(switch) and switch not in KUBEOVN_SYSTEM_SUBNETS
 
 
 async def _get_addon_catalog(k8s) -> AddonCatalog:
