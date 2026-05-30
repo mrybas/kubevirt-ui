@@ -131,8 +131,10 @@ class TenantCreateRequest(BaseModel):
     # users can authenticate via the host Dex / kubelogin. When False,
     # tenant apiserver has no OIDC integration (admin kubeconfig with
     # certs is the only access path, group-based RBAC bindings are
-    # ignored). Defaults to True for dev convenience.
-    enable_oidc: bool = True
+    # ignored). Defaults to False until the cluster's Dex is reachable
+    # from inside the cluster (MetalLB-only routing today) and its TLS
+    # cert is trusted by the apiserver pod (self-signed Traefik).
+    enable_oidc: bool = False
     admin_group: str = ""  # DEX group → cluster-admin in tenant
     viewer_group: str = ""  # DEX group → view role in tenant
 

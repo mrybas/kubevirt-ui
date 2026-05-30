@@ -123,7 +123,7 @@ const defaultWizard: WizardState = {
   worker_network_binding: 'bridge',
   pod_cidr: '10.244.0.0/16',
   service_cidr: '10.96.0.0/12',
-  enable_oidc: true,
+  enable_oidc: false,
   admin_group: '',
   viewer_group: '',
   folder: '',
