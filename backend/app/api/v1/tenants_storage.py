@@ -32,6 +32,7 @@ import logging
 from typing import Any
 
 import yaml
+from fastapi import HTTPException
 from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client import ApiException
 
@@ -439,14 +440,26 @@ async def create_csi_infrastructure_resources(
     #    across re-runs (Secret persists with the tenant ns).
     sa_token = await _ensure_sa_token_secret(core_api, ns, req.name)
 
-    # 5. Resolve the external apiserver URL + cluster CA cert
+    # 5. Resolve the external apiserver URL + cluster CA cert.
+    #    Fail-fast on fallback: the fallback (`kubernetes.default.svc`)
+    #    resolves to the TENANT apiserver from inside a tenant pod, NOT the
+    #    host — a kubeconfig built with it is silently broken (the CSI
+    #    controller would auth against the wrong cluster). Better to abort
+    #    tenant create with an actionable error than ship a dead driver.
+    #    Caller (create_tenant) preserves this HTTPException and rolls back
+    #    the half-created tenant.
     api_server_url, source = await discover_external_api_url(k8s)
     if source == "fallback":
-        logger.warning(
-            "kubevirt-csi kubeconfig will use the in-cluster fallback URL "
-            f"({api_server_url}); set KUBE_API_EXTERNAL_URL or publish the "
-            "kube-public/cluster-info ConfigMap so the tenant CSI driver "
-            "can actually reach the host apiserver."
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Cannot provision tenant storage: the host apiserver's "
+                "externally-reachable URL could not be determined. Set the "
+                "KUBE_API_EXTERNAL_URL env var on the backend, or publish the "
+                "kube-public/cluster-info ConfigMap with the host control-plane "
+                "VIP, then retry. (Create the tenant without storage to skip "
+                "this requirement.)"
+            ),
         )
     ca_data_b64 = _read_host_ca_b64(k8s)
 
