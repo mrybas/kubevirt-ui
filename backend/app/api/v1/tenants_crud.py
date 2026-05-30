@@ -610,25 +610,12 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             detail=f"Tenant '{req.name}' already exists",
         )
 
-    # T7 — Validate vpc_name BEFORE creating the namespace, so a bad choice
-    # fails fast without rolling back any cluster state. The VPC must:
-    #   1. exist
-    #   2. carry kubevirt-ui.io/folder == req.folder
-    #   3. carry kubevirt-ui.io/environment == req.environment, OR be
-    #      folder-wide (no env label, eligible for every env under folder)
-    #
-    # The tenant ns is NOT attached to the VPC (CAPI webhook forbids cross-ns
-    # controlPlaneRef → TCP must live in the tenant ns, and TCP needs default-
-    # overlay reachability to Postgres + Ingress). Worker VM launcher pods
-    # cross into the VPC subnet via the per-pod
-    # `ovn.kubernetes.io/logical_switch=<vpc>-default` annotation set on
-    # the VM pod template (see `_build_kubevirt_machine_template_cr`);
-    # kube-ovn honors that annotation when the target subnet's
-    # `spec.namespaces` includes the launcher pod's namespace, which is
-    # what `_attach_tenant_ns_to_vpc_subnet` (called from
-    # `_create_capi_resources`) APPENDs at create time. Validation here
-    # still matters so we don't run that attach against a missing or
-    # cross-folder VPC.
+    # vpc_name validation kept for forward compatibility — VPC support
+    # for tenant clusters is currently disabled in the UI and tenant
+    # workers run on the cluster default overlay. If a client still POSTs
+    # a vpc_name, we validate (exists + scoped to folder/env) so the
+    # field stays well-defined for the future re-enable, but no
+    # ns-attach or VPC stamping happens at create time.
     if req.vpc_name:
         try:
             vpc_cr = await k8s.custom_api.get_cluster_custom_object(

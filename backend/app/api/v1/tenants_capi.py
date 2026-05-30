@@ -75,17 +75,18 @@ def _build_cluster_cr(
     req: TenantCreateRequest,
     cp_host: str | None = None,
 ) -> dict[str, Any]:
-    # The one place we tell workers how to reach the tenant kube-apiserver:
-    # the cluster's existing 443 Ingress entry point (TLS/SNI passthrough).
-    # Kamaji's own defaults handle everything pod-side / Service-side; we
-    # don't override apiserver port, Service port, certSANs, or anything
-    # else that would force port juggling.
+    # Workers do `kubeadm join <host>:<port>` reading these two fields, so
+    # this is THE place that determines worker reachability. Tenant workers
+    # live on the cluster default overlay (no VPC), which means the Kamaji
+    # TCP Service ClusterIP is natively routable — kube-proxy DNAT'es it
+    # to the apiserver pod. cluster-info also gets the ClusterIP from
+    # Kamaji (NetworkProfile default), so the post-join kubelet.conf
+    # rewrite matches and the worker stays reachable.
     #
-    # Caveat: after kubeadm-join discovery succeeds against this endpoint,
-    # the worker rewrites kubelet.conf from `kube-public/cluster-info`,
-    # which Kamaji writes with the TCP Service ClusterIP — not reachable
-    # from custom VPCs. Admin patches the two ConfigMaps manually per
-    # tenant for now; see PLAN-REVERT-CP-PORTS.md choice α.
+    # We bake a DNS placeholder at create time; `_create_capi_resources`
+    # PATCHes both `host` and `port` to the actual ClusterIP:6443 after
+    # the Kamaji TCP Service is ready. cp_host (used by tests / future
+    # external endpoint flows) overrides the placeholder only.
     host = cp_host or _endpoint_host(req.name)
     return {
         "apiVersion": f"{CAPI_GROUP}/{CAPI_VERSION}",
@@ -104,7 +105,7 @@ def _build_cluster_cr(
         "spec": {
             "controlPlaneEndpoint": {
                 "host": host,
-                "port": 443,
+                "port": 6443,
             },
             "clusterNetwork": {
                 "pods": {"cidrBlocks": [req.pod_cidr]},
@@ -318,26 +319,11 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
         "kubevirt-ui.io/environment": req.environment,
     }
 
-    # 2026.05.29 — POD-NETWORK design, mirroring the solo-VM model in vms.py.
-    # The VM gets a single NIC attached to the cluster default pod network
-    # (kube-ovn CNI primary plugin). When `req.vpc_name` is set, we stamp the
-    # `ovn.kubernetes.io/logical_switch=<vpc>-default` pod annotation so
-    # kube-ovn places the launcher pod on the VPC's default subnet instead
-    # of the cluster default overlay (ovn-default).
-    #
-    # Cross-namespace placement: kube-ovn allows a pod to "borrow" a subnet
-    # from a different namespace as long as the target subnet's
-    # `spec.namespaces` includes the pod's namespace. The tenant ns lives on
-    # the cluster default overlay (Kamaji TCP needs Postgres + Ingress
-    # reachability) — see `_attach_tenant_ns_to_vpc_subnet`, which APPENDS
-    # the tenant ns to the VPC default subnet's `spec.namespaces` so the
-    # annotation is honored.
-    #
-    # The Multus NAD pattern (2026.05.26 b0fbd56) was abandoned: the NAD is a
-    # SECONDARY interface, and kube-ovn CNI only configures the PRIMARY
-    # interface's gateway + DNS via DHCP. Worker VMs end up with no default
-    # route and no DNS. Pod-network + per-pod annotation goes through the
-    # primary plugin path, just like solo VMs, and DHCP delivers everything.
+    # Single NIC on the cluster default pod network (kube-ovn primary
+    # plugin). VPC-overlay placement for tenant workers is deferred — see
+    # the disabled VPC step in the create-tenant UI. Workers stay on the
+    # cluster default overlay so the Kamaji TCP Service ClusterIP is
+    # natively reachable for kubeadm join.
     nic_binding = "masquerade" if req.worker_network_binding == "masquerade" else "bridge"
     primary_iface: dict[str, Any] = {"name": "default", nic_binding: {}}
     networks: list[dict[str, Any]] = [{"name": "default", "pod": {}}]
@@ -345,13 +331,6 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
     # pod annotation to permit live migration on a pod-network bridge interface.
     if nic_binding == "bridge":
         pod_annotations["kubevirt.io/allow-pod-bridge-network-live-migration"] = "true"
-
-    if req.vpc_name:
-        # Steer the launcher pod's primary NIC to the VPC's default subnet.
-        # Subnet name convention: `<vpc>-default` (see vpcs.create_vpc).
-        # The subnet's `spec.namespaces` must include this tenant ns —
-        # handled by `_attach_tenant_ns_to_vpc_subnet` at create time.
-        pod_annotations["ovn.kubernetes.io/logical_switch"] = f"{req.vpc_name}-default"
 
     return {
         "apiVersion": f"{KUBEVIRT_INFRA_GROUP}/{KUBEVIRT_INFRA_VERSION}",
@@ -722,137 +701,14 @@ async def _create_tenant_apiserver_ingress(k8s, req: TenantCreateRequest) -> Non
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_vpc_default_subnet(k8s, vpc_name: str) -> str:
-    """Return the name of the VPC's default subnet (single match required).
-
-    Raises HTTPException(400) when zero or multiple default subnets exist —
-    admin must reconcile the VPC layout before tenant creation can succeed
-    (no silent fallback to ovn-default would land workers on the wrong
-    network).
-    """
-    try:
-        subnet_list = await k8s.custom_api.list_cluster_custom_object(
-            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
-            plural="subnets",
-        )
-    except ApiException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Failed to list subnets while resolving default for VPC "
-                f"{vpc_name!r}: {exc.reason or exc}"
-            ),
-        ) from exc
-
-    default_subnets = [
-        (s.get("metadata") or {}).get("name") or ""
-        for s in subnet_list.get("items", [])
-        if (s.get("spec") or {}).get("vpc") == vpc_name
-        and (s.get("spec") or {}).get("default") is True
-    ]
-    default_subnets = [n for n in default_subnets if n]
-
-    if len(default_subnets) == 1:
-        return default_subnets[0]
-    if len(default_subnets) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"VPC '{vpc_name}' has no default subnet (spec.default=true). "
-                "Worker VMs need a default subnet to attach to via the "
-                "ovn.kubernetes.io/logical_switch pod annotation. "
-                "Admin should mark one subnet of the VPC as default and retry."
-            ),
-        )
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            f"VPC '{vpc_name}' has multiple default subnets "
-            f"({sorted(default_subnets)!r}); kube-ovn only allows one. "
-            "Admin should reconcile this before tenant creation."
-        ),
-    )
-
-
-async def _attach_tenant_ns_to_vpc_subnet(
-    k8s, req: TenantCreateRequest,
-) -> None:
-    """Append ``tenant-<name>`` to the VPC default subnet's ``spec.namespaces``.
-
-    Worker VM launcher pods carry the
-    ``ovn.kubernetes.io/logical_switch=<vpc>-default`` pod annotation;
-    kube-ovn places those pods on that subnet ONLY IF the subnet's
-    ``spec.namespaces`` includes the pod's namespace (or is empty / cluster-
-    wide). We APPEND the tenant ns so multiple tenants can share the VPC —
-    a merge-patch on the full array would race with concurrent attaches.
-
-    No-op when ``req.vpc_name`` is None.
-
-    Race safety: JSON-patch ``add /spec/namespaces/-`` is server-side
-    append, with a defensive ``add /spec/namespaces []`` op first when the
-    field is absent (otherwise the ``/-`` op 422s on a missing array).
-    Idempotent pre-check skips the patch when the tenant ns is already
-    present.
-    """
-    if not req.vpc_name:
-        return
-
-    tenant_ns = _tenant_ns(req.name)
-    subnet_name = await _resolve_vpc_default_subnet(k8s, req.vpc_name)
-
-    try:
-        subnet = await k8s.custom_api.get_cluster_custom_object(
-            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
-            plural="subnets", name=subnet_name,
-        )
-    except ApiException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Could not read subnet {subnet_name!r} for ns attach: "
-                f"{exc.reason or exc}"
-            ),
-        ) from exc
-
-    spec = subnet.get("spec") or {}
-    current_namespaces = spec.get("namespaces")
-    if isinstance(current_namespaces, list) and tenant_ns in current_namespaces:
-        logger.info(
-            f"Tenant ns {tenant_ns!r} already in subnet "
-            f"{subnet_name!r}.spec.namespaces; skipping append"
-        )
-        return
-
-    patch_ops: list[dict[str, Any]] = []
-    if current_namespaces is None:
-        patch_ops.append({"op": "add", "path": "/spec/namespaces", "value": []})
-    patch_ops.append({"op": "add", "path": "/spec/namespaces/-", "value": tenant_ns})
-
-    try:
-        await k8s.custom_api.patch_cluster_custom_object(
-            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
-            plural="subnets", name=subnet_name,
-            body=patch_ops,
-            _content_type="application/json-patch+json",
-        )
-        logger.info(
-            f"Appended tenant ns {tenant_ns!r} to subnet "
-            f"{subnet_name!r}.spec.namespaces (VPC {req.vpc_name!r})"
-        )
-    except ApiException as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Failed to append tenant ns {tenant_ns!r} to subnet "
-                f"{subnet_name!r}: {exc.reason or exc}"
-            ),
-        ) from exc
-
-
 async def _detach_tenant_ns_from_vpc_subnet(k8s, tenant_name: str) -> None:
     """Remove ``tenant-<name>`` from any subnet's ``spec.namespaces``.
 
-    Inverse of `_attach_tenant_ns_to_vpc_subnet` — scans every Subnet for
+    Kept around for legacy cleanup: tenants created before the VPC-for-
+    tenants revert may still have entries in their VPC's default subnet
+    ``spec.namespaces``. Called from delete_tenant to leave no stale
+    entries behind. New tenants don't attach in the first place, so this
+    is a no-op for them. Scans every Subnet for
     one whose `spec.namespaces` contains the tenant ns and removes the
     matching entry. We don't persist ``vpc_name`` on the Cluster CR, so the
     lookup is a full-list scan; in practice a tenant has at most one VPC
@@ -990,18 +846,17 @@ async def _create_capi_resources(
     ``Cluster.spec.controlPlaneRef.namespace != metadata.namespace``, so the
     TCP CR must be same-ns as the Cluster CR.
 
-    The tenant ns itself stays on the cluster default overlay (no VPC attach),
-    which gives the Kamaji TCP pod direct reachability to Postgres + shared
-    cluster Ingress. Worker VM launcher pods cross into the tenant VPC via a
-    per-pod ``ovn.kubernetes.io/logical_switch`` annotation (set on the VM
-    pod template by ``_build_kubevirt_machine_template_cr``); kube-ovn
-    honors that annotation only when the target subnet's ``spec.namespaces``
-    includes this tenant ns — handled by
-    ``_attach_tenant_ns_to_vpc_subnet`` below (append, multi-tenant-safe).
+    The tenant ns and its worker VMs live on the cluster default overlay
+    — VPC placement for tenant workloads is deferred. This keeps worker
+    join simple (Kamaji TCP Service ClusterIP is natively routable) and
+    avoids the cluster-info / kubeadm-config mismatch that the previous
+    Ingress-based path required.
 
-    Order: KamajiControlPlane + KubevirtCluster first → wait for the
-    Kamaji-created TCP Service → create Cluster with the external Ingress
-    endpoint as controlPlaneEndpoint.
+    Order: KamajiControlPlane + KubevirtCluster first → create Cluster
+    with a placeholder endpoint → wait for the Kamaji-created TCP Service
+    → PATCH Cluster.spec.controlPlaneEndpoint to the TCP ClusterIP:6443.
+    External admin access still gets an Ingress (TLS passthrough) on the
+    standard 443 entry point.
 
     When tenant storage is enabled (storage_info provided):
       - KubevirtCluster gets ``infraClusterSecretRef`` so CAPK can speak
@@ -1013,12 +868,6 @@ async def _create_capi_resources(
     ns = _tenant_ns(req.name)
 
     # 0. When the tenant is bound to a VPC, append the tenant ns to the VPC
-    #    default subnet's spec.namespaces BEFORE CAPK reconciles the
-    #    KubevirtMachineTemplate. The VM launcher pods carry the
-    #    `ovn.kubernetes.io/logical_switch` annotation; kube-ovn requires
-    #    the subnet's namespaces list to include the pod's namespace.
-    await _attach_tenant_ns_to_vpc_subnet(k8s, req)
-
     # 1. Create infrastructure + control plane providers first — both in the
     #    tenant ns (CAPI webhook forbids cross-ns controlPlaneRef).
     pre_resources = [
@@ -1031,21 +880,36 @@ async def _create_capi_resources(
             group=group, version=version, namespace=target_ns, plural=plural, body=body,
         )
 
-    # 2. Create CAPI Cluster with the external Ingress endpoint baked in.
-    #    Workers join via cluster Ingress (TLS passthrough), so
-    #    controlPlaneEndpoint already points at the nip.io hostname:443 —
-    #    no later patch with the unreachable TCP ClusterIP needed.
+    # 2. Create CAPI Cluster with a DNS placeholder endpoint; will be
+    #    PATCHed to the TCP ClusterIP after the Kamaji TCP Service is ready.
     cluster_cr = _build_cluster_cr(req)
     await custom.create_namespaced_custom_object(
         group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
         plural="clusters", body=cluster_cr,
     )
 
-    # 3. Wait for TCP Service to be created by Kamaji (smoke check that the
-    #    KamajiControlPlane controller reconciled our CR). Return value is
-    #    unused — the Cluster CR already carries the correct external
-    #    endpoint and certSANs cover the same hostname.
-    await _wait_for_tcp_service_ip(k8s, req.name, ns)
+    # 3. Wait for the Kamaji TCP Service to get a ClusterIP, then PATCH
+    #    Cluster.spec.controlPlaneEndpoint to that ClusterIP:6443. Workers
+    #    join via the ClusterIP (kube-proxy DNATs it to the apiserver pod
+    #    on the same default overlay) and the post-join cluster-info
+    #    rewrite matches — no manual ConfigMap patching needed.
+    cluster_ip = await _wait_for_tcp_service_ip(k8s, req.name, ns)
+    endpoint_patch = {
+        "spec": {
+            "controlPlaneEndpoint": {
+                "host": cluster_ip,
+                "port": 6443,
+            },
+        },
+    }
+    await custom.patch_namespaced_custom_object(
+        group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
+        plural="clusters", name=req.name, body=endpoint_patch,
+        _content_type="application/merge-patch+json",
+    )
+    logger.info(
+        f"Patched Cluster {req.name} controlPlaneEndpoint → {cluster_ip}:6443"
+    )
 
     # 5. Create VM worker resources (skip for bare_metal)
     if req.worker_type == "vm":
