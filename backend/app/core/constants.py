@@ -24,6 +24,10 @@ KUBEOVN_API_VERSION = "v1"
 CAPI_API_GROUP = "cluster.x-k8s.io"
 CAPI_API_VERSION = "v1beta1"
 
+# Kyverno (policy engine) CRD coordinates
+KYVERNO_API_GROUP = "kyverno.io"
+KYVERNO_API_VERSION = "v1"
+
 # KubeVirt UI labels / annotations
 LABEL_PREFIX = "kubevirt-ui.io"
 

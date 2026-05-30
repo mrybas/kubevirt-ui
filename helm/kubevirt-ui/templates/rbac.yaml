@@ -343,6 +343,15 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # -----------------------------------------------------------------------
+  # Kyverno policies (per-VPC DNS-injection ClusterPolicy + future use)
+  # -----------------------------------------------------------------------
+  - apiGroups: ["kyverno.io"]
+    resources:
+      - clusterpolicies
+      - policies
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
   # Cluster API (tenant clusters)
   # -----------------------------------------------------------------------
   - apiGroups: ["cluster.x-k8s.io"]

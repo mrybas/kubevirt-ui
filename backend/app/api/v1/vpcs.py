@@ -21,6 +21,8 @@ from app.core.constants import (
     KUBEOVN_API_VERSION,
     KUBEOVN_SYSTEM_SUBNETS as SYSTEM_SUBNETS,
     KUBEOVN_SYSTEM_VPC as SYSTEM_VPC_NAME,
+    KYVERNO_API_GROUP,
+    KYVERNO_API_VERSION,
 )
 from app.core.errors import k8s_error_to_http
 from app.core.groups import (
@@ -305,6 +307,202 @@ def client_v1_configmap(*, name: str, namespace: str, labels: dict, data: dict) 
     }
 
 
+# ---------------------------------------------------------------------------
+# Kyverno DNS-injection policy — one ClusterPolicy per custom VPC.
+#
+# Pods landing in a custom VPC inherit kubelet's `--cluster-dns=10.96.0.10`,
+# which points at the cluster CoreDNS ClusterIP — unreachable across VPC
+# boundaries. VpcDns gives us a per-VPC CoreDNS deployment fronted by a
+# cluster-wide VIP (OVN SwitchLB routes it locally), but the pod has to
+# be TOLD to use that VIP. We mutate pod.spec.dnsPolicy/dnsConfig at
+# admission time so any workload (CDI importer, KubeVirt virt-launcher,
+# user Deployments) in a VPC ns transparently resolves through VpcDns.
+#
+# Why per-VPC instead of one global policy:
+#   - lifecycle matches the VPC (delete VPC → delete its policy),
+#   - matches the UI's per-VPC view/edit story,
+#   - leaves room for a future per-VPC VIP without a schema change.
+# ---------------------------------------------------------------------------
+
+
+def _kyverno_policy_name(vpc_name: str) -> str:
+    return f"kubevirt-ui-vpc-dns-{vpc_name}"
+
+
+def _build_kyverno_dns_policy(vpc_name: str, vip: str) -> dict[str, Any]:
+    """Build a Kyverno ClusterPolicy that injects VpcDns into pods.
+
+    Match strategy: pods in namespaces with `kubevirt-ui.io/managed=true`
+    (excludes all system namespaces by construction). Two contexts:
+
+      - `nsobj`: the namespace object, for its
+        `ovn.kubernetes.io/logical_switch` annotation.
+      - `vpcSubnets`: list of subnet names whose `spec.vpc` equals this
+        VPC, fetched via apiCall so the policy follows subnet changes
+        without re-rendering.
+
+    Precondition: `nsobj`'s logical-switch annotation is in `vpcSubnets`.
+    Only then mutate: set dnsPolicy=None + dnsConfig.nameservers=[vip] +
+    standard cluster.local search list. `background: false` keeps the
+    policy out of background scans — we mutate only on CREATE.
+    """
+    return {
+        "apiVersion": f"{KYVERNO_API_GROUP}/{KYVERNO_API_VERSION}",
+        "kind": "ClusterPolicy",
+        "metadata": {
+            "name": _kyverno_policy_name(vpc_name),
+            "labels": {
+                "kubevirt-ui.io/managed": "true",
+                "kubevirt-ui.io/vpc": vpc_name,
+            },
+            "annotations": {
+                "policies.kyverno.io/title": f"Inject VpcDns ({vpc_name})",
+                "policies.kyverno.io/category": "DNS",
+                "policies.kyverno.io/description": (
+                    f"Mutates pods landing on a subnet of VPC '{vpc_name}' "
+                    f"to use the per-VPC VpcDns VIP ({vip}) instead of the "
+                    "unreachable cluster CoreDNS ClusterIP."
+                ),
+            },
+        },
+        "spec": {
+            "background": False,
+            "rules": [
+                {
+                    "name": "set-dnsconfig",
+                    "match": {
+                        "any": [
+                            {
+                                "resources": {
+                                    "kinds": ["Pod"],
+                                    "namespaceSelector": {
+                                        "matchLabels": {
+                                            "kubevirt-ui.io/managed": "true",
+                                        },
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                    "context": [
+                        {
+                            "name": "nsobj",
+                            "apiCall": {
+                                "urlPath": "/api/v1/namespaces/{{ request.namespace }}",
+                            },
+                        },
+                        {
+                            "name": "vpcSubnets",
+                            "apiCall": {
+                                "urlPath": f"/apis/{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}/subnets",
+                                "jmesPath": f"items[?spec.vpc=='{vpc_name}'].metadata.name | @",
+                            },
+                        },
+                    ],
+                    "preconditions": {
+                        "all": [
+                            {
+                                "key": '{{ nsobj.metadata.annotations."ovn.kubernetes.io/logical_switch" || \'\' }}',
+                                "operator": "AnyIn",
+                                "value": "{{ vpcSubnets }}",
+                            },
+                        ],
+                    },
+                    "mutate": {
+                        "patchStrategicMerge": {
+                            "spec": {
+                                "dnsPolicy": "None",
+                                "dnsConfig": {
+                                    "nameservers": [vip],
+                                    "searches": [
+                                        "{{ request.namespace }}.svc.cluster.local",
+                                        "svc.cluster.local",
+                                        "cluster.local",
+                                    ],
+                                    "options": [{"name": "ndots", "value": "5"}],
+                                },
+                            },
+                        },
+                    },
+                },
+            ],
+        },
+    }
+
+
+async def _ensure_vpc_dns_policy(k8s, vpc_name: str) -> None:
+    """Create or patch the per-VPC Kyverno DNS-injection ClusterPolicy.
+
+    Skipped for the default cluster VPC (`ovn-cluster`) — its pods reach
+    the standard cluster CoreDNS just fine.
+
+    Idempotent: 409 on create → switch to replace. All other errors are
+    logged-and-swallowed; VPC create still succeeds. If Kyverno isn't
+    installed (404 on the API group) we silently no-op — the policy is
+    not load-bearing for VPC create, only for in-VPC pod DNS.
+    """
+    if vpc_name == SYSTEM_VPC_NAME:
+        return
+    vip = _vpcdns_vip()
+    body = _build_kyverno_dns_policy(vpc_name, vip)
+    policy_name = _kyverno_policy_name(vpc_name)
+    try:
+        await k8s.custom_api.create_cluster_custom_object(
+            group=KYVERNO_API_GROUP, version=KYVERNO_API_VERSION,
+            plural="clusterpolicies", body=body,
+        )
+        logger.info(f"Created Kyverno ClusterPolicy {policy_name} for VPC {vpc_name!r}")
+        return
+    except ApiException as e:
+        if e.status == 409:
+            # Already exists — patch with our latest body so VIP / labels
+            # / rules stay in sync.
+            try:
+                await k8s.custom_api.patch_cluster_custom_object(
+                    group=KYVERNO_API_GROUP, version=KYVERNO_API_VERSION,
+                    plural="clusterpolicies", name=policy_name, body=body,
+                )
+                logger.info(f"Patched Kyverno ClusterPolicy {policy_name}")
+            except ApiException as patch_exc:
+                logger.warning(
+                    f"Kyverno ClusterPolicy {policy_name} patch failed: {patch_exc}"
+                )
+            return
+        if e.status == 404:
+            # Kyverno CRDs not installed — nothing to do. Log once and move on.
+            logger.info(
+                "Kyverno CRDs not present; skipping VpcDns policy for VPC "
+                f"{vpc_name!r}. Install the kyverno bootstrap component to "
+                "enable in-VPC pod DNS injection."
+            )
+            return
+        logger.warning(
+            f"Kyverno ClusterPolicy create for VPC {vpc_name!r} failed: {e}; "
+            "in-VPC pods will not have DNS until policy is created manually."
+        )
+
+
+async def _delete_vpc_dns_policy(k8s, vpc_name: str) -> None:
+    """Delete the per-VPC Kyverno DNS-injection ClusterPolicy.
+
+    404 (already gone, or Kyverno CRDs absent) is tolerated.
+    """
+    if vpc_name == SYSTEM_VPC_NAME:
+        return
+    policy_name = _kyverno_policy_name(vpc_name)
+    try:
+        await k8s.custom_api.delete_cluster_custom_object(
+            group=KYVERNO_API_GROUP, version=KYVERNO_API_VERSION,
+            plural="clusterpolicies", name=policy_name,
+        )
+        logger.info(f"Deleted Kyverno ClusterPolicy {policy_name}")
+    except ApiException as e:
+        if e.status != 404:
+            logger.warning(
+                f"Failed to delete Kyverno ClusterPolicy {policy_name}: {e}"
+            )
+
+
 async def _ensure_vpc_dns(
     k8s, vpc_name: str, subnet_name: str, *, swallow: bool = True,
 ) -> None:
@@ -372,8 +570,8 @@ async def _ensure_vpc_dns(
         logger.info(f"Created VpcDns {vpc_name}-dns for VPC {vpc_name!r}")
     except ApiException as e:
         if e.status == 409:
-            return  # idempotent
-        if swallow:
+            pass  # idempotent — fall through to policy ensure
+        elif swallow:
             logger.warning(
                 f"VpcDns auto-create for VPC {vpc_name!r} failed: {e}; "
                 "admin may need manual setup. Workloads will still get an "
@@ -381,9 +579,17 @@ async def _ensure_vpc_dns(
                 "the VPC-internal DNS forwarder will not work."
             )
             return
-        # swallow=False — propagate so the caller can surface a real
-        # error to the user instead of pretending success.
-        raise
+        else:
+            # swallow=False — propagate so the caller can surface a real
+            # error to the user instead of pretending success.
+            raise
+
+    # Pair the VpcDns CR with a Kyverno ClusterPolicy that mutates pods
+    # landing in this VPC's namespaces to use the VpcDns VIP as DNS.
+    # Without this, kubelet's --cluster-dns wins and in-VPC pods (CDI,
+    # virt-launcher, user workloads) try to reach the unreachable cluster
+    # CoreDNS ClusterIP. Errors are swallowed inside _ensure_vpc_dns_policy.
+    await _ensure_vpc_dns_policy(k8s, vpc_name)
 
 
 async def _get_vpc_peerings(k8s, vpc_name: str) -> list[VpcPeeringInfo]:
@@ -837,6 +1043,9 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
     except ApiException as e:
         if e.status != 404:
             logger.warning(f"Failed to delete VpcDns {name}-dns: {e}")
+
+    # Delete the paired Kyverno ClusterPolicy.
+    await _delete_vpc_dns_policy(k8s, name)
 
     # Delete peerings first
     peerings = await _get_vpc_peerings(k8s, name)
