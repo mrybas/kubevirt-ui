@@ -367,6 +367,11 @@ def _build_kyverno_dns_policy(vpc_name: str, vip: str) -> dict[str, Any]:
         },
         "spec": {
             "background": False,
+            # Don't block pod admission if our context.apiCall errors out
+            # (e.g. kube-ovn API briefly unreachable, RBAC drifts). DNS
+            # injection is opt-in convenience; admission denial would be
+            # destructive for every workload landing in a managed ns.
+            "failurePolicy": "Ignore",
             "rules": [
                 {
                     "name": "set-dnsconfig",

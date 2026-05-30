@@ -430,6 +430,28 @@ subjects:
     name: {{ include "kubevirt-ui.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 
+---
+# Aggregation ClusterRole — Kyverno admission + background controllers
+# need to read kube-ovn resources when our per-VPC ClusterPolicy's
+# context.apiCall fetches subnets/vpcs (e.g. resolving the list of
+# subnets that belong to a given VPC). Kyverno's official ClusterRoles
+# `kyverno:admission-controller` and `kyverno:background-controller`
+# carry `aggregationRule.clusterRoleSelectors` matching these labels,
+# so this rule is auto-included into both — no explicit ClusterRoleBinding
+# needed, no need to know the Kyverno SA names.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-kyverno-kubeovn-read
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    rbac.kyverno.io/aggregate-to-admission-controller: "true"
+    rbac.kyverno.io/aggregate-to-background-controller: "true"
+rules:
+  - apiGroups: ["kubeovn.io"]
+    resources: [subnets, vpcs, vpc-dnses]
+    verbs: [get, list, watch]
+
 {{- else }}
 # -----------------------------------------------------------------------
 # Namespace-scoped Role (single-namespace mode)
