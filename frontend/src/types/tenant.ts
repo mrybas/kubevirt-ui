@@ -52,6 +52,10 @@ export interface TenantCreateRequest {
   enable_oidc?: boolean;
   admin_group: string;
   viewer_group: string;
+  // Worker DNS injection (written into /etc/resolv.conf via cloud-init)
+  dns_servers?: string[];
+  dns_mode?: 'append' | 'override';
+  dns_include_public_fallback?: boolean;
   // Folder / environment binding (T8 — confirmed field names from backend T1)
   folder?: string;      // required by backend when using folder model; optional here for compat
   environment?: string; // required by backend when folder is set

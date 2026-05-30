@@ -412,6 +412,51 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
     }
 
 
+_TENANT_WORKER_PUBLIC_FALLBACK_DNS = ["1.1.1.1", "8.8.8.8"]
+_TENANT_WORKER_DNS_SEARCH = ["cluster.local", "svc.cluster.local"]
+
+
+def _resolve_worker_dns(req: TenantCreateRequest) -> list[str]:
+    """Compute the DNS server list to write into worker /etc/resolv.conf.
+
+    The primary server depends on VPC placement:
+      - default overlay (vpc_name is None) → cluster CoreDNS ClusterIP.
+      - custom VPC                          → per-VPC VpcDns VIP. (forward
+        compat: VPC for tenants is currently disabled in UI, but the
+        backend keeps the branch live.)
+
+    Modes:
+      - "append":   primary + dns_servers + public_fallback (when enabled)
+      - "override": dns_servers only (primary used as safety net if empty)
+    """
+    if req.vpc_name:
+        try:
+            primary = [_vpcdns_vip()]
+        except Exception:
+            primary = ["10.96.0.10"]
+    else:
+        primary = ["10.96.0.10"]
+
+    custom = [s.strip() for s in (req.dns_servers or []) if s.strip()]
+
+    if req.dns_mode == "override":
+        return custom or primary
+    # append mode
+    out = primary + custom
+    if req.dns_include_public_fallback:
+        out += _TENANT_WORKER_PUBLIC_FALLBACK_DNS
+    return out
+
+
+def _build_worker_resolv_conf(req: TenantCreateRequest) -> str:
+    """Render `/etc/resolv.conf` content for tenant worker guest VMs."""
+    dns_list = _resolve_worker_dns(req)
+    lines = [f"nameserver {ip}" for ip in dns_list]
+    lines.append("search " + " ".join(_TENANT_WORKER_DNS_SEARCH))
+    lines.append("options ndots:5")
+    return "\n".join(lines) + "\n"
+
+
 def _build_kubeadm_config_template_cr(
     req: TenantCreateRequest,
 ) -> dict[str, Any]:
@@ -447,6 +492,12 @@ def _build_kubeadm_config_template_cr(
         # Install a systemd drop-in that strips unknown fields before kubelet starts.
         # systemd daemon-reload to pick up kubelet config fix drop-in (written via files)
         "systemctl daemon-reload",
+        # --- DNS: lock /etc/resolv.conf so DHCP renewals don't overwrite it.
+        # `write_files` below put our list into the file; CAPK container-disk
+        # images don't reliably honour DHCP-supplied DNS (netplan defaults),
+        # so we go with the heavy hammer: chattr +i prevents systemd-resolved
+        # / NetworkManager / netplan from touching it.
+        "chattr +i /etc/resolv.conf",
     ]
 
     return {
@@ -483,11 +534,23 @@ def _build_kubeadm_config_template_cr(
                                 "ExecStartPre=/usr/local/bin/fix-kubelet-config.sh\n"
                             ),
                         },
-                        # VpcDns reaches the worker guest two layers down:
-                        # kube-ovn DHCP delivers the VpcDns VIP as `dns_server`
-                        # via subnet.spec.dhcpV4Options, and Kyverno's per-VPC
-                        # ClusterPolicy fixes pod-side DNS for virt-launcher /
-                        # CDI / in-cluster pods. No cloud-init munging here.
+                        # DNS injection: CAPK container-disk images don't
+                        # reliably honour DHCP-supplied DNS, so we write the
+                        # resolv.conf directly and lock it (chattr +i in
+                        # preKubeadmCommands). Cloud-init's own resolv-conf
+                        # module is disabled so it doesn't try to merge.
+                        {
+                            "path": "/etc/resolv.conf",
+                            "owner": "root:root",
+                            "permissions": "0644",
+                            "content": _build_worker_resolv_conf(req),
+                        },
+                        {
+                            "path": "/etc/cloud/cloud.cfg.d/99-disable-resolv-conf.cfg",
+                            "owner": "root:root",
+                            "permissions": "0644",
+                            "content": "manage_resolv_conf: false\n",
+                        },
                     ],
                     "preKubeadmCommands": pre_commands,
                     "joinConfiguration": {

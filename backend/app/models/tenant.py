@@ -127,6 +127,25 @@ class TenantCreateRequest(BaseModel):
 
     pod_cidr: str = "10.244.0.0/16"
     service_cidr: str = "10.96.0.0/12"
+
+    # Worker DNS injection — written into the worker guest's
+    # `/etc/resolv.conf` via cloud-init `write_files`, then made immutable
+    # via `chattr +i` so subsequent DHCP renewals don't overwrite. Needed
+    # because CAPK container-disk images don't pick up DHCP-supplied DNS
+    # reliably (netplan defaults vary).
+    #
+    # Final list = primary + dns_servers + (public_fallback when enabled).
+    # - primary: 10.96.0.10 (cluster CoreDNS) for default VPC tenants;
+    #   per-VPC VpcDns VIP when vpc_name is set (re-enablement path).
+    # - dns_servers: admin-supplied additional servers.
+    # - public_fallback: 1.1.1.1, 8.8.8.8 added at the tail when enabled.
+    #
+    # dns_mode=override drops the primary + fallback and emits ONLY
+    # dns_servers (safety net: if dns_servers is empty, primary is used
+    # to avoid a no-DNS guest).
+    dns_servers: list[str] = Field(default_factory=list)
+    dns_mode: Literal["append", "override"] = "append"
+    dns_include_public_fallback: bool = True
     # When True, tenant apiserver is configured with --oidc-* flags so
     # users can authenticate via the host Dex / kubelogin. When False,
     # tenant apiserver has no OIDC integration (admin kubeconfig with

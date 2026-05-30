@@ -25,6 +25,7 @@ import {
   HardDrive,
   Info,
 } from 'lucide-react';
+import clsx from 'clsx';
 import { useTenants, useCreateTenant, useDeleteTenant, useAddonCatalog, useDiscovery } from '../hooks/useTenants';
 import { useStorageClasses } from '../hooks/useStorage';
 import { useFoldersFlat } from '../hooks/useFolders';
@@ -94,6 +95,9 @@ interface WizardState {
   enable_oidc: boolean;
   admin_group: string;
   viewer_group: string;
+  dns_servers: string[];
+  dns_mode: 'append' | 'override';
+  dns_include_public_fallback: boolean;
   // T8 — folder / environment
   folder: string;
   environment: string;
@@ -126,6 +130,9 @@ const defaultWizard: WizardState = {
   enable_oidc: false,
   admin_group: '',
   viewer_group: '',
+  dns_servers: [],
+  dns_mode: 'append',
+  dns_include_public_fallback: true,
   folder: '',
   environment: '',
   vpc_name: '',
@@ -152,6 +159,61 @@ const capkPresets = [
 /** DNS-1123 label: lowercase alphanumeric + hyphen, ≤63 chars, start/end alphanumeric */
 const isDns1123Label = (s: string): boolean =>
   /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(s);
+
+function DnsServerList({ servers, onChange }: { servers: string[]; onChange: (s: string[]) => void }) {
+  const [draft, setDraft] = useState('');
+  const ipRe = /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/;
+
+  const addServer = () => {
+    const trimmed = draft.trim();
+    if (!trimmed) return;
+    onChange([...servers, trimmed]);
+    setDraft('');
+  };
+
+  return (
+    <div className="space-y-1.5">
+      {servers.length === 0 && (
+        <p className="text-xs text-surface-500 italic">No additional servers.</p>
+      )}
+      {servers.map((s, i) => (
+        <div key={i} className="flex items-center gap-2">
+          <code className={clsx(
+            'flex-1 text-xs px-2 py-1 rounded bg-surface-900 font-mono',
+            ipRe.test(s) ? 'text-surface-300' : 'text-amber-400',
+          )}>
+            {s}
+          </code>
+          <button
+            onClick={() => onChange(servers.filter((_, idx) => idx !== i))}
+            className="p-1.5 text-surface-400 hover:text-red-400 hover:bg-red-500/10 rounded transition-colors"
+            title="Remove"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      ))}
+      <div className="flex gap-2">
+        <input
+          type="text"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addServer(); } }}
+          placeholder="e.g. 192.168.10.1"
+          className="flex-1 px-2 py-1 bg-surface-800 border border-surface-700 rounded text-xs text-surface-100 focus:outline-none focus:border-primary-500 font-mono"
+        />
+        <button
+          onClick={addServer}
+          disabled={!draft.trim()}
+          className="px-3 py-1 text-xs bg-surface-700 hover:bg-surface-600 disabled:opacity-40 disabled:cursor-not-allowed text-surface-100 rounded transition-colors"
+        >
+          Add
+        </button>
+      </div>
+    </div>
+  );
+}
+
 
 function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [step, setStep] = useState(0);
@@ -268,6 +330,10 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
         admin_group: form.admin_group,
         viewer_group: form.viewer_group,
       } : { admin_group: '', viewer_group: '' }),
+      // Worker DNS (cloud-init resolv.conf)
+      dns_servers: form.dns_servers.filter(s => s.trim()),
+      dns_mode: form.dns_mode,
+      dns_include_public_fallback: form.dns_include_public_fallback,
       // T8: folder / environment
       ...(form.folder ? { folder: form.folder } : {}),
       ...(form.environment ? { environment: form.environment } : {}),
@@ -1124,6 +1190,89 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                         Per-tenant VPC overlay isolation. Currently disabled.
                       </p>
                     </div>
+                  </label>
+                </div>
+
+                {/* Worker DNS configuration */}
+                <div className="pt-3 border-t border-surface-700/50 space-y-3">
+                  <div>
+                    <h3 className="text-sm font-semibold text-surface-200">Worker DNS</h3>
+                    <p className="text-xs text-surface-500 mt-0.5">
+                      Injected into the worker VM's <code>/etc/resolv.conf</code> via cloud-init.
+                      Needed because CAPK images don't reliably pick up DHCP-supplied DNS.
+                    </p>
+                  </div>
+
+                  <div className="p-2.5 rounded-md bg-surface-800/50 border border-surface-700/50">
+                    <p className="text-[11px] uppercase tracking-wider text-surface-500 mb-1">Default for this tenant</p>
+                    <code className="text-xs text-primary-300 font-mono">
+                      {/* will switch to VpcDns VIP when custom VPC is selected — currently always cluster CoreDNS */}
+                      10.96.0.10
+                    </code>
+                    <span className="ml-2 text-[10px] text-surface-500">cluster CoreDNS</span>
+                  </div>
+
+                  <div>
+                    <label className="text-xs text-surface-400 mb-1 block">Additional DNS servers</label>
+                    <DnsServerList
+                      servers={form.dns_servers}
+                      onChange={(servers) => setForm({ ...form, dns_servers: servers })}
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <label className="text-xs text-surface-400 block">Mode</label>
+                    <div className="space-y-1.5">
+                      <label className="flex items-start gap-2 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="dns_mode"
+                          value="append"
+                          checked={form.dns_mode === 'append'}
+                          onChange={() => setForm({ ...form, dns_mode: 'append' })}
+                          className="mt-0.5 h-3.5 w-3.5"
+                        />
+                        <span className="text-xs">
+                          <span className="text-surface-200">Append</span>
+                          <span className="text-surface-500"> — primary + your servers (+ public fallback if enabled)</span>
+                        </span>
+                      </label>
+                      <label className="flex items-start gap-2 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="dns_mode"
+                          value="override"
+                          checked={form.dns_mode === 'override'}
+                          onChange={() => setForm({ ...form, dns_mode: 'override' })}
+                          className="mt-0.5 h-3.5 w-3.5"
+                        />
+                        <span className="text-xs">
+                          <span className="text-surface-200">Override</span>
+                          <span className="text-surface-500"> — only your servers (primary used as safety net if empty)</span>
+                        </span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <label className={clsx(
+                    'flex items-start gap-2 cursor-pointer',
+                    form.dns_mode === 'override' && 'opacity-50',
+                  )}>
+                    <input
+                      type="checkbox"
+                      checked={form.dns_include_public_fallback}
+                      onChange={(e) => setForm({ ...form, dns_include_public_fallback: e.target.checked })}
+                      disabled={form.dns_mode === 'override'}
+                      className="mt-0.5 h-3.5 w-3.5"
+                    />
+                    <span className="text-xs">
+                      <span className="text-surface-200">Include public fallback DNS</span>
+                      <span className="text-surface-500">
+                        {' '}— appends 1.1.1.1 and 8.8.8.8 to the end of the list so DNS
+                        keeps working if cluster CoreDNS becomes unreachable. Disable for
+                        air-gapped clusters or to enforce corporate-only DNS.
+                      </span>
+                    </span>
                   </label>
                 </div>
               </div>
