@@ -15,7 +15,6 @@ from app.core.constants import (
     CAPI_API_VERSION,
     KUBEOVN_API_GROUP,
     KUBEOVN_API_VERSION,
-    KUBEOVN_SYSTEM_SUBNETS,
 )
 from app.models.tenant import AddonCatalog, AddonComponent
 
@@ -330,107 +329,6 @@ def _vpcdns_forward_dns() -> str:
 def _vpcdns_vip() -> str:
     return _require_cluster_config()["vpcdns_vip"]
 
-
-# ---------------------------------------------------------------------------
-# VPC DNS injection — shared between solo VM creation (vms.py) and CAPK
-# worker VMs (tenants_capi.py). VMs whose primary interface lands on a
-# kube-ovn VPC overlay cannot reach the default cluster CoreDNS at
-# 10.96.0.10 (cross-VPC ClusterIP). VpcDns (auto-created per VPC) exposes
-# a cluster-wide VIP that kube-ovn SwitchLB routes to a VpcDns pod inside
-# the same VPC, so guests can resolve cluster.local + Service DNS without
-# crossing VPCs.
-# ---------------------------------------------------------------------------
-
-_VPC_DNS_SEARCH_DOMAINS = ["cluster.local", "svc.cluster.local"]
-
-
-def _vpc_dns_resolved_conf() -> str:
-    """`/etc/systemd/resolved.conf` snippet for VMs in a kube-ovn VPC.
-
-    Primary `DNS=<VpcDns VIP>` handles cluster.local + Service resolution
-    inside the VPC. `FallbackDNS=8.8.8.8` survives a broken VpcDns by
-    egressing through the VPC NAT gateway (OvnEip / OvnSnatRule path).
-    `Domains=` is intentionally absent — the search list is owned by the
-    guest's standard /etc/resolv.conf which cloud-init wires up
-    independently.
-    """
-    return (
-        "[Resolve]\n"
-        f"DNS={_vpcdns_vip()}\n"
-        "FallbackDNS=8.8.8.8\n"
-    )
-
-
-def _vpc_dns_resolv_conf() -> str:
-    """`/etc/resolv.conf` snippet for VMs in a kube-ovn VPC.
-
-    Written alongside the systemd-resolved override so guests that bypass
-    systemd-resolved (or run before it's restarted) still see VpcDns +
-    the right cluster.local search list.
-    """
-    searches = " ".join(_VPC_DNS_SEARCH_DOMAINS)
-    return (
-        f"nameserver {_vpcdns_vip()}\n"
-        "nameserver 8.8.8.8\n"
-        f"search {searches}\n"
-        "options ndots:5\n"
-    )
-
-
-def _vpc_dns_cloud_init_files() -> list[dict[str, Any]]:
-    """cloud-init `write_files` entries that wire VpcDns into the VM guest.
-
-    Both file paths get rewritten before kubelet / app containers start;
-    a follow-up `systemctl restart systemd-resolved` (in bootcmd /
-    preKubeadmCommands) makes the resolved override take effect.
-    """
-    return [
-        {
-            "path": "/etc/systemd/resolved.conf",
-            "content": _vpc_dns_resolved_conf(),
-            "permissions": "0644",
-            "owner": "root:root",
-        },
-        {
-            "path": "/etc/resolv.conf",
-            "content": _vpc_dns_resolv_conf(),
-            "permissions": "0644",
-            "owner": "root:root",
-        },
-    ]
-
-
-async def _is_namespace_vpc_bound(k8s, namespace: str) -> bool:
-    """True if the namespace lives on a non-default kube-ovn switch.
-
-    Reads `ns.metadata.annotations["ovn.kubernetes.io/logical_switch"]` —
-    the same annotation kube-ovn-controller honours for pod placement, and
-    the one our VPC-create / tenant-create flows actually stamp. Anything
-    other than a system subnet (`ovn-default`, `join`) means the namespace
-    is on a custom subnet — almost always a VPC overlay where the cluster
-    CoreDNS ClusterIP isn't routable, so DNS must be injected.
-
-    We do NOT consult `Vpc.spec.namespaces` here. That field is only
-    populated when the VPC POST explicitly lists `namespaces:` / `tenant:`
-    — VPCs created via the UI without bound namespaces leave it empty,
-    yet pods/VMs still land on the VPC overlay via the ns annotation.
-
-    Returns False on K8s errors so DNS injection becomes opt-out under
-    failure (a wrong-DNS VM in default overlay is recoverable; a no-DNS
-    VM in a VPC isn't, but a 404/permission error is also non-actionable
-    here — fail open rather than blocking VM create).
-    """
-    try:
-        ns_obj = await k8s.core_api.read_namespace(name=namespace)
-    except ApiException as exc:
-        logger.warning(
-            "Failed to read namespace %r while checking VPC binding: %s",
-            namespace, exc,
-        )
-        return False
-    annotations = (ns_obj.metadata.annotations or {})
-    switch = annotations.get("ovn.kubernetes.io/logical_switch")
-    return bool(switch) and switch not in KUBEOVN_SYSTEM_SUBNETS
 
 
 async def _get_addon_catalog(k8s) -> AddonCatalog:
