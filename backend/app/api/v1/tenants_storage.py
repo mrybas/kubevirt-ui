@@ -26,6 +26,7 @@ tenant create after partial failure doesn't error.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 from typing import Any
@@ -46,21 +47,19 @@ CSI_SA_NAME = "kubevirt-csi"
 CSI_ROLE_NAME = "kubevirt-csi"
 CSI_ROLE_BINDING_NAME = "kubevirt-csi"
 CSI_KUBECONFIG_SECRET_NAME = "infra-cluster-credentials"
+CSI_SA_TOKEN_SECRET_NAME = "kubevirt-csi-token"
 CSI_RESOURCE_QUOTA_NAME = "tenant-storage"
 
-# Token lifetime — ~1 year. The CSI driver doesn't implement token refresh
-# so the bound-token must outlive any reasonable tenant lifecycle; when it
-# finally expires the operator re-runs tenant-create and the secret is
-# replaced with a fresh one.
-#
-# Revocation is NOT tied to this TTL: bound tokens are validated against
-# the owning ServiceAccount on every API call, so deleting the SA (or the
-# tenant ns) invalidates the token instantly. The TTL is just the
-# upper-bound for "no human intervention needed".
-#
-# Matches the auth.py CLI-kubeconfig token lifetime so we share one number
-# across the codebase.
-CSI_TOKEN_EXPIRATION_SEC = 24 * 365 * 3600  # ~1 year
+# The CSI controller in the tenant has no token-refresh path, so we use a
+# legacy non-expiring ServiceAccount-token Secret (type
+# kubernetes.io/service-account-token) instead of a bounded TokenRequest.
+# Its lifetime == the SA's lifetime == the tenant ns lifetime: deleting the
+# tenant deletes the ns → SA → token, no orphaned credential. Revocation is
+# instant (token validated against the owning SA on every call, deleting
+# the SA invalidates it). The kube-controller-manager token controller
+# populates `.data.token` asynchronously; we poll briefly for it.
+CSI_TOKEN_POLL_ATTEMPTS = 20
+CSI_TOKEN_POLL_INTERVAL_SEC = 0.5
 
 
 def _csi_role_rules() -> list[dict[str, Any]]:
@@ -268,23 +267,53 @@ async def _ensure_role_binding(rbac_api, ns: str, tenant_name: str) -> None:
             raise
 
 
-async def _mint_sa_token(core_api, ns: str) -> str:
-    """Mint a bound token for the kubevirt-csi SA via TokenRequest.
+async def _ensure_sa_token_secret(core_api, ns: str, tenant_name: str) -> str:
+    """Create (idempotently) a non-expiring SA-token Secret and return token.
 
-    audiences=[] → the apiserver's own self-identity (default audience),
-    same as the in-cluster default — required because the CSI driver
-    talks to *this* apiserver as itself.
+    A Secret of type ``kubernetes.io/service-account-token`` annotated with
+    the SA name makes the token controller mint a long-lived token bound to
+    `kubevirt-csi`. Unlike TokenRequest the token never expires on its own —
+    it dies only when the SA / namespace is deleted (tenant teardown). The
+    default audience is the apiserver itself, which is exactly what the CSI
+    driver authenticates against.
+
+    The token controller populates `.data.token` a moment after the Secret
+    is created, so we poll until it appears.
     """
-    body = client.AuthenticationV1TokenRequest(
-        spec=client.V1TokenRequestSpec(
-            audiences=[],
-            expiration_seconds=CSI_TOKEN_EXPIRATION_SEC,
-        ),
+    metadata = client.V1ObjectMeta(
+        name=CSI_SA_TOKEN_SECRET_NAME,
+        namespace=ns,
+        annotations={"kubernetes.io/service-account.name": CSI_SA_NAME},
+        labels={
+            "kubevirt-ui.io/managed": "true",
+            "kubevirt-ui.io/tenant": tenant_name,
+            "kubevirt-ui.io/role": "csi-infra",
+        },
     )
-    result = await core_api.create_namespaced_service_account_token(
-        name=CSI_SA_NAME, namespace=ns, body=body,
+    body = client.V1Secret(
+        metadata=metadata,
+        type="kubernetes.io/service-account-token",
     )
-    return result.status.token
+    try:
+        await core_api.create_namespaced_secret(namespace=ns, body=body)
+    except ApiException as e:
+        if e.status != 409:
+            raise  # already exists → fall through to read the token
+
+    for _ in range(CSI_TOKEN_POLL_ATTEMPTS):
+        secret = await core_api.read_namespaced_secret(
+            name=CSI_SA_TOKEN_SECRET_NAME, namespace=ns,
+        )
+        token_b64 = (secret.data or {}).get("token")
+        if token_b64:
+            return base64.b64decode(token_b64).decode("utf-8")
+        await asyncio.sleep(CSI_TOKEN_POLL_INTERVAL_SEC)
+
+    raise RuntimeError(
+        f"SA-token Secret {CSI_SA_TOKEN_SECRET_NAME!r} in {ns!r} was not "
+        "populated with a token by the controller within "
+        f"{CSI_TOKEN_POLL_ATTEMPTS * CSI_TOKEN_POLL_INTERVAL_SEC:.0f}s"
+    )
 
 
 async def _ensure_kubeconfig_secret(
@@ -399,8 +428,9 @@ async def create_csi_infrastructure_resources(
     await _ensure_role(rbac_api, ns, req.name)
     await _ensure_role_binding(rbac_api, ns, req.name)
 
-    # 4. Mint a token (always fresh — see `_ensure_kubeconfig_secret`)
-    sa_token = await _mint_sa_token(core_api, ns)
+    # 4. Ensure a non-expiring SA-token Secret and read the token. Stable
+    #    across re-runs (Secret persists with the tenant ns).
+    sa_token = await _ensure_sa_token_secret(core_api, ns, req.name)
 
     # 5. Resolve the external apiserver URL + cluster CA cert
     api_server_url, source = await discover_external_api_url(k8s)
