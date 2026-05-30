@@ -100,6 +100,7 @@ def _build_cluster_cr(
             "annotations": {
                 "kubevirt-ui.io/display-name": req.display_name,
                 "kubevirt-ui.io/worker-type": req.worker_type,
+                "kubevirt-ui.io/enable-oidc": "true" if req.enable_oidc else "false",
             },
         },
         "spec": {

@@ -91,7 +91,7 @@ export default function TenantDetail() {
   const [deleteImageName, setDeleteImageName] = useState<string | null>(null);
   const [scaleCount, setScaleCount] = useState<number | null>(null);
   const [copied, setCopied] = useState(false);
-  const [kubeconfigType, setKubeconfigType] = useState<'admin' | 'oidc'>('oidc');
+  const [kubeconfigType, setKubeconfigType] = useState<'admin' | 'oidc'>('admin');
   const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
 
   const { data: tenant, isLoading, refetch } = useTenant(name);
@@ -105,8 +105,13 @@ export default function TenantDetail() {
   const enableAddon = useEnableAddon(name || '');
   const disableAddon = useDisableAddon(name || '');
 
-  const fetchKubeconfig = kubeconfigType === 'admin' ? fetchAdminKc : fetchOidcKc;
-  const kubeconfigLoading = kubeconfigType === 'admin' ? adminKcLoading : oidcKcLoading;
+  const oidcEnabled = tenant?.enable_oidc ?? false;
+  // If OIDC is disabled on this tenant, force the admin kubeconfig — the
+  // OIDC tab is hidden in the UI below, but state could still linger.
+  const effectiveKubeconfigType: 'admin' | 'oidc' =
+    !oidcEnabled && kubeconfigType === 'oidc' ? 'admin' : kubeconfigType;
+  const fetchKubeconfig = effectiveKubeconfigType === 'admin' ? fetchAdminKc : fetchOidcKc;
+  const kubeconfigLoading = effectiveKubeconfigType === 'admin' ? adminKcLoading : oidcKcLoading;
 
   const handleDelete = async () => {
     if (!name) return;
@@ -378,20 +383,22 @@ export default function TenantDetail() {
           </h2>
           <div className="flex items-center gap-3 mb-4">
             <div className="flex bg-surface-800 rounded-lg p-0.5">
-              <button
-                onClick={() => setKubeconfigType('oidc')}
-                className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                  kubeconfigType === 'oidc'
-                    ? 'bg-primary-600 text-white'
-                    : 'text-surface-400 hover:text-surface-200'
-                }`}
-              >
-                OIDC (User)
-              </button>
+              {oidcEnabled && (
+                <button
+                  onClick={() => setKubeconfigType('oidc')}
+                  className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                    effectiveKubeconfigType === 'oidc'
+                      ? 'bg-primary-600 text-white'
+                      : 'text-surface-400 hover:text-surface-200'
+                  }`}
+                >
+                  OIDC (User)
+                </button>
+              )}
               <button
                 onClick={() => setKubeconfigType('admin')}
                 className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
-                  kubeconfigType === 'admin'
+                  effectiveKubeconfigType === 'admin'
                     ? 'bg-primary-600 text-white'
                     : 'text-surface-400 hover:text-surface-200'
                 }`}
@@ -399,9 +406,14 @@ export default function TenantDetail() {
                 Admin (Certificate)
               </button>
             </div>
+            {!oidcEnabled && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-400">
+                OIDC disabled for this tenant
+              </span>
+            )}
           </div>
           <p className="text-xs text-surface-500 mb-3">
-            {kubeconfigType === 'oidc'
+            {effectiveKubeconfigType === 'oidc'
               ? 'Uses your current OIDC token from DEX. Access governed by RBAC in tenant cluster.'
               : 'Certificate-based admin access. Full cluster-admin privileges.'}
           </p>

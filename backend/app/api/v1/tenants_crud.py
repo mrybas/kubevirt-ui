@@ -166,6 +166,7 @@ def _parse_tenant_response(
         worker_memory="",
         pod_cidr=pod_cidrs[0] if pod_cidrs else "",
         service_cidr=svc_cidrs[0] if svc_cidrs else "",
+        enable_oidc=metadata.get("annotations", {}).get("kubevirt-ui.io/enable-oidc", "false") == "true",
         created=metadata.get("creationTimestamp"),
         conditions=conditions,
         addons=addon_statuses or [],

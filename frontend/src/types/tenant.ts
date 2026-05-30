@@ -114,6 +114,7 @@ export interface Tenant {
   worker_memory: string;
   pod_cidr: string;
   service_cidr: string;
+  enable_oidc?: boolean;
   created: string | null;
   conditions: TenantCondition[];
   addons: TenantAddonStatus[];

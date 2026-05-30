@@ -501,10 +501,20 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
               </div>
 
               {/* OIDC / RBAC */}
-              <div className="pt-2 border-t border-surface-700/50 space-y-4">
-                <div className="flex items-center justify-between">
+              <div className="mt-4 p-4 rounded-lg border border-surface-700 bg-surface-800/40 space-y-4">
+                <div className="flex items-center justify-between gap-4">
                   <div>
-                    <p className="text-xs font-semibold text-surface-400 uppercase tracking-wider">OIDC Authentication</p>
+                    <p className="text-sm font-semibold text-surface-100">
+                      OIDC Authentication
+                      <span className={clsx(
+                        'ml-2 text-[10px] px-1.5 py-0.5 rounded',
+                        form.enable_oidc
+                          ? 'bg-emerald-500/10 text-emerald-400'
+                          : 'bg-surface-700 text-surface-400',
+                      )}>
+                        {form.enable_oidc ? 'ENABLED' : 'DISABLED'}
+                      </span>
+                    </p>
                     <p className="text-xs text-surface-500 mt-1">
                       Configure tenant apiserver to trust this cluster's Dex.
                       Disable if Dex isn't reachable from the apiserver pod yet.

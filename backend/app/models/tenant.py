@@ -289,6 +289,7 @@ class TenantResponse(BaseModel):
     worker_memory: str = ""
     pod_cidr: str = ""
     service_cidr: str = ""
+    enable_oidc: bool = False
     created: str | None = None
     conditions: list[TenantCondition] = Field(default_factory=list)
     addons: list[TenantAddonStatus] = Field(default_factory=list)
