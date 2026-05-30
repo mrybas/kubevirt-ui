@@ -2,47 +2,26 @@
  * VPC List Page
  */
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  Plus,
   Network,
   RefreshCw,
   Trash2,
-  X,
   Eye,
   CheckCircle,
   AlertCircle,
-  Check,
-  AlertTriangle,
 } from 'lucide-react';
-import { useVpcs, useCreateVpc, useDeleteVpc } from '../hooks/useVpcs';
-import { useNamespaces } from '../hooks/useNamespaces';
-import { useFoldersFlat } from '../hooks/useFolders';
+import { useVpcs, useDeleteVpc } from '../hooks/useVpcs';
 import type { Vpc } from '../types/vpc';
 import { DataTable, type Column } from '@/components/common/DataTable';
 import type { MenuItem } from '@/components/common/KebabMenu';
 import { ActionBar } from '@/components/common/ActionBar';
 
-export default function VPCs({
-  openCreate,
-  onCreateOpened,
-}: {
-  openCreate?: boolean;
-  onCreateOpened?: () => void;
-} = {}) {
+export default function VPCs() {
   const navigate = useNavigate();
-  const [showCreateModal, setShowCreateModal] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-
-  // Open create modal when parent signals
-  useEffect(() => {
-    if (openCreate) {
-      setShowCreateModal(true);
-      onCreateOpened?.();
-    }
-  }, [openCreate]);
 
   const { data, isLoading, refetch } = useVpcs();
   const deleteVpc = useDeleteVpc();
@@ -117,10 +96,6 @@ export default function VPCs({
         <button onClick={() => refetch()} className="btn-secondary" title="Refresh">
           <RefreshCw className="h-4 w-4" />
         </button>
-        <button onClick={() => setShowCreateModal(true)} className="btn-primary">
-          <Plus className="w-4 h-4" />
-          Create VPC
-        </button>
       </ActionBar>
 
       <DataTable
@@ -167,19 +142,9 @@ export default function VPCs({
         emptyState={{
           icon: <Network className="h-16 w-16" />,
           title: 'No VPCs yet',
-          description: 'Create a VPC to set up isolated L3 networking.',
-          action: (
-            <button onClick={() => setShowCreateModal(true)} className="btn-primary">
-              <Plus className="w-4 h-4" />
-              Create your first VPC
-            </button>
-          ),
+          description: 'Use the Create button at the top of the Networks page.',
         }}
       />
-
-      {showCreateModal && (
-        <CreateVpcModal onClose={() => setShowCreateModal(false)} />
-      )}
 
       {showDeleteModal && (
         <DeleteVpcModal
@@ -189,215 +154,6 @@ export default function VPCs({
           isDeleting={deleteVpc.isPending}
         />
       )}
-    </div>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// CreateVpcModal — simple one-step form
-// ---------------------------------------------------------------------------
-
-function CreateVpcModal({ onClose }: { onClose: () => void }) {
-  const [name, setName] = useState('');
-  const [cidr, setCidr] = useState('');
-  const [selectedNamespaces, setSelectedNamespaces] = useState<string[]>([]);
-  const [folder, setFolder] = useState('');
-  const [environment, setEnvironment] = useState('');
-  const [isCreating, setIsCreating] = useState(false);
-  const [error, setError] = useState('');
-  const createVpc = useCreateVpc();
-  const { data: namespacesData } = useNamespaces();
-  const { data: foldersData } = useFoldersFlat();
-
-  const allFolders = foldersData?.items ?? [];
-  const selectedFolder = allFolders.find(f => f.name === folder);
-  const folderEnvironments = selectedFolder?.environments ?? [];
-
-  // Only show namespaces the backend will accept — kubevirt-ui.io/managed=true
-  const userNamespaces = useMemo(() => {
-    if (!namespacesData?.items) return [];
-    return namespacesData.items
-      .filter(ns => ns.labels?.['kubevirt-ui.io/managed'] === 'true')
-      .map(ns => ns.name)
-      .sort();
-  }, [namespacesData]);
-
-  const toggleNamespace = (ns: string) => {
-    setSelectedNamespaces(prev =>
-      prev.includes(ns) ? prev.filter(n => n !== ns) : [...prev, ns]
-    );
-  };
-
-  const canCreate = name.length > 0;
-
-  const handleFolderChange = (f: string) => {
-    setFolder(f);
-    setEnvironment(''); // reset env when folder changes
-  };
-
-  const handleCreate = async () => {
-    setIsCreating(true);
-    setError('');
-    try {
-      await createVpc.mutateAsync({
-        name,
-        ...(cidr ? { subnet_cidr: cidr } : {}),
-        ...(selectedNamespaces.length > 0 ? { namespaces: selectedNamespaces } : {}),
-        ...(folder ? { folder } : {}),
-        ...(environment ? { environment } : {}),
-      });
-      onClose();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Failed to create VPC');
-      setIsCreating(false);
-    }
-  };
-
-  return (
-    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
-      <div className="bg-surface-800 border border-surface-700 rounded-xl w-full max-w-md mx-4 shadow-2xl">
-        {/* Header */}
-        <div className="flex items-center justify-between p-5 border-b border-surface-700">
-          <h2 className="text-lg font-semibold text-surface-100">Create VPC</h2>
-          <button onClick={onClose} className="p-1 text-surface-400 hover:text-surface-200">
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-
-        {/* Content */}
-        <div className="p-5 space-y-4">
-          <div>
-            <label className="block text-sm font-medium text-surface-300 mb-1">Name *</label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
-              placeholder="my-vpc"
-              className="input w-full font-mono text-sm"
-              autoFocus
-            />
-          </div>
-          {/* Folder scope (optional) */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-sm font-medium text-surface-300 mb-1">
-                Folder scope
-                <span className="ml-1 font-normal text-surface-500">(optional)</span>
-              </label>
-              <select
-                value={folder}
-                onChange={(e) => handleFolderChange(e.target.value)}
-                className="w-full px-3 py-2 bg-surface-700 border border-surface-600 rounded-lg text-surface-100 text-sm focus:outline-none focus:border-primary-500"
-              >
-                <option value="">Unscoped (global / admin-only)</option>
-                {allFolders.map(f => (
-                  <option key={f.name} value={f.name}>
-                    {f.display_name || f.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-surface-300 mb-1">
-                Environment scope
-                <span className="ml-1 font-normal text-surface-500">(optional)</span>
-              </label>
-              <select
-                value={environment}
-                onChange={(e) => setEnvironment(e.target.value)}
-                disabled={!folder}
-                className="w-full px-3 py-2 bg-surface-700 border border-surface-600 rounded-lg text-surface-100 text-sm focus:outline-none focus:border-primary-500 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                <option value="">{folder ? 'All environments' : 'Select folder first'}</option>
-                {folderEnvironments.map(env => (
-                  <option key={env.environment} value={env.environment}>
-                    {env.environment}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
-          {folder && !environment && (
-            <p className="text-xs text-surface-500 -mt-2">
-              Without an environment, this VPC will be available to all environments in <span className="font-medium text-surface-400">{folder}</span>.
-            </p>
-          )}
-
-          <div>
-            <label className="block text-sm font-medium text-surface-300 mb-1">Subnet CIDR</label>
-            <input
-              type="text"
-              value={cidr}
-              onChange={(e) => setCidr(e.target.value)}
-              placeholder="10.0.0.0/24"
-              className="input w-full font-mono text-sm"
-            />
-            <p className="text-xs text-surface-500 mt-1">
-              CIDR for the default subnet. Leave empty to auto-allocate.
-            </p>
-          </div>
-
-          {/* Namespaces picker */}
-          <div>
-            <label className="block text-sm font-medium text-surface-300 mb-1">
-              Namespaces
-              <span className="ml-1 font-normal text-surface-500">(optional — leave empty for unrestricted)</span>
-            </label>
-            {userNamespaces.length === 0 ? (
-              <p className="text-xs text-surface-500 italic">Loading namespaces…</p>
-            ) : (
-              <div className="max-h-36 overflow-y-auto rounded-lg border border-surface-700 bg-surface-900/50 divide-y divide-surface-700/50">
-                {userNamespaces.map(ns => (
-                  <label
-                    key={ns}
-                    className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-surface-700/40 transition-colors"
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selectedNamespaces.includes(ns)}
-                      onChange={() => toggleNamespace(ns)}
-                      className="rounded border-surface-600 text-primary-500 bg-surface-800 focus:ring-primary-500 focus:ring-offset-0"
-                    />
-                    <span className="text-sm font-mono text-surface-200">{ns}</span>
-                  </label>
-                ))}
-              </div>
-            )}
-            {selectedNamespaces.length > 0 && (
-              <p className="text-xs text-primary-400 mt-1">
-                {selectedNamespaces.length} namespace{selectedNamespaces.length > 1 ? 's' : ''} selected
-              </p>
-            )}
-          </div>
-
-          {error && (
-            <div className="flex items-center gap-2 text-sm text-red-400 bg-red-900/20 border border-red-800/30 rounded-lg p-3">
-              <AlertTriangle className="w-4 h-4 shrink-0" />
-              {error}
-            </div>
-          )}
-        </div>
-
-        {/* Footer */}
-        <div className="flex items-center justify-end gap-3 p-5 border-t border-surface-700">
-          <button type="button" onClick={onClose} className="btn-secondary">
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={handleCreate}
-            disabled={!canCreate || isCreating}
-            className="btn-primary flex items-center gap-1.5"
-          >
-            {isCreating ? 'Creating...' : (
-              <>
-                <Check className="w-4 h-4" />
-                Create VPC
-              </>
-            )}
-          </button>
-        </div>
-      </div>
     </div>
   );
 }

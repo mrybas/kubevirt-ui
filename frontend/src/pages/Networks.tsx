@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { Plus, ChevronDown } from 'lucide-react';
+import { Plus } from 'lucide-react';
 import { PageTitle } from '@/components/common/PageTitle';
 import VPCs from './VPCs';
 import { Network as UserNetworks } from './Network';
@@ -16,50 +16,20 @@ type TabId = typeof TABS[number]['id'];
 
 export function Networks() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const [createOpen, setCreateOpen] = useState(false);
-  const dropdownRef = useRef<HTMLDivElement>(null);
 
   const rawTab = searchParams.get('tab') as TabId | null;
   const activeTab: TabId = TABS.some(t => t.id === rawTab) ? rawTab! : 'vpcs';
 
-  // Read create signal from URL and clear it
-  const createParam = searchParams.get('create');
-  const [createVpcSignal, setCreateVpcSignal] = useState(false);
+  // Single Create button → CreateNetworkWizard on Subnets tab. The wizard
+  // itself has a type chooser at step 1 (VPC vs external/VLAN subnet), so
+  // we don't need a per-type entry point on this page.
   const [createSubnetSignal, setCreateSubnetSignal] = useState(false);
-
-  useEffect(() => {
-    if (createParam === 'vpc') {
-      setCreateVpcSignal(true);
-      setSearchParams({ tab: 'vpcs' });
-    } else if (createParam === 'subnet') {
-      setCreateSubnetSignal(true);
-      setSearchParams({ tab: 'subnets' });
-    }
-  }, [createParam]);
 
   const setTab = (tab: TabId) => setSearchParams({ tab });
 
   const currentSubtitle = TABS.find(t => t.id === activeTab)?.subtitle ?? '';
 
-  // Close dropdown on outside click
-  useEffect(() => {
-    function handle(e: MouseEvent) {
-      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
-        setCreateOpen(false);
-      }
-    }
-    if (createOpen) document.addEventListener('mousedown', handle);
-    return () => document.removeEventListener('mousedown', handle);
-  }, [createOpen]);
-
-  const handleCreateVPC = () => {
-    setCreateOpen(false);
-    setTab('vpcs');
-    setCreateVpcSignal(true);
-  };
-
-  const handleCreateSubnet = () => {
-    setCreateOpen(false);
+  const handleCreate = () => {
     setTab('subnets');
     setCreateSubnetSignal(true);
   };
@@ -67,32 +37,10 @@ export function Networks() {
   return (
     <div className="space-y-4">
       <PageTitle title="Networks" subtitle={currentSubtitle}>
-        <div className="relative" ref={dropdownRef}>
-          <button
-            onClick={() => setCreateOpen(!createOpen)}
-            className="btn-primary flex items-center gap-2"
-          >
-            <Plus className="h-4 w-4" />
-            Create
-            <ChevronDown className="h-3.5 w-3.5" />
-          </button>
-          {createOpen && (
-            <div className="absolute right-0 top-full mt-1 w-44 bg-surface-900 border border-surface-700 rounded-lg shadow-xl z-20">
-              <button
-                onClick={handleCreateVPC}
-                className="w-full text-left px-4 py-2.5 text-sm text-surface-200 hover:bg-surface-800 rounded-t-lg transition-colors"
-              >
-                Create VPC
-              </button>
-              <button
-                onClick={handleCreateSubnet}
-                className="w-full text-left px-4 py-2.5 text-sm text-surface-200 hover:bg-surface-800 rounded-b-lg transition-colors"
-              >
-                Create Subnet
-              </button>
-            </div>
-          )}
-        </div>
+        <button onClick={handleCreate} className="btn-primary flex items-center gap-2">
+          <Plus className="h-4 w-4" />
+          Create
+        </button>
       </PageTitle>
 
       {/* Tabs */}
@@ -114,12 +62,7 @@ export function Networks() {
 
       {/* Tab content */}
       <div>
-        {activeTab === 'vpcs' && (
-          <VPCs
-            openCreate={createVpcSignal}
-            onCreateOpened={() => setCreateVpcSignal(false)}
-          />
-        )}
+        {activeTab === 'vpcs' && <VPCs />}
         {activeTab === 'subnets' && (
           <UserNetworks
             openCreate={createSubnetSignal}
