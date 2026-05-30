@@ -61,3 +61,24 @@ export async function updateVpcDns(vpcName: string, request: UpdateVpcDnsRequest
 export async function recreateVpcDns(vpcName: string): Promise<VpcDns> {
   return apiRequest<VpcDns>(`/vpcs/${vpcName}/dns/recreate`, { method: 'POST' });
 }
+
+// Per-VPC Kyverno DNS-injection ClusterPolicy. Returned as the raw
+// Kubernetes object so the UI can render it in a JSON editor.
+
+export async function getVpcDnsPolicy(vpcName: string): Promise<Record<string, unknown>> {
+  return apiRequest<Record<string, unknown>>(`/vpcs/${vpcName}/dns-policy`);
+}
+
+export async function updateVpcDnsPolicy(
+  vpcName: string, body: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+  return apiRequest<Record<string, unknown>>(`/vpcs/${vpcName}/dns-policy`, {
+    method: 'PUT', body,
+  });
+}
+
+export async function recreateVpcDnsPolicy(vpcName: string): Promise<Record<string, unknown>> {
+  return apiRequest<Record<string, unknown>>(`/vpcs/${vpcName}/dns-policy/recreate`, {
+    method: 'POST',
+  });
+}

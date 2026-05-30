@@ -1519,3 +1519,140 @@ async def recreate_vpc_dns(
     #    error instead of a misleading "pending" placeholder.
     cr = await _get_vpc_dns_cr(k8s, vpc_name)
     return _parse_vpc_dns(cr, coredns_vip=_vpcdns_vip())
+
+
+# ---------------------------------------------------------------------------
+# Per-VPC Kyverno DNS-injection policy — view + edit endpoints.
+# Each VPC owns one ClusterPolicy named `kubevirt-ui-vpc-dns-<vpc>`. The
+# UI's VPC detail page renders it as JSON, allows in-place edit, and lets
+# admin recreate the default body if a hand-edit goes wrong.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/{vpc_name}/dns-policy")
+async def get_vpc_dns_policy(
+    request: Request, vpc_name: str,
+    user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Fetch the per-VPC Kyverno ClusterPolicy as raw JSON.
+
+    404 distinguishes three states:
+      - VPC missing → "VPC '<name>' not found";
+      - Kyverno CRDs not installed → 404 with kyverno-specific detail;
+      - VPC present but policy never created (default VPC, or legacy
+        VPC predating the auto-create) → 404 with recreate hint.
+    """
+    k8s = request.app.state.k8s_client
+    if not await _vpc_exists(k8s, vpc_name):
+        raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
+    if vpc_name == SYSTEM_VPC_NAME:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"The default VPC ('{SYSTEM_VPC_NAME}') has no DNS-injection "
+                "policy — its pods reach the standard cluster CoreDNS."
+            ),
+        )
+    policy_name = _kyverno_policy_name(vpc_name)
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=KYVERNO_API_GROUP, version=KYVERNO_API_VERSION,
+            plural="clusterpolicies", name=policy_name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No Kyverno ClusterPolicy '{policy_name}' for VPC "
+                    f"'{vpc_name}'. Either Kyverno isn't installed (deploy "
+                    "the `kyverno` bootstrap component) or this VPC "
+                    "pre-dates the auto-create; POST "
+                    f"/vpcs/{vpc_name}/dns-policy/recreate to provision it."
+                ),
+            ) from e
+        raise k8s_error_to_http(e, "ClusterPolicy lookup")
+
+
+@router.put("/{vpc_name}/dns-policy")
+async def update_vpc_dns_policy(
+    request: Request, vpc_name: str, body: dict[str, Any],
+    user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Replace the per-VPC Kyverno ClusterPolicy with `body`.
+
+    `body` must be a Kyverno ClusterPolicy with metadata.name matching
+    the per-VPC convention (`kubevirt-ui-vpc-dns-<vpc>`). We reject any
+    other name to avoid a typo silently creating a stray policy. Other
+    fields (rules, mutate, context) are admin's to edit — including the
+    VIP, search domains, exclusion list.
+    """
+    k8s = request.app.state.k8s_client
+    if not await _vpc_exists(k8s, vpc_name):
+        raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
+    if vpc_name == SYSTEM_VPC_NAME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Refusing to create a DNS-injection policy for the default VPC ('{SYSTEM_VPC_NAME}').",
+        )
+    expected_name = _kyverno_policy_name(vpc_name)
+    body_name = (body.get("metadata") or {}).get("name")
+    if body_name != expected_name:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"ClusterPolicy.metadata.name must be '{expected_name}' "
+                f"(got {body_name!r}). The name is bound to the VPC; "
+                "editing it would orphan the policy from the VPC lifecycle."
+            ),
+        )
+    body.setdefault("apiVersion", f"{KYVERNO_API_GROUP}/{KYVERNO_API_VERSION}")
+    body.setdefault("kind", "ClusterPolicy")
+    try:
+        return await k8s.custom_api.replace_cluster_custom_object(
+            group=KYVERNO_API_GROUP, version=KYVERNO_API_VERSION,
+            plural="clusterpolicies", name=expected_name, body=body,
+        )
+    except ApiException as e:
+        raise k8s_error_to_http(e, "ClusterPolicy replace")
+
+
+@router.post("/{vpc_name}/dns-policy/recreate")
+async def recreate_vpc_dns_policy(
+    request: Request, vpc_name: str,
+    user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """Discard the current policy and recreate the default body.
+
+    Useful when a manual edit broke the policy. Delete first (404
+    tolerated), then call `_ensure_vpc_dns_policy` which rebuilds the
+    default body bound to the current cluster-wide VpcDns VIP.
+    """
+    k8s = request.app.state.k8s_client
+    await _ensure_cluster_config(k8s)
+    if not await _vpc_exists(k8s, vpc_name):
+        raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
+    if vpc_name == SYSTEM_VPC_NAME:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Refusing to create a DNS-injection policy for the default VPC ('{SYSTEM_VPC_NAME}').",
+        )
+    await _delete_vpc_dns_policy(k8s, vpc_name)
+    await _ensure_vpc_dns_policy(k8s, vpc_name)
+    policy_name = _kyverno_policy_name(vpc_name)
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=KYVERNO_API_GROUP, version=KYVERNO_API_VERSION,
+            plural="clusterpolicies", name=policy_name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Recreated policy '{policy_name}' is not visible after "
+                    "create — Kyverno CRDs may be absent. Install the `kyverno` "
+                    "bootstrap component first."
+                ),
+            ) from e
+        raise k8s_error_to_http(e, "ClusterPolicy lookup")

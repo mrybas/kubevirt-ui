@@ -15,6 +15,9 @@ import {
   getVpcDns,
   updateVpcDns,
   recreateVpcDns,
+  getVpcDnsPolicy,
+  updateVpcDnsPolicy,
+  recreateVpcDnsPolicy,
 } from '../api/vpcs';
 import type { CreateVpcRequest, AddVpcPeeringRequest, UpdateVpcRoutesRequest, UpdateVpcDnsRequest } from '../types/vpc';
 import { ApiError } from '../api/client';
@@ -122,6 +125,38 @@ export function useRecreateVpcDns(vpcName: string) {
     mutationFn: () => recreateVpcDns(vpcName),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['vpcs', vpcName, 'dns'] });
+    },
+  });
+}
+
+export function useVpcDnsPolicy(vpcName: string | undefined) {
+  return useQuery({
+    queryKey: ['vpcs', vpcName, 'dns-policy'],
+    queryFn: () => getVpcDnsPolicy(vpcName!),
+    enabled: !!vpcName,
+    retry: (failureCount, error) => {
+      if (error instanceof ApiError && error.status === 404) return false;
+      return failureCount < 3;
+    },
+  });
+}
+
+export function useUpdateVpcDnsPolicy(vpcName: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Record<string, unknown>) => updateVpcDnsPolicy(vpcName, body),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['vpcs', vpcName, 'dns-policy'] });
+    },
+  });
+}
+
+export function useRecreateVpcDnsPolicy(vpcName: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => recreateVpcDnsPolicy(vpcName),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['vpcs', vpcName, 'dns-policy'] });
     },
   });
 }

@@ -15,16 +15,17 @@ import {
   Route,
   Layers,
   Server,
+  Shield,
   AlertCircle,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes, useVpcDns, useUpdateVpcDns, useRecreateVpcDns } from '../hooks/useVpcs';
+import { useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes, useVpcDns, useUpdateVpcDns, useRecreateVpcDns, useVpcDnsPolicy, useUpdateVpcDnsPolicy, useRecreateVpcDnsPolicy } from '../hooks/useVpcs';
 import { useEgressGateways, useDetachVpc } from '../hooks/useEgressGateways';
 import { ApiError } from '../api/client';
 import { notify } from '../store/notifications';
 import type { VpcRoute, VpcSubnet, UpdateVpcDnsRequest } from '../types/vpc';
 
-type Tab = 'overview' | 'subnets' | 'peerings' | 'routes' | 'dns';
+type Tab = 'overview' | 'subnets' | 'peerings' | 'routes' | 'dns' | 'dns-policy';
 
 const TABS: { id: Tab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { id: 'overview', label: 'Overview', icon: Network },
@@ -32,6 +33,7 @@ const TABS: { id: Tab; label: string; icon: React.ComponentType<{ className?: st
   { id: 'peerings', label: 'Peerings', icon: GitMerge },
   { id: 'routes', label: 'Static Routes', icon: Route },
   { id: 'dns', label: 'DNS', icon: Server },
+  { id: 'dns-policy', label: 'DNS Policy', icon: Shield },
 ];
 
 export default function VPCDetail() {
@@ -167,6 +169,7 @@ export default function VPCDetail() {
       {activeTab === 'peerings' && <PeeringsTab vpc={vpc} />}
       {activeTab === 'routes' && <RoutesTab vpcName={vpc.name} />}
       {activeTab === 'dns' && <DnsTab vpcName={vpc.name} subnets={vpc.subnets} />}
+      {activeTab === 'dns-policy' && <DnsPolicyTab vpcName={vpc.name} />}
 
       {showDeleteModal && (
         <DeleteVpcModal
@@ -813,6 +816,171 @@ function DeleteVpcModal({
           >
             {isDeleting ? 'Deleting...' : 'Delete'}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// DnsPolicyTab — view + edit the per-VPC Kyverno ClusterPolicy that
+// injects VpcDns into pods landing in this VPC's namespaces.
+// ---------------------------------------------------------------------------
+
+function DnsPolicyTab({ vpcName }: { vpcName: string }) {
+  const { data: policy, isLoading, error } = useVpcDnsPolicy(vpcName);
+  const updatePolicy = useUpdateVpcDnsPolicy(vpcName);
+  const recreatePolicy = useRecreateVpcDnsPolicy(vpcName);
+
+  const [draft, setDraft] = useState('');
+  const [parseError, setParseError] = useState<string | null>(null);
+  const [isEditing, setIsEditing] = useState(false);
+
+  // Sync draft when policy loads (and on cancel).
+  useEffect(() => {
+    if (policy) setDraft(JSON.stringify(policy, null, 2));
+  }, [policy]);
+
+  const handleSave = async () => {
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(draft);
+    } catch (e) {
+      setParseError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    setParseError(null);
+    try {
+      await updatePolicy.mutateAsync(parsed);
+      notify.success('DNS policy saved');
+      setIsEditing(false);
+    } catch (e) {
+      notify.error('Failed to save policy', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleRecreate = async () => {
+    try {
+      await recreatePolicy.mutateAsync();
+      notify.success('DNS policy recreated with default body');
+      setIsEditing(false);
+    } catch (e) {
+      notify.error('Failed to recreate policy', e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const handleCancel = () => {
+    if (policy) setDraft(JSON.stringify(policy, null, 2));
+    setParseError(null);
+    setIsEditing(false);
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex justify-center py-8">
+        <div className="w-6 h-6 border-2 border-primary-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (error instanceof ApiError && error.status === 404) {
+    return (
+      <div className="flex flex-col items-center justify-center h-48 text-surface-400">
+        <Shield className="w-10 h-10 mb-3 opacity-50" />
+        <p className="text-sm mb-1">No DNS policy for this VPC</p>
+        <p className="text-xs text-surface-500 mb-4 text-center max-w-md">
+          {error.message || 'Either Kyverno is not installed, or this VPC pre-dates the auto-create.'}
+        </p>
+        <button
+          onClick={handleRecreate}
+          disabled={recreatePolicy.isPending}
+          className="btn-primary text-sm"
+        >
+          {recreatePolicy.isPending ? 'Creating...' : 'Create default policy'}
+        </button>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-48 text-surface-400">
+        <AlertCircle className="w-10 h-10 mb-3 text-red-400 opacity-70" />
+        <p className="text-sm">Failed to load DNS policy</p>
+        <p className="text-xs text-red-400 mt-1">{error.message}</p>
+      </div>
+    );
+  }
+
+  if (!policy) return null;
+
+  return (
+    <div className="space-y-4">
+      <div className="card">
+        <div className="card-body space-y-3">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h3 className="font-medium text-surface-100">Kyverno ClusterPolicy</h3>
+              <p className="text-xs text-surface-500 mt-0.5">
+                Mutates pods in this VPC's namespaces to use the VpcDns VIP as DNS.
+                Created automatically at VPC create; edit only if you know what you're doing.
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              {!isEditing && (
+                <button onClick={() => setIsEditing(true)} className="btn-secondary text-sm">
+                  Edit
+                </button>
+              )}
+              {isEditing && (
+                <>
+                  <button
+                    onClick={handleCancel}
+                    className="btn-secondary text-sm"
+                    disabled={updatePolicy.isPending}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSave}
+                    className="btn-primary text-sm"
+                    disabled={updatePolicy.isPending}
+                  >
+                    {updatePolicy.isPending ? 'Saving...' : 'Save'}
+                  </button>
+                </>
+              )}
+              <button
+                onClick={handleRecreate}
+                disabled={recreatePolicy.isPending || isEditing}
+                className="btn-secondary text-sm"
+                title="Discard current and recreate default policy"
+              >
+                {recreatePolicy.isPending ? 'Recreating...' : 'Recreate default'}
+              </button>
+            </div>
+          </div>
+
+          {parseError && (
+            <div className="flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-xs text-red-400">
+              <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+              <span>JSON parse error: {parseError}</span>
+            </div>
+          )}
+
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            readOnly={!isEditing}
+            spellCheck={false}
+            className={clsx(
+              'w-full h-[600px] font-mono text-xs p-3 rounded-lg border resize-y',
+              isEditing
+                ? 'bg-surface-900 border-surface-700 text-surface-100 focus:border-primary-500 focus:outline-none'
+                : 'bg-surface-950 border-surface-800 text-surface-300 cursor-default',
+            )}
+          />
         </div>
       </div>
     </div>
