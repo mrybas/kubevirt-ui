@@ -152,7 +152,7 @@ class VMFromTemplateRequest(BaseModel):
 async def list_vms(
     request: Request,
     namespace: str | None = None,
-    search: str | None = Query(None, description="Case-insensitive substring filter on display_name"),
+    search: str | None = Query(None, description="Case-insensitive substring filter on display_name and any VM IP (primary + guest-agent interfaces)"),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=200),
     user: User = Depends(require_auth),
@@ -161,9 +161,12 @@ async def list_vms(
     Otherwise, list from all enabled project namespaces the user can access.
 
     When ``search`` is supplied, results are filtered in-memory by a
-    case-insensitive substring match against the display name (falling back to
-    ``metadata.name`` if the display-name annotation is missing). Substring
-    semantics support incremental as-you-type filtering on the frontend.
+    case-insensitive substring match against the display name (falling
+    back to ``metadata.name`` if the display-name annotation is missing)
+    AND every known IP for each VM — the primary ``ip_address`` plus any
+    ``ip_address``/``ip_addresses[]`` reported by the guest agent across
+    all interfaces. Substring semantics support both partial IPs
+    (``"10.198"`` matches the subnet) and as-you-type filtering.
     """
     k8s_client = request.app.state.k8s_client
     vm_cache = request.app.state.vm_cache
@@ -241,11 +244,28 @@ async def list_vms(
             else:
                 vm_responses.extend(result)
 
-        # Case-insensitive substring filter on display_name. Applied before
-        # pagination so total/pages reflect the filtered set.
+        # Case-insensitive substring filter on display_name + every known IP
+        # for the VM (primary ip_address + guest-agent interface IPs).
+        # Applied before pagination so total/pages reflect the filtered set.
         if search:
             needle = search.lower()
-            vm_responses = [v for v in vm_responses if needle in v.display_name.lower()]
+
+            def _matches(v: VMResponse) -> bool:
+                if needle in v.display_name.lower():
+                    return True
+                if v.ip_address and needle in v.ip_address.lower():
+                    return True
+                if v.guest_agent:
+                    for iface in v.guest_agent.interfaces:
+                        ip = iface.get("ip_address")
+                        if ip and needle in ip.lower():
+                            return True
+                        for ip in iface.get("ip_addresses") or []:
+                            if ip and needle in ip.lower():
+                                return True
+                return False
+
+            vm_responses = [v for v in vm_responses if _matches(v)]
 
         total = len(vm_responses)
         start = (page - 1) * per_page

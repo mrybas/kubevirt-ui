@@ -130,7 +130,7 @@ describe('VirtualMachines list – search debouncing', () => {
     renderPage();
 
     // Find the DataTable search input
-    const searchInput = screen.getByPlaceholderText('Search VMs by display name...');
+    const searchInput = screen.getByPlaceholderText('Search VMs by name or IP...');
 
     // Simulate typing — DataTable debounces 300ms then calls handleSearch,
     // which in turn debounces another 300ms before updating debouncedSearch
@@ -153,7 +153,7 @@ describe('VirtualMachines list – search debouncing', () => {
 
   it('does NOT fire backend call before 600ms debounce window', () => {
     renderPage();
-    const searchInput = screen.getByPlaceholderText('Search VMs by display name...');
+    const searchInput = screen.getByPlaceholderText('Search VMs by name or IP...');
 
     const callCountBefore = useVMsMock.mock.calls.length;
     fireEvent.change(searchInput, { target: { value: 'web' } });

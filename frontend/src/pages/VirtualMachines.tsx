@@ -316,7 +316,7 @@ export function VirtualMachines() {
             { label: 'Delete', icon: <Trash2 className="h-4 w-4" />, onClick: (items) => { setBulkSelectedVMs(items as VM[]); setShowBulkDeleteModal(true); }, variant: 'danger' },
           ]}
           searchable
-          searchPlaceholder="Search VMs by display name..."
+          searchPlaceholder="Search VMs by name or IP..."
           onSearch={handleSearch}
           pagination={{
             page,
