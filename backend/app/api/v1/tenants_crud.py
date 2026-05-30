@@ -82,6 +82,7 @@ from app.api.v1.tenants_addons import (
 from app.api.v1.tenants_storage import (
     CSI_KUBECONFIG_SECRET_NAME,
     create_csi_infrastructure_resources,
+    delete_csi_cluster_role_binding,
     replicate_csi_credentials_to_tenant,
 )
 
@@ -869,6 +870,10 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
     #    (2026.05.29). Best-effort: helper logs and swallows per-subnet
     #    failures.
     await _detach_tenant_ns_from_vpc_subnet(k8s, name)
+
+    # 2b. Delete the per-tenant CSI ClusterRoleBinding — cluster-scoped, so
+    #     the ns cascade won't touch it. Best-effort, 404-tolerant.
+    await delete_csi_cluster_role_binding(k8s, name)
 
     # 3. Cascade-delete everything else by removing the tenant ns.
     try:

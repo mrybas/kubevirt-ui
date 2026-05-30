@@ -47,6 +47,10 @@ logger = logging.getLogger(__name__)
 CSI_SA_NAME = "kubevirt-csi"
 CSI_ROLE_NAME = "kubevirt-csi"
 CSI_ROLE_BINDING_NAME = "kubevirt-csi"
+# Cluster-scoped read on PVs — shared single ClusterRole across all
+# tenants; the binding is per-tenant so it can be GC'd on tenant delete
+# (cluster-scoped objects don't cascade with the tenant ns).
+CSI_CLUSTER_ROLE_NAME = "kubevirt-csi-cluster"
 CSI_KUBECONFIG_SECRET_NAME = "infra-cluster-credentials"
 CSI_SA_TOKEN_SECRET_NAME = "kubevirt-csi-token"
 CSI_RESOURCE_QUOTA_NAME = "tenant-storage"
@@ -71,15 +75,20 @@ CSI_TOKEN_POLL_INTERVAL_SEC = 0.5
 
 
 def _csi_role_rules() -> list[dict[str, Any]]:
-    """RBAC rules — mirror upstream kubevirt/csi-driver Role exactly.
+    """Namespaced RBAC for the kubevirt-csi controller (in tenant-<name> ns).
 
-    Source: https://github.com/kubevirt/csi-driver/blob/main/deploy/infra-cluster-service-account.yaml
+    Matches the proven working set verified during the storage-passthrough
+    bring-up (see csi-path/kubevirt-csi-manifests/01-infra-sa.yaml): the
+    driver lists/watches the DataVolumes + PVCs it manages, gets/lists VMs
+    & VMIs to map nodes, and updates the addvolume/removevolume
+    subresources to hotplug disks. Cluster-scoped `persistentvolumes: get`
+    lives in a separate ClusterRole (see _ensure_cluster_role).
     """
     return [
         {
             "apiGroups": ["cdi.kubevirt.io"],
             "resources": ["datavolumes"],
-            "verbs": ["get", "create", "delete"],
+            "verbs": ["get", "create", "delete", "list", "watch"],
         },
         {
             "apiGroups": ["kubevirt.io"],
@@ -99,17 +108,7 @@ def _csi_role_rules() -> list[dict[str, Any]]:
         {
             "apiGroups": [""],
             "resources": ["persistentvolumeclaims"],
-            "verbs": ["get", "patch"],
-        },
-        {
-            # Pod read — used by the kubevirt-csi controller to find the
-            # virt-launcher pod hosting the worker VMI when hotplugging.
-            # Upstream doesn't require this in the namespaced Role (they
-            # read VMIs instead) but it's harmless and matches what the
-            # team-lead asked for in the T3 spec.
-            "apiGroups": [""],
-            "resources": ["pods"],
-            "verbs": ["get", "list"],
+            "verbs": ["get", "list", "watch", "patch"],
         },
     ]
 
@@ -275,6 +274,84 @@ async def _ensure_role_binding(rbac_api, ns: str, tenant_name: str) -> None:
             raise
 
 
+def _csi_cluster_binding_name(tenant_name: str) -> str:
+    return f"kubevirt-csi-cluster-binding-{tenant_name}"
+
+
+async def _ensure_cluster_role(rbac_api) -> None:
+    """Shared ClusterRole granting `persistentvolumes: get` to the driver.
+
+    The kubevirt-csi controller reads PV objects (cluster-scoped) to map a
+    tenant PV to its backing infra DataVolume. One ClusterRole serves all
+    tenants; per-tenant bindings attach each tenant's SA to it.
+    """
+    rules = [client.V1PolicyRule(
+        api_groups=[""], resources=["persistentvolumes"], verbs=["get"],
+    )]
+    metadata = client.V1ObjectMeta(
+        name=CSI_CLUSTER_ROLE_NAME,
+        labels={"kubevirt-ui.io/managed": "true", "kubevirt-ui.io/role": "csi-infra"},
+    )
+    try:
+        existing = await rbac_api.read_cluster_role(name=CSI_CLUSTER_ROLE_NAME)
+        existing.rules = rules
+        await rbac_api.replace_cluster_role(name=CSI_CLUSTER_ROLE_NAME, body=existing)
+        return
+    except ApiException as e:
+        if e.status != 404:
+            raise
+    body = client.V1ClusterRole(metadata=metadata, rules=rules)
+    try:
+        await rbac_api.create_cluster_role(body=body)
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+
+async def _ensure_cluster_role_binding(rbac_api, ns: str, tenant_name: str) -> None:
+    """Per-tenant ClusterRoleBinding: tenant SA → shared CSI ClusterRole."""
+    name = _csi_cluster_binding_name(tenant_name)
+    metadata = client.V1ObjectMeta(
+        name=name,
+        labels={
+            "kubevirt-ui.io/managed": "true",
+            "kubevirt-ui.io/tenant": tenant_name,
+            "kubevirt-ui.io/role": "csi-infra",
+        },
+    )
+    body = client.V1ClusterRoleBinding(
+        metadata=metadata,
+        role_ref=client.V1RoleRef(
+            api_group="rbac.authorization.k8s.io",
+            kind="ClusterRole",
+            name=CSI_CLUSTER_ROLE_NAME,
+        ),
+        subjects=[client.RbacV1Subject(
+            kind="ServiceAccount", name=CSI_SA_NAME, namespace=ns,
+        )],
+    )
+    try:
+        await rbac_api.create_cluster_role_binding(body=body)
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+
+async def delete_csi_cluster_role_binding(k8s, tenant_name: str) -> None:
+    """Delete the per-tenant CSI ClusterRoleBinding (cluster-scoped → no
+    cascade with the tenant ns). Best-effort; 404 tolerated. Called from
+    tenant teardown."""
+    rbac_api = client.RbacAuthorizationV1Api(k8s._api_client)
+    name = _csi_cluster_binding_name(tenant_name)
+    try:
+        await rbac_api.delete_cluster_role_binding(name=name)
+    except ApiException as e:
+        if e.status != 404:
+            logger.warning(
+                f"Failed to delete CSI ClusterRoleBinding {name!r}: {e}"
+            )
+
+
 async def _ensure_sa_token_secret(core_api, ns: str, tenant_name: str) -> str:
     """Create (idempotently) a non-expiring SA-token Secret and return token.
 
@@ -431,10 +508,14 @@ async def create_csi_infrastructure_resources(
     rbac_api = client.RbacAuthorizationV1Api(k8s._api_client)
 
     # 1+2+3. SA / Role / RoleBinding (must be created in this order so the
-    # SA exists before TokenRequest, and the binding has a target Role).
+    # SA exists before the token Secret, and the binding has a target Role).
     await _ensure_service_account(core_api, ns, req.name)
     await _ensure_role(rbac_api, ns, req.name)
     await _ensure_role_binding(rbac_api, ns, req.name)
+
+    # 3b. Cluster-scoped PV read (shared ClusterRole + per-tenant binding).
+    await _ensure_cluster_role(rbac_api)
+    await _ensure_cluster_role_binding(rbac_api, ns, req.name)
 
     # 4. Ensure a non-expiring SA-token Secret and read the token. Stable
     #    across re-runs (Secret persists with the tenant ns).
