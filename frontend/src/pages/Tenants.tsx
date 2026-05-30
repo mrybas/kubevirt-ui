@@ -91,6 +91,7 @@ interface WizardState {
   worker_network_binding: 'bridge' | 'masquerade'; // T11
   pod_cidr: string;
   service_cidr: string;
+  enable_oidc: boolean;
   admin_group: string;
   viewer_group: string;
   // T8 — folder / environment
@@ -122,6 +123,7 @@ const defaultWizard: WizardState = {
   worker_network_binding: 'bridge',
   pod_cidr: '10.244.0.0/16',
   service_cidr: '10.96.0.0/12',
+  enable_oidc: true,
   admin_group: '',
   viewer_group: '',
   folder: '',
@@ -258,8 +260,14 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
       worker_disk: form.worker_disk,
       pod_cidr: form.pod_cidr,
       service_cidr: form.service_cidr,
-      admin_group: form.admin_group,
-      viewer_group: form.viewer_group,
+      enable_oidc: form.enable_oidc,
+      // Group bindings only ride along when OIDC is on — without it the
+      // tenant apiserver has no notion of "groups" claim, the strings
+      // would never bind to anything.
+      ...(form.enable_oidc ? {
+        admin_group: form.admin_group,
+        viewer_group: form.viewer_group,
+      } : { admin_group: '', viewer_group: '' }),
       // T8: folder / environment
       ...(form.folder ? { folder: form.folder } : {}),
       ...(form.environment ? { environment: form.environment } : {}),
@@ -426,35 +434,63 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                 </div>
               </div>
 
-              {/* RBAC — DEX group mapping */}
+              {/* OIDC / RBAC */}
               <div className="pt-2 border-t border-surface-700/50 space-y-4">
-                <p className="text-xs font-semibold text-surface-400 uppercase tracking-wider">OIDC / RBAC Access</p>
-                <p className="text-xs text-surface-500">
-                  Map DEX groups to Kubernetes RBAC roles inside the tenant cluster.
-                  Leave empty to skip RBAC setup.
-                </p>
-                <div className="grid grid-cols-2 gap-4">
+                <div className="flex items-center justify-between">
                   <div>
-                    <label className="block text-sm text-surface-300 mb-1">Admin Group (cluster-admin)</label>
-                    <input
-                      type="text"
-                      value={form.admin_group}
-                      placeholder="e.g. tenant-admins"
-                      onChange={e => setForm({ ...form, admin_group: e.target.value })}
-                      className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 placeholder-surface-600"
-                    />
+                    <p className="text-xs font-semibold text-surface-400 uppercase tracking-wider">OIDC Authentication</p>
+                    <p className="text-xs text-surface-500 mt-1">
+                      Configure tenant apiserver to trust this cluster's Dex.
+                      Disable if Dex isn't reachable from the apiserver pod yet.
+                    </p>
                   </div>
-                  <div>
-                    <label className="block text-sm text-surface-300 mb-1">Viewer Group (view)</label>
-                    <input
-                      type="text"
-                      value={form.viewer_group}
-                      placeholder="e.g. tenant-viewers"
-                      onChange={e => setForm({ ...form, viewer_group: e.target.value })}
-                      className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 placeholder-surface-600"
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={form.enable_oidc}
+                    onClick={() => setForm({ ...form, enable_oidc: !form.enable_oidc })}
+                    className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
+                      form.enable_oidc ? 'bg-primary-600' : 'bg-surface-600'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        form.enable_oidc ? 'translate-x-6' : 'translate-x-1'
+                      }`}
                     />
-                  </div>
+                  </button>
                 </div>
+
+                {form.enable_oidc && (
+                  <>
+                    <p className="text-xs text-surface-500">
+                      Map DEX groups to Kubernetes RBAC roles inside the tenant cluster.
+                      Leave empty to skip RBAC setup.
+                    </p>
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-sm text-surface-300 mb-1">Admin Group (cluster-admin)</label>
+                        <input
+                          type="text"
+                          value={form.admin_group}
+                          placeholder="e.g. tenant-admins"
+                          onChange={e => setForm({ ...form, admin_group: e.target.value })}
+                          className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 placeholder-surface-600"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-sm text-surface-300 mb-1">Viewer Group (view)</label>
+                        <input
+                          type="text"
+                          value={form.viewer_group}
+                          placeholder="e.g. tenant-viewers"
+                          onChange={e => setForm({ ...form, viewer_group: e.target.value })}
+                          className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 focus:outline-none focus:border-primary-500 placeholder-surface-600"
+                        />
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
 
               {/* Advanced CIDR — collapsible */}
@@ -1203,13 +1239,17 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                           <span className="text-surface-200">Masquerade</span>
                         </>
                       )}
-                      {form.admin_group && (
+                      <span className="text-surface-500">OIDC</span>
+                      <span className={form.enable_oidc ? 'text-emerald-400' : 'text-surface-400'}>
+                        {form.enable_oidc ? 'Enabled' : 'Disabled'}
+                      </span>
+                      {form.enable_oidc && form.admin_group && (
                         <>
                           <span className="text-surface-500">Admin Group</span>
                           <span className="text-surface-200">{form.admin_group}</span>
                         </>
                       )}
-                      {form.viewer_group && (
+                      {form.enable_oidc && form.viewer_group && (
                         <>
                           <span className="text-surface-500">Viewer Group</span>
                           <span className="text-surface-200">{form.viewer_group}</span>

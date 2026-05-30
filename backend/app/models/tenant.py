@@ -127,6 +127,12 @@ class TenantCreateRequest(BaseModel):
 
     pod_cidr: str = "10.244.0.0/16"
     service_cidr: str = "10.96.0.0/12"
+    # When True, tenant apiserver is configured with --oidc-* flags so
+    # users can authenticate via the host Dex / kubelogin. When False,
+    # tenant apiserver has no OIDC integration (admin kubeconfig with
+    # certs is the only access path, group-based RBAC bindings are
+    # ignored). Defaults to True for dev convenience.
+    enable_oidc: bool = True
     admin_group: str = ""  # DEX group → cluster-admin in tenant
     viewer_group: str = ""  # DEX group → view role in tenant
 

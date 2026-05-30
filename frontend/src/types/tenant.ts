@@ -49,6 +49,7 @@ export interface TenantCreateRequest {
   worker_disk: string;
   pod_cidr: string;
   service_cidr: string;
+  enable_oidc?: boolean;
   admin_group: string;
   viewer_group: string;
   // Folder / environment binding (T8 — confirmed field names from backend T1)

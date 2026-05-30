@@ -153,7 +153,13 @@ def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
     required. See decision memo: ``tcp-konnectivity-decision.md``.
     """
     apiserver_extra_args: list[str] = []
-    if OIDC_ISSUER and OIDC_ISSUER.startswith("https://"):
+    # OIDC injection is gated by req.enable_oidc (per-tenant toggle) AND
+    # a valid cluster-wide OIDC_ISSUER. When the tenant opts out, the
+    # apiserver runs without any --oidc-* flags — no Dex round-trips at
+    # all. Useful while the cluster's Dex isn't reachable from inside
+    # the cluster (MetalLB-only routing) or its TLS cert isn't trusted
+    # by the apiserver pod (self-signed Traefik).
+    if req.enable_oidc and OIDC_ISSUER and OIDC_ISSUER.startswith("https://"):
         apiserver_extra_args += [
             f"--oidc-issuer-url={OIDC_ISSUER}",
             f"--oidc-client-id={OIDC_CLIENT_ID}",
