@@ -413,49 +413,43 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
     }
 
 
-_TENANT_WORKER_PUBLIC_FALLBACK_DNS = ["1.1.1.1", "8.8.8.8"]
-_TENANT_WORKER_DNS_SEARCH = ["cluster.local", "svc.cluster.local"]
+_TENANT_WORKER_PRIMARY_DNS = "1.1.1.1"
+_TENANT_WORKER_FALLBACK_DNS = "8.8.8.8"
 
 
 def _resolve_worker_dns(req: TenantCreateRequest) -> list[str]:
-    """Compute the DNS server list to write into worker /etc/resolv.conf.
+    """Compute the DNS server list to write into worker guest /etc/resolv.conf.
 
-    The primary server depends on VPC placement:
-      - default overlay (vpc_name is None) → cluster CoreDNS ClusterIP.
-      - custom VPC                          → per-VPC VpcDns VIP. (forward
-        compat: VPC for tenants is currently disabled in UI, but the
-        backend keeps the branch live.)
+    These are the servers the worker VM's guest OS uses to resolve internet
+    hostnames (image pulls, package installs, cloud-init payloads). NOT the
+    same as kubelet `--cluster-dns` which kubeadm sets to the tenant's own
+    CoreDNS ClusterIP for in-cluster service resolution by pods running on
+    this worker.
+
+    Default primary is a public resolver (Cloudflare 1.1.1.1). The host or
+    tenant cluster CoreDNS would be useless here — host's only knows host's
+    `cluster.local`, tenant's resolves through its own apiserver which the
+    worker can't reach until after kubeadm join.
 
     Modes:
       - "append":   primary + dns_servers + public_fallback (when enabled)
       - "override": dns_servers only (primary used as safety net if empty)
     """
-    if req.vpc_name:
-        try:
-            primary = [_vpcdns_vip()]
-        except Exception:
-            primary = ["10.96.0.10"]
-    else:
-        primary = ["10.96.0.10"]
-
     custom = [s.strip() for s in (req.dns_servers or []) if s.strip()]
 
     if req.dns_mode == "override":
-        return custom or primary
+        return custom or [_TENANT_WORKER_PRIMARY_DNS]
     # append mode
-    out = primary + custom
+    out = [_TENANT_WORKER_PRIMARY_DNS] + custom
     if req.dns_include_public_fallback:
-        out += _TENANT_WORKER_PUBLIC_FALLBACK_DNS
+        out.append(_TENANT_WORKER_FALLBACK_DNS)
     return out
 
 
 def _build_worker_resolv_conf(req: TenantCreateRequest) -> str:
     """Render `/etc/resolv.conf` content for tenant worker guest VMs."""
     dns_list = _resolve_worker_dns(req)
-    lines = [f"nameserver {ip}" for ip in dns_list]
-    lines.append("search " + " ".join(_TENANT_WORKER_DNS_SEARCH))
-    lines.append("options ndots:5")
-    return "\n".join(lines) + "\n"
+    return "\n".join(f"nameserver {ip}" for ip in dns_list) + "\n"
 
 
 def _build_kubeadm_config_template_cr(
@@ -471,7 +465,22 @@ def _build_kubeadm_config_template_cr(
     Tenant ns is now bound to the folder VPC directly (TCP + workers share
     one subnet), so ClusterIP traffic just works and the DNAT hack is gone.
     """
+    # Compute /etc/resolv.conf content once so we can write it with a
+    # heredoc that survives DHCP / systemd-resolved rewrites.
+    resolv_lines = [f"nameserver {ip}" for ip in _resolve_worker_dns(req)]
+    resolv_heredoc = "\\n".join(resolv_lines)
+
     pre_commands = [
+        # --- DNS: bulletproof override ----------------------------------
+        # CAPK container-disk images may have /etc/resolv.conf as a symlink
+        # to /run/systemd/resolve/stub-resolv.conf, in which case chattr +i
+        # on the symlink doesn't make the target immutable. Remove the
+        # symlink, write a regular file with our nameservers, then lock it.
+        # systemd-resolved / netplan / DHCP renewals subsequently fail with
+        # EPERM and our list stays put.
+        "rm -f /etc/resolv.conf",
+        f"printf '{resolv_heredoc}\\n' > /etc/resolv.conf",
+        "chattr +i /etc/resolv.conf",
         # --- Storage: mount emptyDisk (/dev/vdb) for containerd + kubelet ---
         # ContainerDisk overlay reports 0 capacity → kubelet InvalidDiskCapacity.
         "systemctl mask kubelet",
@@ -493,12 +502,6 @@ def _build_kubeadm_config_template_cr(
         # Install a systemd drop-in that strips unknown fields before kubelet starts.
         # systemd daemon-reload to pick up kubelet config fix drop-in (written via files)
         "systemctl daemon-reload",
-        # --- DNS: lock /etc/resolv.conf so DHCP renewals don't overwrite it.
-        # `write_files` below put our list into the file; CAPK container-disk
-        # images don't reliably honour DHCP-supplied DNS (netplan defaults),
-        # so we go with the heavy hammer: chattr +i prevents systemd-resolved
-        # / NetworkManager / netplan from touching it.
-        "chattr +i /etc/resolv.conf",
     ]
 
     return {

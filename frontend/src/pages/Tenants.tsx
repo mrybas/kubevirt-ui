@@ -1208,18 +1208,17 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                   <div>
                     <h3 className="text-sm font-semibold text-surface-200">Worker DNS</h3>
                     <p className="text-xs text-surface-500 mt-0.5">
-                      Injected into the worker VM's <code>/etc/resolv.conf</code> via cloud-init.
-                      Needed because CAPK images don't reliably pick up DHCP-supplied DNS.
+                      For the worker VM's <strong>guest OS</strong> — image pulls,
+                      package installs, cloud-init. <strong>Not</strong> for in-cluster
+                      service resolution (that's handled by tenant CoreDNS via
+                      kubelet <code>--cluster-dns</code>).
                     </p>
                   </div>
 
                   <div className="p-2.5 rounded-md bg-surface-800/50 border border-surface-700/50">
-                    <p className="text-[11px] uppercase tracking-wider text-surface-500 mb-1">Default for this tenant</p>
-                    <code className="text-xs text-primary-300 font-mono">
-                      {/* will switch to VpcDns VIP when custom VPC is selected — currently always cluster CoreDNS */}
-                      10.96.0.10
-                    </code>
-                    <span className="ml-2 text-[10px] text-surface-500">cluster CoreDNS</span>
+                    <p className="text-[11px] uppercase tracking-wider text-surface-500 mb-1">Default primary</p>
+                    <code className="text-xs text-primary-300 font-mono">1.1.1.1</code>
+                    <span className="ml-2 text-[10px] text-surface-500">Cloudflare public DNS</span>
                   </div>
 
                   <div>
@@ -1278,8 +1277,8 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                     <span className="text-xs">
                       <span className="text-surface-200">Include public fallback DNS</span>
                       <span className="text-surface-500">
-                        {' '}— appends 1.1.1.1 and 8.8.8.8 to the end of the list so DNS
-                        keeps working if cluster CoreDNS becomes unreachable. Disable for
+                        {' '}— appends <code>8.8.8.8</code> (Google) to the end so the worker
+                        still resolves names if Cloudflare is unreachable. Disable for
                         air-gapped clusters or to enforce corporate-only DNS.
                       </span>
                     </span>
