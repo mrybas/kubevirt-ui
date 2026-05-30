@@ -32,7 +32,7 @@ import logging
 from typing import Any
 
 import yaml
-from kubernetes_asyncio import client
+from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client import ApiException
 
 from app.core.kube_api_url import discover_external_api_url
@@ -49,6 +49,13 @@ CSI_ROLE_BINDING_NAME = "kubevirt-csi"
 CSI_KUBECONFIG_SECRET_NAME = "infra-cluster-credentials"
 CSI_SA_TOKEN_SECRET_NAME = "kubevirt-csi-token"
 CSI_RESOURCE_QUOTA_NAME = "tenant-storage"
+
+# Namespace inside the TENANT cluster where the kubevirt-csi-driver chart
+# is released (matches the bootstrap component's `namespace:` field). The
+# controller pod mounts `infra-cluster-credentials` from here, so the
+# host-side secret must be replicated into this tenant ns. kube-system
+# always exists → no namespace creation needed.
+TENANT_DRIVER_NAMESPACE = "kube-system"
 
 # The CSI controller in the tenant has no token-refresh path, so we use a
 # legacy non-expiring ServiceAccount-token Secret (type
@@ -468,3 +475,107 @@ async def create_csi_infrastructure_resources(
         # field. Tenant SC selection happens in the kubevirt-csi-driver
         # HelmRelease values via the INFRA_STORAGE_CLASS_NAME addon param.
     }
+
+
+async def _build_tenant_core_api(k8s, tenant_name: str):
+    """Build a CoreV1Api talking to the tenant cluster, or None if not ready.
+
+    Uses the in-cluster-reachable `super-admin.svc` kubeconfig from the
+    Kamaji `<tenant>-admin-kubeconfig` secret (points at the TCP Service,
+    reachable from the backend pod in the host cluster). Caller must close
+    the returned client's `api_client`.
+    """
+    ns = _tenant_ns(tenant_name)
+    try:
+        sec = await k8s.core_api.read_namespaced_secret(
+            name=f"{tenant_name}-admin-kubeconfig", namespace=ns,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    data = sec.data or {}
+    # Prefer the in-cluster Service endpoint; the external (ingress) variants
+    # may not be routable from the backend pod.
+    raw = data.get("super-admin.svc") or data.get("admin.svc")
+    if not raw:
+        return None
+    try:
+        kc_dict = yaml.safe_load(base64.b64decode(raw).decode("utf-8"))
+        api_client = await config.new_client_from_config_dict(kc_dict)
+    except Exception as e:  # malformed kubeconfig / unreachable
+        logger.warning(
+            f"Could not build tenant client for {tenant_name!r}: {e}"
+        )
+        return None
+    return client.CoreV1Api(api_client)
+
+
+async def replicate_csi_credentials_to_tenant(k8s, tenant_name: str) -> bool:
+    """Copy `infra-cluster-credentials` into the tenant cluster kube-system ns.
+
+    The CSI controller pod runs in the tenant and mounts this secret to talk
+    to the host apiserver. The host-side copy (created by
+    `create_csi_infrastructure_resources`) is consumed by CAPK; this is the
+    second consumer, in a different cluster.
+
+    Idempotent and re-runnable (create→409→replace). Returns True on success,
+    False when the tenant isn't reachable yet (cold control plane) — callers
+    treat that as non-fatal and retry from the storage-reconcile path.
+    """
+    ns = _tenant_ns(tenant_name)
+    try:
+        infra_sec = await k8s.core_api.read_namespaced_secret(
+            name=CSI_KUBECONFIG_SECRET_NAME, namespace=ns,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            logger.warning(
+                f"Cannot replicate CSI creds for {tenant_name!r}: host-side "
+                f"secret {CSI_KUBECONFIG_SECRET_NAME!r} missing in {ns!r}"
+            )
+            return False
+        raise
+    payload = (infra_sec.data or {}).get("kubeconfig")
+    if not payload:
+        return False
+
+    tenant_core = await _build_tenant_core_api(k8s, tenant_name)
+    if tenant_core is None:
+        logger.info(
+            f"Tenant {tenant_name!r} not reachable yet — deferring CSI "
+            "credential replication to the storage-reconcile path"
+        )
+        return False
+
+    try:
+        metadata = client.V1ObjectMeta(
+            name=CSI_KUBECONFIG_SECRET_NAME,
+            namespace=TENANT_DRIVER_NAMESPACE,
+            labels={"kubevirt-ui.io/managed": "true"},
+        )
+        body = client.V1Secret(
+            metadata=metadata, type="Opaque", data={"kubeconfig": payload},
+        )
+        try:
+            await tenant_core.create_namespaced_secret(
+                namespace=TENANT_DRIVER_NAMESPACE, body=body,
+            )
+        except ApiException as e:
+            if e.status != 409:
+                raise
+            existing = await tenant_core.read_namespaced_secret(
+                name=CSI_KUBECONFIG_SECRET_NAME, namespace=TENANT_DRIVER_NAMESPACE,
+            )
+            existing.data = {"kubeconfig": payload}
+            await tenant_core.replace_namespaced_secret(
+                name=CSI_KUBECONFIG_SECRET_NAME,
+                namespace=TENANT_DRIVER_NAMESPACE, body=existing,
+            )
+        logger.info(
+            f"Replicated {CSI_KUBECONFIG_SECRET_NAME!r} into tenant "
+            f"{tenant_name!r} ns {TENANT_DRIVER_NAMESPACE!r}"
+        )
+        return True
+    finally:
+        await tenant_core.api_client.close()

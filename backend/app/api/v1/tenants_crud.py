@@ -82,6 +82,7 @@ from app.api.v1.tenants_addons import (
 from app.api.v1.tenants_storage import (
     CSI_KUBECONFIG_SECRET_NAME,
     create_csi_infrastructure_resources,
+    replicate_csi_credentials_to_tenant,
 )
 
 # Addon ID for the tenant-CP CSI driver — must match the catalog entry
@@ -724,6 +725,26 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         if all_addons and catalog.git_repository_ref:
             await _create_addon_resources(k8s, req.name, all_addons, catalog)
 
+        # Best-effort: push the infra-cluster-credentials secret into the
+        # tenant cluster so the CSI controller can mount it. At create time
+        # the tenant control plane is usually still cold, so this typically
+        # defers to the storage-reconcile path (POST .../storage/reconcile)
+        # — hence we swallow failures and never block tenant create.
+        if req.enable_storage:
+            try:
+                ok = await replicate_csi_credentials_to_tenant(k8s, req.name)
+                if not ok:
+                    logger.info(
+                        f"Tenant {req.name!r}: CSI credential replication "
+                        "deferred (control plane not reachable yet); run "
+                        "POST /tenants/{name}/storage/reconcile once it's up."
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"Tenant {req.name!r}: CSI credential replication "
+                    f"errored (non-fatal): {exc}"
+                )
+
         # Return initial status
         return TenantResponse(
             name=req.name,
@@ -885,6 +906,38 @@ async def scale_tenant(
         raise k8s_error_to_http(e, "tenant operation")
 
     return await get_tenant(request, name)
+
+
+@router.post("/{name}/storage/reconcile")
+async def reconcile_tenant_storage(
+    request: Request, name: str, user: User = Depends(require_auth),
+) -> dict[str, Any]:
+    """Finish CSI passthrough wiring — re-runnable repair path.
+
+    The host-side resources (SA, RBAC, non-expiring token, kubeconfig
+    secret, quota) are created once at tenant-create; this endpoint
+    replicates the infra-cluster-credentials secret into the tenant
+    cluster, which needs the tenant control plane reachable. That's often
+    not the case at create time, so calling this once the tenant is up
+    finishes the wiring. Idempotent — safe to call repeatedly.
+    """
+    k8s = request.app.state.k8s_client
+    ns = _tenant_ns(name)
+    if not await _namespace_exists(k8s, ns):
+        raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
+
+    replicated = await replicate_csi_credentials_to_tenant(k8s, name)
+    return {
+        "tenant": name,
+        "credentials_replicated": replicated,
+        "detail": (
+            "Storage wiring complete."
+            if replicated
+            else "Tenant control plane not reachable yet, or host-side CSI "
+                 "secret missing — ensure storage was enabled at create and "
+                 "re-run once the tenant is up."
+        ),
+    }
 
 
 @router.get("/{name}/kubeconfig", response_model=TenantKubeconfigResponse)
