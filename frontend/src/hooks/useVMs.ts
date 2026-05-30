@@ -71,6 +71,29 @@ export function useUpdateVMDisplayName() {
   });
 }
 
+export function useVMCloudInit(namespace: string, name: string) {
+  return useQuery({
+    queryKey: ['vm', namespace, name, 'cloud-init'],
+    queryFn: () => vmApi.getVMCloudInit(namespace, name),
+    enabled: !!namespace && !!name,
+    retry: (failureCount, error) => {
+      if (error instanceof Error && (error as { status?: number }).status === 404) return false;
+      return failureCount < 3;
+    },
+  });
+}
+
+export function useUpdateVMCloudInit() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ namespace, name, user_data }: { namespace: string; name: string; user_data: string }) =>
+      vmApi.updateVMCloudInit(namespace, name, user_data),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['vm', variables.namespace, variables.name, 'cloud-init'] });
+    },
+  });
+}
+
 export function useDeleteVM() {
   const queryClient = useQueryClient();
 

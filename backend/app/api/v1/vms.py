@@ -22,9 +22,11 @@ from app.core.naming import (
 )
 from app.api.v1.cluster import get_cluster_settings
 from app.models.vm import (
+    VMCloudInitResponse,
     VMCreateRequest,
     VMListResponse,
     VMResponse,
+    VMUpdateCloudInitRequest,
     VMUpdateDisplayNameRequest,
     VMUpdateRequest,
     vm_from_k8s,
@@ -575,6 +577,145 @@ async def update_vm_display_name(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update display name: {e.reason}",
         ) from e
+
+
+# ---------------------------------------------------------------------------
+# Cloud-init editor — view + replace inline userData on an existing VM.
+# Edit applies to spec.template.spec.volumes[name=...].cloudInitNoCloud
+# (or cloudInitConfigDrive). Changes only take effect on next VMI start,
+# so the response carries a `note` field the UI surfaces.
+# ---------------------------------------------------------------------------
+
+
+def _find_cloud_init_volume(vm: dict[str, Any]) -> tuple[int, str, dict[str, Any]] | None:
+    """Return (index, ci_field_name, ci_dict) of the first cloud-init volume,
+    or None if the VM has none. `ci_field_name` is `cloudInitNoCloud` or
+    `cloudInitConfigDrive`.
+    """
+    volumes = (((vm.get("spec") or {}).get("template") or {}).get("spec") or {}).get("volumes") or []
+    for i, vol in enumerate(volumes):
+        for field in ("cloudInitNoCloud", "cloudInitConfigDrive"):
+            if field in vol:
+                return i, field, vol[field]
+    return None
+
+
+@router.get("/{name}/cloud-init", response_model=VMCloudInitResponse)
+async def get_vm_cloud_init(
+    request: Request,
+    namespace: str,
+    name: str,
+    user: User = Depends(require_env_viewer()),
+) -> VMCloudInitResponse:
+    """Return the current inline cloud-init userData for a VM.
+
+    404 when the VM exists but has no cloud-init volume. `editable=False`
+    + `source="secret"` when userData comes from `userDataSecretRef`
+    (this UI doesn't edit Secrets in place — admin must edit the Secret).
+    """
+    k8s_client = request.app.state.k8s_client
+    try:
+        vm = await k8s_client.get_virtual_machine(name=name, namespace=namespace)
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=404, detail=f"VM {name} not found")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    found = _find_cloud_init_volume(vm)
+    if not found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"VM {name} has no cloud-init volume — nothing to edit.",
+        )
+    _, _, ci = found
+    volume_name = (((vm.get("spec") or {}).get("template") or {}).get("spec") or {}).get("volumes", [{}])[found[0]].get("name") or ""
+
+    if "userDataSecretRef" in ci:
+        return VMCloudInitResponse(
+            volume_name=volume_name, user_data=None,
+            editable=False, source="secret",
+            note="userData lives in a Secret — edit the Secret directly.",
+        )
+    if "userDataBase64" in ci and "userData" not in ci:
+        import base64
+        try:
+            decoded = base64.b64decode(ci["userDataBase64"]).decode("utf-8")
+        except Exception:
+            decoded = None
+        return VMCloudInitResponse(
+            volume_name=volume_name, user_data=decoded,
+            editable=True, source="base64",
+        )
+    return VMCloudInitResponse(
+        volume_name=volume_name, user_data=ci.get("userData"),
+        editable=True, source="inline",
+    )
+
+
+@router.put("/{name}/cloud-init", response_model=VMCloudInitResponse)
+async def update_vm_cloud_init(
+    request: Request,
+    namespace: str,
+    name: str,
+    update: VMUpdateCloudInitRequest,
+    user: User = Depends(require_env_member()),
+) -> VMCloudInitResponse:
+    """Replace the VM's inline cloud-init userData.
+
+    Effective on next VMI start — admin must stop/start the VM. We
+    deliberately do NOT auto-restart: cloud-init only runs at first boot
+    by default (instance-id cached) so a restart alone wouldn't re-run
+    most modules anyway.
+
+    Secret-backed userData (`userDataSecretRef`) is rejected with 400 —
+    this UI doesn't edit Secrets in place. Same for unknown shapes.
+    """
+    k8s_client = request.app.state.k8s_client
+    try:
+        vm = await k8s_client.get_virtual_machine(name=name, namespace=namespace)
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=404, detail=f"VM {name} not found")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    found = _find_cloud_init_volume(vm)
+    if not found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"VM {name} has no cloud-init volume — nothing to edit.",
+        )
+    idx, ci_field, ci = found
+    if "userDataSecretRef" in ci:
+        raise HTTPException(
+            status_code=400,
+            detail="userData lives in a Secret — edit the Secret directly.",
+        )
+
+    volumes = list(((vm.get("spec") or {}).get("template") or {}).get("spec", {}).get("volumes") or [])
+    new_ci = dict(ci)
+    new_ci["userData"] = update.user_data
+    # If the VM had only base64, drop it so the two don't disagree.
+    new_ci.pop("userDataBase64", None)
+    volumes[idx] = {**volumes[idx], ci_field: new_ci}
+
+    patch = {"spec": {"template": {"spec": {"volumes": volumes}}}}
+    try:
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        await custom_api.patch_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines",
+            name=name, body=patch,
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update cloud-init: {e.reason}") from e
+
+    logger.info(f"User {user.username} updated cloud-init for VM {namespace}/{name}")
+    volume_name = volumes[idx].get("name") or ""
+    return VMCloudInitResponse(
+        volume_name=volume_name, user_data=update.user_data,
+        editable=True, source="inline",
+    )
 
 
 @router.post("", response_model=VMResponse, status_code=status.HTTP_201_CREATED)

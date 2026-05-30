@@ -28,17 +28,18 @@ import {
   CalendarClock,
   MoreVertical,
   RefreshCw,
+  FileText,
 } from 'lucide-react';
 import { useVM, useStartVM, useStopVM, useRestartVM, useMigrateVM, useVMYaml, useUpdateVM, useDeleteVM, useRecreateVM, useCloneVM, useResizeVM, useUpdateVMDisplayName } from '@/hooks/useVMs';
 import { useBreadcrumbOverride } from '@/contexts/BreadcrumbContext';
 import { StatusBadge } from '@/components/common/StatusBadge';
 import VMMetricsPanel from '@/components/charts/VMMetricsPanel';
-import { OverviewTab, ConsoleTab, DisksTab, NetworkTab, EventsTab, YamlTab, SnapshotsTab, ScheduleTab } from '@/components/vm/tabs';
+import { OverviewTab, ConsoleTab, DisksTab, NetworkTab, EventsTab, YamlTab, SnapshotsTab, ScheduleTab, CloudInitTab } from '@/components/vm/tabs';
 import { EditVMModal } from '@/components/vm/EditVMModal';
 import { MigrateVMModal } from '@/components/vm/MigrateVMModal';
 import { ConfirmDeleteModal } from '@/components/common/ConfirmDeleteModal';
 
-type TabId = 'overview' | 'monitoring' | 'console' | 'disks' | 'snapshots' | 'network' | 'schedule' | 'events' | 'yaml';
+type TabId = 'overview' | 'monitoring' | 'console' | 'disks' | 'snapshots' | 'network' | 'schedule' | 'cloud-init' | 'events' | 'yaml';
 
 const tabs: { id: TabId; label: string; icon: typeof Activity }[] = [
   { id: 'overview', label: 'Overview', icon: Activity },
@@ -48,6 +49,7 @@ const tabs: { id: TabId; label: string; icon: typeof Activity }[] = [
   { id: 'snapshots', label: 'Snapshots', icon: Camera },
   { id: 'network', label: 'Network', icon: Network },
   { id: 'schedule', label: 'Schedule', icon: CalendarClock },
+  { id: 'cloud-init', label: 'Cloud-init', icon: FileText },
   { id: 'events', label: 'Events', icon: Clock },
   { id: 'yaml', label: 'YAML', icon: FileCode },
 ];
@@ -671,6 +673,10 @@ export function VMDetail() {
           <ScheduleTab vm={vm} />
         )}
         
+        {activeTab === 'cloud-init' && (
+          <CloudInitTab namespace={vm.namespace} name={vm.name} />
+        )}
+
         {activeTab === 'events' && (
           <EventsTab namespace={vm.namespace} name={vm.name} />
         )}

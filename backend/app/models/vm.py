@@ -223,6 +223,26 @@ class VMUpdateDisplayNameRequest(BaseModel):
     display_name: str = Field(..., min_length=1, max_length=100)
 
 
+class VMCloudInitResponse(BaseModel):
+    """Inline cloud-init userData for a VM. `editable=False` means the
+    userData lives in a Secret (`userDataSecretRef`) and this UI doesn't
+    edit Secrets in place — admin must edit the Secret directly."""
+
+    volume_name: str
+    user_data: str | None = None
+    editable: bool = True
+    source: str = "inline"  # inline | secret | base64
+    note: str = (
+        "Changes apply on next VMI start — stop/start the VM to take effect."
+    )
+
+
+class VMUpdateCloudInitRequest(BaseModel):
+    """Replace a VM's inline cloud-init userData."""
+
+    user_data: str = Field(..., max_length=65536)
+
+
 class VMUpdateRequest(BaseModel):
     """Request model for updating a VM."""
 

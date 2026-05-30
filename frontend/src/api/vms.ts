@@ -68,6 +68,26 @@ export async function deleteVM(namespace: string, name: string): Promise<void> {
   });
 }
 
+export interface VMCloudInit {
+  volume_name: string;
+  user_data: string | null;
+  editable: boolean;
+  source: 'inline' | 'secret' | 'base64';
+  note: string;
+}
+
+export async function getVMCloudInit(namespace: string, name: string): Promise<VMCloudInit> {
+  return apiRequest<VMCloudInit>(`/namespaces/${namespace}/vms/${name}/cloud-init`);
+}
+
+export async function updateVMCloudInit(
+  namespace: string, name: string, user_data: string,
+): Promise<VMCloudInit> {
+  return apiRequest<VMCloudInit>(`/namespaces/${namespace}/vms/${name}/cloud-init`, {
+    method: 'PUT', body: { user_data },
+  });
+}
+
 export async function startVM(
   namespace: string,
   name: string
