@@ -90,6 +90,34 @@ export function useUpdateVMCloudInit() {
       vmApi.updateVMCloudInit(namespace, name, user_data),
     onSuccess: (_, variables) => {
       queryClient.invalidateQueries({ queryKey: ['vm', variables.namespace, variables.name, 'cloud-init'] });
+      queryClient.invalidateQueries({ queryKey: ['vm', variables.namespace, variables.name, 'cloud-init', 'form'] });
+    },
+  });
+}
+
+export function useVMCloudInitForm(namespace: string, name: string) {
+  return useQuery({
+    queryKey: ['vm', namespace, name, 'cloud-init', 'form'],
+    queryFn: () => vmApi.getVMCloudInitForm(namespace, name),
+    enabled: !!namespace && !!name,
+    retry: (failureCount, error) => {
+      if (error instanceof Error && (error as { status?: number }).status === 404) return false;
+      return failureCount < 3;
+    },
+  });
+}
+
+export function useUpdateVMCloudInitForm() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ namespace, name, body }: {
+      namespace: string;
+      name: string;
+      body: { global_ssh_keys: string[]; users: vmApi.VMCloudInitFormUser[] };
+    }) => vmApi.updateVMCloudInitForm(namespace, name, body),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['vm', variables.namespace, variables.name, 'cloud-init'] });
+      queryClient.invalidateQueries({ queryKey: ['vm', variables.namespace, variables.name, 'cloud-init', 'form'] });
     },
   });
 }

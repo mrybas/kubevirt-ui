@@ -243,6 +243,51 @@ class VMUpdateCloudInitRequest(BaseModel):
     user_data: str = Field(..., max_length=65536)
 
 
+class VMCloudInitFormUser(BaseModel):
+    """One user in the structured cloud-init form."""
+
+    name: str = Field(..., min_length=1, max_length=32, pattern=r"^[a-z_][a-z0-9_-]*$")
+    # Empty string = no password change AND no password creation. If the
+    # YAML has a pre-existing passwd hash AND form sends "" → backend
+    # preserves the hash (see has_existing_password in the response).
+    password: str = Field(default="", max_length=256)
+    ssh_keys: list[str] = Field(default_factory=list)
+    # One of: "none" | "passwordless" | "with-password". The frontend
+    # is responsible for greying out "with-password" when password is
+    # empty AND the user has no pre-existing hash — backend tolerates
+    # the request but produces a no-op sudo (account stays unprivileged).
+    sudo: str = Field(default="none", pattern=r"^(none|passwordless|with-password)$")
+    # True when the parsed VM userData had a passwd hash for this user
+    # but no plain_text_passwd. Surfaces to UI so it can show a mask
+    # rather than an empty field. Ignored on PUT.
+    has_existing_password: bool = False
+
+
+class VMCloudInitFormResponse(BaseModel):
+    """Structured view of a VM's inline cloud-init userData.
+
+    `form_compatible=false` means the userData uses cloud-init features
+    outside the form's subset (`ssh_authorized_keys` + `users`) — e.g.
+    `runcmd`, `write_files`, `bootcmd`. UI should hide the form editor
+    and force the YAML editor for such VMs.
+    """
+
+    form_compatible: bool
+    incompatible_keys: list[str] = Field(default_factory=list)
+    global_ssh_keys: list[str] = Field(default_factory=list)
+    users: list[VMCloudInitFormUser] = Field(default_factory=list)
+    note: str = (
+        "Changes apply on next VMI start — stop/start the VM to take effect."
+    )
+
+
+class VMUpdateCloudInitFormRequest(BaseModel):
+    """Replace VM cloud-init userData from a structured form."""
+
+    global_ssh_keys: list[str] = Field(default_factory=list)
+    users: list[VMCloudInitFormUser] = Field(default_factory=list)
+
+
 class VMUpdateRequest(BaseModel):
     """Request model for updating a VM."""
 

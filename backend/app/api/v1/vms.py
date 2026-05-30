@@ -6,6 +6,7 @@ import logging
 import uuid
 from typing import Any, Literal
 
+import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
@@ -22,10 +23,13 @@ from app.core.naming import (
 )
 from app.api.v1.cluster import get_cluster_settings
 from app.models.vm import (
+    VMCloudInitFormResponse,
+    VMCloudInitFormUser,
     VMCloudInitResponse,
     VMCreateRequest,
     VMListResponse,
     VMResponse,
+    VMUpdateCloudInitFormRequest,
     VMUpdateCloudInitRequest,
     VMUpdateDisplayNameRequest,
     VMUpdateRequest,
@@ -714,6 +718,276 @@ async def update_vm_cloud_init(
     volume_name = volumes[idx].get("name") or ""
     return VMCloudInitResponse(
         volume_name=volume_name, user_data=update.user_data,
+        editable=True, source="inline",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Form-based cloud-init editor — structured view + write for the common
+# subset (ssh_authorized_keys + users with passwords + ssh_keys + sudo).
+# Anything else (runcmd, write_files, bootcmd, ...) marks the userData as
+# `form_compatible=false` and forces the UI to fall back to raw YAML.
+# ---------------------------------------------------------------------------
+
+_FORM_SUPPORTED_KEYS = {"ssh_authorized_keys", "users", "chpasswd"}
+# `chpasswd` is tolerated because cloud-init defaults often add it; we
+# preserve it round-trip but the form doesn't expose it directly.
+
+
+def _parse_cloud_init_userdata(raw: str | None) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse a userData string into a dict.
+
+    Returns (parsed_dict, error_hint). ``parsed_dict`` is None when the
+    payload isn't a YAML mapping (shell script, MIME multipart, etc.) —
+    that's not an error per se, just not form-editable.
+    """
+    if not raw or not raw.strip():
+        return {}, None
+    body = raw.lstrip()
+    if body.startswith("#cloud-config"):
+        body = body.split("\n", 1)[1] if "\n" in body else ""
+    try:
+        parsed = yaml.safe_load(body)
+    except yaml.YAMLError as exc:
+        return None, f"YAML parse error: {exc}"
+    if parsed is None:
+        return {}, None
+    if not isinstance(parsed, dict):
+        return None, "userData root is not a mapping — likely a script or multipart payload"
+    return parsed, None
+
+
+def _sudo_mode_from_yaml(sudo_value: Any) -> str:
+    """Map a cloud-init `sudo:` value to one of our 3 form modes."""
+    if sudo_value is None or sudo_value is False or sudo_value == "":
+        return "none"
+    if isinstance(sudo_value, list):
+        sudo_str = " ".join(str(s) for s in sudo_value)
+    else:
+        sudo_str = str(sudo_value)
+    if "NOPASSWD" in sudo_str.upper():
+        return "passwordless"
+    return "with-password"
+
+
+def _sudo_yaml_from_mode(mode: str) -> str | None:
+    """Inverse — return the sudo string for the form mode, or None."""
+    if mode == "passwordless":
+        return "ALL=(ALL) NOPASSWD:ALL"
+    if mode == "with-password":
+        return "ALL=(ALL) ALL"
+    return None
+
+
+def _cloud_init_to_form(raw: str | None) -> VMCloudInitFormResponse:
+    parsed, err = _parse_cloud_init_userdata(raw)
+    if parsed is None:
+        return VMCloudInitFormResponse(
+            form_compatible=False, incompatible_keys=[err or "unparseable"],
+        )
+
+    incompatible = sorted(set(parsed.keys()) - _FORM_SUPPORTED_KEYS)
+    form_compatible = not incompatible
+
+    users: list[VMCloudInitFormUser] = []
+    for u in parsed.get("users") or []:
+        if not isinstance(u, dict):
+            # 'default' string entry etc — skip; preserved by raw editor
+            continue
+        name = u.get("name")
+        if not name:
+            continue
+        has_hash = bool(u.get("passwd"))
+        users.append(VMCloudInitFormUser(
+            name=name,
+            password=u.get("plain_text_passwd") or "",
+            ssh_keys=list(u.get("ssh_authorized_keys") or []),
+            sudo=_sudo_mode_from_yaml(u.get("sudo")),
+            has_existing_password=has_hash,
+        ))
+
+    return VMCloudInitFormResponse(
+        form_compatible=form_compatible,
+        incompatible_keys=incompatible,
+        global_ssh_keys=list(parsed.get("ssh_authorized_keys") or []),
+        users=users,
+    )
+
+
+def _form_to_cloud_init(
+    update: VMUpdateCloudInitFormRequest,
+    existing_raw: str | None,
+) -> str:
+    """Serialize the form to a `#cloud-config` document.
+
+    Preserves pre-existing `passwd` (hash) for users whose form password
+    is empty AND who had a hash in the existing userData. This lets the
+    UI show a masked field without forcing the admin to re-enter the
+    password on every save.
+    """
+    existing, _ = _parse_cloud_init_userdata(existing_raw)
+    existing_users_by_name: dict[str, dict[str, Any]] = {
+        u["name"]: u
+        for u in ((existing or {}).get("users") or [])
+        if isinstance(u, dict) and u.get("name")
+    }
+
+    cfg: dict[str, Any] = {}
+    if update.global_ssh_keys:
+        cfg["ssh_authorized_keys"] = list(update.global_ssh_keys)
+
+    if update.users:
+        out_users: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for u in update.users:
+            if u.name in seen:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Duplicate user name in form: {u.name!r}",
+                )
+            seen.add(u.name)
+
+            entry: dict[str, Any] = {
+                "name": u.name,
+                "shell": "/bin/bash",
+            }
+            if u.ssh_keys:
+                entry["ssh_authorized_keys"] = list(u.ssh_keys)
+
+            # Password handling
+            if u.password:
+                entry["plain_text_passwd"] = u.password
+                entry["lock_passwd"] = False
+            else:
+                existing_hash = existing_users_by_name.get(u.name, {}).get("passwd")
+                if existing_hash:
+                    entry["passwd"] = existing_hash
+                    entry["lock_passwd"] = existing_users_by_name[u.name].get(
+                        "lock_passwd", False,
+                    )
+                # else: no password at all; cloud-init default locks the account
+
+            sudo_str = _sudo_yaml_from_mode(u.sudo)
+            if sudo_str:
+                entry["sudo"] = sudo_str
+
+            out_users.append(entry)
+        cfg["users"] = out_users
+
+    if not cfg:
+        return "#cloud-config\n{}\n"
+    return "#cloud-config\n" + yaml.safe_dump(cfg, sort_keys=False)
+
+
+@router.get("/{name}/cloud-init/form", response_model=VMCloudInitFormResponse)
+async def get_vm_cloud_init_form(
+    request: Request, namespace: str, name: str,
+    user: User = Depends(require_env_viewer()),
+) -> VMCloudInitFormResponse:
+    """Parsed structured view of a VM's cloud-init userData.
+
+    404 only when the VM is missing or has no cloud-init volume. A
+    VM with secret-backed or non-mapping userData returns 200 with
+    `form_compatible=false` and an empty form — the UI then routes the
+    user to the raw YAML editor.
+    """
+    k8s_client = request.app.state.k8s_client
+    try:
+        vm = await k8s_client.get_virtual_machine(name=name, namespace=namespace)
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=404, detail=f"VM {name} not found")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    found = _find_cloud_init_volume(vm)
+    if not found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"VM {name} has no cloud-init volume — nothing to edit.",
+        )
+    _, _, ci = found
+
+    if "userDataSecretRef" in ci:
+        return VMCloudInitFormResponse(
+            form_compatible=False,
+            incompatible_keys=["userDataSecretRef"],
+        )
+    raw = ci.get("userData")
+    if raw is None and "userDataBase64" in ci:
+        import base64
+        try:
+            raw = base64.b64decode(ci["userDataBase64"]).decode("utf-8")
+        except Exception:
+            raw = None
+
+    return _cloud_init_to_form(raw)
+
+
+@router.put("/{name}/cloud-init/form", response_model=VMCloudInitResponse)
+async def update_vm_cloud_init_form(
+    request: Request, namespace: str, name: str,
+    update: VMUpdateCloudInitFormRequest,
+    user: User = Depends(require_env_member()),
+) -> VMCloudInitResponse:
+    """Replace VM cloud-init userData from a structured form.
+
+    Returns the raw VMCloudInitResponse so the UI can sync the YAML
+    tab with the canonical serialized output (whitespace, sort order)
+    without an extra GET.
+    """
+    k8s_client = request.app.state.k8s_client
+    try:
+        vm = await k8s_client.get_virtual_machine(name=name, namespace=namespace)
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=404, detail=f"VM {name} not found")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    found = _find_cloud_init_volume(vm)
+    if not found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"VM {name} has no cloud-init volume — nothing to edit.",
+        )
+    idx, ci_field, ci = found
+    if "userDataSecretRef" in ci:
+        raise HTTPException(
+            status_code=400,
+            detail="userData lives in a Secret — edit the Secret directly.",
+        )
+
+    existing_raw = ci.get("userData")
+    if existing_raw is None and "userDataBase64" in ci:
+        import base64
+        try:
+            existing_raw = base64.b64decode(ci["userDataBase64"]).decode("utf-8")
+        except Exception:
+            existing_raw = None
+
+    new_user_data = _form_to_cloud_init(update, existing_raw)
+
+    volumes = list(((vm.get("spec") or {}).get("template") or {}).get("spec", {}).get("volumes") or [])
+    new_ci = dict(ci)
+    new_ci["userData"] = new_user_data
+    new_ci.pop("userDataBase64", None)
+    volumes[idx] = {**volumes[idx], ci_field: new_ci}
+
+    patch = {"spec": {"template": {"spec": {"volumes": volumes}}}}
+    try:
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        await custom_api.patch_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines",
+            name=name, body=patch,
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update cloud-init: {e.reason}") from e
+
+    logger.info(f"User {user.username} updated cloud-init (form) for VM {namespace}/{name}")
+    volume_name = volumes[idx].get("name") or ""
+    return VMCloudInitResponse(
+        volume_name=volume_name, user_data=new_user_data,
         editable=True, source="inline",
     )
 

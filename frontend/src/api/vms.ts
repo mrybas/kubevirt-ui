@@ -88,6 +88,44 @@ export async function updateVMCloudInit(
   });
 }
 
+// Structured form-based cloud-init editor.
+
+export type VMCloudInitSudoMode = 'none' | 'passwordless' | 'with-password';
+
+export interface VMCloudInitFormUser {
+  name: string;
+  password: string;
+  ssh_keys: string[];
+  sudo: VMCloudInitSudoMode;
+  has_existing_password: boolean;
+}
+
+export interface VMCloudInitForm {
+  form_compatible: boolean;
+  incompatible_keys: string[];
+  global_ssh_keys: string[];
+  users: VMCloudInitFormUser[];
+  note: string;
+}
+
+export async function getVMCloudInitForm(
+  namespace: string, name: string,
+): Promise<VMCloudInitForm> {
+  return apiRequest<VMCloudInitForm>(
+    `/namespaces/${namespace}/vms/${name}/cloud-init/form`,
+  );
+}
+
+export async function updateVMCloudInitForm(
+  namespace: string, name: string,
+  body: { global_ssh_keys: string[]; users: VMCloudInitFormUser[] },
+): Promise<VMCloudInit> {
+  return apiRequest<VMCloudInit>(
+    `/namespaces/${namespace}/vms/${name}/cloud-init/form`,
+    { method: 'PUT', body },
+  );
+}
+
 export async function startVM(
   namespace: string,
   name: string
