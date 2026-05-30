@@ -254,8 +254,8 @@ async def _list_attached_vpcs(k8s, gateway_name: str) -> list[AttachedVpcInfo]:
     data, _ = await _get_transit_allocator(k8s, gateway_name)
     attached = []
     for key, value in data.items():
-        if key.startswith("vpc:"):
-            vpc_name = key.removeprefix("vpc:")
+        if key.startswith("vpc."):
+            vpc_name = key.removeprefix("vpc.")
             parts = value.split(",")  # transit_ip,subnet_name,cidr
             attached.append(AttachedVpcInfo(
                 vpc_name=vpc_name,
@@ -689,11 +689,11 @@ async def attach_tenant_to_gateway(
 
     # 1. Allocate transit IP for tenant
     alloc_data, resource_version = await _get_transit_allocator(k8s, gateway_name)
-    used_ips = {v.split(",")[0] for k, v in alloc_data.items() if k.startswith("vpc:")}
+    used_ips = {v.split(",")[0] for k, v in alloc_data.items() if k.startswith("vpc.")}
     used_ips.add(alloc_data.get("_gateway_ip", ""))
 
     # Check if already attached
-    alloc_key = f"vpc:{tenant_vpc_name}"
+    alloc_key = f"vpc.{tenant_vpc_name}"
     if alloc_key in alloc_data:
         existing = alloc_data[alloc_key].split(",")
         return AttachedVpcInfo(
@@ -795,7 +795,7 @@ async def detach_tenant_from_gateway(
 
     # Get tenant allocation
     alloc_data, resource_version = await _get_transit_allocator(k8s, gateway_name)
-    alloc_key = f"vpc:{tenant_vpc_name}"
+    alloc_key = f"vpc.{tenant_vpc_name}"
     tenant_info = alloc_data.get(alloc_key, "")
     tenant_cidr = tenant_info.split(",")[2] if len(tenant_info.split(",")) > 2 else ""
 
@@ -849,7 +849,7 @@ async def _find_gateway_for_vpc(k8s, vpc_name: str) -> str | None:
         if not gw_name:
             continue
         data, _ = await _get_transit_allocator(k8s, gw_name)
-        if f"vpc:{vpc_name}" in data:
+        if f"vpc.{vpc_name}" in data:
             return gw_name
 
     return None
