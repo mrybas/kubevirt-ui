@@ -15,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 # Label for enabled namespaces
 PROJECT_ENABLED_LABEL = "kubevirt-ui.io/enabled"
+# Present only on per-tenant "service" namespaces (tenant-<name>) that host a
+# single Kamaji control plane + its worker VMs. These must not appear in
+# project/template/VM/new-tenant pickers — this endpoint is the picker source.
+TENANT_LABEL = "kubevirt-ui.io/tenant"
 
 
 @router.get("", response_model=NamespaceListResponse)
@@ -24,13 +28,24 @@ async def list_namespaces(
         False,
         description="Include all namespaces (admin only). By default, only enabled namespaces are shown.",
     ),
+    include_tenants: bool = Query(
+        False,
+        description=(
+            "Include per-tenant service namespaces (tenant-<name>). Excluded "
+            "by default — they host a single tenant control plane and must "
+            "not be selectable as projects. Worker-VM visibility in /vms is "
+            "unaffected (that path uses get_user_namespaces, not this endpoint)."
+        ),
+    ),
     user: User = Depends(require_auth),
 ) -> NamespaceListResponse:
     """
     List namespaces accessible to the user.
-    
-    By default, only namespaces with `kubevirt-ui.io/enabled=true` label are shown.
-    Admins can use `include_all=true` to see all namespaces.
+
+    By default, only namespaces with `kubevirt-ui.io/enabled=true` are shown,
+    and per-tenant service namespaces (`kubevirt-ui.io/tenant` label) are
+    excluded. Admins can pass `include_all=true` (all namespaces) or
+    `include_tenants=true` (also list tenant namespaces).
     """
     k8s_client = request.app.state.k8s_client
 
@@ -42,10 +57,12 @@ async def list_namespaces(
             # Admin requested all namespaces
             namespaces = await k8s_client.list_namespaces()
         else:
-            # Default: only show enabled namespaces
-            namespaces = await k8s_client.list_namespaces(
-                label_selector=f"{PROJECT_ENABLED_LABEL}=true"
-            )
+            # Default: enabled namespaces, minus tenant service namespaces.
+            # The negative match (`!label`) is evaluated server-side.
+            selector = f"{PROJECT_ENABLED_LABEL}=true"
+            if not include_tenants:
+                selector += f",!{TENANT_LABEL}"
+            namespaces = await k8s_client.list_namespaces(label_selector=selector)
 
         # RBAC: non-admin users only see namespaces they have access to
         if not is_admin and not include_all:
