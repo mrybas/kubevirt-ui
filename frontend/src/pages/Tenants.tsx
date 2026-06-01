@@ -29,6 +29,7 @@ import clsx from 'clsx';
 import { useTenants, useCreateTenant, useDeleteTenant, useAddonCatalog, useDiscovery } from '../hooks/useTenants';
 import { useStorageClasses } from '../hooks/useStorage';
 import { useFoldersFlat } from '../hooks/useFolders';
+import { useVpcs } from '../hooks/useVpcs';
 import { useAuthStore } from '../store/auth';
 import type { Tenant, TenantCreateRequest, TenantAddon, AddonComponent } from '../types/tenant';
 import { WizardStepIndicator } from '../components/common/WizardStepIndicator';
@@ -226,6 +227,14 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
   const { data: discovery } = useDiscovery();
   const { data: foldersData } = useFoldersFlat();
   const { data: storageClassesData } = useStorageClasses();
+  // VPCs scoped to the chosen folder/env (re-fetches when they change).
+  // Tenants in the same folder/env that pick the same VPC share one trust
+  // domain (the VPC), per the shared-VPC tenant model.
+  const { data: vpcsData } = useVpcs(
+    form.folder && form.environment
+      ? { folder: form.folder, environment: form.environment }
+      : undefined
+  );
   const user = useAuthStore(s => s.user);
   const createTenant = useCreateTenant();
 
@@ -1146,62 +1155,97 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                 <div>
                   <h3 className="text-sm font-semibold text-surface-200 mb-1">Network</h3>
                   <p className="text-xs text-surface-500 mb-4">
-                    Tenant workers run on the cluster default overlay.
+                    Where the tenant's worker VMs run. A VPC isolates them on a
+                    dedicated kube-ovn overlay; tenants sharing one VPC form one
+                    trust domain (mutually reachable).
                   </p>
                 </div>
 
-                <div className="flex items-start gap-3 p-3 bg-amber-500/10 border border-amber-500/30 rounded-lg">
-                  <Info className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
-                  <div className="text-xs text-amber-200">
-                    VPC isolation for tenants is being reworked and is temporarily
-                    disabled. New tenants are created on the cluster default
-                    network. Per-VPC tenant workloads will return in a future
-                    release.
+                {!form.folder || !form.environment ? (
+                  <div className="flex items-start gap-3 p-4 bg-surface-800/60 border border-surface-700/50 rounded-lg">
+                    <Info className="h-4 w-4 text-surface-400 shrink-0 mt-0.5" />
+                    <p className="text-xs text-surface-400">
+                      Select folder and environment first (Basics step) to see available VPCs.
+                    </p>
                   </div>
-                </div>
+                ) : (
+                  <div className="space-y-2">
+                    {/* Default cluster network */}
+                    <label className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                      form.vpc_name === ''
+                        ? 'border-primary-500 bg-primary-500/10'
+                        : 'border-surface-700 bg-surface-800 hover:border-surface-600'
+                    }`}>
+                      <input
+                        type="radio"
+                        name="vpc_name"
+                        value=""
+                        checked={form.vpc_name === ''}
+                        onChange={() => setForm({ ...form, vpc_name: '' })}
+                        className="mt-0.5 h-4 w-4 border-surface-600 bg-surface-700 text-primary-500 focus:ring-primary-500"
+                      />
+                      <div>
+                        <p className={`text-sm font-medium ${form.vpc_name === '' ? 'text-primary-300' : 'text-surface-200'}`}>
+                          Default cluster network
+                          <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-400">no VPC isolation</span>
+                        </p>
+                        <p className="text-xs text-surface-500 mt-0.5">
+                          Workers run on the cluster overlay; control plane reachable via its ClusterIP.
+                        </p>
+                      </div>
+                    </label>
 
-                <div className="space-y-2">
-                  {/* Default option — only choice available */}
-                  <label className="flex items-start gap-3 p-3 rounded-lg border border-primary-500 bg-primary-500/10 cursor-default">
-                    <input
-                      type="radio"
-                      name="vpc_name"
-                      value=""
-                      checked={true}
-                      readOnly
-                      className="mt-0.5 h-4 w-4 border-surface-600 bg-surface-700 text-primary-500"
-                    />
-                    <div>
-                      <p className="text-sm font-medium text-primary-300">
-                        Default cluster network
-                      </p>
-                      <p className="text-xs text-surface-500 mt-0.5">
-                        Tenant namespace runs on the cluster overlay. Internet egress via the cluster gateway.
-                      </p>
-                    </div>
-                  </label>
-
-                  {/* VPC option — disabled */}
-                  <label className="flex items-start gap-3 p-3 rounded-lg border border-surface-700/50 bg-surface-800/30 cursor-not-allowed opacity-60">
-                    <input
-                      type="radio"
-                      name="vpc_name"
-                      value="__disabled__"
-                      checked={false}
-                      disabled
-                      className="mt-0.5 h-4 w-4 border-surface-600 bg-surface-700"
-                    />
-                    <div>
-                      <p className="text-sm font-medium text-surface-400">
-                        Custom VPC
-                        <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-surface-700 text-surface-500">Coming later</span>
-                      </p>
-                      <p className="text-xs text-surface-500 mt-0.5">
-                        Per-tenant VPC overlay isolation. Currently disabled.
-                      </p>
-                    </div>
-                  </label>
-                </div>
+                    {(vpcsData?.items ?? []).length === 0 ? (
+                      <div className="flex items-start gap-3 p-3 bg-surface-800/50 border border-surface-700/50 rounded-lg">
+                        <Info className="h-4 w-4 text-surface-500 shrink-0 mt-0.5" />
+                        <p className="text-xs text-surface-500">
+                          No VPCs scoped to <span className="font-mono text-surface-400">{form.folder}/{form.environment}</span>.
+                          Ask an admin to label a VPC with this folder/environment.
+                        </p>
+                      </div>
+                    ) : (
+                      (vpcsData?.items ?? []).map(vpc => (
+                        <label
+                          key={vpc.name}
+                          className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                            form.vpc_name === vpc.name
+                              ? 'border-primary-500 bg-primary-500/10'
+                              : 'border-surface-700 bg-surface-800 hover:border-surface-600'
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name="vpc_name"
+                            value={vpc.name}
+                            checked={form.vpc_name === vpc.name}
+                            onChange={() => setForm({ ...form, vpc_name: vpc.name })}
+                            className="mt-0.5 h-4 w-4 border-surface-600 bg-surface-700 text-primary-500 focus:ring-primary-500"
+                          />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className={`text-sm font-medium font-mono ${form.vpc_name === vpc.name ? 'text-primary-300' : 'text-surface-200'}`}>
+                                {vpc.name}
+                              </p>
+                              {vpc.folder && (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary-500/10 text-primary-400">
+                                  {vpc.folder}{vpc.environment ? `/${vpc.environment}` : ''}
+                                </span>
+                              )}
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded ${vpc.ready ? 'bg-emerald-500/10 text-emerald-400' : 'bg-amber-500/10 text-amber-400'}`}>
+                                {vpc.ready ? 'Ready' : 'Pending'}
+                              </span>
+                            </div>
+                            {(vpc.subnets ?? []).length > 0 && (
+                              <p className="text-xs text-surface-500 mt-0.5">
+                                {vpc.subnets.map(s => s.cidr_block).join(', ')}
+                              </p>
+                            )}
+                          </div>
+                        </label>
+                      ))
+                    )}
+                  </div>
+                )}
 
                 {/* Worker DNS configuration */}
                 <div className="pt-3 border-t border-surface-700/50 space-y-3">
