@@ -106,6 +106,7 @@ export interface Tenant {
   phase: string | null;
   endpoint: string | null;
   control_plane_replicas: number;
+  control_plane_ready_replicas?: number;
   control_plane_ready: boolean;
   worker_type: string;
   worker_count: number;

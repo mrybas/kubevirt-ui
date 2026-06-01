@@ -285,7 +285,9 @@ export default function TenantDetail() {
                 <span className="text-amber-400">Pending</span>
               )}
             </p>
-            <p className="text-xs text-surface-500">{tenant.control_plane_replicas} replicas</p>
+            <p className="text-xs text-surface-500">
+              {tenant.control_plane_ready_replicas ?? 0}/{tenant.control_plane_replicas} replicas
+            </p>
           </div>
         </div>
         <div className="card">

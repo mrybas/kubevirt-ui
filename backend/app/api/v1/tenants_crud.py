@@ -225,6 +225,38 @@ async def _enrich_with_workers(
     return tenant
 
 
+async def _enrich_with_control_plane(k8s, tenant: TenantResponse) -> TenantResponse:
+    """Fill CP replica counts from the KamajiControlPlane CR.
+
+    The CAPI Cluster status only carries a `controlPlaneReady` bool, not
+    replica counts — those live on the KamajiControlPlane status
+    (replicas / readyReplicas), mirroring the underlying Kamaji TCP. Without
+    this the UI showed "0 replicas" for a healthy 2-replica control plane.
+    """
+    try:
+        kcp = await k8s.custom_api.get_namespaced_custom_object(
+            group=KAMAJI_CP_GROUP, version=KAMAJI_CP_VERSION,
+            namespace=tenant.namespace, plural="kamajicontrolplanes", name=tenant.name,
+        )
+    except ApiException as e:
+        if e.status != 404:
+            logger.debug(f"Could not fetch KamajiControlPlane for {tenant.name}: {e}")
+        return tenant
+
+    kcp_spec = kcp.get("spec", {})
+    kcp_status = kcp.get("status", {})
+    # Desired: spec.replicas (fall back to status.replicas).
+    tenant.control_plane_replicas = kcp_spec.get(
+        "replicas", kcp_status.get("replicas", tenant.control_plane_replicas)
+    )
+    # Ready: prefer readyReplicas; else status.replicas when marked ready.
+    ready = kcp_status.get("readyReplicas")
+    if ready is None:
+        ready = kcp_status.get("replicas", 0) if kcp_status.get("ready") else 0
+    tenant.control_plane_ready_replicas = ready or 0
+    return tenant
+
+
 # ---------------------------------------------------------------------------
 # Host cluster discovery
 # ---------------------------------------------------------------------------
@@ -538,6 +570,7 @@ async def list_tenants(
         for cluster in clusters:
             tenant = _parse_tenant_response(cluster)
             tenant = await _enrich_with_workers(k8s, tenant)
+            tenant = await _enrich_with_control_plane(k8s, tenant)
             items.append(tenant)
 
         total = len(items)
@@ -829,6 +862,7 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
     addon_statuses = await _get_addon_statuses(k8s, name)
     tenant = _parse_tenant_response(cluster, addon_statuses)
     tenant = await _enrich_with_workers(k8s, tenant)
+    tenant = await _enrich_with_control_plane(k8s, tenant)
     return tenant
 
 

@@ -281,6 +281,7 @@ class TenantResponse(BaseModel):
     phase: str | None = None  # CAPI Cluster phase
     endpoint: str | None = None  # tenant API URL
     control_plane_replicas: int = 0
+    control_plane_ready_replicas: int = 0
     control_plane_ready: bool = False
     worker_type: str = "vm"
     worker_count: int = 0
