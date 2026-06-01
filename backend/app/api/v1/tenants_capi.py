@@ -30,6 +30,7 @@ from app.api.v1.tenants_common import (
     _ingress_class,
     _ingress_controller,
 )
+from app.api.v1.tenants_cp_ports import allocate_cp_ports
 
 # Konnectivity image overrides — defaults match upstream Kamaji defaults.
 # Override for air-gapped clusters via env (e.g. mirror.internal/kas-network-proxy/...).
@@ -1032,12 +1033,35 @@ async def _create_capi_resources(
     custom = k8s.custom_api
     ns = _tenant_ns(req.name)
 
-    # 0. When the tenant is bound to a VPC, append the tenant ns to the VPC
+    # 0. VPC tenant? Allocate the per-tenant CP ports on the shared demux VIP.
+    #    Default-overlay tenant (vpc_name=None) → all the *_port/vip stay None
+    #    and every builder takes its unchanged default-overlay branch.
+    vpc = bool(req.vpc_name)
+    vip = api_port = konn_port = None
+    if vpc:
+        vip = _cp_demux_vip()
+        if not vip:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "VPC tenant requested but no shared CP demux VIP is "
+                    "configured — set TENANTS_CP_DEMUX_VIP (a MetalLB IP) "
+                    "or create the tenant without a VPC."
+                ),
+            )
+        api_port, konn_port = await allocate_cp_ports(k8s, req.name)
+        logger.info(
+            f"VPC tenant {req.name!r}: CP ports api={api_port} konn={konn_port} "
+            f"on shared VIP {vip}"
+        )
+
     # 1. Create infrastructure + control plane providers first — both in the
     #    tenant ns (CAPI webhook forbids cross-ns controlPlaneRef).
     pre_resources = [
-        (KAMAJI_CP_GROUP, KAMAJI_CP_VERSION, "kamajicontrolplanes", _build_kamaji_cp_cr(req)),
-        (KUBEVIRT_INFRA_GROUP, KUBEVIRT_INFRA_VERSION, "kubevirtclusters", _build_kubevirt_cluster_cr(req, storage_info)),
+        (KAMAJI_CP_GROUP, KAMAJI_CP_VERSION, "kamajicontrolplanes",
+         _build_kamaji_cp_cr(req, advertise_vip=vip, konn_port=konn_port)),
+        (KUBEVIRT_INFRA_GROUP, KUBEVIRT_INFRA_VERSION, "kubevirtclusters",
+         _build_kubevirt_cluster_cr(req, storage_info)),
     ]
     for group, version, plural, body in pre_resources:
         target_ns = body["metadata"]["namespace"]
@@ -1045,36 +1069,39 @@ async def _create_capi_resources(
             group=group, version=version, namespace=target_ns, plural=plural, body=body,
         )
 
-    # 2. Create CAPI Cluster with a DNS placeholder endpoint; will be
-    #    PATCHed to the TCP ClusterIP after the Kamaji TCP Service is ready.
-    cluster_cr = _build_cluster_cr(req)
+    # 2. Create CAPI Cluster.
+    cluster_cr = _build_cluster_cr(req, api_port=api_port)
     await custom.create_namespaced_custom_object(
         group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
         plural="clusters", body=cluster_cr,
     )
 
-    # 3. Wait for the Kamaji TCP Service to get a ClusterIP, then PATCH
-    #    Cluster.spec.controlPlaneEndpoint to that ClusterIP:6443. Workers
-    #    join via the ClusterIP (kube-proxy DNATs it to the apiserver pod
-    #    on the same default overlay) and the post-join cluster-info
-    #    rewrite matches — no manual ConfigMap patching needed.
-    cluster_ip = await _wait_for_tcp_service_ip(k8s, req.name, ns)
-    endpoint_patch = {
-        "spec": {
-            "controlPlaneEndpoint": {
-                "host": cluster_ip,
-                "port": 6443,
-            },
-        },
-    }
-    await custom.patch_namespaced_custom_object(
-        group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
-        plural="clusters", name=req.name, body=endpoint_patch,
-        _content_type="application/merge-patch+json",
-    )
-    logger.info(
-        f"Patched Cluster {req.name} controlPlaneEndpoint → {cluster_ip}:6443"
-    )
+    if vpc:
+        # 3-VPC. advertiseAddress model: cluster-info is already correct
+        #   (<vip>:<api_port> baked by KCP), so NO endpoint patch. Create the
+        #   per-tenant MetalLB shared-IP Service that fronts this tenant's CP
+        #   pods on the shared VIP; workers reach it via native kube-proxy.
+        cp_lb = _build_cp_lb_service(req, vip, api_port, konn_port)
+        await k8s.core_api.create_namespaced_service(namespace=ns, body=cp_lb)
+        logger.info(
+            f"Created {req.name}-cp-lb on {vip}:{api_port}(api)/{konn_port}(konn)"
+        )
+    else:
+        # 3-default. Wait for the Kamaji TCP Service ClusterIP, then PATCH
+        #   controlPlaneEndpoint to it. Workers join via the ClusterIP
+        #   (natively routable on the default overlay); cluster-info matches.
+        cluster_ip = await _wait_for_tcp_service_ip(k8s, req.name, ns)
+        endpoint_patch = {
+            "spec": {"controlPlaneEndpoint": {"host": cluster_ip, "port": 6443}},
+        }
+        await custom.patch_namespaced_custom_object(
+            group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
+            plural="clusters", name=req.name, body=endpoint_patch,
+            _content_type="application/merge-patch+json",
+        )
+        logger.info(
+            f"Patched Cluster {req.name} controlPlaneEndpoint → {cluster_ip}:6443"
+        )
 
     # 5. Create VM worker resources (skip for bare_metal)
     if req.worker_type == "vm":
