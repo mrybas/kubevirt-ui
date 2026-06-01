@@ -54,6 +54,16 @@ ENV_ENABLED_LABEL = "kubevirt-ui.io/enabled"
 ENV_MANAGED_LABEL = "kubevirt-ui.io/managed"
 ENV_FOLDER_LABEL = "kubevirt-ui.io/folder"
 ENV_ENVIRONMENT_LABEL = "kubevirt-ui.io/environment"
+# Tenant control-plane namespaces (tenant-<name>) carry this label. They also
+# carry folder/environment labels (for Phase 2 authz), so they'd otherwise leak
+# into a folder's environment list and show up as selectable envs in the tenant
+# wizard. Excluded from user-facing environment listings (NOT from RBAC
+# reconciliation, which must still reach tenant namespaces).
+TENANT_LABEL = "kubevirt-ui.io/tenant"
+
+
+def _is_tenant_ns(ns_obj: Any) -> bool:
+    return bool((ns_obj.metadata.labels or {}).get(TENANT_LABEL))
 
 # Labels for managed RoleBindings
 ACCESS_MANAGED_LABEL = "kubevirt-ui.io/managed"
@@ -712,9 +722,12 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
     except ApiException:
         all_ns = type("obj", (), {"items": []})()
 
-    # Index namespaces by folder label
+    # Index namespaces by folder label, skipping tenant control-plane
+    # namespaces so they don't surface as selectable environments.
     ns_by_folder: dict[str, list] = {}
     for ns in all_ns.items:
+        if _is_tenant_ns(ns):
+            continue
         folder = (ns.metadata.labels or {}).get(ENV_FOLDER_LABEL)
         if folder:
             ns_by_folder.setdefault(folder, []).append(ns)
@@ -857,8 +870,9 @@ async def get_folder(request: Request, name: str, user: User = Depends(require_a
 
     meta = folders[name]
 
-    # List environments for this folder
-    ns_items = await _get_folder_namespaces(k8s_client, name)
+    # List environments for this folder, excluding tenant control-plane
+    # namespaces (they carry folder/env labels but must not appear as envs).
+    ns_items = [ns for ns in await _get_folder_namespaces(k8s_client, name) if not _is_tenant_ns(ns)]
 
     envs = []
     total_vms = 0
