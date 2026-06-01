@@ -261,6 +261,27 @@ async def _enrich_with_control_plane(k8s, tenant: TenantResponse) -> TenantRespo
     return tenant
 
 
+async def _enrich_with_folder_env(k8s, tenant: TenantResponse) -> TenantResponse:
+    """Backfill folder/environment from the tenant namespace labels.
+
+    New tenants carry these on the Cluster CR (read in _parse_tenant_response),
+    but tenants created before that label was added don't. The tenant namespace
+    `tenant-<name>` is reliably stamped with kubevirt-ui.io/folder + environment
+    by _create_namespace, so use it as the fallback — needed for the UI to scope
+    the tenant list by the global env-namespace selector.
+    """
+    if tenant.folder and tenant.environment:
+        return tenant
+    try:
+        ns_obj = await k8s.core_api.read_namespace(name=tenant.namespace)
+        labels = ns_obj.metadata.labels or {}
+        tenant.folder = tenant.folder or labels.get("kubevirt-ui.io/folder", "")
+        tenant.environment = tenant.environment or labels.get("kubevirt-ui.io/environment", "")
+    except ApiException as e:
+        logger.debug(f"Could not read namespace labels for {tenant.name}: {e}")
+    return tenant
+
+
 # ---------------------------------------------------------------------------
 # Host cluster discovery
 # ---------------------------------------------------------------------------
@@ -575,6 +596,7 @@ async def list_tenants(
             tenant = _parse_tenant_response(cluster)
             tenant = await _enrich_with_workers(k8s, tenant)
             tenant = await _enrich_with_control_plane(k8s, tenant)
+            tenant = await _enrich_with_folder_env(k8s, tenant)
             items.append(tenant)
 
         total = len(items)
@@ -867,6 +889,7 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
     tenant = _parse_tenant_response(cluster, addon_statuses)
     tenant = await _enrich_with_workers(k8s, tenant)
     tenant = await _enrich_with_control_plane(k8s, tenant)
+    tenant = await _enrich_with_folder_env(k8s, tenant)
     return tenant
 
 
