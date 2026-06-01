@@ -45,6 +45,22 @@ backend:
     TENANTS_KONNECTIVITY_AGENT_IMAGE: ""
     # OCI containerDisk image for tenant worker VMs
     TENANTS_DEFAULT_WORKER_IMAGE: ""
+    # -- VPC-isolated tenants (advertiseAddress model). All optional.
+    # Shared MetalLB VIP that fronts every VPC tenant's apiserver +
+    # konnectivity, demultiplexed by per-tenant ports. REQUIRED to create
+    # VPC tenants — when empty, choosing a VPC in the wizard returns 422
+    # (default-overlay tenants are unaffected). Must be an IP in a MetalLB
+    # pool reachable from the tenant VPC.
+    TENANTS_CP_DEMUX_VIP: ""
+    # MetalLB pool + shared-IP key for the per-tenant cp-lb Services
+    # (defaults: traefik / cp-demux).
+    TENANTS_CP_METALLB_POOL: ""
+    TENANTS_CP_SHARED_IP_KEY: ""
+    # CP port pool on the shared VIP (defaults: 20000 / 60000, 2 ports per
+    # tenant) and Kamaji-reserved konnectivity ports to avoid (8133,8134).
+    TENANTS_CP_PORT_BASE: ""
+    TENANTS_CP_PORT_END: ""
+    TENANTS_CP_RESERVED_PORTS: ""
 
   # -- Extra env vars from secrets/configmaps
   envFrom: []
