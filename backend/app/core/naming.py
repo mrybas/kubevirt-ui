@@ -18,6 +18,13 @@ import uuid
 # Annotation/label keys
 DISPLAY_NAME_ANNOTATION = "kubevirt-ui.io/display-name"
 SLUG_LABEL = "kubevirt-ui.io/slug"
+# Unique-per-VM label whose value == the VM's metadata.name. The slug
+# label is NOT unique (display-name collisions); the synthetic name is.
+# Stamped post-create (the name comes from generateName, server-assigned)
+# so Velero can target an individual VM via orLabelSelectors for the
+# folder→env→VM backup wizard. The kubevirt-velero-plugin then follows
+# the VM to its DataVolumes/PVCs.
+VM_NAME_LABEL = "kubevirt-ui.io/vm-name"
 
 # K8s naming constraints
 DNS_1123_MAX = 63

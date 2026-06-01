@@ -18,6 +18,7 @@ from app.core.kubevirt import get_hotplug_mode
 from app.core.naming import (
     DISPLAY_NAME_ANNOTATION,
     SLUG_LABEL,
+    VM_NAME_LABEL,
     sanitize_display_name,
     with_synthetic_metadata,
 )
@@ -992,6 +993,28 @@ async def update_vm_cloud_init_form(
     )
 
 
+async def _ensure_vm_name_label(k8s_client, namespace: str, name: str) -> None:
+    """Stamp kubevirt-ui.io/vm-name=<name> on a VM (idempotent, best-effort).
+
+    The name comes from generateName (server-assigned), so it can only be
+    labelled after create. Backup/schedule selection targets this unique
+    label; backfilled lazily for VMs that predate it. Failure is non-fatal
+    — VM create must not break because of a label patch.
+    """
+    if not name:
+        return
+    try:
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        await custom_api.patch_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=name,
+            body={"metadata": {"labels": {VM_NAME_LABEL: name}}},
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        logger.warning(f"Could not stamp {VM_NAME_LABEL} on VM {namespace}/{name}: {e}")
+
+
 @router.post("", response_model=VMResponse, status_code=status.HTTP_201_CREATED)
 async def create_vm(
     request: Request, namespace: str, vm_request: VMCreateRequest,
@@ -1020,6 +1043,8 @@ async def create_vm(
             namespace=namespace, body=vm_manifest
         )
         actual_name = created_vm.get("metadata", {}).get("name", "")
+        # Stamp the unique vm-name label (post-create: name from generateName).
+        await _ensure_vm_name_label(k8s_client, namespace, actual_name)
         logger.info(
             f"User {user.username} created VM {namespace}/{actual_name} "
             f"(display_name={vm_request.display_name!r})"
@@ -1437,6 +1462,7 @@ async def create_vm_from_template(
             body=vm_manifest,
         )
         actual_name = created_vm.get("metadata", {}).get("name", "")
+        await _ensure_vm_name_label(k8s_client, namespace, actual_name)
 
         logger.info(
             f"User {user.username} created VM from template {namespace}/{actual_name} "
