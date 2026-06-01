@@ -34,6 +34,12 @@ import { ActionBar } from '../components/common/ActionBar';
 import { DataTable, type Column } from '@/components/common/DataTable';
 import type { MenuItem } from '@/components/common/KebabMenu';
 import { Modal } from '@/components/common/Modal';
+import {
+  BackupTargetPicker,
+  EMPTY_TARGET,
+  isTargetValid,
+  type BackupTarget,
+} from '../components/backups/BackupTargetPicker';
 
 import {
   useVeleroBackups,
@@ -154,8 +160,7 @@ interface CreateScheduleState {
   name: string;
   schedule: string;
   // Velero fields
-  included_namespaces: string;
-  label_selector: string;
+  target: BackupTarget;
   snapshot_volumes: boolean;
   ttl_days: string;
   // Snapshot fields
@@ -167,8 +172,7 @@ const DEFAULT_SCHEDULE_STATE: CreateScheduleState = {
   type: 'velero',
   name: '',
   schedule: '0 2 * * *',
-  included_namespaces: '',
-  label_selector: '',
+  target: EMPTY_TARGET,
   snapshot_volumes: true,
   ttl_days: '30',
   vm_namespace: '',
@@ -185,8 +189,10 @@ function CreateScheduleModal({
   onCreateVelero: (data: {
     name: string;
     schedule: string;
-    included_namespaces: string[];
-    label_selector: string;
+    folder: string;
+    environment: string;
+    all_vms: boolean;
+    vm_names: string[];
     snapshot_volumes: boolean;
     ttl: string;
   }) => void;
@@ -205,17 +211,19 @@ function CreateScheduleModal({
   const valid =
     state.name.length > 0 &&
     state.schedule.length > 0 &&
-    (state.type === 'velero' || (state.vm_namespace.length > 0 && state.vm_name.length > 0));
+    (state.type === 'velero'
+      ? isTargetValid(state.target)
+      : state.vm_namespace.length > 0 && state.vm_name.length > 0);
 
   const handleSubmit = () => {
     if (state.type === 'velero') {
       onCreateVelero({
         name: state.name,
         schedule: state.schedule,
-        included_namespaces: state.included_namespaces
-          ? state.included_namespaces.split(',').map((s) => s.trim()).filter(Boolean)
-          : [],
-        label_selector: state.label_selector,
+        folder: state.target.folder,
+        environment: state.target.environment,
+        all_vms: state.target.all_vms,
+        vm_names: state.target.vm_names,
         snapshot_volumes: state.snapshot_volumes,
         ttl: `${parseInt(state.ttl_days, 10) * 24}h`,
       });
@@ -272,28 +280,7 @@ function CreateScheduleModal({
 
         {state.type === 'velero' ? (
           <>
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="block text-xs text-surface-300 mb-1">Namespaces (comma-separated)</label>
-                <input
-                  type="text"
-                  value={state.included_namespaces}
-                  onChange={(e) => set({ included_namespaces: e.target.value })}
-                  placeholder="default, production (empty = all)"
-                  className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 text-sm"
-                />
-              </div>
-              <div>
-                <label className="block text-xs text-surface-300 mb-1">Label Filter</label>
-                <input
-                  type="text"
-                  value={state.label_selector}
-                  onChange={(e) => set({ label_selector: e.target.value })}
-                  placeholder="app=myapp,env=prod"
-                  className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
-                />
-              </div>
-            </div>
+            <BackupTargetPicker value={state.target} onChange={(target) => set({ target })} />
             <div className="grid grid-cols-2 gap-3">
               <div>
                 <label className="block text-xs text-surface-300 mb-1">Retention (days)</label>
@@ -368,16 +355,17 @@ function CreateBackupModal({
   onClose: () => void;
   onCreate: (data: {
     name: string;
-    included_namespaces: string[];
-    label_selector: string;
+    folder: string;
+    environment: string;
+    all_vms: boolean;
+    vm_names: string[];
     snapshot_volumes: boolean;
     ttl: string;
   }) => void;
   isCreating: boolean;
 }) {
   const [name, setName] = useState('');
-  const [namespaces, setNamespaces] = useState('');
-  const [labels, setLabels] = useState('');
+  const [target, setTarget] = useState<BackupTarget>(EMPTY_TARGET);
   const [ttlDays, setTtlDays] = useState('30');
   const [snapVols, setSnapVols] = useState(true);
 
@@ -394,28 +382,7 @@ function CreateBackupModal({
             className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
           />
         </div>
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs text-surface-300 mb-1">Namespaces (comma-separated)</label>
-            <input
-              type="text"
-              value={namespaces}
-              onChange={(e) => setNamespaces(e.target.value)}
-              placeholder="default, production (empty = all)"
-              className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 text-sm"
-            />
-          </div>
-          <div>
-            <label className="block text-xs text-surface-300 mb-1">Label Filter</label>
-            <input
-              type="text"
-              value={labels}
-              onChange={(e) => setLabels(e.target.value)}
-              placeholder="app=myapp"
-              className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
-            />
-          </div>
-        </div>
+        <BackupTargetPicker value={target} onChange={setTarget} />
         <div className="grid grid-cols-2 gap-3">
           <div>
             <label className="block text-xs text-surface-300 mb-1">Retention (days)</label>
@@ -444,15 +411,15 @@ function CreateBackupModal({
             onClick={() =>
               onCreate({
                 name,
-                included_namespaces: namespaces
-                  ? namespaces.split(',').map((s) => s.trim()).filter(Boolean)
-                  : [],
-                label_selector: labels,
+                folder: target.folder,
+                environment: target.environment,
+                all_vms: target.all_vms,
+                vm_names: target.vm_names,
                 snapshot_volumes: snapVols,
                 ttl: `${parseInt(ttlDays, 10) * 24}h`,
               })
             }
-            disabled={!name || isCreating}
+            disabled={!name || !isTargetValid(target) || isCreating}
             className="btn-primary"
           >
             {isCreating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Archive className="w-4 h-4" />}

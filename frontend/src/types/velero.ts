@@ -62,6 +62,10 @@ export interface VeleroRestore {
 
 export interface CreateVeleroBackupRequest {
   name: string;
+  folder?: string;
+  environment?: string;
+  all_vms?: boolean;
+  vm_names?: string[];
   included_namespaces?: string[];
   label_selector?: string;
   snapshot_volumes?: boolean;
@@ -71,6 +75,10 @@ export interface CreateVeleroBackupRequest {
 export interface CreateVeleroScheduleRequest {
   name: string;
   schedule: string;
+  folder?: string;
+  environment?: string;
+  all_vms?: boolean;
+  vm_names?: string[];
   included_namespaces?: string[];
   label_selector?: string;
   snapshot_volumes?: boolean;
