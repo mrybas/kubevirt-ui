@@ -38,6 +38,19 @@ import type { MenuItem } from '@/components/common/KebabMenu';
 
 type ViewMode = 'table' | 'grid';
 
+const FOLDER_LABEL = 'kubevirt-ui.io/folder';
+const ENV_LABEL = 'kubevirt-ui.io/environment';
+
+// The env namespace ({folder}-{environment}) a VM *belongs* to by label.
+// Tenant worker VMs physically live in `tenant-<name>` but carry the folder +
+// environment of their tenant, so this maps them back to the env namespace the
+// global selector / folder filter reasons about.
+function vmEnvNamespace(vm: VM): string | null {
+  const f = vm.labels?.[FOLDER_LABEL];
+  const e = vm.labels?.[ENV_LABEL];
+  return f && e ? `${f}-${e}` : null;
+}
+
 // Collect all namespace names in a folder subtree (including sub-folders)
 function collectFolderNamespaces(folderName: string, allFolders: FolderType[]): Set<string> {
   const ns = new Set<string>();
@@ -83,8 +96,11 @@ export function VirtualMachines() {
     if (selectedNamespace && filterFolder) setFilterFolder('');
   }, [selectedNamespace]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // VM hooks - if no namespace selected, fetch all VMs from all projects
-  const { data: vmData, isLoading, error, refetch: refetchVMs } = useVMs(selectedNamespace || undefined, page, perPage, debouncedSearch || undefined);
+  // Always fetch across all accessible namespaces; the global namespace scope
+  // is applied client-side (by label) below so tenant worker VMs — which live
+  // in `tenant-<name>`, not in the env namespace — still surface under their
+  // env. A server-side single-namespace fetch would miss them.
+  const { data: vmData, isLoading, error, refetch: refetchVMs } = useVMs(undefined, page, perPage, debouncedSearch || undefined);
   const { data: namespacesData } = useNamespaces();
   const { data: foldersData } = useFoldersFlat();
   const startVM = useStartVM();
@@ -98,7 +114,7 @@ export function VirtualMachines() {
   const activeFolder = allFolders.find((f) => f.name === filterFolder) ?? null;
 
   // Namespaces belonging to the selected folder tree. Ignored while a global
-  // namespace scope is active (that scope already narrows the fetch to one ns).
+  // namespace scope is active (the namespace scope wins).
   const folderNamespaces = !selectedNamespace && filterFolder
     ? collectFolderNamespaces(filterFolder, allFolders)
     : null;
@@ -107,10 +123,19 @@ export function VirtualMachines() {
   const addPending = (key: string) => setPendingActions(prev => new Set(prev).add(key));
   const removePending = (key: string) => setPendingActions(prev => { const s = new Set(prev); s.delete(key); return s; });
 
-  // Filter by folder client-side; search is handled server-side via debouncedSearch
-  const filteredVMs = (vmData?.items || []).filter(vm =>
-    !folderNamespaces || folderNamespaces.has(vm.namespace)
-  );
+  // Scope client-side; search is handled server-side via debouncedSearch.
+  // A VM matches a namespace either by living in it or by belonging to its env
+  // (worker VMs). The global namespace scope wins over the folder filter.
+  const filteredVMs = (vmData?.items || []).filter(vm => {
+    if (selectedNamespace) {
+      return vm.namespace === selectedNamespace || vmEnvNamespace(vm) === selectedNamespace;
+    }
+    if (folderNamespaces) {
+      const envNs = vmEnvNamespace(vm);
+      return folderNamespaces.has(vm.namespace) || (!!envNs && folderNamespaces.has(envNs));
+    }
+    return true;
+  });
 
   const handleStart = (vm: VM) => {
     const k = vmKey(vm);
