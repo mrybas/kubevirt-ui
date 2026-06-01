@@ -310,6 +310,21 @@ def _endpoint_host(name: str) -> str:
     return f"{name}.{_require_cluster_config()['ingress_domain']}"
 
 
+def _external_dns_target() -> str:
+    """IP external-dns should publish for tenant API hostnames.
+
+    external-dns can't infer a target from an IngressRouteTCP (no
+    `.status.loadBalancer` — the VIP belongs to the shared Traefik LB
+    Service, not the IRT), so we stamp it explicitly via the
+    `external-dns.alpha.kubernetes.io/target` annotation. Defaults to the
+    cluster ingress VIP (where the ingress controller listens); override
+    via ``TENANTS_EXTERNAL_DNS_TARGET``. Empty when no ingress_ip is known
+    — callers then skip the annotation.
+    """
+    return (os.getenv("TENANTS_EXTERNAL_DNS_TARGET") or "").strip() \
+        or _require_cluster_config().get("ingress_ip") or ""
+
+
 def _ingress_class() -> str:
     return _require_cluster_config()["ingress_class"]
 

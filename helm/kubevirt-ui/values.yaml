@@ -42,6 +42,11 @@ backend:
     # IngressRouteTCP HostSNI + apiserver certSANs, so it must match the
     # kubeconfig server host exactly or TLS passthrough breaks.
     TENANTS_INGRESS_DOMAIN: ""
+    # IP external-dns publishes for tenant API hostnames (stamped as
+    # external-dns.alpha.kubernetes.io/target on the apiserver ingress —
+    # external-dns can't infer it from an IngressRouteTCP). Empty → cluster
+    # ingress VIP. Set if external-dns must publish a different address.
+    TENANTS_EXTERNAL_DNS_TARGET: ""
     # kube-dns/coredns Service ClusterIP override
     TENANTS_VPCDNS_FORWARD_DNS: ""
     # VPC DNS VIP within service CIDR (default: <service-cidr>.200)

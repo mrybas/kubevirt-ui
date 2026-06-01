@@ -29,6 +29,7 @@ from app.api.v1.tenants_common import (
     _endpoint_host,
     _ingress_class,
     _ingress_controller,
+    _external_dns_target,
 )
 from app.api.v1.tenants_cp_ports import allocate_cp_ports
 
@@ -664,7 +665,7 @@ def _build_kubeadm_config_template_cr(
     }
 
 
-def _build_ingress_nginx(req: TenantCreateRequest, host: str, backend_port: int = 6443) -> dict[str, Any]:
+def _build_ingress_nginx(req: TenantCreateRequest, host: str, backend_port: int = 6443, dns_target: str = "") -> dict[str, Any]:
     # Ingress must live in the same namespace as the backend Service it points
     # at — Kamaji generates the TCP Service in the tenant ns alongside the
     # KamajiControlPlane CR, so the Ingress lives there too.
@@ -686,6 +687,8 @@ def _build_ingress_nginx(req: TenantCreateRequest, host: str, backend_port: int 
             "annotations": {
                 "nginx.ingress.kubernetes.io/ssl-passthrough": "true",
                 "nginx.ingress.kubernetes.io/backend-protocol": "HTTPS",
+                # Tell external-dns which IP to publish for this host.
+                **({"external-dns.alpha.kubernetes.io/target": dns_target} if dns_target else {}),
             },
         },
         "spec": {
@@ -713,17 +716,19 @@ def _build_ingress_nginx(req: TenantCreateRequest, host: str, backend_port: int 
     }
 
 
-def _build_ingress_haproxy(req: TenantCreateRequest, host: str, backend_port: int = 6443) -> dict[str, Any]:
-    body = _build_ingress_nginx(req, host, backend_port)
-    # Same Ingress shape, different annotation key.
+def _build_ingress_haproxy(req: TenantCreateRequest, host: str, backend_port: int = 6443, dns_target: str = "") -> dict[str, Any]:
+    body = _build_ingress_nginx(req, host, backend_port, dns_target)
+    # Same Ingress shape, different annotation keys (keep the external-dns
+    # target from the nginx builder).
     body["metadata"]["annotations"] = {
         "haproxy.org/ssl-passthrough": "true",
         "haproxy.org/backend-protocol": "h2",
+        **({"external-dns.alpha.kubernetes.io/target": dns_target} if dns_target else {}),
     }
     return body
 
 
-def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str, backend_port: int = 6443) -> dict[str, Any]:
+def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str, backend_port: int = 6443, dns_target: str = "") -> dict[str, Any]:
     # Traefik entryPoint name varies by deployment; default to "websecure"
     # (Traefik's standard HTTPS entry point). Override via env if needed.
     # Workers reach the tenant apiserver via the cluster's standard 443
@@ -742,6 +747,10 @@ def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str, backend_
             "labels": {
                 "kubevirt-ui.io/tenant": req.name,
             },
+            # external-dns can't infer a target from an IngressRouteTCP
+            # (no LB status), so publish the ingress VIP explicitly. The
+            # hostname is taken from the HostSNI match below.
+            **({"annotations": {"external-dns.alpha.kubernetes.io/target": dns_target}} if dns_target else {}),
         },
         "spec": {
             "entryPoints": [entry_point],
@@ -760,7 +769,7 @@ def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str, backend_
     }
 
 
-def _build_httpproxy_contour(req: TenantCreateRequest, host: str, backend_port: int = 6443) -> dict[str, Any]:
+def _build_httpproxy_contour(req: TenantCreateRequest, host: str, backend_port: int = 6443, dns_target: str = "") -> dict[str, Any]:
     # Same-ns as the Kamaji-generated TCP Service in the tenant ns.
     return {
         "apiVersion": "projectcontour.io/v1",
@@ -771,6 +780,7 @@ def _build_httpproxy_contour(req: TenantCreateRequest, host: str, backend_port: 
             "labels": {
                 "kubevirt-ui.io/tenant": req.name,
             },
+            **({"annotations": {"external-dns.alpha.kubernetes.io/target": dns_target}} if dns_target else {}),
         },
         "spec": {
             "virtualhost": {
@@ -813,23 +823,24 @@ async def _create_tenant_apiserver_ingress(
     ns = _tenant_ns(req.name)
     controller = _ingress_controller()
     backend_port = api_port if api_port is not None else 6443
+    dns_target = _external_dns_target()
 
     if "ingress-nginx" in controller:
-        body = _build_ingress_nginx(req, host, backend_port)
+        body = _build_ingress_nginx(req, host, backend_port, dns_target)
         networking_api = client.NetworkingV1Api(k8s._api_client)
         await networking_api.create_namespaced_ingress(namespace=ns, body=body)
         logger.info(f"Created nginx Ingress {ns}/{req.name}-api host={host} → :{backend_port}")
         return
 
     if "haproxy" in controller:
-        body = _build_ingress_haproxy(req, host, backend_port)
+        body = _build_ingress_haproxy(req, host, backend_port, dns_target)
         networking_api = client.NetworkingV1Api(k8s._api_client)
         await networking_api.create_namespaced_ingress(namespace=ns, body=body)
         logger.info(f"Created haproxy Ingress {ns}/{req.name}-api host={host} → :{backend_port}")
         return
 
     if "traefik" in controller:
-        body = _build_ingressroutetcp_traefik(req, host, backend_port)
+        body = _build_ingressroutetcp_traefik(req, host, backend_port, dns_target)
         await k8s.custom_api.create_namespaced_custom_object(
             group="traefik.io", version="v1alpha1", namespace=ns,
             plural="ingressroutetcps", body=body,
@@ -838,7 +849,7 @@ async def _create_tenant_apiserver_ingress(
         return
 
     if "contour" in controller:
-        body = _build_httpproxy_contour(req, host, backend_port)
+        body = _build_httpproxy_contour(req, host, backend_port, dns_target)
         await k8s.custom_api.create_namespaced_custom_object(
             group="projectcontour.io", version="v1", namespace=ns,
             plural="httpproxies", body=body,
