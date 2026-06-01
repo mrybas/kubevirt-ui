@@ -8,6 +8,7 @@ Manages Velero CRDs for cluster-level backup and restore operations:
 """
 
 import logging
+import os
 import time
 from typing import Any
 
@@ -82,9 +83,28 @@ class StorageLocationUpdateRequest(BaseModel):
 
 
 async def _find_velero_namespace(k8s_client: Any) -> str:
-    """Find the namespace where Velero is installed by looking for BackupStorageLocations."""
-    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    """Resolve the namespace where Velero runs.
 
+    Order:
+      1. VELERO_NAMESPACE env — explicit, authoritative (the bootstrap
+         installs Velero in o0-velero, not the upstream-default `velero`).
+      2. An existing BackupStorageLocation's namespace (works once Velero
+         is configured).
+      3. The Velero **Deployment** namespace (label app.kubernetes.io/name=
+         velero, else a Deployment literally named `velero`). Critical for
+         a fresh install: discovery by existing BSL is chicken-and-egg when
+         the user is creating the FIRST BSL — there are none yet — so we
+         must locate Velero by its workload instead. The Helm chart labels
+         the workload, not the namespace, which is why the old namespace-
+         label lookup missed o0-velero and CREATE fell through to `velero`.
+      4. A namespace labelled app.kubernetes.io/name=velero.
+      5. Upstream default `velero`.
+    """
+    env_ns = os.getenv("VELERO_NAMESPACE", "").strip()
+    if env_ns:
+        return env_ns
+
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
     try:
         result = await custom_api.list_cluster_custom_object(
             group=VELERO_GROUP, version=VELERO_VERSION,
@@ -96,7 +116,25 @@ async def _find_velero_namespace(k8s_client: Any) -> str:
     except ApiException:
         pass
 
-    # Fallback: look for namespace with "velero" in name
+    # Locate Velero by its Deployment — works before any BSL exists.
+    apps_api = client.AppsV1Api(k8s_client._api_client)
+    try:
+        deploys = await apps_api.list_deployment_for_all_namespaces(
+            label_selector="app.kubernetes.io/name=velero",
+        )
+        if deploys.items:
+            return deploys.items[0].metadata.namespace
+    except ApiException:
+        pass
+    try:
+        all_deploys = await apps_api.list_deployment_for_all_namespaces()
+        for d in all_deploys.items:
+            if d.metadata.name == "velero":
+                return d.metadata.namespace
+    except ApiException:
+        pass
+
+    # Namespace-level label (rare, but cheap to try).
     core_api = client.CoreV1Api(k8s_client._api_client)
     try:
         ns_list = await core_api.list_namespace(

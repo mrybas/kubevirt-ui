@@ -34,6 +34,12 @@ backend:
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as
     # a fallback if the Deployment is not found in this namespace.
     KUBE_OVN_NAMESPACE: "kube-ovn"
+    # Namespace where Velero runs. Empty → backend discovers it (existing
+    # BackupStorageLocation, then the Velero Deployment, then a velero-
+    # labelled namespace, then `velero`). Set explicitly (e.g. o0-velero)
+    # to skip discovery — required if Velero isn't in the default `velero`
+    # ns and no BSL exists yet (creating the first BSL otherwise 404s).
+    VELERO_NAMESPACE: ""
     # -- Tenant-stack overrides — all optional, backend autodetects/defaults when unset
     # Base domain for tenant API + ingress hostnames: <tenant>.<domain>.
     # Empty → falls back to <ingress_ip>.nip.io. Set to your own wildcard
