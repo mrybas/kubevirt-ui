@@ -19,6 +19,8 @@ from pydantic import BaseModel, Field
 
 from app.core.auth import User, require_auth
 from app.core.errors import k8s_error_to_http
+from app.core.groups import ENV_FOLDER_LABEL, ENV_ENVIRONMENT_LABEL
+from app.core.naming import VM_NAME_LABEL
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -32,6 +34,16 @@ VELERO_VERSION = "v1"
 
 class VeleroBackupCreateRequest(BaseModel):
     name: str = Field(..., pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", max_length=63)
+    # Folder→env→VM target (preferred). The backend resolves folder+
+    # environment to the env namespace(s); all_vms backs up the whole
+    # namespace, otherwise vm_names selects specific VMs via the unique
+    # kubevirt-ui.io/vm-name label (kubevirt-velero-plugin pulls their
+    # disks). Legacy included_namespaces / label_selector remain as a
+    # raw fallback when folder/environment are omitted.
+    folder: str = ""
+    environment: str = ""
+    all_vms: bool = True
+    vm_names: list[str] = []
     included_namespaces: list[str] = []
     label_selector: str = ""
     snapshot_volumes: bool = True
@@ -41,6 +53,10 @@ class VeleroBackupCreateRequest(BaseModel):
 class VeleroScheduleCreateRequest(BaseModel):
     name: str = Field(..., pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$", max_length=63)
     schedule: str = Field(..., description="Cron expression (e.g. '0 2 * * *')")
+    folder: str = ""
+    environment: str = ""
+    all_vms: bool = True
+    vm_names: list[str] = []
     included_namespaces: list[str] = []
     label_selector: str = ""
     snapshot_volumes: bool = True
@@ -146,6 +162,82 @@ async def _find_velero_namespace(k8s_client: Any) -> str:
         pass
 
     return "velero"
+
+
+async def _namespaces_for_env(k8s_client: Any, folder: str, environment: str) -> list[str]:
+    """Resolve a (folder, environment) pair to its env namespace(s)."""
+    core_api = client.CoreV1Api(k8s_client._api_client)
+    selector = f"{ENV_FOLDER_LABEL}={folder},{ENV_ENVIRONMENT_LABEL}={environment}"
+    ns_list = await core_api.list_namespace(label_selector=selector)
+    return [ns.metadata.name for ns in ns_list.items]
+
+
+async def _ensure_vm_name_labels(k8s_client: Any, namespace: str, names: list[str]) -> None:
+    """Backfill kubevirt-ui.io/vm-name=<name> on VMs that predate it.
+
+    VMs created after the labelling change already carry it; this patches
+    any that don't so the selector matches. Best-effort per VM.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    for name in names:
+        try:
+            await custom_api.patch_namespaced_custom_object(
+                group="kubevirt.io", version="v1",
+                namespace=namespace, plural="virtualmachines", name=name,
+                body={"metadata": {"labels": {VM_NAME_LABEL: name}}},
+                _content_type="application/merge-patch+json",
+            )
+        except ApiException as e:
+            logger.warning(f"Could not backfill {VM_NAME_LABEL} on {namespace}/{name}: {e}")
+
+
+async def _build_backup_template_spec(
+    k8s_client: Any, req: Any,
+) -> dict[str, Any]:
+    """Build the Velero backup template spec from a backup/schedule request.
+
+    Folder/environment path (preferred): resolve env namespace(s);
+    all_vms → whole namespace; else select the named VMs via the unique
+    vm-name label (backfilling it first) so the kubevirt-velero-plugin
+    captures each VM with its DataVolumes/PVCs. Falls back to raw
+    included_namespaces / label_selector when folder/environment unset.
+    """
+    spec: dict[str, Any] = {
+        "snapshotVolumes": req.snapshot_volumes,
+        "ttl": req.ttl,
+    }
+
+    if req.folder and req.environment:
+        nss = await _namespaces_for_env(k8s_client, req.folder, req.environment)
+        if not nss:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"No namespace found for folder '{req.folder}' / environment "
+                    f"'{req.environment}'. Pick an existing folder/environment."
+                ),
+            )
+        spec["includedNamespaces"] = nss
+        if not req.all_vms:
+            if not req.vm_names:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Select at least one VM, or enable 'all VMs in environment'.",
+                )
+            # Backfill the unique label on the chosen VMs, then OR-select them.
+            for ns in nss:
+                await _ensure_vm_name_labels(k8s_client, ns, req.vm_names)
+            spec["orLabelSelectors"] = [
+                {"matchLabels": {VM_NAME_LABEL: name}} for name in req.vm_names
+            ]
+        return spec
+
+    # Legacy raw path.
+    if req.included_namespaces:
+        spec["includedNamespaces"] = req.included_namespaces
+    if req.label_selector:
+        spec["labelSelector"] = {"matchLabels": _parse_label_selector(req.label_selector)}
+    return spec
 
 
 def _parse_backup(item: dict[str, Any]) -> dict[str, Any]:
@@ -275,14 +367,7 @@ async def create_velero_backup(
     k8s_client = request.app.state.k8s_client
     velero_ns = await _find_velero_namespace(k8s_client)
 
-    spec: dict[str, Any] = {
-        "snapshotVolumes": backup_request.snapshot_volumes,
-        "ttl": backup_request.ttl,
-    }
-    if backup_request.included_namespaces:
-        spec["includedNamespaces"] = backup_request.included_namespaces
-    if backup_request.label_selector:
-        spec["labelSelector"] = {"matchLabels": _parse_label_selector(backup_request.label_selector)}
+    spec = await _build_backup_template_spec(k8s_client, backup_request)
 
     body = {
         "apiVersion": f"{VELERO_GROUP}/{VELERO_VERSION}",
@@ -433,14 +518,7 @@ async def create_velero_schedule(
     k8s_client = request.app.state.k8s_client
     velero_ns = await _find_velero_namespace(k8s_client)
 
-    template: dict[str, Any] = {
-        "snapshotVolumes": schedule_request.snapshot_volumes,
-        "ttl": schedule_request.ttl,
-    }
-    if schedule_request.included_namespaces:
-        template["includedNamespaces"] = schedule_request.included_namespaces
-    if schedule_request.label_selector:
-        template["labelSelector"] = {"matchLabels": _parse_label_selector(schedule_request.label_selector)}
+    template = await _build_backup_template_spec(k8s_client, schedule_request)
 
     body = {
         "apiVersion": f"{VELERO_GROUP}/{VELERO_VERSION}",
