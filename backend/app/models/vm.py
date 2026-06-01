@@ -428,7 +428,13 @@ def vm_from_k8s(vm: dict[str, Any], vmi: dict[str, Any] | None, pod_ip: str | No
 
     if "cpu" in domain:
         cpu_cores = domain["cpu"].get("cores")
-    if "resources" in domain:
+    # Memory: prefer the modern `domain.memory.guest` (set by tenant worker
+    # KubevirtMachineTemplates and our own VM create flow), fall back to the
+    # scheduler request. Reading only `resources.requests` left worker VMs —
+    # which set `memory.guest` but no resource request — showing blank RAM.
+    if domain.get("memory", {}).get("guest"):
+        memory = domain["memory"]["guest"]
+    elif "resources" in domain:
         memory = domain["resources"].get("requests", {}).get("memory")
     
     # Get console settings from devices
