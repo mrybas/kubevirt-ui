@@ -132,10 +132,6 @@ export function DataTable<T>({
     [data, selected, keyExtractor]
   );
 
-  if (loading) {
-    return <LoadingSkeleton rows={8} columns={visibleColumns.length} />;
-  }
-
   const totalPages = pagination ? Math.ceil(pagination.total / pagination.pageSize) : 1;
 
   return (
@@ -156,7 +152,12 @@ export function DataTable<T>({
         </div>
       )}
 
-      {/* Table */}
+      {/* Body — only this swaps to a skeleton while loading, so the search
+          input above stays mounted and keeps focus while you type. */}
+      {loading ? (
+        <LoadingSkeleton rows={8} columns={visibleColumns.length} />
+      ) : (
+      <>
       <div className="card overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full">
@@ -272,6 +273,8 @@ export function DataTable<T>({
             </button>
           ))}
         </div>
+      )}
+      </>
       )}
     </div>
   );
