@@ -2,12 +2,15 @@ import { useState, useRef, useEffect } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { User, LogOut, ChevronDown, Menu } from 'lucide-react';
 import { useNamespaces } from '@/hooks/useNamespaces';
-import { useProjects } from '@/hooks/useProjects';
+import { useFoldersFlat } from '@/hooks/useFolders';
 import { useAppStore } from '@/store';
 import { useAuthStore } from '@/store/auth';
 import { CustomSelect } from '@/components/common/CustomSelect';
 import type { SelectOption } from '@/components/common/CustomSelect';
 import { triggerSidebarToggle } from './Sidebar';
+
+const FOLDER_LABEL = 'kubevirt-ui.io/folder';
+const ENV_LABEL = 'kubevirt-ui.io/environment';
 
 const pageTitles: Record<string, string> = {
   '/dashboard': 'Dashboard',
@@ -22,12 +25,30 @@ const pageTitles: Record<string, string> = {
 export function Header() {
   const location = useLocation();
   const navigate = useNavigate();
+  // `useNamespaces` is already access-scoped server-side (admins see all
+  // enabled namespaces; others only those with a RoleBinding for them), so the
+  // selector lists exactly what the user may narrow to — nothing they can't see.
   const { data: namespaces } = useNamespaces();
-  const { data: projectsData } = useProjects();
+  const { data: foldersData } = useFoldersFlat();
   const { selectedNamespace, setSelectedNamespace } = useAppStore();
   const { user, logout, config } = useAuthStore();
   const [showUserMenu, setShowUserMenu] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  // Map folder slug → display name for grouping the namespace options.
+  const folderDisplay: Record<string, string> = {};
+  for (const f of foldersData?.items ?? []) folderDisplay[f.name] = f.display_name || f.name;
+
+  const namespaceOptions: SelectOption[] = [{ value: '', label: 'All namespaces' }];
+  for (const ns of namespaces?.items ?? []) {
+    const folder = ns.labels?.[FOLDER_LABEL];
+    const env = ns.labels?.[ENV_LABEL];
+    namespaceOptions.push({
+      value: ns.name,
+      label: env ? `${env} (${ns.name})` : ns.name,
+      group: folder ? folderDisplay[folder] ?? folder : undefined,
+    });
+  }
 
   const pageTitle = pageTitles[location.pathname] ?? 'KubeVirt UI';
 
@@ -64,27 +85,15 @@ export function Header() {
       </div>
 
       <div className="flex items-center gap-2 md:gap-4 min-w-0">
-        {/* Namespace selector (grouped by project) — hidden on very small screens */}
+        {/* Global namespace scope — narrows VMs, images, disks, templates and
+            tenants to one namespace the user has access to. Cluster-wide
+            resources (subnets, security groups, …) are unaffected. */}
         <CustomSelect
           value={selectedNamespace}
           onChange={setSelectedNamespace}
           className="hidden sm:block w-40 md:w-52"
           placeholder="All namespaces"
-          options={(() => {
-            const opts: SelectOption[] = [{ value: '', label: 'All namespaces' }];
-            if (projectsData && projectsData.items.length > 0) {
-              for (const project of projectsData.items) {
-                for (const env of project.environments) {
-                  opts.push({ value: env.name, label: `${env.environment} (${env.name})`, group: project.display_name });
-                }
-              }
-            } else if (namespaces?.items) {
-              for (const ns of namespaces.items) {
-                opts.push({ value: ns.name, label: ns.name });
-              }
-            }
-            return opts;
-          })()}
+          options={namespaceOptions}
         />
 
         {/* User menu */}

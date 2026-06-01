@@ -158,6 +158,8 @@ def _parse_tenant_response(
         name=name,
         display_name=metadata.get("annotations", {}).get("kubevirt-ui.io/display-name", name),
         namespace=metadata.get("namespace", ""),
+        folder=metadata.get("labels", {}).get("kubevirt-ui.io/folder", ""),
+        environment=metadata.get("labels", {}).get("kubevirt-ui.io/environment", ""),
         kubernetes_version=cluster_status.get("version", ""),
         status=status_str,
         phase=phase,

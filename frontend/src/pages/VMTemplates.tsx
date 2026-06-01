@@ -64,13 +64,17 @@ export function VMTemplates() {
   // Get unique project namespaces from templates
   const templateProjects = [...new Set(templates.map(t => t.golden_image_namespace).filter(Boolean))];
   
-  // Filter templates by search and project
+  // Filter templates by search and project. A global namespace scope (header)
+  // wins over the page-local project filter and pins templates to that
+  // namespace via their golden image's namespace.
   const filteredTemplates = templates.filter(t => {
-    const matchesSearch = !searchQuery || 
+    const matchesSearch = !searchQuery ||
       t.display_name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       t.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       (t.description || '').toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesProject = filterProject === 'all' || t.golden_image_namespace === filterProject;
+    const matchesProject = selectedNamespace
+      ? t.golden_image_namespace === selectedNamespace
+      : filterProject === 'all' || t.golden_image_namespace === filterProject;
     return matchesSearch && matchesProject;
   });
   

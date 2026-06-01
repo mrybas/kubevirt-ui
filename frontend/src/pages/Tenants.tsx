@@ -31,6 +31,7 @@ import { useStorageClasses } from '../hooks/useStorage';
 import { useFoldersFlat } from '../hooks/useFolders';
 import { useVpcs } from '../hooks/useVpcs';
 import { useAuthStore } from '../store/auth';
+import { useAppStore } from '../store';
 import type { Tenant, TenantCreateRequest, TenantAddon, AddonComponent } from '../types/tenant';
 import { WizardStepIndicator } from '../components/common/WizardStepIndicator';
 import { DataTable, type Column } from '@/components/common/DataTable';
@@ -1573,15 +1574,19 @@ export default function Tenants() {
 
   const { data: tenantsData, isLoading, refetch } = useTenants();
   const deleteTenantMutation = useDeleteTenant();
+  const { selectedNamespace } = useAppStore();
 
   const allTenants = tenantsData?.items ?? [];
-  const filteredTenants = searchQuery
-    ? allTenants.filter(
-        (t: Tenant) =>
-          t.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-          t.display_name.toLowerCase().includes(searchQuery.toLowerCase())
-      )
-    : allTenants;
+  const filteredTenants = allTenants.filter((t: Tenant) => {
+    // Global namespace scope: a tenant belongs to the env namespace
+    // `{folder}-{environment}`; show only those matching the selected one.
+    if (selectedNamespace && `${t.folder ?? ''}-${t.environment ?? ''}` !== selectedNamespace) {
+      return false;
+    }
+    if (!searchQuery) return true;
+    const q = searchQuery.toLowerCase();
+    return t.name.toLowerCase().includes(q) || t.display_name.toLowerCase().includes(q);
+  });
 
   const handleDelete = async (name: string) => {
     await deleteTenantMutation.mutateAsync(name);

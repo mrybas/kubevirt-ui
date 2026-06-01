@@ -76,6 +76,13 @@ export function VirtualMachines() {
   // Reset to page 1 when folder filter changes
   useEffect(() => { setPage(1); }, [filterFolder]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // The global namespace scope wins over the per-page folder filter — picking a
+  // namespace clears any folder selection so the two can't conflict into an
+  // empty list. While a namespace is selected the folder dropdown is disabled.
+  useEffect(() => {
+    if (selectedNamespace && filterFolder) setFilterFolder('');
+  }, [selectedNamespace]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // VM hooks - if no namespace selected, fetch all VMs from all projects
   const { data: vmData, isLoading, error, refetch: refetchVMs } = useVMs(selectedNamespace || undefined, page, perPage, debouncedSearch || undefined);
   const { data: namespacesData } = useNamespaces();
@@ -90,8 +97,9 @@ export function VirtualMachines() {
   const total = vmData?.total ?? 0;
   const activeFolder = allFolders.find((f) => f.name === filterFolder) ?? null;
 
-  // Namespaces belonging to the selected folder tree
-  const folderNamespaces = filterFolder
+  // Namespaces belonging to the selected folder tree. Ignored while a global
+  // namespace scope is active (that scope already narrows the fetch to one ns).
+  const folderNamespaces = !selectedNamespace && filterFolder
     ? collectFolderNamespaces(filterFolder, allFolders)
     : null;
 
@@ -241,7 +249,8 @@ export function VirtualMachines() {
             <CustomSelect
               value={filterFolder}
               onChange={setFilterFolder}
-              placeholder="All folders"
+              disabled={!!selectedNamespace}
+              placeholder={selectedNamespace ? 'Namespace scope' : 'All folders'}
               options={[
                 { value: '', label: 'All folders' },
                 ...allFolders.map((f) => ({

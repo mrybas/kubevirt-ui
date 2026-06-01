@@ -124,6 +124,11 @@ def _build_cluster_cr(
             "namespace": _tenant_ns(req.name),
             "labels": {
                 "kubevirt-ui.io/tenant": req.name,
+                # Bind the tenant to its env namespace ({folder}-{environment})
+                # so the UI can scope the tenant list by the global namespace
+                # selector. Omitted for legacy/folderless tenants.
+                **({"kubevirt-ui.io/folder": req.folder} if req.folder else {}),
+                **({"kubevirt-ui.io/environment": req.environment} if req.environment else {}),
             },
             "annotations": {
                 "kubevirt-ui.io/display-name": req.display_name,

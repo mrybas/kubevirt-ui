@@ -284,6 +284,8 @@ class TenantResponse(BaseModel):
     name: str
     display_name: str
     namespace: str  # tenant-{name}
+    folder: str = ""  # owning folder (from Cluster label)
+    environment: str = ""  # owning environment; env ns = {folder}-{environment}
     kubernetes_version: str
     status: str  # Provisioning, Ready, NotReady, Deleting
     phase: str | None = None  # CAPI Cluster phase

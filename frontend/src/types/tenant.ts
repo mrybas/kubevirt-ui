@@ -104,6 +104,8 @@ export interface Tenant {
   name: string;
   display_name: string;
   namespace: string;
+  folder?: string;
+  environment?: string;
   kubernetes_version: string;
   status: string;
   phase: string | null;
