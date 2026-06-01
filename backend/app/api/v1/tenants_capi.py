@@ -664,17 +664,16 @@ def _build_kubeadm_config_template_cr(
     }
 
 
-def _build_ingress_nginx(req: TenantCreateRequest, host: str) -> dict[str, Any]:
+def _build_ingress_nginx(req: TenantCreateRequest, host: str, backend_port: int = 6443) -> dict[str, Any]:
     # Ingress must live in the same namespace as the backend Service it points
     # at — Kamaji generates the TCP Service in the tenant ns alongside the
     # KamajiControlPlane CR, so the Ingress lives there too.
     #
-    # Backend port = 6443: Kamaji's TCP Service exposes the apiserver on
-    # the default NetworkProfile.Port. We deliberately don't override that
-    # port (modern apiserver images can't bind <1024 as uid 65532), so the
-    # Service stays on 6443 regardless of which external port `_endpoint_port`
-    # advertises in `Cluster.spec.controlPlaneEndpoint`. Admin's Ingress
-    # entry point should also be on 6443 for a clean passthrough.
+    # backend_port = the Kamaji TCP Service port = NetworkProfile.Port.
+    # Default-overlay tenants leave it at 6443; VPC tenants set
+    # apiServerPort=<allocated api port>, so the Service listens on that
+    # port and the ingress MUST target it (pointing at 6443 would 502 →
+    # Traefik/nginx serves its default cert).
     return {
         "apiVersion": "networking.k8s.io/v1",
         "kind": "Ingress",
@@ -702,7 +701,7 @@ def _build_ingress_nginx(req: TenantCreateRequest, host: str) -> dict[str, Any]:
                                 "backend": {
                                     "service": {
                                         "name": req.name,
-                                        "port": {"number": 6443},
+                                        "port": {"number": backend_port},
                                     },
                                 },
                             }
@@ -714,8 +713,8 @@ def _build_ingress_nginx(req: TenantCreateRequest, host: str) -> dict[str, Any]:
     }
 
 
-def _build_ingress_haproxy(req: TenantCreateRequest, host: str) -> dict[str, Any]:
-    body = _build_ingress_nginx(req, host)
+def _build_ingress_haproxy(req: TenantCreateRequest, host: str, backend_port: int = 6443) -> dict[str, Any]:
+    body = _build_ingress_nginx(req, host, backend_port)
     # Same Ingress shape, different annotation key.
     body["metadata"]["annotations"] = {
         "haproxy.org/ssl-passthrough": "true",
@@ -724,7 +723,7 @@ def _build_ingress_haproxy(req: TenantCreateRequest, host: str) -> dict[str, Any
     return body
 
 
-def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str) -> dict[str, Any]:
+def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str, backend_port: int = 6443) -> dict[str, Any]:
     # Traefik entryPoint name varies by deployment; default to "websecure"
     # (Traefik's standard HTTPS entry point). Override via env if needed.
     # Workers reach the tenant apiserver via the cluster's standard 443
@@ -750,11 +749,10 @@ def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str) -> dict[
                 "match": f"HostSNI(`{host}`)",
                 "services": [{
                     "name": req.name,
-                    # Backend port 6443 = Kamaji TCP Service port (default
-                    # NetworkProfile.Port; we don't override it because doing
-                    # so would also change kube-apiserver --secure-port and
-                    # break privileged-port binding on 1.30+).
-                    "port": 6443,
+                    # = Kamaji TCP Service port = NetworkProfile.Port.
+                    # 6443 for default-overlay tenants; the allocated api
+                    # port for VPC tenants (apiServerPort).
+                    "port": backend_port,
                 }],
             }],
             "tls": {"passthrough": True},
@@ -762,7 +760,7 @@ def _build_ingressroutetcp_traefik(req: TenantCreateRequest, host: str) -> dict[
     }
 
 
-def _build_httpproxy_contour(req: TenantCreateRequest, host: str) -> dict[str, Any]:
+def _build_httpproxy_contour(req: TenantCreateRequest, host: str, backend_port: int = 6443) -> dict[str, Any]:
     # Same-ns as the Kamaji-generated TCP Service in the tenant ns.
     return {
         "apiVersion": "projectcontour.io/v1",
@@ -782,21 +780,28 @@ def _build_httpproxy_contour(req: TenantCreateRequest, host: str) -> dict[str, A
             "tcpproxy": {
                 "services": [{
                     "name": req.name,
-                    # Backend port 6443 = Kamaji TCP Service port (see note
-                    # in `_build_ingressroutetcp_traefik`).
-                    "port": 6443,
+                    # = Kamaji TCP Service port (see note in
+                    # `_build_ingressroutetcp_traefik`).
+                    "port": backend_port,
                 }],
             },
         },
     }
 
 
-async def _create_tenant_apiserver_ingress(k8s, req: TenantCreateRequest) -> None:
+async def _create_tenant_apiserver_ingress(
+    k8s, req: TenantCreateRequest, api_port: int | None = None,
+) -> None:
     """Expose the tenant kube-apiserver (Kamaji TCP) externally with TLS passthrough.
 
     Dispatches to the right resource shape per ingress controller. All current
     targets require end-to-end TLS passthrough — the tenant apiserver cert is
     served by Kamaji directly and ingress must not terminate.
+
+    `api_port` is the Kamaji TCP Service port: None (default overlay) → 6443;
+    VPC tenants pass their allocated apiServerPort, which the Service actually
+    listens on (pointing the ingress at 6443 instead would 502 and the
+    controller would serve its own default cert).
 
     The Ingress/IngressRouteTCP/HTTPProxy resource is created in the tenant
     namespace (alongside the Kamaji-generated TCP Service) because ingress
@@ -807,32 +812,33 @@ async def _create_tenant_apiserver_ingress(k8s, req: TenantCreateRequest) -> Non
     host = _endpoint_host(req.name)
     ns = _tenant_ns(req.name)
     controller = _ingress_controller()
+    backend_port = api_port if api_port is not None else 6443
 
     if "ingress-nginx" in controller:
-        body = _build_ingress_nginx(req, host)
+        body = _build_ingress_nginx(req, host, backend_port)
         networking_api = client.NetworkingV1Api(k8s._api_client)
         await networking_api.create_namespaced_ingress(namespace=ns, body=body)
-        logger.info(f"Created nginx Ingress {ns}/{req.name}-api host={host}")
+        logger.info(f"Created nginx Ingress {ns}/{req.name}-api host={host} → :{backend_port}")
         return
 
     if "haproxy" in controller:
-        body = _build_ingress_haproxy(req, host)
+        body = _build_ingress_haproxy(req, host, backend_port)
         networking_api = client.NetworkingV1Api(k8s._api_client)
         await networking_api.create_namespaced_ingress(namespace=ns, body=body)
-        logger.info(f"Created haproxy Ingress {ns}/{req.name}-api host={host}")
+        logger.info(f"Created haproxy Ingress {ns}/{req.name}-api host={host} → :{backend_port}")
         return
 
     if "traefik" in controller:
-        body = _build_ingressroutetcp_traefik(req, host)
+        body = _build_ingressroutetcp_traefik(req, host, backend_port)
         await k8s.custom_api.create_namespaced_custom_object(
             group="traefik.io", version="v1alpha1", namespace=ns,
             plural="ingressroutetcps", body=body,
         )
-        logger.info(f"Created Traefik IngressRouteTCP {ns}/{req.name}-api host={host}")
+        logger.info(f"Created Traefik IngressRouteTCP {ns}/{req.name}-api host={host} → :{backend_port}")
         return
 
     if "contour" in controller:
-        body = _build_httpproxy_contour(req, host)
+        body = _build_httpproxy_contour(req, host, backend_port)
         await k8s.custom_api.create_namespaced_custom_object(
             group="projectcontour.io", version="v1", namespace=ns,
             plural="httpproxies", body=body,
@@ -1118,5 +1124,6 @@ async def _create_capi_resources(
 
     # 6. Expose tenant kube-apiserver externally with TLS passthrough.
     #    Resource shape depends on the ingress controller (nginx Ingress vs
-    #    Traefik IngressRouteTCP vs Contour HTTPProxy).
-    await _create_tenant_apiserver_ingress(k8s, req)
+    #    Traefik IngressRouteTCP vs Contour HTTPProxy). For VPC tenants the
+    #    backend Service port is the allocated api_port, not 6443.
+    await _create_tenant_apiserver_ingress(k8s, req, api_port=api_port)

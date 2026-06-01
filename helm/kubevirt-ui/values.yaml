@@ -35,6 +35,13 @@ backend:
     # a fallback if the Deployment is not found in this namespace.
     KUBE_OVN_NAMESPACE: "kube-ovn"
     # -- Tenant-stack overrides — all optional, backend autodetects/defaults when unset
+    # Base domain for tenant API + ingress hostnames: <tenant>.<domain>.
+    # Empty → falls back to <ingress_ip>.nip.io. Set to your own wildcard
+    # domain (e.g. lab.beardlabs.cc). MUST have a wildcard DNS record
+    # (*.<domain> → the ingress/Traefik VIP); used for the tenant API
+    # IngressRouteTCP HostSNI + apiserver certSANs, so it must match the
+    # kubeconfig server host exactly or TLS passthrough breaks.
+    TENANTS_INGRESS_DOMAIN: ""
     # kube-dns/coredns Service ClusterIP override
     TENANTS_VPCDNS_FORWARD_DNS: ""
     # VPC DNS VIP within service CIDR (default: <service-cidr>.200)
