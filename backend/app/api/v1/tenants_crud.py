@@ -5,7 +5,9 @@ and Flux HelmRelease CRs per addon per tenant. Addon catalog read from ConfigMap
 """
 
 import base64
+import copy
 import logging
+import uuid
 from typing import Any
 
 import yaml
@@ -933,23 +935,105 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
         raise k8s_error_to_http(e, "tenant operation")
 
 
+async def _rotate_worker_template(
+    k8s, ns: str, md_name: str, worker_vcpu: int | None, worker_memory: str | None,
+) -> str | None:
+    """Resize tenant workers by rotating their KubevirtMachineTemplate.
+
+    CAPI infra templates are immutable, and changing CPU/RAM means recreating
+    the worker VMs anyway, so we copy the current template, apply the new
+    domain.cpu/memory, create it under a fresh name, and repoint the
+    MachineDeployment's infrastructureRef — CAPI then rolls the workers.
+
+    Returns the new template name, or None when nothing changed.
+    """
+    md = await k8s.custom_api.get_namespaced_custom_object(
+        group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
+        plural="machinedeployments", name=md_name,
+    )
+    infra_ref = (
+        md.get("spec", {}).get("template", {}).get("spec", {}).get("infrastructureRef", {})
+    )
+    if infra_ref.get("kind") != "KubevirtMachineTemplate":
+        return None
+    old_tpl_name = infra_ref.get("name", "")
+
+    tpl = await k8s.custom_api.get_namespaced_custom_object(
+        group=KUBEVIRT_INFRA_GROUP, version=KUBEVIRT_INFRA_VERSION, namespace=ns,
+        plural="kubevirtmachinetemplates", name=old_tpl_name,
+    )
+    domain = (
+        tpl.get("spec", {}).get("template", {}).get("spec", {})
+        .get("virtualMachineTemplate", {}).get("spec", {})
+        .get("template", {}).get("spec", {}).get("domain", {})
+    )
+    cur_vcpu = domain.get("cpu", {}).get("cores")
+    cur_mem = domain.get("memory", {}).get("guest")
+    if (worker_vcpu is None or worker_vcpu == cur_vcpu) and (
+        worker_memory is None or worker_memory == cur_mem
+    ):
+        return None  # no resource change requested
+
+    # Build the new template: copy spec, drop server-managed metadata, resize.
+    # Base the name on the MachineDeployment (not the possibly-already-suffixed
+    # old template) so repeated resizes don't grow the name unbounded.
+    new_name = f"{md_name}-{uuid.uuid4().hex[:5]}"
+    new_tpl: dict[str, Any] = {
+        "apiVersion": tpl["apiVersion"],
+        "kind": tpl["kind"],
+        "metadata": {"name": new_name, "namespace": ns},
+        "spec": copy.deepcopy(tpl["spec"]),
+    }
+    new_domain = (
+        new_tpl["spec"]["template"]["spec"]["virtualMachineTemplate"]["spec"]
+        ["template"]["spec"]["domain"]
+    )
+    if worker_vcpu is not None:
+        new_domain.setdefault("cpu", {})["cores"] = worker_vcpu
+    if worker_memory is not None:
+        new_domain.setdefault("memory", {})["guest"] = worker_memory
+
+    await k8s.custom_api.create_namespaced_custom_object(
+        group=KUBEVIRT_INFRA_GROUP, version=KUBEVIRT_INFRA_VERSION, namespace=ns,
+        plural="kubevirtmachinetemplates", body=new_tpl,
+    )
+    return new_name
+
+
 @router.post("/{name}/scale", response_model=TenantResponse)
 async def scale_tenant(
     request: Request, name: str, scale: TenantScaleRequest,
     user: User = Depends(require_auth),
 ) -> TenantResponse:
-    """Scale tenant worker nodes."""
+    """Scale and/or resize tenant worker nodes."""
     k8s = request.app.state.k8s_client
     ns = _tenant_ns(name)
+    md_name = f"{name}-workers"
 
     try:
+        # Resize first (rotate template), so the replica patch below lands on
+        # the MachineDeployment that already points at the new template.
+        new_tpl_name = await _rotate_worker_template(
+            k8s, ns, md_name, scale.worker_vcpu, scale.worker_memory,
+        )
+
+        patch: dict[str, Any] = {"spec": {"replicas": scale.worker_count}}
+        if new_tpl_name:
+            patch["spec"].setdefault("template", {}).setdefault("spec", {})[
+                "infrastructureRef"
+            ] = {
+                "apiVersion": f"{KUBEVIRT_INFRA_GROUP}/{KUBEVIRT_INFRA_VERSION}",
+                "kind": "KubevirtMachineTemplate",
+                "name": new_tpl_name,
+            }
+
         await k8s.custom_api.patch_namespaced_custom_object(
             group=CAPI_GROUP,
             version=CAPI_VERSION,
             namespace=ns,
             plural="machinedeployments",
-            name=f"{name}-workers",
-            body={"spec": {"replicas": scale.worker_count}},
+            name=md_name,
+            body=patch,
             _content_type="application/merge-patch+json",
         )
     except ApiException as e:

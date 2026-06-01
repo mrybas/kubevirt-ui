@@ -241,9 +241,17 @@ class TenantCreateRequest(BaseModel):
         return stripped or None
 
 class TenantScaleRequest(BaseModel):
-    """Request to scale tenant workers."""
+    """Request to scale / resize tenant workers.
+
+    ``worker_count`` always patches the MachineDeployment replicas. When
+    ``worker_vcpu`` and/or ``worker_memory`` are supplied (and differ from the
+    current spec) the worker KubevirtMachineTemplate is rotated, which triggers
+    a CAPI rolling replacement of the worker machines at the new size.
+    """
 
     worker_count: int = Field(..., ge=1, le=20)
+    worker_vcpu: int | None = Field(default=None, ge=1, le=32)
+    worker_memory: str | None = None
 
 
 # ---------------------------------------------------------------------------

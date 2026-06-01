@@ -90,6 +90,8 @@ export default function TenantDetail() {
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [deleteImageName, setDeleteImageName] = useState<string | null>(null);
   const [scaleCount, setScaleCount] = useState<number | null>(null);
+  const [scaleVcpu, setScaleVcpu] = useState<number | null>(null);
+  const [scaleMemory, setScaleMemory] = useState<string>('');
   const [copied, setCopied] = useState(false);
   const [kubeconfigType, setKubeconfigType] = useState<'admin' | 'oidc'>('admin');
   const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
@@ -120,9 +122,23 @@ export default function TenantDetail() {
   };
 
   const handleScale = async () => {
-    if (!name || scaleCount === null) return;
-    await scaleMutation.mutateAsync({ name, request: { worker_count: scaleCount } });
+    if (!name || !tenant) return;
+    // Count defaults to current when only resources are being changed.
+    const worker_count = scaleCount ?? tenant.worker_count;
+    const vcpuChanged = scaleVcpu !== null && scaleVcpu !== tenant.worker_vcpu;
+    const memChanged = scaleMemory.trim() !== '' && scaleMemory.trim() !== tenant.worker_memory;
+    if (scaleCount === null && !vcpuChanged && !memChanged) return;
+    await scaleMutation.mutateAsync({
+      name,
+      request: {
+        worker_count,
+        ...(vcpuChanged ? { worker_vcpu: scaleVcpu! } : {}),
+        ...(memChanged ? { worker_memory: scaleMemory.trim() } : {}),
+      },
+    });
     setScaleCount(null);
+    setScaleVcpu(null);
+    setScaleMemory('');
   };
 
   const handleDownloadKubeconfig = async () => {
@@ -350,28 +366,55 @@ export default function TenantDetail() {
               <Cpu className="h-5 w-5 text-primary-400" />
               Workers
             </h2>
-            <div className="flex items-center gap-2">
-              <input
-                type="number"
-                min={1} max={20}
-                placeholder={String(tenant.worker_count)}
-                value={scaleCount ?? ''}
-                onChange={e => setScaleCount(e.target.value ? parseInt(e.target.value) : null)}
-                className="w-20 px-2 py-1 bg-surface-800 border border-surface-700 rounded text-sm text-surface-200 focus:outline-none focus:border-primary-500"
-              />
+            <div className="flex items-end gap-2">
+              <div>
+                <label className="block text-[10px] uppercase tracking-wider text-surface-500 mb-0.5">Count</label>
+                <input
+                  type="number"
+                  min={1} max={20}
+                  placeholder={String(tenant.worker_count)}
+                  value={scaleCount ?? ''}
+                  onChange={e => setScaleCount(e.target.value ? parseInt(e.target.value) : null)}
+                  className="w-20 px-2 py-1 bg-surface-800 border border-surface-700 rounded text-sm text-surface-200 focus:outline-none focus:border-primary-500"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] uppercase tracking-wider text-surface-500 mb-0.5">vCPU</label>
+                <input
+                  type="number"
+                  min={1} max={32}
+                  placeholder={String(tenant.worker_vcpu)}
+                  value={scaleVcpu ?? ''}
+                  onChange={e => setScaleVcpu(e.target.value ? parseInt(e.target.value) : null)}
+                  className="w-20 px-2 py-1 bg-surface-800 border border-surface-700 rounded text-sm text-surface-200 focus:outline-none focus:border-primary-500"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] uppercase tracking-wider text-surface-500 mb-0.5">Memory</label>
+                <input
+                  type="text"
+                  placeholder={tenant.worker_memory || '2Gi'}
+                  value={scaleMemory}
+                  onChange={e => setScaleMemory(e.target.value)}
+                  className="w-24 px-2 py-1 bg-surface-800 border border-surface-700 rounded text-sm text-surface-200 font-mono focus:outline-none focus:border-primary-500"
+                />
+              </div>
               <button
                 onClick={handleScale}
-                disabled={scaleCount === null || scaleMutation.isPending}
-                className="flex items-center gap-1 px-3 py-1 bg-primary-600 hover:bg-primary-500 disabled:opacity-50 text-white rounded text-sm transition-colors"
+                disabled={scaleMutation.isPending}
+                className="flex items-center gap-1 px-3 py-1.5 bg-primary-600 hover:bg-primary-500 disabled:opacity-50 text-white rounded text-sm transition-colors"
               >
                 {scaleMutation.isPending && <Loader2 className="h-3 w-3 animate-spin" />}
-                Scale
+                Apply
               </button>
             </div>
           </div>
           <p className="text-sm text-surface-400">
             {tenant.workers_ready} of {tenant.worker_count} workers ready ·{' '}
             {tenant.worker_vcpu} vCPU · {tenant.worker_memory} per worker
+          </p>
+          <p className="text-xs text-surface-500 mt-1">
+            Changing vCPU or memory rotates the worker template and rolls all workers.
           </p>
         </div>
       </div>

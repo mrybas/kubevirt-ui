@@ -77,6 +77,9 @@ export interface TenantCreateRequest {
 
 export interface TenantScaleRequest {
   worker_count: number;
+  /** Optional resize: when set (and changed) the worker template is rotated. */
+  worker_vcpu?: number;
+  worker_memory?: string;
 }
 
 // Tenant response
