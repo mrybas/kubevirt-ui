@@ -46,6 +46,21 @@ def _konnectivity_proxy_image() -> str:
 def _konnectivity_agent_image() -> str:
     return os.getenv("TENANTS_KONNECTIVITY_AGENT_IMAGE") or _DEFAULT_KONNECTIVITY_AGENT_IMAGE
 
+
+# --- VPC-tenant CP demux (advertiseAddress model) configuration ---------
+# The shared MetalLB VIP that fronts every VPC tenant's apiserver +
+# konnectivity, demultiplexed by the per-tenant ports from the allocator.
+def _cp_demux_vip() -> str | None:
+    return os.getenv("TENANTS_CP_DEMUX_VIP") or None
+
+
+def _cp_metallb_pool() -> str:
+    return os.getenv("TENANTS_CP_METALLB_POOL", "traefik")
+
+
+def _cp_shared_ip_key() -> str:
+    return os.getenv("TENANTS_CP_SHARED_IP_KEY", "cp-demux")
+
 logger = logging.getLogger(__name__)
 
 def _resolve_worker_container_disk_image(req: TenantCreateRequest) -> str:
@@ -74,20 +89,31 @@ def _resolve_worker_container_disk_image(req: TenantCreateRequest) -> str:
 def _build_cluster_cr(
     req: TenantCreateRequest,
     cp_host: str | None = None,
+    api_port: int | None = None,
 ) -> dict[str, Any]:
-    # Workers do `kubeadm join <host>:<port>` reading these two fields, so
-    # this is THE place that determines worker reachability. Tenant workers
-    # live on the cluster default overlay (no VPC), which means the Kamaji
-    # TCP Service ClusterIP is natively routable — kube-proxy DNAT'es it
-    # to the apiserver pod. cluster-info also gets the ClusterIP from
-    # Kamaji (NetworkProfile default), so the post-join kubelet.conf
-    # rewrite matches and the worker stays reachable.
+    # Two worker-reachability models, keyed on api_port:
     #
-    # We bake a DNS placeholder at create time; `_create_capi_resources`
-    # PATCHes both `host` and `port` to the actual ClusterIP:6443 after
-    # the Kamaji TCP Service is ready. cp_host (used by tests / future
-    # external endpoint flows) overrides the placeholder only.
+    # default overlay (api_port=None): workers join the Kamaji TCP Service
+    #   ClusterIP, natively routable on the default overlay (kube-proxy
+    #   DNATs it). We bake a DNS placeholder + port 6443 here and
+    #   `_create_capi_resources` PATCHes host→ClusterIP after the Service
+    #   is ready. cluster-info matches the ClusterIP, no further work.
+    #
+    # VPC (api_port set): the advertiseAddress model. apiServerPort flows
+    #   to NetworkProfile.Port → apiserver --secure-port AND the port
+    #   advertised in cluster-info as <advertiseAddress>:<api_port>. That
+    #   address is the shared MetalLB CP VIP, reachable from the isolated
+    #   VPC, so kube-proxy DNATs 10.96.0.1 natively — no node-DNAT, no
+    #   ClusterIP patch. controlPlaneEndpoint is the external Traefik SNI
+    #   host:443 (what kubectl-from-outside dials).
+    vpc = api_port is not None
     host = cp_host or _endpoint_host(req.name)
+    cluster_network: dict[str, Any] = {
+        "pods": {"cidrBlocks": [req.pod_cidr]},
+        "services": {"cidrBlocks": [req.service_cidr]},
+    }
+    if vpc:
+        cluster_network["apiServerPort"] = api_port
     return {
         "apiVersion": f"{CAPI_GROUP}/{CAPI_VERSION}",
         "kind": "Cluster",
@@ -106,12 +132,9 @@ def _build_cluster_cr(
         "spec": {
             "controlPlaneEndpoint": {
                 "host": host,
-                "port": 6443,
+                "port": 443 if vpc else 6443,
             },
-            "clusterNetwork": {
-                "pods": {"cidrBlocks": [req.pod_cidr]},
-                "services": {"cidrBlocks": [req.service_cidr]},
-            },
+            "clusterNetwork": cluster_network,
             "controlPlaneRef": {
                 # KamajiControlPlane lives in the same tenant namespace —
                 # CAPI v1beta1 webhook `validation.cluster.cluster.x-k8s.io`
@@ -130,7 +153,52 @@ def _build_cluster_cr(
     }
 
 
-def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
+def _build_cp_lb_service(
+    req: TenantCreateRequest, vip: str, api_port: int, konn_port: int,
+) -> dict[str, Any]:
+    """Per-tenant MetalLB shared-IP Service fronting this tenant's CP pods.
+
+    All VPC tenants share ONE VIP via metallb.universe.tf/allow-shared-ip;
+    MetalLB demultiplexes by the per-tenant (api_port, konn_port) — which
+    the allocator guarantees are globally non-overlapping. The selector
+    `kamaji.clastix.io/name=<tenant>` targets exactly this tenant's Kamaji
+    control-plane pods. `service.cilium.io/type: ClusterIP` opts the VIP
+    out of Cilium's LB BPF DNAT (same fix as the ingress Services) so
+    in-VPC pod traffic isn't rewritten before kube-ovn routing.
+    """
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": f"{req.name}-cp-lb",
+            "namespace": _tenant_ns(req.name),
+            "labels": {
+                "kubevirt-ui.io/tenant": req.name,
+                "kubevirt-ui.io/managed": "true",
+            },
+            "annotations": {
+                "service.cilium.io/type": "ClusterIP",
+                "metallb.universe.tf/address-pool": _cp_metallb_pool(),
+                "metallb.universe.tf/loadBalancerIPs": vip,
+                "metallb.universe.tf/allow-shared-ip": _cp_shared_ip_key(),
+            },
+        },
+        "spec": {
+            "type": "LoadBalancer",
+            "selector": {"kamaji.clastix.io/name": req.name},
+            "ports": [
+                {"name": "api", "port": api_port, "targetPort": api_port, "protocol": "TCP"},
+                {"name": "konn", "port": konn_port, "targetPort": konn_port, "protocol": "TCP"},
+            ],
+        },
+    }
+
+
+def _build_kamaji_cp_cr(
+    req: TenantCreateRequest,
+    advertise_vip: str | None = None,
+    konn_port: int | None = None,
+) -> dict[str, Any]:
     """Build KamajiControlPlane CR.
 
     TCP CR is placed in the tenant namespace so the CAPI v1beta1 webhook
@@ -174,6 +242,11 @@ def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
     }
     pod_additional_metadata: dict[str, Any] = {"labels": pod_labels}
 
+    # VPC (advertiseAddress) model: per-tenant konnectivity port on the
+    # shared CP VIP. Must avoid Kamaji's hardcoded admin=8133/health=8134
+    # — guaranteed by the allocator. Default overlay uses 8132.
+    konn_server_port = konn_port if konn_port is not None else 8132
+
     spec: dict[str, Any] = {
         "replicas": req.control_plane_replicas,
         "version": req.kubernetes_version,
@@ -183,7 +256,7 @@ def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
             "kubeProxy": {},
             "konnectivity": {
                 "server": {
-                    "port": 8132,
+                    "port": konn_server_port,
                     "image": _konnectivity_proxy_image(),
                     "resources": {
                         "requests": {"cpu": "50m", "memory": "64Mi"},
@@ -214,6 +287,12 @@ def _build_kamaji_cp_cr(req: TenantCreateRequest) -> dict[str, Any]:
             "podAdditionalMetadata": pod_additional_metadata,
         },
     }
+    # VPC (advertiseAddress) model: advertise the shared CP VIP so
+    # cluster-info points workers at <vip>:<apiServerPort> (reachable from
+    # the isolated VPC). serviceType stays ClusterIP. Default overlay omits
+    # this and relies on the ClusterIP being natively routable.
+    if advertise_vip is not None:
+        spec["network"]["advertiseAddress"] = advertise_vip
     if apiserver_extra_args:
         spec["apiServer"] = {"extraArgs": apiserver_extra_args}
 
@@ -326,11 +405,13 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
         "kubevirt-ui.io/environment": req.environment,
     }
 
-    # Single NIC on the cluster default pod network (kube-ovn primary
-    # plugin). VPC-overlay placement for tenant workers is deferred — see
-    # the disabled VPC step in the create-tenant UI. Workers stay on the
-    # cluster default overlay so the Kamaji TCP Service ClusterIP is
-    # natively reachable for kubeadm join.
+    # Single NIC on the kube-ovn primary plugin. Placement depends on
+    # req.vpc_name:
+    #   None      → cluster default overlay; Kamaji TCP ClusterIP natively
+    #               reachable for kubeadm join (default-overlay model).
+    #   <vpc>     → the VPC's default subnet via the per-pod
+    #               ovn.kubernetes.io/logical_switch annotation; worker→CP
+    #               reachability is the advertiseAddress model (shared VIP).
     nic_binding = "masquerade" if req.worker_network_binding == "masquerade" else "bridge"
     primary_iface: dict[str, Any] = {"name": "default", nic_binding: {}}
     networks: list[dict[str, Any]] = [{"name": "default", "pod": {}}]
@@ -338,6 +419,17 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
     # pod annotation to permit live migration on a pod-network bridge interface.
     if nic_binding == "bridge":
         pod_annotations["kubevirt.io/allow-pod-bridge-network-live-migration"] = "true"
+
+    # VPC workers: pin the launcher pod to the VPC default subnet. CAPK
+    # (in the default overlay) then can't SSH into the isolated worker, so
+    # the default `ssh` bootstrap check would fail forever and the
+    # MachineDeployment would read 0-ready even though nodes are fine —
+    # `none` skips only that verification (kubeadm/cloud-init still run).
+    if req.vpc_name:
+        pod_annotations["ovn.kubernetes.io/logical_switch"] = f"{req.vpc_name}-default"
+        check_strategy = "none"
+    else:
+        check_strategy = "ssh"
 
     return {
         "apiVersion": f"{KUBEVIRT_INFRA_GROUP}/{KUBEVIRT_INFRA_VERSION}",
@@ -350,7 +442,7 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
             "template": {
                 "spec": {
                     "virtualMachineBootstrapCheck": {
-                        "checkStrategy": "ssh",
+                        "checkStrategy": check_strategy,
                     },
                     "virtualMachineTemplate": {
                         "spec": {
