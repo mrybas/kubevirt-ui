@@ -44,6 +44,10 @@ kubectl -n kubevirt-ui port-forward svc/kubevirt-ui-frontend 8080:8080
 
 Suitable for air-gapped or trusted internal clusters.
 
+Every request is served as an anonymous admin, and `auth.adminGroups` is
+ignored — with authentication off there is no identity to check a group
+against. Anyone who can reach the UI has full cluster access.
+
 ```yaml
 # values-no-auth.yaml
 auth:
@@ -221,6 +225,94 @@ metrics:
   direct: "true"
   service: "monitoring/vmsingle-victoria:8429"
 ```
+
+## Tenant VPC Isolation
+
+Separate VPCs are separate routing domains, but every tenant prefix is
+announced to the same upstream router, and that router forwards between them.
+Without ACLs a VPC is reachable from every other tenant — the traffic simply
+leaves and comes back:
+
+```
+ 1  10.198.224.1     t1 VPC router
+ 2  10.198.224.7     t1 egress gateway
+ 3  10.198.191.254   upstream router      <- hairpin
+ 4  10.198.190.211   t2 egress gateway
+ 5  10.198.240.4     t2 pod
+```
+
+The VPC wizard's **Isolated** checkbox (on by default) closes this at
+creation. It writes one rule set on the VPC's default subnet:
+
+| Priority | Rule |
+|----------|------|
+| 3200 | allow the VPC's own CIDR |
+| 3100+ | allow each prefix listed in **Shared networks** |
+| 3000 | drop everything inside `TENANT_SUPERNET` |
+
+The drop is scoped, not universal, so traffic leaving tenant space — the
+internet — matches no rule and stays allowed:
+
+```
+t1 -> internet OK    t1 -> shared OK    t1 -> t2 BLOCKED
+```
+
+### Configuring TENANT_SUPERNET
+
+```yaml
+backend:
+  env:
+    TENANT_SUPERNET: "10.198.192.0/18"
+```
+
+**Isolation does nothing until this is set.** There is no default, because
+the right value is a property of your addressing plan and a wrong guess is
+worse than no isolation at all. With it unset, VPCs are created without
+isolation ACLs, the backend logs a warning, and `GET /api/v1/vpcs` reports
+`isolated: false`.
+
+Two requirements, both hard. The aggregate must:
+
+- **contain every tenant VPC CIDR**, present and future — new tenants fall
+  under the existing drop automatically, so no other VPC has to be edited
+  when one is added;
+- **contain nothing else.** Overlap the cluster's pod CIDR and VPC workloads
+  lose DNS (VpcDns forwards to CoreDNS *pod* IPs). Overlap the service CIDR
+  and tenant clusters cannot reach their own control plane. Overlap the node
+  or management network and you will be debugging it for a while.
+
+So carve tenants a dedicated block rather than reusing a wide one like
+`10.0.0.0/8` or all of RFC1918: everything inside the aggregate needs an
+explicit allow to work, and each allow is a hole to maintain.
+
+Check a candidate against reality before setting it:
+
+```bash
+kubectl get subnet -o custom-columns=NAME:.metadata.name,CIDR:.spec.cidrBlock
+kubectl cluster-info dump | grep -m1 cluster-cidr            # pod CIDR
+kubectl cluster-info dump | grep -m1 service-cluster-ip-range
+```
+
+If the aggregate covers either of the last two, pick a narrower one.
+
+Note that the built-in VPC CIDR allocator hands out `10.{200+N}.0.0/24`,
+whose smallest aggregate (`10.192.0.0/10`) also swallows the common
+`10.244.0.0/16` pod CIDR. If you rely on the allocator, either set
+`TENANT_SUPERNET` to a block you have verified is tenant-only, or create VPCs
+with an explicit `subnet_cidr` inside your chosen aggregate — overlaps are
+rejected at creation either way.
+
+### Shared services
+
+Prefixes a tenant may still reach while isolated (corporate git, a package
+mirror) go in the wizard's **Shared networks** field, or `shared_cidrs` on
+the create request. They become higher-priority allows above the drop.
+
+### Not `Subnet.spec.private`
+
+Kube-OVN's `private: true` looks like the knob for this and is not. It does
+block tenant-to-tenant, but it also drops return traffic from the internet
+(8.8.8.8 is not in `allowSubnets`), so the tenant silently loses egress.
 
 ## Ingress
 

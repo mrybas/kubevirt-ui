@@ -40,6 +40,22 @@ backend:
     # to skip discovery — required if Velero isn't in the default `velero`
     # ns and no BSL exists yet (creating the first BSL otherwise 404s).
     VELERO_NAMESPACE: ""
+    # -- The aggregate every tenant VPC is carved out of, e.g.
+    # "10.198.192.0/18". REQUIRED for the wizard's "Isolated" checkbox to do
+    # anything: isolation is written as "drop traffic whose peer is another
+    # tenant, allow everything else", and this is what scopes that drop.
+    # Traffic leaving the aggregate (the internet) matches no rule and stays
+    # allowed. Empty → VPCs are created WITHOUT isolation ACLs, the backend
+    # logs a warning, and the VPC reports isolated=false.
+    #
+    # No default on purpose — the right value is a property of your
+    # addressing plan, and guessing wrong is worse than not isolating. It
+    # must contain every tenant VPC CIDR and NOTHING else: overlap the
+    # cluster's pod CIDR and VPC workloads lose DNS (VpcDns forwards to
+    # CoreDNS pod IPs); overlap the service CIDR and tenant clusters cannot
+    # reach their own control plane. Carve tenants a dedicated block rather
+    # than reusing a wide one like 10.0.0.0/8. See docs/deployment.md.
+    TENANT_SUPERNET: ""
     # -- Tenant-stack overrides — all optional, backend autodetects/defaults when unset
     # Base domain for tenant API + ingress hostnames: <tenant>.<domain>.
     # Empty → falls back to <ingress_ip>.nip.io. Set to your own wildcard
@@ -217,6 +233,12 @@ auth:
   # KubeVirt UI admins (full cluster access). Defaults to the bundled-LLDAP
   # convention "kubevirt-ui-admins"; set to e.g. "admins" or
   # "admins,platform-team" to match your external IdP's groups.
+  #
+  # Ignored when `auth.type: none`: with authentication off the backend
+  # serves a synthetic anonymous user and every request is admin. Checking
+  # that user against this list would only be checking a group the backend
+  # invented for itself — and pointing this at your own group used to make
+  # "auth disabled" answer 403 to everything.
   adminGroups: "kubevirt-ui-admins"
 
   oidc:
