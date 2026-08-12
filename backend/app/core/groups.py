@@ -71,12 +71,23 @@ def get_known_teams() -> list[dict[str, Any]]:
 def is_admin(groups: list[str]) -> bool:
     """Check if user is platform admin.
 
-    Two admin signals are honored:
+    Three admin signals are honored:
+    - AUTH_TYPE=none. There is no authentication at all: `get_current_user`
+      hands out a synthetic anonymous user in "kubevirt-ui-admins", and
+      group-checking it is theatre — it is whatever we decided to put there.
+      Worse, it silently broke deployments that point ADMIN_GROUPS at their
+      own group (an LDAP one, say): "auth disabled" then answered 403 to
+      every write, including creating the first folder, which blocks tenant
+      creation entirely. Auth off means auth off.
     - Membership in any group from settings.admin_groups (env var ADMIN_GROUPS,
       comma-separated; defaults to "kubevirt-ui-admins").
     - Presence of "system:masters" (Kubernetes' built-in cluster-admin group,
       typically only set for SA/cert tokens — mirrors the kubeconfig endpoint).
     """
+    from app.core.auth import AUTH_TYPE
+    if AUTH_TYPE == "none":
+        return True
+
     from app.config import get_settings
     admin_groups = set(get_settings().admin_groups_list)
     if "system:masters" in groups:
