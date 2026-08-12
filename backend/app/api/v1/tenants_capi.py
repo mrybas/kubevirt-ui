@@ -337,8 +337,14 @@ def _build_kubevirt_cluster_cr(
     """
     spec: dict[str, Any] = {}
     if storage_info:
+        # `capk_secret_name` — NOT `secret_name`. Setting this field takes
+        # CAPK off its own manager identity for every host-cluster call it
+        # makes for this tenant, so it must reference the CAPK-scoped
+        # credentials; the CSI secret is replicated into the tenant cluster
+        # and is intentionally too narrow (and too exposed) for that job.
+        # See tenants_storage._capk_role_rules.
         spec["infraClusterSecretRef"] = {
-            "name": storage_info["secret_name"],
+            "name": storage_info.get("capk_secret_name") or storage_info["secret_name"],
             "namespace": storage_info["secret_namespace"],
         }
 

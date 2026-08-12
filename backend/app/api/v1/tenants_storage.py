@@ -17,7 +17,11 @@ The flow when `enable_storage=True`:
   4. Secret `infra-cluster-credentials` containing a kubeconfig assembled
      from (external API URL, cluster CA, SA token) — this is the secret
      the kubevirt-csi HelmRelease consumes in the tenant CP.
-  5. ResourceQuota in the tenant ns capping `persistentvolumeclaims` and
+  5. A second, host-side-only identity `capk-infra` (SA + Role +
+     RoleBinding + token + Secret `capk-infra-credentials`) with a wider
+     rule set, referenced by `KubevirtCluster.spec.infraClusterSecretRef`.
+     See the CAPK_* block below for why CAPK cannot reuse (2).
+  6. ResourceQuota in the tenant ns capping `persistentvolumeclaims` and
      `requests.storage`.
 
 All steps are idempotent (409 / read-before-create) so re-running a
@@ -29,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+from collections.abc import Callable
 from typing import Any
 
 import yaml
@@ -54,6 +59,20 @@ CSI_CLUSTER_ROLE_NAME = "kubevirt-csi-cluster"
 CSI_KUBECONFIG_SECRET_NAME = "infra-cluster-credentials"
 CSI_SA_TOKEN_SECRET_NAME = "kubevirt-csi-token"
 CSI_RESOURCE_QUOTA_NAME = "tenant-storage"
+
+# Setting KubevirtCluster.spec.infraClusterSecretRef makes CAPK stop using
+# its own manager identity and speak to the host cluster as whatever that
+# secret holds — for *everything*: reading the bootstrap Secret, creating
+# the cloud-init Secret, creating the worker VirtualMachines. The CSI
+# identity above cannot be reused for that: its kubeconfig is replicated
+# INTO the tenant cluster (kube-system/infra-cluster-credentials), where
+# any tenant admin can read it, so it must stay scoped to volume
+# operations. Hence a second, host-side-only identity for CAPK.
+CAPK_SA_NAME = "capk-infra"
+CAPK_ROLE_NAME = "capk-infra"
+CAPK_ROLE_BINDING_NAME = "capk-infra"
+CAPK_SA_TOKEN_SECRET_NAME = "capk-infra-token"
+CAPK_KUBECONFIG_SECRET_NAME = "capk-infra-credentials"
 
 # Namespace inside the TENANT cluster where the kubevirt-csi-driver chart
 # is released (matches the bootstrap component's `namespace:` field). The
@@ -113,13 +132,65 @@ def _csi_role_rules() -> list[dict[str, Any]]:
     ]
 
 
-def _build_csi_kubeconfig(
+def _capk_role_rules() -> list[dict[str, Any]]:
+    """Namespaced RBAC for CAPK acting on the host cluster (tenant-<name> ns).
+
+    Only consulted when tenant storage is enabled, because that is the only
+    case where we set `infraClusterSecretRef` and thereby take CAPK off its
+    own (cluster-admin-ish) manager identity. Everything CAPK does per
+    machine happens inside the tenant namespace:
+
+      * reads the CABPK bootstrap Secret and writes the cloud-init Secret
+      * creates/deletes the worker VirtualMachine and watches its VMI
+      * reads the virt-launcher Pod to find the VMI's address
+      * emits Events
+
+    Without at least secrets:get and virtualmachines:create the machines
+    sit at `VMProvisioned=False(WaitingForBootstrapData)` forever with no
+    VMI ever created and nothing logged on the tenant side — the failure is
+    entirely silent from the tenant's point of view.
+    """
+    return [
+        {
+            "apiGroups": [""],
+            "resources": ["secrets"],
+            "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"],
+        },
+        {
+            "apiGroups": ["kubevirt.io"],
+            "resources": ["virtualmachines", "virtualmachineinstances"],
+            "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"],
+        },
+        {
+            "apiGroups": [""],
+            "resources": ["pods", "services", "persistentvolumeclaims"],
+            "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"],
+        },
+        {
+            "apiGroups": ["cdi.kubevirt.io"],
+            "resources": ["datavolumes"],
+            "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"],
+        },
+        {
+            "apiGroups": [""],
+            "resources": ["events"],
+            "verbs": ["create", "patch"],
+        },
+    ]
+
+
+def _build_infra_kubeconfig(
     api_server_url: str,
     ca_data_b64: str,
     sa_token: str,
     tenant_ns: str,
+    sa_name: str = CSI_SA_NAME,
 ) -> str:
-    """Assemble the kubeconfig YAML that the tenant-CP CSI driver consumes.
+    """Assemble a host-cluster kubeconfig for one of the two SA identities.
+
+    Used for both `kubevirt-csi` (consumed by the tenant-CP CSI driver) and
+    `capk-infra` (consumed by CAPK in the host cluster) — same shape, only
+    `sa_name`/token differ.
 
     Mirrors upstream `deploy/example/infracluster-kubeconfig.yaml`. The
     `namespace` is set so the driver doesn't have to be told twice (the
@@ -144,14 +215,14 @@ def _build_csi_kubeconfig(
             "name": "only-context",
             "context": {
                 "cluster": "infra-cluster",
-                "user": CSI_SA_NAME,
+                "user": sa_name,
                 "namespace": tenant_ns,
             },
         }],
         "current-context": "only-context",
         "preferences": {},
         "users": [{
-            "name": CSI_SA_NAME,
+            "name": sa_name,
             "user": {"token": sa_token},
         }],
     }
@@ -180,10 +251,13 @@ def _read_host_ca_b64(k8s) -> str:
         return ""
 
 
-async def _ensure_service_account(core_api, ns: str, tenant_name: str) -> None:
+async def _ensure_service_account(
+    core_api, ns: str, tenant_name: str,
+    sa_name: str = CSI_SA_NAME, role_label: str = "csi-infra",
+) -> None:
     try:
         await core_api.read_namespaced_service_account(
-            name=CSI_SA_NAME, namespace=ns,
+            name=sa_name, namespace=ns,
         )
         return
     except ApiException as e:
@@ -191,12 +265,12 @@ async def _ensure_service_account(core_api, ns: str, tenant_name: str) -> None:
             raise
     body = client.V1ServiceAccount(
         metadata=client.V1ObjectMeta(
-            name=CSI_SA_NAME,
+            name=sa_name,
             namespace=ns,
             labels={
                 "kubevirt-ui.io/managed": "true",
                 "kubevirt-ui.io/tenant": tenant_name,
-                "kubevirt-ui.io/role": "csi-infra",
+                "kubevirt-ui.io/role": role_label,
             },
         ),
     )
@@ -207,30 +281,35 @@ async def _ensure_service_account(core_api, ns: str, tenant_name: str) -> None:
             raise
 
 
-async def _ensure_role(rbac_api, ns: str, tenant_name: str) -> None:
+async def _ensure_role(
+    rbac_api, ns: str, tenant_name: str,
+    role_name: str = CSI_ROLE_NAME,
+    rules_fn: Callable[[], list[dict[str, Any]]] = _csi_role_rules,
+    role_label: str = "csi-infra",
+) -> None:
     rules = [
         client.V1PolicyRule(
             api_groups=r["apiGroups"],
             resources=r["resources"],
             verbs=r["verbs"],
         )
-        for r in _csi_role_rules()
+        for r in rules_fn()
     ]
     metadata = client.V1ObjectMeta(
-        name=CSI_ROLE_NAME,
+        name=role_name,
         namespace=ns,
         labels={
             "kubevirt-ui.io/managed": "true",
             "kubevirt-ui.io/tenant": tenant_name,
-            "kubevirt-ui.io/role": "csi-infra",
+            "kubevirt-ui.io/role": role_label,
         },
     )
     try:
-        existing = await rbac_api.read_namespaced_role(name=CSI_ROLE_NAME, namespace=ns)
-        # Replace rules so RBAC stays in sync if we change _csi_role_rules() across releases
+        existing = await rbac_api.read_namespaced_role(name=role_name, namespace=ns)
+        # Replace rules so RBAC stays in sync if we change the rule set across releases
         existing.rules = rules
         await rbac_api.replace_namespaced_role(
-            name=CSI_ROLE_NAME, namespace=ns, body=existing,
+            name=role_name, namespace=ns, body=existing,
         )
         return
     except ApiException as e:
@@ -244,24 +323,30 @@ async def _ensure_role(rbac_api, ns: str, tenant_name: str) -> None:
             raise
 
 
-async def _ensure_role_binding(rbac_api, ns: str, tenant_name: str) -> None:
+async def _ensure_role_binding(
+    rbac_api, ns: str, tenant_name: str,
+    binding_name: str = CSI_ROLE_BINDING_NAME,
+    role_name: str = CSI_ROLE_NAME,
+    sa_name: str = CSI_SA_NAME,
+    role_label: str = "csi-infra",
+) -> None:
     metadata = client.V1ObjectMeta(
-        name=CSI_ROLE_BINDING_NAME,
+        name=binding_name,
         namespace=ns,
         labels={
             "kubevirt-ui.io/managed": "true",
             "kubevirt-ui.io/tenant": tenant_name,
-            "kubevirt-ui.io/role": "csi-infra",
+            "kubevirt-ui.io/role": role_label,
         },
     )
     role_ref = client.V1RoleRef(
         api_group="rbac.authorization.k8s.io",
         kind="Role",
-        name=CSI_ROLE_NAME,
+        name=role_name,
     )
     subject = client.RbacV1Subject(
         kind="ServiceAccount",
-        name=CSI_SA_NAME,
+        name=sa_name,
         namespace=ns,
     )
     body = client.V1RoleBinding(
@@ -352,7 +437,12 @@ async def delete_csi_cluster_role_binding(k8s, tenant_name: str) -> None:
             )
 
 
-async def _ensure_sa_token_secret(core_api, ns: str, tenant_name: str) -> str:
+async def _ensure_sa_token_secret(
+    core_api, ns: str, tenant_name: str,
+    secret_name: str = CSI_SA_TOKEN_SECRET_NAME,
+    sa_name: str = CSI_SA_NAME,
+    role_label: str = "csi-infra",
+) -> str:
     """Create (idempotently) a non-expiring SA-token Secret and return token.
 
     A Secret of type ``kubernetes.io/service-account-token`` annotated with
@@ -366,13 +456,13 @@ async def _ensure_sa_token_secret(core_api, ns: str, tenant_name: str) -> str:
     is created, so we poll until it appears.
     """
     metadata = client.V1ObjectMeta(
-        name=CSI_SA_TOKEN_SECRET_NAME,
+        name=secret_name,
         namespace=ns,
-        annotations={"kubernetes.io/service-account.name": CSI_SA_NAME},
+        annotations={"kubernetes.io/service-account.name": sa_name},
         labels={
             "kubevirt-ui.io/managed": "true",
             "kubevirt-ui.io/tenant": tenant_name,
-            "kubevirt-ui.io/role": "csi-infra",
+            "kubevirt-ui.io/role": role_label,
         },
     )
     body = client.V1Secret(
@@ -387,7 +477,7 @@ async def _ensure_sa_token_secret(core_api, ns: str, tenant_name: str) -> str:
 
     for _ in range(CSI_TOKEN_POLL_ATTEMPTS):
         secret = await core_api.read_namespaced_secret(
-            name=CSI_SA_TOKEN_SECRET_NAME, namespace=ns,
+            name=secret_name, namespace=ns,
         )
         token_b64 = (secret.data or {}).get("token")
         if token_b64:
@@ -395,7 +485,7 @@ async def _ensure_sa_token_secret(core_api, ns: str, tenant_name: str) -> str:
         await asyncio.sleep(CSI_TOKEN_POLL_INTERVAL_SEC)
 
     raise RuntimeError(
-        f"SA-token Secret {CSI_SA_TOKEN_SECRET_NAME!r} in {ns!r} was not "
+        f"SA-token Secret {secret_name!r} in {ns!r} was not "
         "populated with a token by the controller within "
         f"{CSI_TOKEN_POLL_ATTEMPTS * CSI_TOKEN_POLL_INTERVAL_SEC:.0f}s"
     )
@@ -408,34 +498,38 @@ async def _ensure_kubeconfig_secret(
     api_server_url: str,
     ca_data_b64: str,
     sa_token: str,
+    secret_name: str = CSI_KUBECONFIG_SECRET_NAME,
+    sa_name: str = CSI_SA_NAME,
+    role_label: str = "csi-infra",
 ) -> None:
-    kubeconfig_str = _build_csi_kubeconfig(
+    kubeconfig_str = _build_infra_kubeconfig(
         api_server_url=api_server_url,
         ca_data_b64=ca_data_b64,
         sa_token=sa_token,
         tenant_ns=ns,
+        sa_name=sa_name,
     )
     data = {"kubeconfig": base64.b64encode(kubeconfig_str.encode("utf-8")).decode("ascii")}
     metadata = client.V1ObjectMeta(
-        name=CSI_KUBECONFIG_SECRET_NAME,
+        name=secret_name,
         namespace=ns,
         labels={
             "kubevirt-ui.io/managed": "true",
             "kubevirt-ui.io/tenant": tenant_name,
-            "kubevirt-ui.io/role": "csi-infra",
+            "kubevirt-ui.io/role": role_label,
         },
     )
     body = client.V1Secret(metadata=metadata, type="Opaque", data=data)
     try:
         existing = await core_api.read_namespaced_secret(
-            name=CSI_KUBECONFIG_SECRET_NAME, namespace=ns,
+            name=secret_name, namespace=ns,
         )
         # Always refresh the kubeconfig payload — the SA token changes on
         # every create call (we mint a new one) and we want the Secret to
         # reflect that so the tenant CP picks up the new credentials.
         existing.data = data
         await core_api.replace_namespaced_secret(
-            name=CSI_KUBECONFIG_SECRET_NAME, namespace=ns, body=existing,
+            name=secret_name, namespace=ns, body=existing,
         )
         return
     except ApiException as e:
@@ -549,6 +643,33 @@ async def create_csi_infrastructure_resources(
         core_api, ns, req.name, api_server_url, ca_data_b64, sa_token,
     )
 
+    # 6b. The separate CAPK identity (see CAPK_SA_NAME above). Same shape,
+    #     different rule set, and its kubeconfig stays in the host cluster —
+    #     only the CSI one is replicated into the tenant.
+    await _ensure_service_account(
+        core_api, ns, req.name, sa_name=CAPK_SA_NAME, role_label="capk-infra",
+    )
+    await _ensure_role(
+        rbac_api, ns, req.name,
+        role_name=CAPK_ROLE_NAME, rules_fn=_capk_role_rules,
+        role_label="capk-infra",
+    )
+    await _ensure_role_binding(
+        rbac_api, ns, req.name,
+        binding_name=CAPK_ROLE_BINDING_NAME, role_name=CAPK_ROLE_NAME,
+        sa_name=CAPK_SA_NAME, role_label="capk-infra",
+    )
+    capk_token = await _ensure_sa_token_secret(
+        core_api, ns, req.name,
+        secret_name=CAPK_SA_TOKEN_SECRET_NAME, sa_name=CAPK_SA_NAME,
+        role_label="capk-infra",
+    )
+    await _ensure_kubeconfig_secret(
+        core_api, ns, req.name, api_server_url, ca_data_b64, capk_token,
+        secret_name=CAPK_KUBECONFIG_SECRET_NAME, sa_name=CAPK_SA_NAME,
+        role_label="capk-infra",
+    )
+
     # 7. ResourceQuota
     await _ensure_resource_quota(
         core_api, ns, req.name,
@@ -564,6 +685,9 @@ async def create_csi_infrastructure_resources(
     return {
         "secret_name": CSI_KUBECONFIG_SECRET_NAME,
         "secret_namespace": ns,
+        # What KubevirtCluster.spec.infraClusterSecretRef must point at.
+        # Deliberately NOT the CSI secret — see the CAPK_* block at the top.
+        "capk_secret_name": CAPK_KUBECONFIG_SECRET_NAME,
         # NOTE: storage class is NOT plumbed through KubevirtCluster.spec —
         # the CAPK v1alpha1 schema has no `infraClusterStorageClassName`
         # field. Tenant SC selection happens in the kubevirt-csi-driver
