@@ -363,6 +363,19 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # -----------------------------------------------------------------------
+  # cert-manager — PKI for Talos tenants
+  # -----------------------------------------------------------------------
+  # A Talos tenant's CSR signer needs a server certificate, issued per tenant
+  # from a per-tenant CA (selfSigned Issuer -> CA -> Issuer(ca) -> cert).
+  # Without these the tenant comes up and its workers loop forever waiting on
+  # a signer that never gets a certificate (tenants_talos.build_talos_pki).
+  - apiGroups: ["cert-manager.io"]
+    resources:
+      - issuers
+      - certificates
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
   # Cluster API (tenant clusters)
   # -----------------------------------------------------------------------
   - apiGroups: ["cluster.x-k8s.io"]
