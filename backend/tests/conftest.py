@@ -19,6 +19,19 @@ from app.core.auth import (
 from app.main import app
 
 
+@pytest.fixture(autouse=True)
+def authenticated_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the suite as if authentication is on.
+
+    `is_admin` short-circuits to True when AUTH_TYPE=none — auth off means auth
+    off — and AUTH_TYPE defaults to "none" when the env var is unset. Without
+    this the authorization tests pass under docker-compose (which sets
+    AUTH_TYPE=oidc) and fail under a bare `pytest`, which is a miserable thing
+    to debug. Tests that exercise the auth-disabled path monkeypatch it back.
+    """
+    monkeypatch.setattr("app.core.auth.AUTH_TYPE", "oidc")
+
+
 @pytest.fixture
 def mock_k8s_client() -> MagicMock:
     """Create a mock Kubernetes client."""
