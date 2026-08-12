@@ -65,6 +65,13 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     ("storage.k8s.io", "storageclasses", "list", "tenants_crud._discover_ceph"),
     # --- Kyverno DNS-injection policy per VPC ---
     ("kyverno.io", "clusterpolicies", "create", "vpcs._ensure_vpc_dns_policy"),
+    # --- VPC underlay fabric ---
+    ("kubeovn.io", "provider-networks", "create", "vpc_underlay.ensure"),
+    ("kubeovn.io", "vlans", "create", "vpc_underlay.ensure"),
+    ("kubeovn.io", "subnets", "create", "vpc_underlay.ensure"),
+    ("k8s.cni.cncf.io", "network-attachment-definitions", "create", "vpc_underlay.ensure"),
+    ("apps", "daemonsets", "create", "vpc_underlay._ensure_daemonset"),
+    ("apps", "daemonsets", "patch", "vpc_underlay._ensure_daemonset (reconcile)"),
 ]
 
 

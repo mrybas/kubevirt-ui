@@ -9,6 +9,7 @@ from app.api.v1.users import users_router, groups_router
 from app.api.v1.disks import router as disks_router, snapshots_router
 from app.api.v1.namespaces import router as namespaces_router
 from app.api.v1.network import router as network_router
+from app.api.v1.vpc_underlay import router as vpc_underlay_router
 from app.api.v1.profile import router as profile_router
 from app.api.v1.folders import router as folders_router
 from app.api.v1.projects import router as projects_router, teams_router
@@ -74,6 +75,7 @@ router.include_router(images_router, prefix="/images", tags=["Images"])
 
 # Network Management (Kube-OVN)
 router.include_router(network_router, prefix="/network", tags=["Network"])
+router.include_router(vpc_underlay_router, prefix="/network", tags=["Network"])
 router.include_router(vpcs_router, prefix="/vpcs", tags=["VPCs"])
 router.include_router(security_groups_router, prefix="/security-groups", tags=["Security Groups"])
 router.include_router(egress_gateway_router, prefix="/egress-gateways", tags=["Egress Gateways"])
