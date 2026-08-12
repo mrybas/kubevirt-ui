@@ -93,13 +93,11 @@ from app.api.v1.tenants_storage import (
     schedule_credential_replication,
 )
 from app.api.v1.tenants_cp_ports import release_cp_ports
-from app.api.v1.tenants_capi import _cp_demux_vip, _cp_metallb_pool, _cp_shared_ip_key
 from app.api.v1.tenants_talos import (
     assert_cabpt_installed,
-    ensure_talos_cluster_singletons,
+    ensure_talos_bootstrap_provider,
     ensure_talos_golden_image,
     ensure_talos_tenant_objects,
-    update_sni_router_map,
     validate_worker_binding,
 )
 
@@ -879,16 +877,12 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
 
         # 2c. Talos workers: the signer's PKI and the machine secrets must
         #     exist before the control plane (which mounts the certificate)
-        #     and before the machine config (which embeds the token). The SNI
-        #     route must land before the first worker boots, or that worker
-        #     loops on its CSR — so it goes in here, not after the VMs.
+        #     and before the machine config (which embeds the token) — hence
+        #     here, ahead of the CAPI resources. The trustd route itself is
+        #     created with the rest of the CAPI objects, since it is just
+        #     another per-tenant ingress alongside the apiserver's.
         if req.worker_os == "talos":
-            await ensure_talos_cluster_singletons(
-                k8s,
-                shared_vip=_cp_demux_vip(),
-                metallb_pool=_cp_metallb_pool(),
-                shared_ip_key=_cp_shared_ip_key(),
-            )
+            await ensure_talos_bootstrap_provider(k8s)
             await ensure_talos_tenant_objects(k8s, req.name, ns)
             await ensure_talos_golden_image(
                 k8s, req.name, ns,
@@ -896,7 +890,6 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                 size=req.worker_image_size,
                 storage_class=req.storage_class or None,
             )
-            await update_sni_router_map(k8s, req.name, ns, add=True)
 
         # 3. Create CAPI resources + Ingress.
         await _create_capi_resources(k8s, req, storage_info)
@@ -1066,15 +1059,6 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
     return tenant
 
 
-async def _remove_talos_sni_route(k8s, tenant_name: str) -> None:
-    """Drop this tenant's line from the SNI router map.
-
-    Keyed on the tenant name, so it is harmless for a non-Talos tenant (the
-    key simply is not there) and for clusters with no router deployed.
-    """
-    await update_sni_router_map(k8s, tenant_name, _tenant_ns(tenant_name), add=False)
-
-
 @router.delete("/{name}", status_code=204)
 async def delete_tenant(request: Request, name: str, user: User = Depends(require_auth)) -> None:
     """Delete a tenant.
@@ -1131,9 +1115,6 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
         ("detach tenant ns from the VPC subnet", _detach_tenant_ns_from_vpc_subnet),
         ("delete the CSI ClusterRoleBinding", delete_csi_cluster_role_binding),
         ("release the CP demux ports", release_cp_ports),
-        # Talos tenants only; a no-op for everyone else, and for clusters
-        # where each tenant has its own VIP and no router is deployed.
-        ("remove the SNI router route", _remove_talos_sni_route),
     ):
         try:
             await cleanup(k8s, name)

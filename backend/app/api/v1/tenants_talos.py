@@ -11,16 +11,19 @@ The pieces, in the order they matter:
   * Talos secrets — generated once and never rotated (`build_talos_secrets`);
   * a kubeadm-format bootstrap token in the tenant's kube-system;
   * the signer sidecar plus port 50001 on the control-plane Service;
-  * a worker machine config whose endpoint is a NAME, not an address;
-  * one line in the SNI router's map, when tenants share a VIP.
+  * a worker machine config whose endpoint is a NAME, not an address.
 
-Shared-VIP mode is what makes the SNI router necessary: Talos always dials
-trustd on the fixed port 50001, so tenants sharing an address are told apart by
-SNI — which only works because the endpoint is a name. With a VIP per tenant
-the router is not needed at all, and port 50001 simply goes on that tenant's
-own `cp-lb`. Verified 2026-08-12: a tenant with its own VIP signed a worker CSR
-with zero traffic through the router, so no patched control-plane provider
-build is required either way.
+Talos always dials trustd on the fixed port 50001 of whatever host is in
+`cluster.controlPlane.endpoint`, and puts that host in the TLS SNI. That is
+the same shape the tenant apiserver already uses — TLS passthrough matched on
+HostSNI — so exposing the signer is one more per-tenant route through the
+cluster ingress, not a component of its own. It is created and deleted with
+the tenant, and nothing shared has to be edited or restarted.
+
+With a VIP per tenant even that is unnecessary: port 50001 goes straight onto
+that tenant's own control-plane Service. Verified 2026-08-12 — a tenant with
+its own VIP signed a worker CSR with no router in the path at all, which is
+also why no patched control-plane provider build is needed.
 """
 
 from __future__ import annotations
@@ -66,9 +69,6 @@ TALOS_GOLDEN_IMAGE_URL = (
 CERT_MANAGER_GROUP = "cert-manager.io"
 CERT_MANAGER_VERSION = "v1"
 
-SNI_ROUTER_NAMESPACE = "talos-csr-sni"
-SNI_ROUTER_CONFIGMAP = "sni-router"
-SNI_ROUTER_MAP_KEY = "routes"
 
 MANAGED_LABEL = {"kubevirt-ui.io/managed": "true"}
 
@@ -79,7 +79,7 @@ _TOKEN_ALPHABET = string.ascii_lowercase + string.digits
 
 # ---------------------------------------------------------------------------
 # Naming — one place, because several of these strings must match each other
-# exactly (the certificate's SAN, the worker's endpoint, the SNI map key).
+# exactly (the certificate's SAN, the worker's endpoint, the ingress HostSNI).
 # ---------------------------------------------------------------------------
 
 def signer_dns_names(tenant: str, namespace: str) -> list[str]:
@@ -98,8 +98,8 @@ def worker_endpoint(tenant: str, namespace: str, api_port: int) -> str:
     """Control-plane endpoint for a Talos worker — a NAME, never an address.
 
     This is what makes SNI possible, and therefore what lets tenants share
-    port 50001 on one VIP. An IP endpoint sends no SNI, and the router has
-    nothing to demultiplex on.
+    one listener on port 50001. An IP endpoint sends no SNI at all, so the
+    ingress has nothing to match `HostSNI` against.
     """
     return f"https://{tenant}.{namespace}.svc:{api_port}"
 
@@ -335,7 +335,7 @@ def build_talos_worker_config(
     Three settings carry the design:
 
     * the endpoint is a **name**, which is what produces SNI and therefore
-      what lets tenants share port 50001;
+      what lets tenants share one listener on port 50001;
     * `extraHostEntries` pins that name to the control-plane VIP inside the
       node itself, so joining needs no working DNS — which matters because
       the node has none until it has joined;
@@ -465,203 +465,37 @@ def build_bootstrap_provider() -> dict[str, Any]:
     }
 
 
-def build_sni_router(vip: str, metallb_pool: str, shared_ip_key: str) -> list[dict[str, Any]]:
-    """Namespace, ConfigMap, Deployment and Service for the SNI router.
+async def ensure_talos_bootstrap_provider(k8s) -> str:
+    """Ask capi-operator to install CABPT, idempotently.
 
-    Needed because Talos always dials trustd on the fixed port 50001 taken
-    from `cluster.controlPlane.endpoint` — the per-tenant-port trick that
-    demultiplexes the apiserver does not apply. So tenants share one
-    `VIP:50001` and are told apart by SNI, which is only possible because the
-    endpoint is a name. nginx does the work with `stream` + `ssl_preread`: it
-    never terminates TLS, it only reads the requested name and forwards.
+    The only cluster-wide object Talos support needs. Everything else is
+    per-tenant: the CSR signer is exposed by the same TLS-passthrough route
+    the apiserver already uses, one object per tenant, created and deleted
+    with it.
 
-    Verified on the lab with two tenants in two different VPCs on one
-    VIP:50001.
+    Returns what happened, for the caller to log.
     """
-    labels = {**MANAGED_LABEL, "app": "sni-router"}
-    nginx_conf = (
-        "events {}\n"
-        "stream {\n"
-        "    map $ssl_preread_server_name $backend {\n"
-        "        include /etc/nginx/routes/routes;\n"
-        "        default \"\";\n"
-        "    }\n"
-        "    server {\n"
-        f"        listen {TALOS_TRUSTD_PORT};\n"
-        "        ssl_preread on;\n"
-        "        proxy_pass $backend;\n"
-        "    }\n"
-        "}\n"
-    )
-    return [
-        {
-            "apiVersion": "v1",
-            "kind": "Namespace",
-            "metadata": {"name": SNI_ROUTER_NAMESPACE, "labels": labels},
-        },
-        {
-            "apiVersion": "v1",
-            "kind": "ConfigMap",
-            "metadata": {
-                "name": SNI_ROUTER_CONFIGMAP,
-                "namespace": SNI_ROUTER_NAMESPACE,
-                "labels": labels,
-            },
-            # `routes` starts empty; each Talos tenant adds its own line.
-            "data": {"nginx.conf": nginx_conf, SNI_ROUTER_MAP_KEY: ""},
-        },
-        {
-            "apiVersion": "apps/v1",
-            "kind": "Deployment",
-            "metadata": {
-                "name": SNI_ROUTER_CONFIGMAP,
-                "namespace": SNI_ROUTER_NAMESPACE,
-                "labels": labels,
-            },
-            "spec": {
-                "replicas": 1,
-                "selector": {"matchLabels": {"app": "sni-router"}},
-                "template": {
-                    "metadata": {"labels": {"app": "sni-router"}},
-                    "spec": {
-                        "containers": [{
-                            "name": "nginx",
-                            "image": "mirror.gcr.io/library/nginx:1.27-alpine",
-                            "ports": [{"containerPort": TALOS_TRUSTD_PORT}],
-                            "volumeMounts": [
-                                {
-                                    "name": "conf",
-                                    "mountPath": "/etc/nginx/nginx.conf",
-                                    "subPath": "nginx.conf",
-                                },
-                                {"name": "conf", "mountPath": "/etc/nginx/routes"},
-                            ],
-                            "resources": {
-                                "requests": {"cpu": "10m", "memory": "32Mi"},
-                                "limits": {"memory": "64Mi"},
-                            },
-                        }],
-                        "volumes": [{
-                            "name": "conf",
-                            "configMap": {"name": SNI_ROUTER_CONFIGMAP},
-                        }],
-                    },
-                },
-            },
-        },
-        {
-            "apiVersion": "v1",
-            "kind": "Service",
-            "metadata": {
-                "name": SNI_ROUTER_CONFIGMAP,
-                "namespace": SNI_ROUTER_NAMESPACE,
-                "labels": labels,
-                "annotations": {
-                    # Shares the control-plane VIP: 50001 is free there
-                    # precisely because the per-tenant ports are the apiserver
-                    # and konnectivity ones.
-                    "metallb.universe.tf/address-pool": metallb_pool,
-                    "metallb.universe.tf/loadBalancerIPs": vip,
-                    "metallb.universe.tf/allow-shared-ip": shared_ip_key,
-                },
-            },
-            "spec": {
-                "type": "LoadBalancer",
-                "selector": {"app": "sni-router"},
-                "ports": [{
-                    "name": "trustd",
-                    "port": TALOS_TRUSTD_PORT,
-                    "targetPort": TALOS_TRUSTD_PORT,
-                    "protocol": "TCP",
-                }],
-            },
-        },
-    ]
-
-
-async def ensure_talos_cluster_singletons(
-    k8s, *, shared_vip: str | None, metallb_pool: str, shared_ip_key: str,
-) -> dict[str, str]:
-    """Ensure the cluster-wide objects a Talos tenant depends on.
-
-    Idempotent, on demand, at the first Talos tenant — the same pattern the
-    VpcDns prerequisites use. The SNI router is built only in shared-VIP mode:
-    with a VIP per tenant, port 50001 goes on that tenant's own Service and
-    the router has nothing to do.
-
-    The Talos golden image is deliberately NOT created here. Which namespace
-    it belongs in is the operator's choice, not something to hardcode into a
-    cluster singleton.
-    """
-    from kubernetes_asyncio import client as k8s_client
-
-    results: dict[str, str] = {}
-
     try:
         await k8s.custom_api.create_namespaced_custom_object(
             group=CAPI_OPERATOR_GROUP, version=CAPI_OPERATOR_VERSION,
             namespace="capi-talos-bootstrap-system",
             plural="bootstrapproviders", body=build_bootstrap_provider(),
         )
-        results["BootstrapProvider"] = "created"
         logger.info("Requested CABPT via BootstrapProvider 'talos'")
+        return "created"
     except ApiException as e:
         if e.status == 409:
-            results["BootstrapProvider"] = "exists"
-        elif e.status == 404:
+            return "exists"
+        if e.status == 404:
             # capi-operator absent, or its namespace missing. Not fatal here:
             # `assert_cabpt_installed` gives the caller a precise error before
             # anything is created.
-            results["BootstrapProvider"] = "unavailable"
             logger.warning(
                 "capi-operator not present; cannot request CABPT automatically"
             )
-        else:
-            results["BootstrapProvider"] = f"failed: {e.reason}"
-            logger.warning(f"Could not create BootstrapProvider: {e}")
-
-    if not shared_vip:
-        results["sni-router"] = "skipped"
-        return results
-
-    for obj in build_sni_router(shared_vip, metallb_pool, shared_ip_key):
-        kind = obj["kind"]
-        try:
-            if kind == "Namespace":
-                await k8s.core_api.create_namespace(
-                    body=k8s_client.V1Namespace(
-                        metadata=k8s_client.V1ObjectMeta(**obj["metadata"]),
-                    ),
-                )
-            elif kind == "ConfigMap":
-                await k8s.core_api.create_namespaced_config_map(
-                    namespace=SNI_ROUTER_NAMESPACE,
-                    body=k8s_client.V1ConfigMap(
-                        metadata=k8s_client.V1ObjectMeta(**obj["metadata"]),
-                        data=obj["data"],
-                    ),
-                )
-            elif kind == "Deployment":
-                await k8s.apps_api.create_namespaced_deployment(
-                    namespace=SNI_ROUTER_NAMESPACE, body=obj,
-                )
-            elif kind == "Service":
-                await k8s.core_api.create_namespaced_service(
-                    namespace=SNI_ROUTER_NAMESPACE, body=obj,
-                )
-            results[kind] = "created"
-        except ApiException as e:
-            if e.status == 409:
-                # Never re-apply the ConfigMap: it carries the live route map,
-                # and overwriting it would cut every other Talos tenant off
-                # from its signer.
-                results[kind] = "exists"
-            else:
-                results[kind] = f"failed: {e.reason}"
-                logger.warning(f"SNI router {kind} ensure failed: {e}")
-
-    logger.info(f"Talos cluster singletons: {results}")
-    return results
+            return "unavailable"
+        logger.warning(f"Could not create BootstrapProvider: {e}")
+        return f"failed: {e.reason}"
 
 
 async def read_talos_secrets(k8s, tenant: str, namespace: str) -> dict[str, str]:
@@ -823,98 +657,6 @@ async def assert_cabpt_installed(k8s) -> None:
         # Anything else (403, transient) is not proof of absence — let the
         # create proceed rather than blocking on a diagnostic.
         logger.warning(f"Could not verify CABPT installation: {e}")
-
-
-# ---------------------------------------------------------------------------
-# SNI router map — the one cluster-wide object a tenant touches
-# ---------------------------------------------------------------------------
-
-def sni_route_entry(tenant: str, namespace: str) -> tuple[str, str]:
-    """(server name, backend) for one tenant in the router's map."""
-    return (
-        f"{tenant}.{namespace}.svc",
-        f"{tenant}.{namespace}.svc.cluster.local:{TALOS_TRUSTD_PORT}",
-    )
-
-
-def apply_sni_route(routes: dict[str, str], tenant: str, namespace: str) -> dict[str, str]:
-    """Add this tenant's route. Pure, so the merge is testable on its own."""
-    name, backend = sni_route_entry(tenant, namespace)
-    updated = dict(routes)
-    updated[name] = backend
-    return updated
-
-
-def remove_sni_route(routes: dict[str, str], tenant: str, namespace: str) -> dict[str, str]:
-    name, _ = sni_route_entry(tenant, namespace)
-    updated = dict(routes)
-    updated.pop(name, None)
-    return updated
-
-
-def parse_sni_routes(raw: str) -> dict[str, str]:
-    """Parse the router map: one `name backend` pair per line.
-
-    Tolerant of blank lines and `#` comments, because a human may well have
-    edited this file — it is the one place tenants and operators share.
-    """
-    routes: dict[str, str] = {}
-    for line in (raw or "").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) >= 2:
-            routes[parts[0]] = parts[1]
-    return routes
-
-
-def render_sni_routes(routes: dict[str, str]) -> str:
-    """Render deterministically — sorted, so re-writing an unchanged map
-    produces an identical object and does not churn the ConfigMap."""
-    return "".join(f"{name} {backend}\n" for name, backend in sorted(routes.items()))
-
-
-async def update_sni_router_map(
-    k8s, tenant: str, namespace: str, *, add: bool,
-) -> bool:
-    """Add or remove this tenant's SNI route.
-
-    Must land BEFORE the tenant's first worker boots: Talos retries its CSR
-    against whatever answers on 50001, and with no route it loops. Returns
-    False when the router is not deployed (per-VIP mode, where it is not
-    needed).
-    """
-    try:
-        cm = await k8s.core_api.read_namespaced_config_map(
-            name=SNI_ROUTER_CONFIGMAP, namespace=SNI_ROUTER_NAMESPACE,
-        )
-    except ApiException as e:
-        if e.status == 404:
-            logger.info(
-                "SNI router not deployed; skipping route update for tenant "
-                f"{tenant!r} (expected when each tenant has its own VIP)"
-            )
-            return False
-        raise
-
-    current = parse_sni_routes((cm.data or {}).get(SNI_ROUTER_MAP_KEY, ""))
-    updated = (
-        apply_sni_route(current, tenant, namespace) if add
-        else remove_sni_route(current, tenant, namespace)
-    )
-    if updated == current:
-        return True  # already correct — do not churn a cluster-wide object
-
-    await k8s.core_api.patch_namespaced_config_map(
-        name=SNI_ROUTER_CONFIGMAP, namespace=SNI_ROUTER_NAMESPACE,
-        body={"data": {SNI_ROUTER_MAP_KEY: render_sni_routes(updated)}},
-    )
-    logger.info(
-        f"{'Added' if add else 'Removed'} SNI route for tenant {tenant!r} "
-        f"({len(updated)} route(s) total)"
-    )
-    return True
 
 
 # ---------------------------------------------------------------------------

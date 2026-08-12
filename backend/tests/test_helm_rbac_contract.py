@@ -72,10 +72,9 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     ("k8s.cni.cncf.io", "network-attachment-definitions", "create", "vpc_underlay.ensure"),
     ("apps", "daemonsets", "create", "vpc_underlay._ensure_daemonset"),
     ("apps", "daemonsets", "patch", "vpc_underlay._ensure_daemonset (reconcile)"),
-    # --- Talos tenants: PKI via cert-manager, plus the SNI router map ---
+    # --- Talos tenants: PKI via cert-manager for the CSR signer ---
     ("cert-manager.io", "issuers", "create", "tenants_talos.build_talos_pki"),
     ("cert-manager.io", "certificates", "create", "tenants_talos.build_talos_pki"),
-    ("", "configmaps", "patch", "tenants_talos.update_sni_router_map"),
 ]
 
 

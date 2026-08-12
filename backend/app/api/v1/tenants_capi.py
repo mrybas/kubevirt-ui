@@ -35,6 +35,7 @@ from app.api.v1.tenants_common import (
 )
 from app.api.v1.tenants_cp_ports import allocate_cp_ports
 from app.api.v1.tenants_talos import (
+    TALOS_TRUSTD_PORT,
     build_talos_config_template,
     read_talos_secrets,
     build_talos_worker_config,
@@ -909,42 +910,94 @@ async def _create_tenant_apiserver_ingress(
     controllers (nginx, haproxy, traefik, contour). Cleanup is handled by
     the tenant ns cascade on delete — no dedicated cleanup helper needed.
     """
-    host = _endpoint_host(req.name)
+    await _create_tenant_ingress(
+        k8s, req,
+        host=_endpoint_host(req.name),
+        backend_port=api_port if api_port is not None else 6443,
+        name_suffix="api",
+    )
+
+
+async def _create_tenant_trustd_ingress(k8s, req: TenantCreateRequest) -> None:
+    """Expose the Talos CSR signer (trustd) the same way as the apiserver.
+
+    Talos dials trustd on a fixed port 50001 at whatever host is in
+    `cluster.controlPlane.endpoint`, and puts that host in the TLS SNI. That
+    is exactly the shape the tenant apiserver already uses — TLS passthrough
+    matched on HostSNI — so it is one more per-tenant route, not a component:
+    it is created and deleted with the tenant, the controller picks it up, and
+    nothing shared has to be edited or restarted.
+
+    The one platform prerequisite is a listener on 50001 (for Traefik, an
+    entryPoint; the name is overridable via TENANTS_TRAEFIK_TRUSTD_ENTRYPOINT).
+    A shared listener configured once beats owning a router forever.
+
+    Not needed when each tenant has its own VIP — then 50001 simply goes on
+    that tenant's own control-plane Service.
+    """
+    await _create_tenant_ingress(
+        k8s, req,
+        host=f"{req.name}.{_tenant_ns(req.name)}.svc",
+        backend_port=TALOS_TRUSTD_PORT,
+        name_suffix="trustd",
+        entry_point=os.getenv("TENANTS_TRAEFIK_TRUSTD_ENTRYPOINT", "trustd"),
+    )
+
+
+async def _create_tenant_ingress(
+    k8s,
+    req: TenantCreateRequest,
+    *,
+    host: str,
+    backend_port: int,
+    name_suffix: str,
+    entry_point: str | None = None,
+) -> None:
+    """Create one TLS-passthrough route to a port on the tenant's TCP Service.
+
+    Shared by the apiserver and trustd routes: same four controllers, same
+    passthrough, only the host, port and object name differ.
+    """
     ns = _tenant_ns(req.name)
     controller = _ingress_controller()
-    backend_port = api_port if api_port is not None else 6443
     dns_target = _external_dns_target()
 
+    def _named(body: dict[str, Any]) -> dict[str, Any]:
+        body["metadata"]["name"] = f"{req.name}-{name_suffix}"
+        if entry_point and body.get("kind") == "IngressRouteTCP":
+            body["spec"]["entryPoints"] = [entry_point]
+        return body
+
     if "ingress-nginx" in controller:
-        body = _build_ingress_nginx(req, host, backend_port, dns_target)
+        body = _named(_build_ingress_nginx(req, host, backend_port, dns_target))
         networking_api = client.NetworkingV1Api(k8s._api_client)
         await networking_api.create_namespaced_ingress(namespace=ns, body=body)
-        logger.info(f"Created nginx Ingress {ns}/{req.name}-api host={host} → :{backend_port}")
+        logger.info(f"Created nginx Ingress {ns}/{req.name}-{name_suffix} host={host} → :{backend_port}")
         return
 
     if "haproxy" in controller:
-        body = _build_ingress_haproxy(req, host, backend_port, dns_target)
+        body = _named(_build_ingress_haproxy(req, host, backend_port, dns_target))
         networking_api = client.NetworkingV1Api(k8s._api_client)
         await networking_api.create_namespaced_ingress(namespace=ns, body=body)
-        logger.info(f"Created haproxy Ingress {ns}/{req.name}-api host={host} → :{backend_port}")
+        logger.info(f"Created haproxy Ingress {ns}/{req.name}-{name_suffix} host={host} → :{backend_port}")
         return
 
     if "traefik" in controller:
-        body = _build_ingressroutetcp_traefik(req, host, backend_port, dns_target)
+        body = _named(_build_ingressroutetcp_traefik(req, host, backend_port, dns_target))
         await k8s.custom_api.create_namespaced_custom_object(
             group="traefik.io", version="v1alpha1", namespace=ns,
             plural="ingressroutetcps", body=body,
         )
-        logger.info(f"Created Traefik IngressRouteTCP {ns}/{req.name}-api host={host} → :{backend_port}")
+        logger.info(f"Created Traefik IngressRouteTCP {ns}/{req.name}-{name_suffix} host={host} → :{backend_port}")
         return
 
     if "contour" in controller:
-        body = _build_httpproxy_contour(req, host, backend_port, dns_target)
+        body = _named(_build_httpproxy_contour(req, host, backend_port, dns_target))
         await k8s.custom_api.create_namespaced_custom_object(
             group="projectcontour.io", version="v1", namespace=ns,
             plural="httpproxies", body=body,
         )
-        logger.info(f"Created Contour HTTPProxy {ns}/{req.name}-api host={host}")
+        logger.info(f"Created Contour HTTPProxy {ns}/{req.name}-{name_suffix} host={host}")
         return
 
     raise HTTPException(
@@ -1256,3 +1309,10 @@ async def _create_capi_resources(
     #    Traefik IngressRouteTCP vs Contour HTTPProxy). For VPC tenants the
     #    backend Service port is the allocated api_port, not 6443.
     await _create_tenant_apiserver_ingress(k8s, req, api_port=api_port)
+
+    # 7. Talos workers reach the CSR signer the same way — one more
+    #    passthrough route, on 50001 instead of the apiserver port. Only
+    #    needed when tenants share a VIP; with a VIP per tenant the port is
+    #    already published on that tenant's own control-plane Service.
+    if req.worker_os == "talos" and vip is not None:
+        await _create_tenant_trustd_ingress(k8s, req)

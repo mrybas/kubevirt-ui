@@ -119,3 +119,42 @@ class TestRequestValidation:
 
     def test_talos_is_accepted(self) -> None:
         assert _req(worker_os="talos").worker_os == "talos"
+
+
+class TestTrustdRoute:
+    """The signer is exposed by the same mechanism as the apiserver.
+
+    It used to be a bespoke nginx SNI router with a shared route map: one
+    cluster-wide object, edited per tenant, needing a manual restart to take
+    effect and manual cleanup on delete — the very shape criticised elsewhere
+    in this codebase. The apiserver's own path already does TLS passthrough
+    matched on HostSNI with a configurable backend port, so trustd is one more
+    per-tenant route through it.
+    """
+
+    def _traefik(self, **kw: object):
+        from app.api.v1.tenants_capi import _build_ingressroutetcp_traefik
+
+        return _build_ingressroutetcp_traefik(_req(**kw), "t1.tenant-t1.svc", 50001)
+
+    def test_route_is_tls_passthrough_matched_on_the_sni_name(self) -> None:
+        body = self._traefik()
+        assert body["spec"]["tls"]["passthrough"] is True
+        assert body["spec"]["routes"][0]["match"] == "HostSNI(`t1.tenant-t1.svc`)"
+
+    def test_backend_port_is_the_fixed_trustd_port(self) -> None:
+        from app.api.v1.tenants_talos import TALOS_TRUSTD_PORT
+
+        body = self._traefik()
+        assert body["spec"]["routes"][0]["services"][0]["port"] == TALOS_TRUSTD_PORT
+
+    def test_route_lives_in_the_tenant_namespace(self) -> None:
+        # So the namespace cascade removes it — no cleanup helper needed.
+        assert self._traefik()["metadata"]["namespace"] == "tenant-t1"
+
+    def test_no_shared_object_is_involved(self) -> None:
+        # Guards the regression: nothing here may reach outside the tenant.
+        import app.api.v1.tenants_talos as talos
+
+        assert not hasattr(talos, "build_sni_router")
+        assert not hasattr(talos, "update_sni_router_map")

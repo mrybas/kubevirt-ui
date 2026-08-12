@@ -14,19 +14,13 @@ from kubernetes_asyncio.client import ApiException
 from app.api.v1 import tenants_talos
 from app.api.v1.tenants_talos import (
     TALOS_TRUSTD_PORT,
-    apply_sni_route,
     build_bootstrap_token_secret,
     build_talos_pki,
     build_talos_secrets,
     build_talos_worker_config,
     generate_bootstrap_token,
-    parse_sni_routes,
-    remove_sni_route,
-    render_sni_routes,
     signer_dns_names,
-    sni_route_entry,
     talos_control_plane_additions,
-    update_sni_router_map,
     validate_worker_binding,
     worker_endpoint,
 )
@@ -207,90 +201,6 @@ class TestWorkerConfig:
         assert self._config(ca_cert_b64="Y2E=")["machine"]["ca"]["crt"] == "Y2E="
 
 
-class TestSniMap:
-    def test_entry_points_the_short_name_at_the_long_one(self) -> None:
-        name, backend = sni_route_entry(TENANT, NS)
-        assert name == f"{TENANT}.{NS}.svc"
-        assert backend == f"{TENANT}.{NS}.svc.cluster.local:{TALOS_TRUSTD_PORT}"
-
-    def test_parse_ignores_comments_and_blanks(self) -> None:
-        raw = "# a comment\n\nt1.tenant-t1.svc t1.tenant-t1.svc.cluster.local:50001\n"
-        assert parse_sni_routes(raw) == {
-            "t1.tenant-t1.svc": "t1.tenant-t1.svc.cluster.local:50001",
-        }
-
-    def test_render_is_sorted_so_rewrites_do_not_churn(self) -> None:
-        routes = {"b.svc": "b:50001", "a.svc": "a:50001"}
-        assert render_sni_routes(routes).splitlines() == [
-            "a.svc a:50001", "b.svc b:50001",
-        ]
-
-    def test_round_trip(self) -> None:
-        routes = apply_sni_route({}, TENANT, NS)
-        assert parse_sni_routes(render_sni_routes(routes)) == routes
-
-    def test_add_is_idempotent(self) -> None:
-        once = apply_sni_route({}, TENANT, NS)
-        assert apply_sni_route(once, TENANT, NS) == once
-
-    def test_remove_leaves_other_tenants_alone(self) -> None:
-        routes = apply_sni_route(apply_sni_route({}, TENANT, NS), "t2", "tenant-t2")
-        remaining = remove_sni_route(routes, TENANT, NS)
-        assert list(remaining) == ["t2.tenant-t2.svc"]
-
-    def test_remove_of_absent_tenant_is_a_no_op(self) -> None:
-        assert remove_sni_route({}, TENANT, NS) == {}
-
-
-@pytest.mark.asyncio
-class TestSniRouterUpdate:
-    def _k8s(self, raw: str = "") -> MagicMock:
-        k8s = MagicMock()
-        cm = MagicMock()
-        cm.data = {tenants_talos.SNI_ROUTER_MAP_KEY: raw}
-        k8s.core_api.read_namespaced_config_map = AsyncMock(return_value=cm)
-        k8s.core_api.patch_namespaced_config_map = AsyncMock()
-        return k8s
-
-    async def test_adds_the_route(self) -> None:
-        k8s = self._k8s()
-
-        assert await update_sni_router_map(k8s, TENANT, NS, add=True) is True
-
-        body = k8s.core_api.patch_namespaced_config_map.await_args.kwargs["body"]
-        assert f"{TENANT}.{NS}.svc" in body["data"][tenants_talos.SNI_ROUTER_MAP_KEY]
-
-    async def test_missing_router_is_not_an_error(self) -> None:
-        # Expected in per-VIP mode, where no router is deployed at all.
-        k8s = self._k8s()
-        k8s.core_api.read_namespaced_config_map = AsyncMock(
-            side_effect=ApiException(status=404, reason="Not Found"),
-        )
-
-        assert await update_sni_router_map(k8s, TENANT, NS, add=True) is False
-
-    async def test_unchanged_map_is_not_rewritten(self) -> None:
-        # It is a cluster-wide object; churning it has a blast radius.
-        name, backend = sni_route_entry(TENANT, NS)
-        k8s = self._k8s(f"{name} {backend}\n")
-
-        assert await update_sni_router_map(k8s, TENANT, NS, add=True) is True
-        k8s.core_api.patch_namespaced_config_map.assert_not_awaited()
-
-    async def test_removal_drops_only_this_tenant(self) -> None:
-        k8s = self._k8s(
-            "t1.tenant-t1.svc t1.tenant-t1.svc.cluster.local:50001\n"
-            "t2.tenant-t2.svc t2.tenant-t2.svc.cluster.local:50001\n"
-        )
-
-        await update_sni_router_map(k8s, TENANT, NS, add=False)
-
-        body = k8s.core_api.patch_namespaced_config_map.await_args.kwargs["body"]
-        rendered = body["data"][tenants_talos.SNI_ROUTER_MAP_KEY]
-        assert "t2.tenant-t2.svc" in rendered
-        assert "t1.tenant-t1.svc" not in rendered
-
-
 class TestWorkerBinding:
     def test_bridge_is_accepted(self) -> None:
         validate_worker_binding("bridge")
@@ -338,43 +248,10 @@ class TestSignerImage:
 
 class TestClusterSingletons:
     def test_bootstrap_provider_is_the_thin_capi_operator_cr(self) -> None:
+        # The only cluster-wide object Talos support needs: it asks
+        # capi-operator to install CABPT. Everything else is per-tenant.
         from app.api.v1.tenants_talos import build_bootstrap_provider
 
         cr = build_bootstrap_provider()
         assert cr["kind"] == "BootstrapProvider"
         assert cr["metadata"]["name"] == "talos"
-
-    def test_sni_router_never_terminates_tls(self) -> None:
-        # It reads the requested name with ssl_preread and forwards; it has no
-        # certificate and must not need one.
-        from app.api.v1.tenants_talos import build_sni_router
-
-        cm = next(o for o in build_sni_router("10.0.0.1", "pool", "key")
-                  if o["kind"] == "ConfigMap")
-        conf = cm["data"]["nginx.conf"]
-        assert "ssl_preread on" in conf
-        assert "ssl_certificate" not in conf
-
-    def test_sni_router_listens_on_the_fixed_trustd_port(self) -> None:
-        from app.api.v1.tenants_talos import build_sni_router
-
-        svc = next(o for o in build_sni_router("10.0.0.1", "pool", "key")
-                   if o["kind"] == "Service")
-        assert svc["spec"]["ports"][0]["port"] == TALOS_TRUSTD_PORT
-
-    def test_sni_router_shares_the_control_plane_vip(self) -> None:
-        from app.api.v1.tenants_talos import build_sni_router
-
-        svc = next(o for o in build_sni_router("10.0.0.1", "pool", "key")
-                   if o["kind"] == "Service")
-        ann = svc["metadata"]["annotations"]
-        assert ann["metallb.universe.tf/loadBalancerIPs"] == "10.0.0.1"
-        assert ann["metallb.universe.tf/allow-shared-ip"] == "key"
-
-    def test_route_map_starts_empty(self) -> None:
-        # Tenants add their own lines; ensure must never clobber them later.
-        from app.api.v1.tenants_talos import SNI_ROUTER_MAP_KEY, build_sni_router
-
-        cm = next(o for o in build_sni_router("10.0.0.1", "pool", "key")
-                  if o["kind"] == "ConfigMap")
-        assert cm["data"][SNI_ROUTER_MAP_KEY] == ""

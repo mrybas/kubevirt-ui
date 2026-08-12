@@ -95,6 +95,28 @@ backend:
     TENANTS_CP_PORT_BASE: ""
     TENANTS_CP_PORT_END: ""
     TENANTS_CP_RESERVED_PORTS: ""
+    # -- Talos worker support. All optional; only read when a tenant is
+    # created with worker_os=talos.
+    #
+    # The CSR signer image. Pinned by digest in code because upstream ships no
+    # versioned tags at all — set this to your own mirror, ideally also by
+    # digest.
+    TALOS_SIGNER_IMAGE: ""
+    # Traefik entryPoint that listens on 50001, used only when tenants share a
+    # CP VIP. Talos always dials trustd on that fixed port and puts the host
+    # in the TLS SNI, so the tenants are demultiplexed exactly like their
+    # apiservers — one passthrough route each, no extra component. The
+    # listener itself is a one-time platform change in Traefik's own values:
+    #
+    #   ports:
+    #     trustd:
+    #       port: 50001
+    #       exposedPort: 50001
+    #       protocol: TCP
+    #
+    # Not needed when each tenant gets its own VIP: then 50001 is published on
+    # that tenant's own control-plane Service and nothing is shared.
+    TENANTS_TRAEFIK_TRUSTD_ENTRYPOINT: ""
 
   # -- Extra env vars from secrets/configmaps
   envFrom: []
