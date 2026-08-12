@@ -6,6 +6,7 @@ import { useState, useEffect, useRef } from 'react';
 import { X, Server, HardDrive, Cpu, MemoryStick, Check, Loader2, FolderOpen, Network, Globe, Plus, Trash2, Gauge, ChevronRight, Folder } from 'lucide-react';
 import { useTemplates, useGoldenImages, useCreateVMFromTemplate } from '@/hooks/useTemplates';
 import { useSubnets } from '@/hooks/useNetwork';
+import { useStorageClasses } from '@/hooks/useStorage';
 import type { VMTemplate, VMFromTemplateRequest } from '@/types/template';
 import { CustomSelect } from '@/components/common/CustomSelect';
 import { WizardStepIndicator } from '@/components/common/WizardStepIndicator';
@@ -141,6 +142,9 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   const [cpuCores, setCpuCores] = useState<number | undefined>(defaultTemplate?.compute.cpu_cores);
   const [memory, setMemory] = useState<string | undefined>(defaultTemplate?.compute.memory);
   const [diskSize, setDiskSize] = useState<string | undefined>(defaultTemplate?.disk.size);
+  // Left empty = cluster default. Deliberately NOT seeded from the template's
+  // own class: templates live on the cheap tier, VM disks should not.
+  const [storageClass, setStorageClass] = useState<string>('');
   const [sshKey, setSshKey] = useState('');
   const [password, setPassword] = useState('');
   const [startVM, setStartVM] = useState(true);
@@ -150,6 +154,8 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   
   const { data: templatesData, isLoading: templatesLoading } = useTemplates();
   const { data: subnets } = useSubnets();
+  const { data: storageClassesData } = useStorageClasses();
+  const storageClasses = storageClassesData?.items ?? [];
   const { data: goldenImagesData } = useGoldenImages();
   const createVM = useCreateVMFromTemplate();
   
@@ -211,6 +217,7 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
       if (cpuCores) request.cpu_cores = cpuCores;
       if (memory) request.memory = memory;
       if (diskSize) request.disk_size = diskSize;
+      if (storageClass) request.storage_class = storageClass;
       if (sshKey) request.ssh_key = sshKey;
       if (password) request.password = password;
       if (nics.length > 0) {
@@ -502,6 +509,28 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
               Disk Size
             </label>
             <SizeInput value={diskSize || ''} onChange={(v) => setDiskSize(v)} units={['Gi', 'Ti']} defaultUnit="Gi" />
+          </div>
+
+          <div className="col-span-2">
+            <label className="block text-sm font-medium text-surface-300 mb-1">
+              Storage Class
+            </label>
+            <CustomSelect
+              value={storageClass}
+              onChange={setStorageClass}
+              placeholder="(cluster default)"
+              options={[
+                { value: '', label: '(cluster default)' },
+                ...storageClasses.map(sc => ({
+                  value: sc.name,
+                  label: sc.is_default ? `${sc.name} (default)` : sc.name,
+                })),
+              ]}
+            />
+            <p className="text-xs text-surface-500 mt-1">
+              Where this VM's disk lives. The template's own class is not reused — templates
+              usually sit on a cheaper tier than the VMs made from them.
+            </p>
           </div>
         </div>
       </div>

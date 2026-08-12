@@ -75,6 +75,10 @@ class VMFromTemplateRequest(BaseModel):
     cpu_cores: int | None = None
     memory: str | None = None
     disk_size: str | None = None
+    # Where the VM's own disk goes. Deliberately NOT inherited from the
+    # template's disk when omitted — see the storage-class note in
+    # create_vm_from_template.
+    storage_class: str | None = None
 
     # Cloud-init
     ssh_key: str | None = None
@@ -1111,7 +1115,14 @@ async def create_vm_from_template(
         vcpu = compute.get("vcpu", cpu_cores)  # vCPUs visible to VM (defaults to cpu_cores)
         memory = vm_request.memory or compute.get("memory", "4Gi")
         disk_size = vm_request.disk_size or disk_config.get("size", "50Gi")
-        storage_class = disk_config.get("storage_class")
+        # The template's class describes where the TEMPLATE lives, which is not
+        # where the VM's disk belongs once storage is tiered: templates sit on
+        # a cheap erasure-coded class, VM disks want the replicated one.
+        # Inheriting it sent every write the VM makes to erasure coding. So:
+        # explicit request wins, otherwise fall through to the cluster default
+        # by leaving storageClassName unset. Cross-class cloning is thin and
+        # costs nothing.
+        storage_class = vm_request.storage_class
         
         golden_image_name = template.get("golden_image_name")
         golden_image_namespace = template.get("golden_image_namespace", "golden-images")

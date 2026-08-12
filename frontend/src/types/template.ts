@@ -188,6 +188,8 @@ export interface VMFromTemplateRequest {
   cpu_cores?: number;
   memory?: string;
   disk_size?: string;
+  /** Where the VM's disk goes. Omitted = cluster default, never the template's class. */
+  storage_class?: string;
   ssh_key?: string;
   password?: string;
   user_data?: string;

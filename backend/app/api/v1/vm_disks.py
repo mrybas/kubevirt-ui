@@ -317,9 +317,15 @@ async def create_image_from_vm(
     image_name: str,
     display_name: str | None = None,
     description: str | None = None,
+    storage_class: str | None = None,
     user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
-    """Create a golden image from VM's root disk (VM must be stopped)."""
+    """Create a golden image from VM's root disk (VM must be stopped).
+
+    `storage_class` targets the new image; omitted means the cluster default,
+    not the VM disk's class — golden images belong on the cheap tier by
+    default, and inheriting pinned them to whatever the VM was running on.
+    """
     k8s_client = request.app.state.k8s_client
     
     try:
@@ -382,8 +388,9 @@ async def create_image_from_vm(
             namespace=namespace,
         )
         size = source_pvc.spec.resources.requests.get("storage", "50Gi")
-        storage_class = source_pvc.spec.storage_class_name
-        
+        # NOT source_pvc.spec.storage_class_name — see the docstring.
+        target_storage_class = storage_class
+
         # Create golden image from disk
         golden_images_ns = "golden-images"
         
@@ -408,8 +415,8 @@ async def create_image_from_vm(
                 }
             },
         }
-        if storage_class:
-            golden_storage["storageClassName"] = storage_class
+        if target_storage_class:
+            golden_storage["storageClassName"] = target_storage_class
         
         dv = {
             "apiVersion": "cdi.kubevirt.io/v1beta1",

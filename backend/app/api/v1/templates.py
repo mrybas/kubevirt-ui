@@ -1048,8 +1048,11 @@ async def create_golden_image_from_disk(
         )
         
         size = source_pvc.spec.resources.requests.get("storage", "50Gi")
-        storage_class = source_pvc.spec.storage_class_name
-        
+        # Explicit target class wins; otherwise leave it unset so the cluster
+        # default applies. Inheriting the source's class is what pinned every
+        # image to whichever tier its source VM happened to sit on.
+        storage_class = req.storage_class
+
         # Build storage spec (new CDI format)
         clone_storage: dict[str, Any] = {
             "volumeMode": "Block",  # Required for snapshot-based cloning

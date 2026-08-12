@@ -278,6 +278,12 @@ class CreateImageFromDiskRequest(BaseModel):
     # Target namespace for the new image (defaults to source_namespace if not provided)
     target_namespace: str | None = None
 
+    # StorageClass for the new image. Omitted → cluster default, NOT the
+    # source disk's class: images are exactly what you want to put on the
+    # cheap tier deliberately, and inheriting pins them wherever the VM
+    # happened to live.
+    storage_class: str | None = None
+
     # New image details
     name: str | None = Field(
         None,

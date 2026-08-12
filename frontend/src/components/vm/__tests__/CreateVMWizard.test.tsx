@@ -25,6 +25,10 @@ vi.mock('@/hooks/useNetwork', () => ({
   useSubnets: () => ({ data: [] }),
 }));
 
+vi.mock('@/hooks/useStorage', () => ({
+  useStorageClasses: () => ({ data: { items: [] } }),
+}));
+
 vi.mock('@/hooks/useFolders', () => ({
   useFoldersFlat: () => ({ data: { items: [] } }),
 }));
