@@ -20,7 +20,13 @@ from app.api.v1.subnet_acls import (
     _acls_to_spec,
     build_isolation_acls,
 )
-from app.api.v1.tenants_common import _ensure_cluster_config, _tenant_ns, _vpcdns_vip
+from app.api.v1.tenants_common import (
+    _ensure_cluster_config,
+    _host_service_cidr,
+    _tenant_ns,
+    _vpcdns_forward_dns,
+    _vpcdns_vip,
+)
 from app.config import get_settings
 from app.core.allocators import (
     allocate_peering_link,
@@ -149,67 +155,135 @@ async def _get_vpc_subnets(k8s, vpc_name: str) -> tuple[list[VpcSubnetInfo], boo
     return subnets, isolated
 
 
-async def _discover_coredns_pod_ips(k8s) -> list[str]:
-    """List CoreDNS pod IPs in kube-system.
+# Provider key of the VpcDns secondary NIC. kube-ovn's CNI reads per-provider
+# annotations off the pod template under this prefix.
+VPCDNS_NAD_PROVIDER = "ovn-nad.default.ovn"
+VPCDNS_ROUTES_ANNOTATION = f"{VPCDNS_NAD_PROVIDER}.kubernetes.io/routes"
+# Subnet backing the default cluster overlay — its gateway is the next hop for
+# the service network from a VpcDns pod's secondary NIC.
+OVN_DEFAULT_SUBNET = "ovn-default"
 
-    Used to populate the VpcDns `Corefile` so cluster.local resolution
-    works for pods in custom VPCs. VpcDns's secondary NIC only has a
-    `10.96.0.1/32` route into the default cluster overlay (kube-ovn-controller
-    sets this — not configurable yet), so it can reach the apiserver but
-    NOT the kube-dns ClusterIP `10.96.0.10`. Forwarding to the actual
-    CoreDNS pod IPs (same `ovn-default` switch as the secondary NIC) works.
 
-    Fragile: a CoreDNS rescheduling silently breaks the chain. The
-    explicit `recreate_vpc_dns` API endpoint re-runs this discovery and
-    refreshes the ConfigMap.
+async def _overlay_gateway(k8s) -> str | None:
+    """Gateway of the default cluster overlay subnet (`10.16.0.1` upstream).
+
+    Read rather than assumed: the overlay CIDR is a cluster install choice,
+    and a wrong next hop here produces exactly the silent failure this whole
+    route exists to prevent.
     """
     try:
-        pods = await k8s.core_api.list_namespaced_pod(
-            namespace="kube-system",
-            label_selector="k8s-app=kube-dns",
+        subnet = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
+            name=OVN_DEFAULT_SUBNET,
         )
     except ApiException as exc:
-        logger.warning(f"Failed to list CoreDNS pods for VpcDns Corefile: {exc}")
-        return []
-    return [
-        p.status.pod_ip for p in pods.items
-        if p.status and p.status.pod_ip and p.status.phase == "Running"
-    ]
+        logger.warning(
+            f"Could not read subnet {OVN_DEFAULT_SUBNET!r} for the VpcDns "
+            f"service-network route: {exc}"
+        )
+        return None
+    return (subnet.get("spec", {}) or {}).get("gateway") or None
 
 
-def _build_vpc_dns_corefile(coredns_pod_ips: list[str]) -> str:
-    """Split Corefile: cluster.local + reverse zones → CoreDNS pod IPs; rest → public.
+async def _ensure_vpc_dns_service_route(k8s, vpc_name: str) -> bool:
+    """Give a VpcDns pod a route to the service network.
 
-    Without the cluster.local stanza VpcDns forwards everything to 8.8.8.8
-    and Service DNS inside a custom VPC silently returns NXDOMAIN. With
-    the stanza, pods in any VPC can resolve `kubernetes.default.svc`,
-    `*.svc.cluster.local`, etc.
+    A VpcDns pod's secondary NIC gets exactly one route into the default
+    overlay — `10.96.0.1/32`, set by kube-ovn-controller and not configurable
+    — so the apiserver ClusterIP is reachable and the overlay subnet is
+    on-link, but the kube-dns ClusterIP is not: that packet takes the pod's
+    default route out into the VPC and dies there.
+
+    That is the only reason the Corefile ever pinned CoreDNS *pod* IPs. Pod IPs
+    are ephemeral, so the pin breaks on the next CoreDNS reschedule — and
+    breaks silently: measured, after a `rollout restart coredns` moved the pods
+    from 10.16.0.8/9 to 10.16.0.26/28, VPC DNS answered nothing while the
+    VpcDns object still reported ACTIVE=true with both pods 1/1 Running.
+
+    Adding a route for the whole service network removes the pin: forwarding
+    to the stable kube-dns ClusterIP then works and nothing goes stale.
+    kube-ovn's CNI honours a per-provider `routes` annotation on the pod
+    template, and the VpcDns controller leaves it in place.
+
+    Best-effort: the Deployment is created by the kube-ovn controller after the
+    VpcDns CR, so on the create path it may not exist yet — the recreate
+    endpoint applies it later. Returns True when the annotation is in place.
     """
-    if coredns_pod_ips:
-        cluster_targets = " ".join(coredns_pod_ips)
-    else:
-        # No CoreDNS pods discovered — fall back to a stub that fails fast
-        # rather than silently mis-resolving via 8.8.8.8.
-        cluster_targets = "10.96.0.10"
+    from app.api.v1.network import _find_kubeovn_namespace
+
+    service_cidr = _host_service_cidr()
+    if not service_cidr:
+        logger.warning(
+            f"VpcDns {vpc_name!r}: host service CIDR unknown, cannot add the "
+            "service-network route; DNS in this VPC will not resolve"
+        )
+        return False
+
+    gateway = await _overlay_gateway(k8s)
+    if not gateway:
+        return False
+
+    kubeovn_ns = await _find_kubeovn_namespace(k8s)
+    deploy_name = f"vpc-dns-{vpc_name}-dns"
+    routes = json.dumps([{"dst": service_cidr, "gw": gateway}])
+    patch = {
+        "spec": {
+            "template": {
+                "metadata": {"annotations": {VPCDNS_ROUTES_ANNOTATION: routes}},
+            },
+        },
+    }
+
+    try:
+        await k8s.apps_api.patch_namespaced_deployment(
+            name=deploy_name, namespace=kubeovn_ns, body=patch,
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            logger.info(
+                f"VpcDns Deployment {kubeovn_ns}/{deploy_name} not created yet; "
+                "the service-network route will be applied on the next reconcile"
+            )
+        else:
+            logger.warning(
+                f"Could not annotate {kubeovn_ns}/{deploy_name} with the "
+                f"service-network route: {exc}"
+            )
+        return False
+
+    logger.info(
+        f"VpcDns {vpc_name!r}: routed {service_cidr} via {gateway} on "
+        f"{kubeovn_ns}/{deploy_name}"
+    )
+    return True
+
+
+def _build_vpc_dns_corefile(cluster_dns_ip: str) -> str:
+    """Corefile for VpcDns: one forward to the cluster's own CoreDNS.
+
+    Everything, not just cluster.local. The public half used to go straight to
+    8.8.8.8 and timed out, for a structural reason: a VpcDns pod runs in the
+    kube-ovn namespace while the VPC egress gateway selects the *tenant*
+    namespace, so the pod is never steered through the gateway and has no path
+    to the internet at all. Cluster CoreDNS is reachable and already resolves
+    the public internet, so a single forward covers both zones and drops the
+    egress dependency entirely.
+
+    The target is the kube-dns ClusterIP, which is stable — reachable only
+    because `_ensure_vpc_dns_service_route` routes the service network over
+    the secondary NIC. Forwarding to CoreDNS *pod* IPs instead would work
+    until the next reschedule and then fail silently.
+    """
     return (
-        "cluster.local:53 in-addr.arpa:53 ip6.arpa:53 {\n"
-        "    errors\n"
-        "    cache 30\n"
-        f"    forward . {cluster_targets} {{\n"
-        "        prefer_udp\n"
-        "        policy round_robin\n"
-        "    }\n"
-        "    reload\n"
-        "    loadbalance\n"
-        "}\n"
         ".:53 {\n"
         "    errors\n"
         "    health\n"
         "    ready\n"
-        "    forward . 8.8.8.8 8.8.4.4 {\n"
-        "        prefer_udp\n"
-        "    }\n"
         "    cache 30\n"
+        f"    forward . {cluster_dns_ip} {{\n"
+        "        prefer_udp\n"
+        "        policy round_robin\n"
+        "    }\n"
         "    loop\n"
         "    reload\n"
         "    loadbalance\n"
@@ -223,7 +297,7 @@ async def _ensure_vpc_dns_prereqs(k8s) -> None:
     kube-ovn upstream lets the operator define these manually; we automate
     them at first VPC create so the user doesn't have to apply YAML by hand.
     Run from `_ensure_vpc_dns` (auto-create path) AND from the recreate
-    endpoint (so Corefile pod IPs refresh when admin clicks Recreate).
+    endpoint.
 
     Resources:
       - NetworkAttachmentDefinition `ovn-nad` in `default` ns — secondary
@@ -232,8 +306,8 @@ async def _ensure_vpc_dns_prereqs(k8s) -> None:
         controller (`enable-vpc-dns: true`) and tells it which NAD + VIP
         to use.
       - ConfigMap `vpc-dns-corefile` in kube-ovn ns — CoreDNS Corefile
-        mounted by the per-VPC VpcDns Deployment. Re-rendered each call
-        with currently-running CoreDNS pod IPs.
+        mounted by EVERY VpcDns Deployment in the cluster, so its content is
+        deliberately cluster-generic: one forward to the kube-dns ClusterIP.
 
     The matching ServiceAccount `vpc-dns` in the kube-ovn ns is shipped
     by k8s-bootstrap (static infrastructure, no runtime data).
@@ -288,11 +362,12 @@ async def _ensure_vpc_dns_prereqs(k8s) -> None:
         if e.status != 409:
             logger.warning(f"VpcDns config CM ensure failed: {e}")
 
-    # 3. ConfigMap vpc-dns-corefile — rebuild each call so pod-IP forwards
-    # track current CoreDNS pods. Create-or-replace; idempotent when no IPs
-    # changed.
-    coredns_ips = await _discover_coredns_pod_ips(k8s)
-    corefile = _build_vpc_dns_corefile(coredns_ips)
+    # 3. ConfigMap vpc-dns-corefile. Note the blast radius: this one ConfigMap
+    # is mounted by EVERY VpcDns in the cluster, so a change here affects all
+    # VPCs at once. CoreDNS's `reload` plugin picks it up without restarting a
+    # single pod. Content is stable now that it names the kube-dns ClusterIP
+    # rather than pod IPs, so re-rendering is a no-op in practice.
+    corefile = _build_vpc_dns_corefile(_vpcdns_forward_dns())
     cm_corefile = client_v1_configmap(
         name="vpc-dns-corefile",
         namespace=kubeovn_ns,
@@ -305,7 +380,7 @@ async def _ensure_vpc_dns_prereqs(k8s) -> None:
         )
         logger.info(
             f"Created VpcDns prereq ConfigMap {kubeovn_ns}/vpc-dns-corefile "
-            f"(CoreDNS targets: {coredns_ips or ['10.96.0.10 fallback']})"
+            f"(forwarding to {_vpcdns_forward_dns()})"
         )
     except ApiException as e:
         if e.status == 409:
@@ -315,8 +390,8 @@ async def _ensure_vpc_dns_prereqs(k8s) -> None:
                     body={"data": {"Corefile": corefile}},
                 )
                 logger.info(
-                    f"Refreshed VpcDns Corefile (CoreDNS targets: "
-                    f"{coredns_ips or ['10.96.0.10 fallback']})"
+                    f"Refreshed VpcDns Corefile (forwarding to "
+                    f"{_vpcdns_forward_dns()})"
                 )
             except ApiException as patch_exc:
                 logger.warning(f"VpcDns corefile CM patch failed: {patch_exc}")
@@ -616,6 +691,14 @@ async def _ensure_vpc_dns(
             # swallow=False — propagate so the caller can surface a real
             # error to the user instead of pretending success.
             raise
+
+    # Route the service network over the VpcDns pod's secondary NIC, so its
+    # Corefile can name the stable kube-dns ClusterIP instead of pinning
+    # CoreDNS pod IPs. Best-effort here: the kube-ovn controller creates the
+    # Deployment after this CR, so on a fresh VPC it usually is not there yet
+    # and the recreate endpoint applies it. Without the route, DNS in this VPC
+    # resolves nothing while every object still reports healthy.
+    await _ensure_vpc_dns_service_route(k8s, vpc_name)
 
     # Pair the VpcDns CR with a Kyverno ClusterPolicy that mutates pods
     # landing in this VPC's namespaces to use the VpcDns VIP as DNS.
@@ -1671,6 +1754,14 @@ async def recreate_vpc_dns(
       - VPC pre-dates the T2 auto-create (404 from GET /dns).
       - VpcDns reconciliation stuck in error and a clean re-create might
         recover (e.g. stale references after a subnet rename).
+      - The service-network route is missing from the VpcDns Deployment —
+        the usual case, because the kube-ovn controller creates that
+        Deployment after the CR, so the create path could not annotate it yet.
+
+    This endpoint used to exist mainly to refresh CoreDNS pod IPs pinned into
+    the Corefile. It no longer pins any: the Corefile names the kube-dns
+    ClusterIP, which does not move. What it now repairs is the route that
+    makes that ClusterIP reachable.
 
     Idempotent in the sense that if the CR is already absent, we still
     call `_ensure_vpc_dns` to create it. Spec recreated with the VPC's
