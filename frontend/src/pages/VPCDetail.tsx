@@ -362,6 +362,14 @@ function PeeringsTab({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data
                   <div className="flex items-center gap-3">
                     <GitMerge className="w-4 h-4 text-surface-400" />
                     <span className="text-sm font-medium text-surface-200 font-mono">{p.remote_vpc}</span>
+                    {p.link_cidr && (
+                      <span
+                        className="text-xs text-surface-500 font-mono"
+                        title="Link-local /30 between the two VPC routers"
+                      >
+                        {p.local_connect_ip} → {p.remote_connect_ip}
+                      </span>
+                    )}
                     <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-900/30 text-emerald-400">
                       Active
                     </span>

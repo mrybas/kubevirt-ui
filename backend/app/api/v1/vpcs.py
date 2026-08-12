@@ -6,6 +6,7 @@ Dedicated VPC router covering:
   - Static route management
 """
 
+import ipaddress
 import json
 import logging
 from typing import Any
@@ -21,7 +22,11 @@ from app.api.v1.subnet_acls import (
 )
 from app.api.v1.tenants_common import _ensure_cluster_config, _tenant_ns, _vpcdns_vip
 from app.config import get_settings
-from app.core.allocators import allocate_vpc_cidr, assert_cidr_free
+from app.core.allocators import (
+    allocate_peering_link,
+    allocate_vpc_cidr,
+    assert_cidr_free,
+)
 from app.core.auth import User, require_auth, require_admin
 from app.core.constants import (
     KUBEOVN_API_GROUP,
@@ -621,25 +626,40 @@ async def _ensure_vpc_dns(
 
 
 async def _get_vpc_peerings(k8s, vpc_name: str) -> list[VpcPeeringInfo]:
-    """Get peering connections involving a VPC."""
+    """Peerings involving a VPC, read from `Vpc.spec.vpcPeerings`.
+
+    That spec field is the peering — there is no separate object to look at,
+    so this reports what is actually configured on the router.
+    """
     try:
-        result = await k8s.custom_api.list_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpc-peerings",
+        item = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
+            name=vpc_name,
         )
     except ApiException:
         return []
 
     peerings = []
-    for item in result.get("items", []):
-        spec = item.get("spec", {})
-        local = spec.get("localVpc", "")
-        remote = spec.get("remoteVpc", "")
-        if local == vpc_name or remote == vpc_name:
-            peerings.append(VpcPeeringInfo(
-                name=item["metadata"]["name"],
-                local_vpc=local,
-                remote_vpc=remote,
-            ))
+    for entry in item.get("spec", {}).get("vpcPeerings", []) or []:
+        remote = entry.get("remoteVpc", "")
+        connect_ip = entry.get("localConnectIP", "")
+        local_ip = connect_ip.split("/")[0]
+        try:
+            network = ipaddress.ip_network(connect_ip, strict=False)
+            hosts = [str(h) for h in network.hosts()]
+            link_cidr = str(network)
+            remote_ip = next((h for h in hosts if h != local_ip), "")
+        except ValueError:
+            link_cidr, remote_ip = "", ""
+
+        peerings.append(VpcPeeringInfo(
+            name=f"{vpc_name}-to-{remote}",
+            local_vpc=vpc_name,
+            remote_vpc=remote,
+            link_cidr=link_cidr,
+            local_connect_ip=local_ip,
+            remote_connect_ip=remote_ip,
+        ))
     return peerings
 
 
@@ -1149,84 +1169,243 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
 # VPC Peering
 # ============================================================================
 
+# A VpcEgressGateway installs a reroute policy at priority 29100 that catches
+# *everything* leaving the VPC, so it wins over a peering static route and the
+# traffic hairpins out to the upstream router anyway. The peering only takes
+# effect once a higher-priority allow sits above it.
+PEERING_POLICY_PRIORITY = 31001
+
+
+async def _vpc_subnet_cidrs(k8s, vpc_name: str) -> list[str]:
+    """CIDRs of every subnet in a VPC — what the peer has to route to."""
+    subnets, _ = await _get_vpc_subnets(k8s, vpc_name)
+    return [s.cidr_block for s in subnets if s.cidr_block]
+
+
+def _peering_side_patch(
+    spec: dict[str, Any],
+    remote_vpc: str,
+    local_connect_ip: str,
+    link_cidr: str,
+    remote_cidrs: list[str],
+    remote_connect_ip: str,
+) -> dict[str, Any]:
+    """One side of a peering: link, routes to the peer, and the allow above
+    the egress gateway's catch-all reroute."""
+    prefix = link_cidr.split("/")[-1]
+
+    peerings = [
+        p for p in spec.get("vpcPeerings", []) or []
+        if p.get("remoteVpc") != remote_vpc
+    ]
+    peerings.append({
+        "remoteVpc": remote_vpc,
+        "localConnectIP": f"{local_connect_ip}/{prefix}",
+    })
+
+    # Drop any earlier entries for these destinations so re-peering converges
+    # instead of stacking duplicates.
+    routes = [
+        r for r in spec.get("staticRoutes", []) or []
+        if r.get("cidr") not in remote_cidrs
+    ]
+    routes.extend({
+        "cidr": cidr,
+        "nextHopIP": remote_connect_ip,
+        "policy": "policyDst",
+    } for cidr in remote_cidrs)
+
+    policies = [
+        p for p in spec.get("policyRoutes", []) or []
+        if p.get("match") not in {f"ip4.dst == {c}" for c in remote_cidrs}
+    ]
+    policies.extend({
+        "priority": PEERING_POLICY_PRIORITY,
+        "action": "allow",
+        "match": f"ip4.dst == {cidr}",
+    } for cidr in remote_cidrs)
+
+    return {"vpcPeerings": peerings, "staticRoutes": routes, "policyRoutes": policies}
+
+
 @router.post("/{name}/peerings", response_model=VpcPeeringInfo, status_code=201)
 async def create_vpc_peering(
     request: Request, name: str, data: VpcPeeringCreateRequest,
     user: User = Depends(require_admin),
 ) -> VpcPeeringInfo:
-    """Create a VPC peering connection. Path VPC is the local side."""
+    """Peer two VPCs directly. Path VPC is the local side.
+
+    Without peering, a tenant reaching a shared VPC goes tenant -> its egress
+    gateway -> upstream router -> the other egress gateway -> target: four
+    extra hops, with every shared-service flow crossing the lab router. Peered,
+    it is one link:
+
+         1  10.198.224.1     t1 VPC router
+         2  169.254.101.2    peering link
+         3  10.198.192.3     shared service
+
+    Both VPCs are patched: the link (`vpcPeerings`), static routes to the
+    peer's subnets, and — the part that is easy to miss — a policy route above
+    the egress gateway's 29100 catch-all, without which the traffic hairpins
+    anyway and the peering looks broken for no visible reason.
+    """
     k8s = request.app.state.k8s_client
 
-    # Validate both VPCs exist
+    if name == data.remote_vpc:
+        raise HTTPException(status_code=400, detail="A VPC cannot peer with itself")
+
+    specs: dict[str, dict[str, Any]] = {}
     for vpc_name in [name, data.remote_vpc]:
         try:
-            await k8s.custom_api.get_cluster_custom_object(
+            item = await k8s.custom_api.get_cluster_custom_object(
                 group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
                 name=vpc_name,
             )
+            specs[vpc_name] = item.get("spec", {}) or {}
         except ApiException as e:
             if e.status == 404:
                 raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
             raise k8s_error_to_http(e, "VPC operation")
 
-    peering_name = f"{name}-to-{data.remote_vpc}"
-    peering_manifest: dict[str, Any] = {
-        "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",
-        "kind": "VpcPeering",
-        "metadata": {
-            "name": peering_name,
-            "labels": {"kubevirt-ui.io/managed": "true"},
-        },
-        "spec": {
-            "localVpc": name,
-            "remoteVpc": data.remote_vpc,
-        },
+    local_cidrs = await _vpc_subnet_cidrs(k8s, name)
+    remote_cidrs = await _vpc_subnet_cidrs(k8s, data.remote_vpc)
+    if not local_cidrs or not remote_cidrs:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Both VPCs need at least one subnet before they can be peered "
+                "— there would be nothing to route to."
+            ),
+        )
+
+    if data.link_cidr:
+        network = ipaddress.ip_network(data.link_cidr, strict=False)
+        hosts = list(network.hosts())
+        if len(hosts) < 2:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Link CIDR {data.link_cidr} has no room for two addresses",
+            )
+        local_ip, remote_ip, link_cidr = str(hosts[0]), str(hosts[1]), str(network)
+    else:
+        local_ip, remote_ip, link_cidr = await allocate_peering_link(k8s)
+
+    patches = {
+        name: _peering_side_patch(
+            specs[name], data.remote_vpc, local_ip, link_cidr,
+            remote_cidrs, remote_ip,
+        ),
+        data.remote_vpc: _peering_side_patch(
+            specs[data.remote_vpc], name, remote_ip, link_cidr,
+            local_cidrs, local_ip,
+        ),
     }
 
+    applied: list[str] = []
+    for vpc_name, patch in patches.items():
+        try:
+            await k8s.custom_api.patch_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
+                name=vpc_name, body={"spec": patch},
+            )
+            applied.append(vpc_name)
+        except ApiException as e:
+            # A peering configured on one side only is a black hole: the other
+            # VPC has no route back. Undo what landed before giving up.
+            for done in applied:
+                try:
+                    await _remove_peering_side(k8s, done, _other(done, name, data.remote_vpc))
+                except Exception as undo_err:
+                    logger.warning(
+                        f"Could not roll back half-applied peering on {done!r}: {undo_err}"
+                    )
+            raise k8s_error_to_http(e, f"peering VPC '{vpc_name}'")
+
+    logger.info(
+        f"Peered VPC {name!r} with {data.remote_vpc!r} over {link_cidr} "
+        f"({local_ip} <-> {remote_ip})"
+    )
+    return VpcPeeringInfo(
+        name=f"{name}-to-{data.remote_vpc}",
+        local_vpc=name,
+        remote_vpc=data.remote_vpc,
+        link_cidr=link_cidr,
+        local_connect_ip=local_ip,
+        remote_connect_ip=remote_ip,
+    )
+
+
+def _other(this: str, a: str, b: str) -> str:
+    return b if this == a else a
+
+
+async def _remove_peering_side(k8s, vpc_name: str, remote_vpc: str) -> None:
+    """Strip a peer's link, routes and policy routes from one VPC."""
     try:
-        await k8s.custom_api.create_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpc-peerings",
-            body=peering_manifest,
+        item = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
+            name=vpc_name,
         )
     except ApiException as e:
-        if e.status == 409:
-            raise HTTPException(status_code=409, detail=f"Peering '{peering_name}' already exists")
-        raise k8s_error_to_http(e, "VPC operation")
+        if e.status == 404:
+            return
+        raise
+    spec = item.get("spec", {}) or {}
 
-    return VpcPeeringInfo(name=peering_name, local_vpc=name, remote_vpc=data.remote_vpc)
+    remote_cidrs = set(await _vpc_subnet_cidrs(k8s, remote_vpc))
+    next_hops = {
+        p.get("localConnectIP", "").split("/")[0]
+        for p in spec.get("vpcPeerings", []) or []
+        if p.get("remoteVpc") == remote_vpc
+    }
+
+    patch = {
+        "vpcPeerings": [
+            p for p in spec.get("vpcPeerings", []) or []
+            if p.get("remoteVpc") != remote_vpc
+        ],
+        # Match on destination rather than next hop: the peer's addresses are
+        # what identifies these routes, and the link IP may already be gone.
+        "staticRoutes": [
+            r for r in spec.get("staticRoutes", []) or []
+            if r.get("cidr") not in remote_cidrs
+            and r.get("nextHopIP") not in next_hops
+        ],
+        "policyRoutes": [
+            p for p in spec.get("policyRoutes", []) or []
+            if p.get("match") not in {f"ip4.dst == {c}" for c in remote_cidrs}
+        ],
+    }
+    await k8s.custom_api.patch_cluster_custom_object(
+        group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
+        name=vpc_name, body={"spec": patch},
+    )
 
 
 @router.delete("/{name}/peerings/{remote_vpc}")
 async def delete_vpc_peering(request: Request, name: str, remote_vpc: str, user: User = Depends(require_admin)) -> dict:
-    """Delete a VPC peering connection."""
+    """Tear a peering down from both sides.
+
+    Both, always: a peering left configured on one side is worse than none —
+    that VPC keeps routing to a peer that has no route back, so the traffic
+    leaves and is silently dropped.
+    """
     k8s = request.app.state.k8s_client
 
-    peering_name = f"{name}-to-{remote_vpc}"
-    try:
-        await k8s.custom_api.delete_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpc-peerings",
-            name=peering_name,
-        )
-    except ApiException as e:
-        if e.status == 404:
-            # Try reverse direction
-            peering_name = f"{remote_vpc}-to-{name}"
-            try:
-                await k8s.custom_api.delete_cluster_custom_object(
-                    group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpc-peerings",
-                    name=peering_name,
-                )
-            except ApiException as e2:
-                if e2.status == 404:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Peering between '{name}' and '{remote_vpc}' not found",
-                    )
-                raise k8s_error_to_http(e2, "VPC peering cleanup")
-        else:
-            raise k8s_error_to_http(e, "VPC operation")
+    removed: list[str] = []
+    for local, remote in ((name, remote_vpc), (remote_vpc, name)):
+        try:
+            await _remove_peering_side(k8s, local, remote)
+            removed.append(local)
+        except ApiException as e:
+            raise k8s_error_to_http(e, f"removing peering from VPC '{local}'")
 
-    return {"status": "deleted", "peering": peering_name}
+    logger.info(f"Removed peering between {name!r} and {remote_vpc!r}")
+    return {
+        "status": "deleted",
+        "peering": f"{name}-to-{remote_vpc}",
+        "vpcs_updated": removed,
+    }
 
 
 # ============================================================================

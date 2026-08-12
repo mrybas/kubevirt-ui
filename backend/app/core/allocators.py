@@ -185,3 +185,63 @@ async def _allocate_vpc_cidr_once(k8s) -> tuple[str, str]:
     )
 
     return cidr, gateway
+
+
+# Link networks for VPC peering. Link-local space (RFC 3927) on purpose: these
+# /30s exist only between two VPC routers, are never announced, and must not
+# collide with anything routable.
+PEERING_LINK_BASE = "169.254.101.0"
+PEERING_LINK_MAX = 62  # /24 carved into /30s, minus the all-zeros one
+
+
+def peering_link_addresses(index: int) -> tuple[str, str, str]:
+    """The (local, remote, cidr) addresses of peering link `index`.
+
+    Each link is a /30: .0 network, .1 local, .2 remote, .3 broadcast.
+    """
+    base = int(ipaddress.ip_address(PEERING_LINK_BASE))
+    net = ipaddress.ip_network(f"{ipaddress.ip_address(base + index * 4)}/30")
+    hosts = list(net.hosts())
+    return str(hosts[0]), str(hosts[1]), str(net)
+
+
+async def list_peering_link_cidrs(k8s) -> list[str]:
+    """Link /30s already claimed by an existing peering."""
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
+        )
+    except ApiException as e:
+        logger.warning(f"Could not list VPCs for peering-link allocation: {e}")
+        return []
+
+    used: list[str] = []
+    for item in result.get("items", []):
+        for peering in item.get("spec", {}).get("vpcPeerings", []) or []:
+            connect_ip = peering.get("localConnectIP", "")
+            if connect_ip:
+                # Stored as "169.254.101.1/30" — normalise to the network.
+                try:
+                    used.append(str(ipaddress.ip_network(connect_ip, strict=False)))
+                except ValueError:
+                    continue
+    return used
+
+
+async def allocate_peering_link(k8s) -> tuple[str, str, str]:
+    """Allocate an unused /30 for a VPC peering link.
+
+    Returns (local_ip, remote_ip, cidr). Skips links already referenced by a
+    VPC's `vpcPeerings`, so it stays correct even when one was created by
+    hand or the counter ConfigMap is lost.
+    """
+    used = set(await list_peering_link_cidrs(k8s))
+    for index in range(PEERING_LINK_MAX):
+        local, remote, cidr = peering_link_addresses(index)
+        if cidr not in used:
+            return local, remote, cidr
+
+    raise HTTPException(
+        status_code=409,
+        detail=f"VPC peering link pool exhausted (max {PEERING_LINK_MAX} links)",
+    )

@@ -58,6 +58,11 @@ class VpcPeeringInfo(BaseModel):
     name: str
     local_vpc: str
     remote_vpc: str
+    # The /30 carrying the link, and this side's address on it. Empty for
+    # peerings created before the link was modelled.
+    link_cidr: str = ""
+    local_connect_ip: str = ""
+    remote_connect_ip: str = ""
 
 
 class VpcCreateRequest(BaseModel):
@@ -201,6 +206,14 @@ class VpcListResponse(BaseModel):
 class VpcPeeringCreateRequest(BaseModel):
     """Request to create a VPC peering connection."""
     remote_vpc: str = Field(..., description="Remote VPC name to peer with")
+    link_cidr: Optional[str] = Field(
+        None,
+        description=(
+            "The /30 carrying the peering link. Allocated from link-local "
+            "space (169.254.101.0/24) when omitted — these addresses exist "
+            "only between the two VPC routers and are never announced."
+        ),
+    )
 
 
 class VpcPeeringDeleteRequest(BaseModel):

@@ -18,6 +18,10 @@ export interface VpcPeering {
   name: string;
   local_vpc: string;
   remote_vpc: string;
+  /** The /30 carrying the link — link-local, never announced. */
+  link_cidr: string;
+  local_connect_ip: string;
+  remote_connect_ip: string;
 }
 
 export interface VpcRoute {
@@ -62,6 +66,8 @@ export interface CreateVpcRequest {
 
 export interface AddVpcPeeringRequest {
   remote_vpc: string;
+  /** Omit to have a /30 allocated from link-local space. */
+  link_cidr?: string;
 }
 
 export interface VpcRoutesResponse {
