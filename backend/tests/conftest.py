@@ -38,6 +38,11 @@ def mock_k8s_client() -> MagicMock:
         return_value={"installed": True, "phase": "Deployed"}
     )
     mock.get_cdi_status = AsyncMock(return_value={"installed": True, "phase": "Deployed"})
+    # Endpoints that build a real kubernetes_asyncio API object off the raw
+    # client (`client.CustomObjectsApi(k8s._api_client)`) end up calling
+    # `call_api` — a plain MagicMock there is not awaitable, so the generated
+    # method blows up before the endpoint's own logic is exercised.
+    mock._api_client.call_api = AsyncMock(return_value={})
     return mock
 
 

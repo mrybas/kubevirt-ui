@@ -297,7 +297,7 @@ def _template_configmap() -> Any:
 def test_create_vm_from_template_uses_generate_name(
     client: TestClient, mock_k8s_client: MagicMock
 ) -> None:
-    """from-template should use generateName + stamp display-name; one POST, no patch."""
+    """from-template should use generateName + stamp display-name; one POST, no runStrategy patch."""
     mock_k8s_client.core_api.read_namespaced_config_map = AsyncMock(
         return_value=_template_configmap()
     )
@@ -369,8 +369,15 @@ def test_create_vm_from_template_uses_generate_name(
     tpl_meta = captured_create["spec"]["template"].get("metadata", {})
     assert "kubevirt.io/domain" not in tpl_meta.get("labels", {})
 
-    # No post-create patch.
-    patch_mock.assert_not_called()
+    # The only post-create patch is the vm-name label stamp (the label is
+    # unique per VM and backup/schedule targeting selects on it; it can only
+    # be applied once the server has assigned the generateName suffix). The
+    # old Halted→Always runStrategy patch is gone — assert that specifically,
+    # since that's what this test guards.
+    patch_mock.assert_awaited_once()
+    assert patch_mock.await_args.kwargs["body"] == {
+        "metadata": {"labels": {"kubevirt-ui.io/vm-name": "my-app-xyz12"}},
+    }
 
 
 def test_create_vm_from_template_rejects_blank_display_name(client: TestClient) -> None:

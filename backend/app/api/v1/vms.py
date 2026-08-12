@@ -1011,7 +1011,10 @@ async def _ensure_vm_name_label(k8s_client, namespace: str, name: str) -> None:
             body={"metadata": {"labels": {VM_NAME_LABEL: name}}},
             _content_type="application/merge-patch+json",
         )
-    except ApiException as e:
+    except Exception as e:
+        # Deliberately broad: this runs *after* the VM exists, so anything
+        # escaping here would fail the create call for a VM that was in fact
+        # created. The label is backfilled lazily elsewhere.
         logger.warning(f"Could not stamp {VM_NAME_LABEL} on VM {namespace}/{name}: {e}")
 
 
