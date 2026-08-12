@@ -13,7 +13,14 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
+from app.api.v1.subnet_acls import (
+    ISOLATION_PRIORITY_DROP,
+    SubnetAcl,
+    _acls_to_spec,
+    build_isolation_acls,
+)
 from app.api.v1.tenants_common import _ensure_cluster_config, _tenant_ns, _vpcdns_vip
+from app.config import get_settings
 from app.core.allocators import allocate_vpc_cidr, assert_cidr_free
 from app.core.auth import User, require_auth, require_admin
 from app.core.constants import (
@@ -97,20 +104,36 @@ def _parse_vpc(item: dict[str, Any]) -> VpcResponse:
     )
 
 
-async def _get_vpc_subnets(k8s, vpc_name: str) -> list[VpcSubnetInfo]:
-    """Get all subnets belonging to a VPC."""
+def _has_isolation_acls(spec: dict[str, Any]) -> bool:
+    """Whether a subnet spec carries the tenant-isolation catch-all drop.
+
+    The drop is the rule that does the isolating — the allow rules above it
+    only carve exceptions out of it — so its presence is what "isolated"
+    means. Checked on the live object rather than remembered in a label, so
+    an admin editing the ACLs by hand is reflected honestly.
+    """
+    return any(
+        a.get("action") == "drop" and a.get("priority") == ISOLATION_PRIORITY_DROP
+        for a in spec.get("acls", []) or []
+    )
+
+
+async def _get_vpc_subnets(k8s, vpc_name: str) -> tuple[list[VpcSubnetInfo], bool]:
+    """Subnets belonging to a VPC, and whether any of them is isolated."""
     try:
         result = await k8s.custom_api.list_cluster_custom_object(
             group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
         )
     except ApiException:
-        return []
+        return [], False
 
     subnets = []
+    isolated = False
     for item in result.get("items", []):
         if item.get("spec", {}).get("vpc") == vpc_name:
             spec = item.get("spec", {})
             st = item.get("status", {})
+            isolated = isolated or _has_isolation_acls(spec)
             subnets.append(VpcSubnetInfo(
                 name=item["metadata"]["name"],
                 cidr_block=spec.get("cidrBlock", ""),
@@ -118,7 +141,7 @@ async def _get_vpc_subnets(k8s, vpc_name: str) -> list[VpcSubnetInfo]:
                 available_ips=st.get("v4availableIPs", 0),
                 used_ips=st.get("v4usingIPs", 0),
             ))
-    return subnets
+    return subnets, isolated
 
 
 async def _discover_coredns_pod_ips(k8s) -> list[str]:
@@ -671,7 +694,7 @@ async def list_vpcs(
     vpcs = []
     for item in result.get("items", []):
         vpc = _parse_vpc(item)
-        vpc.subnets = await _get_vpc_subnets(k8s, vpc.name)
+        vpc.subnets, vpc.isolated = await _get_vpc_subnets(k8s, vpc.name)
         vpcs.append(vpc)
 
     # T7 — folder/env filter applied AFTER fetch (label selector with OR semantics
@@ -784,6 +807,27 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
                 ),
             )
 
+    # Tenant isolation, decided before the subnet manifest is built so the
+    # ACLs land at creation rather than in a follow-up patch a caller could
+    # never make. `tenant_supernet` scopes the catch-all drop; with none
+    # configured we create the VPC un-isolated and report that truthfully
+    # instead of writing a rule set that would blackhole the internet.
+    isolation_acls: list[SubnetAcl] = []
+    if data.isolated:
+        supernet = get_settings().tenant_supernet
+        if supernet:
+            isolation_acls = build_isolation_acls(
+                subnet_cidr=cidr,
+                tenant_supernet=supernet,
+                shared_cidrs=data.shared_cidrs,
+            )
+        else:
+            logger.warning(
+                f"VPC {data.name!r}: isolation requested but TENANT_SUPERNET is "
+                "not configured — creating without isolation ACLs. Every other "
+                "tenant can reach this VPC via the upstream router."
+            )
+
     labels: dict[str, str] = {"kubevirt-ui.io/managed": "true"}
     if data.tenant:
         labels["kubevirt-ui.io/tenant"] = data.tenant
@@ -861,6 +905,7 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             "dhcpV4Options": dhcp_v4,
             "natOutgoing": data.enable_nat_gateway,
             **({"namespaces": bind_namespaces} if bind_namespaces else {}),
+            **({"acls": _acls_to_spec(isolation_acls)} if isolation_acls else {}),
         },
     }
 
@@ -1003,6 +1048,8 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             for r in data.static_routes
         ],
         namespaces=bind_namespaces,
+        # What was actually written, not what was asked for.
+        isolated=bool(isolation_acls),
         ready=False,
     )
 
@@ -1022,7 +1069,7 @@ async def get_vpc(request: Request, name: str, user: User = Depends(require_auth
         raise k8s_error_to_http(e, "VPC operation")
 
     vpc = _parse_vpc(item)
-    vpc.subnets = await _get_vpc_subnets(k8s, name)
+    vpc.subnets, vpc.isolated = await _get_vpc_subnets(k8s, name)
     vpc.peerings = await _get_vpc_peerings(k8s, name)
     return vpc
 

@@ -61,6 +61,9 @@ interface WizardState {
   vpcSubnetCidr: string;
   vpcEnableNat: boolean;
   vpcEnablePeering: boolean;
+  vpcIsolated: boolean;
+  /** Comma-separated CIDRs, parsed on submit. */
+  vpcSharedCidrs: string;
   vpcNamespaces: string[];
   vpcFolder: string;
   vpcEnvironment: string;
@@ -86,6 +89,11 @@ const initialState: WizardState = {
   vpcSubnetCidr: '10.100.0.0/24',
   vpcEnableNat: true,
   vpcEnablePeering: true,
+  // Closed by default — every tenant prefix reaches the same upstream router,
+  // so an un-isolated VPC is visible to every other tenant from the moment it
+  // exists.
+  vpcIsolated: true,
+  vpcSharedCidrs: '',
   vpcNamespaces: [],
   vpcFolder: '',
   vpcEnvironment: '',
@@ -402,6 +410,15 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
         name: state.vpcName,
         subnet_cidr: state.vpcSubnetCidr || undefined,
         enable_nat_gateway: state.vpcEnableNat,
+        isolated: state.vpcIsolated,
+        ...(state.vpcSharedCidrs.trim()
+          ? {
+              shared_cidrs: state.vpcSharedCidrs
+                .split(',')
+                .map((c) => c.trim())
+                .filter(Boolean),
+            }
+          : {}),
         ...(state.vpcNamespaces.length > 0 ? { namespaces: state.vpcNamespaces } : {}),
         ...(state.vpcFolder ? { folder: state.vpcFolder } : {}),
         ...(state.vpcEnvironment ? { environment: state.vpcEnvironment } : {}),
@@ -1215,6 +1232,52 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                     }`}
                   />
                 </button>
+              </div>
+
+              {/* Tenant isolation */}
+              <div className="p-4 bg-surface-800/50 rounded-lg border border-surface-700 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-surface-200">Isolated</p>
+                    <p className="text-xs text-surface-400 mt-1">
+                      Block traffic to and from other tenant VPCs. Internet access is
+                      unaffected. Leave this on unless the VPC is meant to be shared.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setState((s) => ({ ...s, vpcIsolated: !s.vpcIsolated }))}
+                    className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                      state.vpcIsolated ? 'bg-primary-500' : 'bg-surface-600'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        state.vpcIsolated ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {state.vpcIsolated && (
+                  <div>
+                    <label className="block text-sm font-medium text-surface-200 mb-1">
+                      Shared networks
+                      <span className="ml-1 font-normal text-surface-500">(optional)</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={state.vpcSharedCidrs}
+                      onChange={(e) => setState((s) => ({ ...s, vpcSharedCidrs: e.target.value }))}
+                      placeholder="10.198.192.0/24, 10.198.193.0/24"
+                      className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-600 focus:outline-none focus:border-primary-500 text-sm"
+                    />
+                    <p className="text-xs text-surface-500 mt-1">
+                      Comma-separated CIDRs this VPC may still reach while isolated — shared
+                      services such as corporate git.
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* Namespaces picker */}

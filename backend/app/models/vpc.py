@@ -72,6 +72,27 @@ class VpcCreateRequest(BaseModel):
         None,
         description="CIDR for default subnet (auto-assigned from 10.{200+N}.0.0/24 if empty)",
     )
+    # Default ON: every tenant prefix is announced to the same upstream
+    # router, which forwards between them, so an un-isolated VPC is reachable
+    # from every other tenant the moment it exists. That has to be closed at
+    # creation, not remembered later.
+    isolated: bool = Field(
+        True,
+        description=(
+            "Write tenant-isolation ACLs on the default subnet: reachable from "
+            "the internet and from `shared_cidrs`, but not from other tenant "
+            "VPCs. Requires TENANT_SUPERNET to be configured on the backend; "
+            "without it the VPC is created un-isolated and says so in the "
+            "response."
+        ),
+    )
+    shared_cidrs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Prefixes this VPC may still reach while isolated — shared "
+            "services such as corporate git. Written as higher-priority allows."
+        ),
+    )
     tenant: Optional[str] = Field(None, description="Tenant name to bind this VPC to")
     # T7 — folder/env scoping. Stamped onto VPC.metadata.labels + default
     # subnet labels so the tenant-create wizard can list VPCs eligible for
@@ -165,6 +186,10 @@ class VpcResponse(BaseModel):
     namespaces: list[str] = []
     ready: bool = False
     conditions: list[dict] = []
+    # Whether tenant-isolation ACLs were actually written on the default
+    # subnet. Reports what happened, not what was asked for: requesting
+    # isolation without a configured TENANT_SUPERNET leaves this false.
+    isolated: bool = False
 
 
 class VpcListResponse(BaseModel):

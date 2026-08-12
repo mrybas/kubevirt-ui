@@ -43,6 +43,20 @@ class Settings(BaseSettings):
     def admin_groups_list(self) -> list[str]:
         return [g.strip() for g in self.admin_groups.split(",") if g.strip()]
 
+    # The aggregate every tenant VPC is carved out of (TENANT_SUPERNET env
+    # var), e.g. "10.198.192.0/18". Tenant isolation is expressed as "drop
+    # traffic whose peer is another tenant, allow everything else", and this
+    # is what scopes that drop: without it the catch-all would take the
+    # internet with it.
+    #
+    # No default on purpose. The right value is a property of the site's
+    # addressing plan, and guessing it wrong is worse than not isolating:
+    # too wide silently blackholes the cluster's own pod/service CIDRs, too
+    # narrow leaves tenants reachable while the UI claims otherwise. When it
+    # is unset the isolation ACLs are skipped and the VPC reports
+    # `isolated: false`, so the gap is visible rather than assumed.
+    tenant_supernet: str = ""
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

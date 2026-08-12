@@ -101,6 +101,82 @@ def _acls_to_spec(acls: list[SubnetAcl]) -> list[dict[str, Any]]:
     ]
 
 
+# Priorities for the tenant-isolation rule set. Ordering is the whole trick:
+# the VPC's own range first, then anything explicitly shared, then a catch-all
+# drop that covers only tenant space.
+ISOLATION_PRIORITY_OWN = 3200
+ISOLATION_PRIORITY_SHARED = 3100
+ISOLATION_PRIORITY_DROP = 3000
+
+
+def build_isolation_acls(
+    subnet_cidr: str,
+    tenant_supernet: str,
+    shared_cidrs: list[str] | None = None,
+) -> list[SubnetAcl]:
+    """ACLs that make one VPC unreachable from the other tenants.
+
+    Separate VPCs are separate routing domains, but every tenant prefix is
+    announced to the same upstream router, and that router forwards between
+    them quite happily — so by default a tenant reaches every other tenant via
+    a hairpin through the lab gateway. Isolation has to be switched on when
+    the VPC is created, not remembered afterwards.
+
+    The catch-all drop is scoped to `tenant_supernet` — the aggregate all
+    tenant VPCs are carved from — so traffic to anything outside it (the
+    internet) matches no rule and stays allowed:
+
+        t1 -> internet OK     t1 -> shared OK     t1 -> t2 BLOCKED
+
+    Do NOT reach for `Subnet.spec.private: true` instead. It is the
+    obvious-looking knob and it does block tenant-to-tenant, but it also drops
+    return traffic from the internet (8.8.8.8 is not in `allowSubnets`), so
+    the tenant silently loses egress.
+
+    Returns an empty list when there is no supernet to scope the drop to —
+    a drop without one would take the internet with it.
+    """
+    if not subnet_cidr or not tenant_supernet:
+        return []
+
+    acls = [
+        SubnetAcl(
+            action="allow-related", direction="from-lport",
+            match=f"ip4.dst == {subnet_cidr}", priority=ISOLATION_PRIORITY_OWN,
+        ),
+        SubnetAcl(
+            action="allow-related", direction="to-lport",
+            match=f"ip4.src == {subnet_cidr}", priority=ISOLATION_PRIORITY_OWN,
+        ),
+    ]
+
+    # Each shared prefix gets its own priority so they stay individually
+    # identifiable (and removable) rather than collapsing into one band.
+    priority = ISOLATION_PRIORITY_SHARED
+    for shared in shared_cidrs or []:
+        if not shared:
+            continue
+        acls.append(SubnetAcl(
+            action="allow-related", direction="from-lport",
+            match=f"ip4.dst == {shared}", priority=priority,
+        ))
+        acls.append(SubnetAcl(
+            action="allow-related", direction="to-lport",
+            match=f"ip4.src == {shared}", priority=priority,
+        ))
+        priority += 1
+
+    acls.append(SubnetAcl(
+        action="drop", direction="from-lport",
+        match=f"ip4.dst == {tenant_supernet}", priority=ISOLATION_PRIORITY_DROP,
+    ))
+    acls.append(SubnetAcl(
+        action="drop", direction="to-lport",
+        match=f"ip4.src == {tenant_supernet}", priority=ISOLATION_PRIORITY_DROP,
+    ))
+    return acls
+
+
 def _get_preset_templates(subnet_cidr: str = "") -> list[AclPresetTemplate]:
     """Return static ACL preset templates."""
     templates = [

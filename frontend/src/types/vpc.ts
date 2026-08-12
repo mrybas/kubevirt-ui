@@ -50,6 +50,10 @@ export interface CreateVpcRequest {
   name: string;
   subnet_cidr?: string;
   enable_nat_gateway?: boolean;
+  /** Write tenant-isolation ACLs on the default subnet. Defaults to true server-side. */
+  isolated?: boolean;
+  /** Prefixes this VPC may still reach while isolated (shared services). */
+  shared_cidrs?: string[];
   namespaces?: string[];
   // Optional folder/env scope — backend stamps kubevirt-ui.io/folder + /environment labels
   folder?: string;
