@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 import yaml
+from fastapi import HTTPException
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 
@@ -165,9 +166,15 @@ async def _ensure_cluster_config(k8s) -> dict[str, Any]:
         )
         vpcdns_forward_dns = _VPCDNS_FORWARD_DNS_FALLBACK
 
+    # Discovered unconditionally (not only when deriving the VIP): tenant
+    # create validates its own service CIDR against this one, and a tenant
+    # that overlaps the host's is a silent, delayed failure — see
+    # `assert_tenant_cidrs_free`.
+    host_service_cidr = await _discover_service_cidr(k8s)
+
     vpcdns_vip = vpcdns_vip_override
     if not vpcdns_vip:
-        service_cidr = await _discover_service_cidr(k8s)
+        service_cidr = host_service_cidr
         if service_cidr:
             try:
                 net = ipaddress.ip_network(service_cidr, strict=False)
@@ -196,6 +203,7 @@ async def _ensure_cluster_config(k8s) -> dict[str, Any]:
         "mgmt_cidr": mgmt_cidr,
         "vpcdns_forward_dns": vpcdns_forward_dns,
         "vpcdns_vip": vpcdns_vip,
+        "host_service_cidr": host_service_cidr,
         "fetched_at": now,
     }
     logger.info(
@@ -343,6 +351,114 @@ def _vpcdns_forward_dns() -> str:
 
 def _vpcdns_vip() -> str:
     return _require_cluster_config()["vpcdns_vip"]
+
+
+def _host_service_cidr() -> str | None:
+    return _require_cluster_config().get("host_service_cidr")
+
+
+def find_tenant_cidr_conflicts(
+    service_cidr: str,
+    pod_cidr: str,
+    host_service_cidr: str | None,
+    host_dns_ip: str | None,
+) -> list[str]:
+    """Reasons the tenant's own address plan collides with the host's.
+
+    The expensive one is DNS. A tenant whose service CIDR contains the HOST
+    cluster's CoreDNS address makes its own kube-proxy hijack that address to
+    the tenant's CoreDNS — which has no endpoints until a CNI is running, and
+    the CNI image cannot be pulled because name resolution is now dead:
+
+        failed to resolve reference "ghcr.io/flannel-io/flannel-cni-plugin:…":
+          dial tcp: lookup ghcr.io on 127.0.0.53:53: server misbehaving
+
+    The trap is the timing — kube-proxy only starts after the node has joined,
+    so this surfaces long after create and reads as anything but DNS.
+
+    Checked in both directions and for both ranges: a tenant pod CIDR
+    overlapping the host's service network breaks the same way, and neither
+    is Talos-specific — any tenant whose nodes resolve through the host is
+    exposed. Returns human-readable reasons; empty means no conflict.
+    """
+    reasons: list[str] = []
+
+    def _net(cidr: str):
+        try:
+            return ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            return None
+
+    tenant_service = _net(service_cidr)
+    tenant_pod = _net(pod_cidr)
+
+    # The DNS address is the specific failure the lab hit, so name it
+    # explicitly rather than leaving the operator to infer it from a range.
+    if host_dns_ip:
+        try:
+            dns_addr = ipaddress.ip_address(host_dns_ip)
+        except ValueError:
+            dns_addr = None
+        if dns_addr is not None:
+            if tenant_service is not None and dns_addr in tenant_service:
+                reasons.append(
+                    f"tenant service CIDR {service_cidr} contains the host "
+                    f"cluster's DNS address {host_dns_ip} — the tenant's "
+                    "kube-proxy would hijack it and its nodes would lose name "
+                    "resolution once kube-proxy starts"
+                )
+            if tenant_pod is not None and dns_addr in tenant_pod:
+                reasons.append(
+                    f"tenant pod CIDR {pod_cidr} contains the host cluster's "
+                    f"DNS address {host_dns_ip}"
+                )
+
+    if host_service_cidr:
+        host_net = _net(host_service_cidr)
+        if host_net is not None:
+            for label, cidr, net in (
+                ("service", service_cidr, tenant_service),
+                ("pod", pod_cidr, tenant_pod),
+            ):
+                if (
+                    net is not None
+                    and net.version == host_net.version
+                    and net.overlaps(host_net)
+                    # Already reported above, with a better explanation.
+                    and not any(cidr in r for r in reasons)
+                ):
+                    reasons.append(
+                        f"tenant {label} CIDR {cidr} overlaps the host "
+                        f"cluster's service CIDR {host_service_cidr}"
+                    )
+
+    return reasons
+
+
+def assert_tenant_cidrs_free(service_cidr: str, pod_cidr: str) -> None:
+    """Raise 422 when the tenant's address plan collides with the host's.
+
+    Deliberately a refusal rather than an auto-shift: silently rewriting a
+    caller's address plan is worse than declining it, because the tenant then
+    works while its kubeconfig, firewall rules and documentation describe a
+    different network. Skipped entirely when the host's own ranges could not
+    be discovered — a failed lookup must not block tenant creation.
+    """
+    reasons = find_tenant_cidr_conflicts(
+        service_cidr=service_cidr,
+        pod_cidr=pod_cidr,
+        host_service_cidr=_host_service_cidr(),
+        host_dns_ip=_vpcdns_forward_dns(),
+    )
+    if reasons:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Tenant network overlaps the host cluster: "
+                + "; ".join(reasons)
+                + ". Pick ranges outside the host's service network."
+            ),
+        )
 
 
 

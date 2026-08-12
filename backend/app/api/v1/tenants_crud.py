@@ -69,6 +69,7 @@ from app.api.v1.tenants_common import (
     _get_addon_catalog,
     _namespace_exists,
     _create_namespace,
+    assert_tenant_cidrs_free,
 )
 from app.api.v1.folders import reconcile_namespace_rbac
 
@@ -730,6 +731,11 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
     k8s = request.app.state.k8s_client
     await _ensure_cluster_config(k8s)
     ns = _tenant_ns(req.name)
+
+    # Before anything is created: a tenant whose service CIDR swallows the
+    # host's DNS address comes up, joins, and only then loses name resolution
+    # on its own nodes — long after this call returned 201.
+    assert_tenant_cidrs_free(req.service_cidr, req.pod_cidr)
 
     # T1 — validate folder/env exist + caller has folder_admin (or global admin).
     # We don't run the namespace check below until folder/env are confirmed; this

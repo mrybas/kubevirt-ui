@@ -128,7 +128,11 @@ const defaultWizard: WizardState = {
   worker_image_pull_secrets: [],
   worker_network_binding: 'bridge',
   pod_cidr: '10.244.0.0/16',
-  service_cidr: '10.96.0.0/12',
+  // Must stay off the host cluster's own service CIDR (10.96.0.0/12 on both
+  // kubeadm and Talos) — sharing it costs the tenant's nodes their DNS once
+  // kube-proxy starts. Kept in step with TenantCreateRequest on the backend,
+  // which rejects an overlapping plan outright.
+  service_cidr: '10.112.0.0/12',
   enable_oidc: false,
   admin_group: '',
   viewer_group: '',

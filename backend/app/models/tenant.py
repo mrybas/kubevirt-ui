@@ -126,7 +126,14 @@ class TenantCreateRequest(BaseModel):
     worker_image_pull_secrets: list[str] = Field(default_factory=list)
 
     pod_cidr: str = "10.244.0.0/16"
-    service_cidr: str = "10.96.0.0/12"
+    # NOT 10.96.0.0/12, which is the host cluster's own service CIDR on both
+    # kubeadm and Talos: a tenant sharing it makes its kube-proxy hijack the
+    # host's DNS address for the tenant's own CoreDNS, and its nodes lose name
+    # resolution the moment kube-proxy starts — after they have already
+    # joined. 10.112.0.0/12 is the adjacent block, disjoint from it.
+    # `assert_tenant_cidrs_free` still checks this against the host's actual
+    # ranges, because a cluster may of course use 10.112 itself.
+    service_cidr: str = "10.112.0.0/12"
 
     # Worker DNS injection — written into the worker guest's
     # `/etc/resolv.conf` via cloud-init `write_files`, then made immutable
