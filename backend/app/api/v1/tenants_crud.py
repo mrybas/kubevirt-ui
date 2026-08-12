@@ -906,12 +906,11 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
       1. Best-effort delete of the CAPI ``Cluster`` CR so CAPI runs its
          finalizers cleanly (the ns cascade would catch it too, but giving
          CAPI a head start avoids 30s+ stuck-in-Terminating cycles).
-      2. Remove the tenant ns from the VPC default subnet's
-         ``spec.namespaces`` (2026.05.29). The ns cascade does NOT touch
-         the cluster-scoped Subnet, so without this step the subnet keeps
-         a stale entry for the deleted tenant. Sister tenants sharing the
-         VPC are unaffected (test+remove JSON-patch by index). Best-
-         effort; logs and continues on failure.
+      2. Clean up the cluster-scoped leftovers the ns cascade cannot reach
+         (VPC subnet membership, CSI ClusterRoleBinding, CP demux ports).
+         Every one of these is best-effort: a failure here must not skip
+         step 3, or the caller gets an error while a fully running tenant —
+         control plane pods, worker VMs and their volumes — stays behind.
       3. Delete the tenant ns — cascade does the rest.
     """
     k8s = request.app.state.k8s_client
@@ -935,19 +934,29 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
         else:
             logger.warning(f"Failed to delete CAPI Cluster {ns}/{name}: {exc}")
 
-    # 2. Detach tenant ns from VPC default subnet's spec.namespaces
-    #    (2026.05.29). Best-effort: helper logs and swallows per-subnet
-    #    failures.
-    await _detach_tenant_ns_from_vpc_subnet(k8s, name)
-
-    # 2b. Delete the per-tenant CSI ClusterRoleBinding — cluster-scoped, so
-    #     the ns cascade won't touch it. Best-effort, 404-tolerant.
-    await delete_csi_cluster_role_binding(k8s, name)
-
-    # 2c. Release this tenant's CP demux ports (entry in the cluster-wide
-    #     allocator ConfigMap — not reaped by the ns cascade). No-op for
-    #     default-overlay tenants that never allocated. Idempotent.
-    await release_cp_ports(k8s, name)
+    # 2. Cluster-scoped leftovers, none of which the ns cascade reaps:
+    #      * the tenant's entry in the VPC default subnet's spec.namespaces
+    #        (2026.05.29) — otherwise the Subnet keeps a stale entry
+    #      * the per-tenant CSI ClusterRoleBinding
+    #      * the tenant's CP demux ports in the cluster-wide allocator
+    #        ConfigMap (no-op for default-overlay tenants that never
+    #        allocated)
+    #    All idempotent, and all wrapped: `release_cp_ports` re-raises
+    #    non-409/404 ApiExceptions and the others can fail on a transient
+    #    apiserver error, which previously aborted the request before step 3
+    #    and left the tenant fully alive behind a 5xx.
+    for label, cleanup in (
+        ("detach tenant ns from the VPC subnet", _detach_tenant_ns_from_vpc_subnet),
+        ("delete the CSI ClusterRoleBinding", delete_csi_cluster_role_binding),
+        ("release the CP demux ports", release_cp_ports),
+    ):
+        try:
+            await cleanup(k8s, name)
+        except Exception as exc:
+            logger.warning(
+                f"Tenant {name!r}: could not {label} ({exc}); continuing "
+                "teardown — the namespace delete below still runs"
+            )
 
     # 3. Cascade-delete everything else by removing the tenant ns.
     try:
