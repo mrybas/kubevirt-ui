@@ -108,6 +108,16 @@ class TenantCreateRequest(BaseModel):
 
     # Worker type: "vm" creates KubeVirt VMs, "bare_metal" skips VM resources
     worker_type: Literal["vm", "bare_metal"] = "vm"
+
+    # What the worker nodes run. "cloud-init" is the existing path: a CAPK
+    # container-disk image bootstrapped with kubeadm through a
+    # KubeadmConfigTemplate. "talos" swaps the bootstrap provider for CABPT
+    # and brings its own per-tenant objects (a CSR signer with its own PKI,
+    # stable machine secrets, a bootstrap token, port 50001 on the control
+    # plane). Talos nodes cannot be bootstrapped the cloud-init way at all —
+    # they ask a trustd signer for a certificate instead — so this is a
+    # different mechanism, not a different image.
+    worker_os: Literal["cloud-init", "talos"] = "cloud-init"
     worker_count: int = Field(default=2, ge=1, le=20)
     worker_vcpu: int = Field(default=2, ge=1, le=32)
     worker_memory: str = "2Gi"

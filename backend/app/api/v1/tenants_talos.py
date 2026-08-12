@@ -363,6 +363,166 @@ def build_talos_worker_config(
 
 
 # ---------------------------------------------------------------------------
+# CAPI bootstrap
+# ---------------------------------------------------------------------------
+
+CABPT_GROUP = "bootstrap.cluster.x-k8s.io"
+CABPT_VERSION = "v1alpha3"
+CABPT_PLURAL = "talosconfigtemplates"
+
+
+def build_talos_config_template(
+    tenant: str, namespace: str, machine_config_yaml: str,
+) -> dict[str, Any]:
+    """TalosConfigTemplate carrying a fully-rendered machine config.
+
+    `generateType: none` on purpose: we already know every value that goes
+    in — the endpoint name, the host entry, the token — and several of them
+    have to match objects created elsewhere in this flow exactly. Letting
+    CABPT generate the config instead would mean reconciling two sources of
+    truth for the same strings.
+    """
+    return {
+        "apiVersion": f"{CABPT_GROUP}/{CABPT_VERSION}",
+        "kind": "TalosConfigTemplate",
+        "metadata": {
+            "name": f"{tenant}-workers",
+            "namespace": namespace,
+            "labels": {**MANAGED_LABEL, "kubevirt-ui.io/tenant": tenant},
+        },
+        "spec": {
+            "template": {
+                "spec": {
+                    "generateType": "none",
+                    "data": machine_config_yaml,
+                },
+            },
+        },
+    }
+
+
+def talos_bootstrap_ref(tenant: str) -> dict[str, str]:
+    """`bootstrap.configRef` for a Talos MachineDeployment."""
+    return {
+        "apiVersion": f"{CABPT_GROUP}/{CABPT_VERSION}",
+        "kind": "TalosConfigTemplate",
+        "name": f"{tenant}-workers",
+    }
+
+
+async def read_talos_secrets(k8s, tenant: str, namespace: str) -> dict[str, str]:
+    """Read back the tenant's Talos secrets, decoded.
+
+    Read rather than regenerated on purpose: these values are fixed for the
+    tenant's whole life, and generating a second set here would hand the
+    workers a token the signer does not know.
+    """
+    secret = await k8s.core_api.read_namespaced_secret(
+        name=f"{tenant}-talos-secrets", namespace=namespace,
+    )
+    data = secret.data or {}
+    return {
+        key: base64.b64decode(value).decode("utf-8")
+        for key, value in data.items()
+    }
+
+
+async def ensure_talos_tenant_objects(k8s, tenant: str, namespace: str) -> None:
+    """Create the per-tenant Talos objects that must exist before the CAPI ones.
+
+    Ordering matters: the control plane mounts the signer certificate, and the
+    machine config embeds the machine token, so both have to exist before the
+    KamajiControlPlane and the TalosConfigTemplate are built.
+
+    Create-if-absent throughout. The secrets in particular must never be
+    overwritten — see `build_talos_secrets`.
+    """
+    from kubernetes_asyncio import client as k8s_client
+
+    core = k8s.core_api
+    secret_body = build_talos_secrets(tenant, namespace)
+    try:
+        await core.create_namespaced_secret(
+            namespace=namespace, body=k8s_client.V1Secret(**{
+                "metadata": k8s_client.V1ObjectMeta(**secret_body["metadata"]),
+                "type": secret_body["type"],
+                "string_data": secret_body["stringData"],
+            }),
+        )
+        logger.info(f"Created Talos secrets for tenant {tenant!r}")
+    except ApiException as e:
+        if e.status != 409:
+            raise
+        logger.info(f"Talos secrets for tenant {tenant!r} already exist; keeping them")
+
+    for obj in build_talos_pki(tenant, namespace):
+        plural = f"{obj['kind'].lower()}s"
+        try:
+            await k8s.custom_api.create_namespaced_custom_object(
+                group=CERT_MANAGER_GROUP, version=CERT_MANAGER_VERSION,
+                namespace=namespace, plural=plural, body=obj,
+            )
+        except ApiException as e:
+            if e.status == 409:
+                continue
+            if e.status == 404:
+                from fastapi import HTTPException
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Talos workers need cert-manager for the CSR signer's "
+                        f"PKI, but {plural}.{CERT_MANAGER_GROUP} is not "
+                        "installed. Install cert-manager or choose "
+                        "worker_os='cloud-init'."
+                    ),
+                ) from e
+            raise
+    logger.info(f"Ensured Talos PKI for tenant {tenant!r}")
+
+
+async def assert_cabpt_installed(k8s) -> None:
+    """Fail early when the Talos bootstrap provider is missing.
+
+    Without CABPT the TalosConfigTemplate is accepted by nobody: the
+    MachineDeployment is created, the Machine sits at
+    `WaitingForBootstrapData` forever, and no VM is ever built. That reads as
+    a broken tenant rather than a missing provider, so refuse up front.
+    """
+    from fastapi import HTTPException
+
+    try:
+        await k8s.custom_api.list_cluster_custom_object(
+            group="apiextensions.k8s.io", version="v1", plural="customresourcedefinitions",
+            field_selector=f"metadata.name={CABPT_PLURAL}.{CABPT_GROUP}",
+        )
+    except ApiException:
+        # Listing CRDs may itself be forbidden; fall through to the direct
+        # probe below rather than failing on the diagnostic.
+        pass
+
+    try:
+        await k8s.custom_api.list_namespaced_custom_object(
+            group=CABPT_GROUP, version=CABPT_VERSION,
+            namespace="default", plural=CABPT_PLURAL,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Talos workers need the Talos bootstrap provider (CABPT): "
+                    f"{CABPT_PLURAL}.{CABPT_GROUP} is not installed on this "
+                    "cluster. Install it (capi-operator BootstrapProvider "
+                    "'talos') or choose worker_os='cloud-init'. Without it the "
+                    "workers would wait for bootstrap data forever."
+                ),
+            )
+        # Anything else (403, transient) is not proof of absence — let the
+        # create proceed rather than blocking on a diagnostic.
+        logger.warning(f"Could not verify CABPT installation: {e}")
+
+
+# ---------------------------------------------------------------------------
 # SNI router map — the one cluster-wide object a tenant touches
 # ---------------------------------------------------------------------------
 

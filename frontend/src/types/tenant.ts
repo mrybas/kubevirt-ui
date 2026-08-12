@@ -43,6 +43,8 @@ export interface TenantCreateRequest {
   kubernetes_version: string;
   control_plane_replicas: number;
   worker_type: 'vm' | 'bare_metal';
+  /** What the worker nodes run. Talos swaps the CAPI bootstrap provider. */
+  worker_os?: 'cloud-init' | 'talos';
   worker_count: number;
   worker_vcpu: number;
   worker_memory: string;

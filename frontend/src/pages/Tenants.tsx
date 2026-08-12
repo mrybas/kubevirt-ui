@@ -85,6 +85,7 @@ interface WizardState {
   kubernetes_version: string;
   control_plane_replicas: number;
   worker_type: 'vm' | 'bare_metal';
+  worker_os: 'cloud-init' | 'talos';
   worker_count: number;
   worker_vcpu: number;
   worker_memory: string;
@@ -120,6 +121,7 @@ const defaultWizard: WizardState = {
   kubernetes_version: 'v1.32.1', // matches latest confirmed CAPK tag (T10)
   control_plane_replicas: 2,
   worker_type: 'vm',
+  worker_os: 'cloud-init',
   worker_count: 2,
   worker_vcpu: 2,
   worker_memory: '2Gi',
@@ -353,6 +355,7 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
       kubernetes_version: form.kubernetes_version,
       control_plane_replicas: form.control_plane_replicas,
       worker_type: form.worker_type,
+      worker_os: form.worker_os,
       worker_count: form.worker_count,
       worker_vcpu: form.worker_vcpu,
       worker_memory: form.worker_memory,
@@ -706,6 +709,52 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                     </div>
                   </button>
                 </div>
+              </div>
+
+              {/* Worker OS */}
+              <div>
+                <label className="block text-sm text-surface-300 mb-2">Worker OS</label>
+                <div className="grid grid-cols-2 gap-3">
+                  {([
+                    {
+                      value: 'cloud-init' as const,
+                      title: 'Standard (cloud-init)',
+                      hint: 'kubeadm join from a CAPK image',
+                    },
+                    {
+                      value: 'talos' as const,
+                      title: 'Talos',
+                      hint: 'Immutable OS, CSR signer on the control plane',
+                    },
+                  ]).map(opt => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      onClick={() => setForm({ ...form, worker_os: opt.value })}
+                      className={`flex items-center gap-3 p-3 rounded-lg border text-left transition-colors ${
+                        form.worker_os === opt.value
+                          ? 'border-primary-500 bg-primary-500/10'
+                          : 'border-surface-700 bg-surface-800 hover:border-surface-600'
+                      }`}
+                    >
+                      <Server className={`h-5 w-5 shrink-0 ${form.worker_os === opt.value ? 'text-primary-400' : 'text-surface-500'}`} />
+                      <div>
+                        <p className={`text-sm font-medium ${form.worker_os === opt.value ? 'text-primary-300' : 'text-surface-300'}`}>
+                          {opt.title}
+                        </p>
+                        <p className="text-xs text-surface-500">{opt.hint}</p>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+                {form.worker_os === 'talos' && (
+                  <p className="text-xs text-surface-500 mt-2">
+                    Needs the Talos bootstrap provider (CABPT) and cert-manager on the host
+                    cluster; the wizard checks both before creating anything. Workers are
+                    forced to bridge networking — with masquerade every guest sees itself as
+                    the same address and only the first node can join.
+                  </p>
+                )}
               </div>
 
               {/* Worker Resources */}
