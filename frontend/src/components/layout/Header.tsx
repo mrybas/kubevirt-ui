@@ -71,7 +71,13 @@ export function Header() {
   const displayName = user?.username || user?.email || 'User';
   const isAdmin = user?.groups?.includes('kubevirt-ui-admins');
   return (
-    <header className="flex h-16 items-center justify-between border-b border-surface-800 bg-surface-950/50 px-3 md:px-6 backdrop-blur-sm">
+    // `relative z-30` is load-bearing: `backdrop-blur-sm` makes this header a
+    // stacking context, so the dropdowns' own z-50 only orders them *within*
+    // it. Every `.card` is also backdrop-blurred (globals.css) and sits later
+    // in the DOM, so without a z-index here the cards paint over the open
+    // namespace/user menus. z-30, not z-50, so the mobile sidebar drawer
+    // (z-50), its overlay (z-40) and modals (z-50) still cover the header.
+    <header className="relative z-30 flex h-16 items-center justify-between border-b border-surface-800 bg-surface-950/50 px-3 md:px-6 backdrop-blur-sm">
       <div className="flex items-center gap-2 md:gap-4">
         {/* Hamburger menu for mobile */}
         <button
