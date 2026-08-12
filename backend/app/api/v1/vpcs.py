@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
 from app.api.v1.tenants_common import _ensure_cluster_config, _tenant_ns, _vpcdns_vip
-from app.core.allocators import allocate_vpc_cidr
+from app.core.allocators import allocate_vpc_cidr, assert_cidr_free
 from app.core.auth import User, require_auth, require_admin
 from app.core.constants import (
     KUBEOVN_API_GROUP,
@@ -740,6 +740,10 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
 
     if data.subnet_cidr:
         cidr = data.subnet_cidr
+        # A hand-picked CIDR bypasses the allocator, so nothing else has
+        # checked it. Overlapping VPCs break peering routes, the CIDR-based
+        # isolation ACLs, and BGP (two gateways deriving the same router-id).
+        await assert_cidr_free(k8s, cidr)
         parts = cidr.split("/")[0].rsplit(".", 1)
         gateway = f"{parts[0]}.1"
     else:

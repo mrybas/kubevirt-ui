@@ -1,7 +1,9 @@
 """Shared CIDR allocator using ConfigMap-based counter with optimistic locking."""
 
 import asyncio
+import ipaddress
 import logging
+from typing import Any
 
 from fastapi import HTTPException
 from kubernetes_asyncio.client import ApiException, V1ConfigMap, V1ObjectMeta
@@ -15,6 +17,83 @@ VPC_CIDR_BASE = 200  # 10.{200+N}.0.0/24 — above K8s service CIDR (10.96.0.0/1
 
 MAX_RETRIES = 5
 BASE_DELAY = 0.1  # seconds
+
+KUBEOVN_GROUP = "kubeovn.io"
+KUBEOVN_VERSION = "v1"
+
+
+async def list_subnet_cidrs(k8s) -> list[tuple[str, str]]:
+    """Every (subnet name, cidrBlock) currently defined in the cluster.
+
+    Includes subnets we did not create — an overlap with one of those breaks
+    just as thoroughly as an overlap with ours.
+    """
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
+        )
+    except ApiException as e:
+        logger.warning(f"Could not list subnets for CIDR conflict check: {e}")
+        return []
+
+    cidrs: list[tuple[str, str]] = []
+    for item in result.get("items", []):
+        cidr = item.get("spec", {}).get("cidrBlock", "")
+        name = item.get("metadata", {}).get("name", "")
+        # Dual-stack subnets carry "v4cidr,v6cidr"; we only allocate IPv4.
+        for part in str(cidr).split(","):
+            part = part.strip()
+            if part:
+                cidrs.append((name, part))
+    return cidrs
+
+
+def _parse(cidr: str) -> Any | None:
+    try:
+        return ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return None
+
+
+def find_cidr_conflicts(cidr: str, existing: list[tuple[str, str]]) -> list[str]:
+    """Names of the subnets whose range overlaps `cidr`.
+
+    Overlap — not equality: 10.203.0.0/24 inside somebody's 10.203.0.0/16 is
+    just as broken, and containment in either direction is a conflict.
+    """
+    wanted = _parse(cidr)
+    if wanted is None:
+        return []
+
+    conflicts: list[str] = []
+    for name, other in existing:
+        parsed = _parse(other)
+        if parsed is None or parsed.version != wanted.version:
+            continue
+        if wanted.overlaps(parsed):
+            conflicts.append(f"{name} ({other})")
+    return conflicts
+
+
+async def assert_cidr_free(k8s, cidr: str) -> None:
+    """Raise 409 when `cidr` overlaps an existing subnet.
+
+    Overlapping VPCs break more than addressing: peering static routes become
+    ambiguous, the isolation ACLs are written in terms of CIDRs, and BGP
+    derives each gateway's router-id from its internal address — two VPCs on
+    the same range give two speakers the same id, which the peer rejects
+    within one AS.
+    """
+    conflicts = find_cidr_conflicts(cidr, await list_subnet_cidrs(k8s))
+    if conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"CIDR {cidr} overlaps existing subnet(s): {', '.join(conflicts)}. "
+                "Pick a non-overlapping range, or omit subnet_cidr to have one "
+                "allocated."
+            ),
+        )
 
 
 async def allocate_vpc_cidr(k8s) -> tuple[str, str]:
@@ -64,11 +143,29 @@ async def _allocate_vpc_cidr_once(k8s) -> tuple[str, str]:
         else:
             raise
 
-    second_octet = VPC_CIDR_BASE + next_index
-    if second_octet > 254:
-        raise HTTPException(status_code=409, detail="VPC CIDR pool exhausted (max 55 VPCs)")
+    # The counter alone is not authoritative: `subnet_cidr` on the create
+    # request lets a caller take a range out of this same pool by hand, and
+    # the counter knows nothing about it. Walking past occupied indices is
+    # what stops the allocator from later handing out a duplicate of one.
+    existing = await list_subnet_cidrs(k8s)
 
-    cidr = f"10.{second_octet}.0.0/24"
+    index = next_index
+    while True:
+        second_octet = VPC_CIDR_BASE + index
+        if second_octet > 254:
+            raise HTTPException(
+                status_code=409, detail="VPC CIDR pool exhausted (max 55 VPCs)",
+            )
+        cidr = f"10.{second_octet}.0.0/24"
+        conflicts = find_cidr_conflicts(cidr, existing)
+        if not conflicts:
+            break
+        logger.info(
+            f"VPC CIDR {cidr} already taken by {', '.join(conflicts)}; "
+            "skipping to the next index"
+        )
+        index += 1
+
     gateway = f"10.{second_octet}.0.1"
 
     # Increment counter with optimistic lock (resourceVersion).
@@ -83,7 +180,7 @@ async def _allocate_vpc_cidr_once(k8s) -> tuple[str, str]:
                 resource_version=resource_version,
                 labels={"kubevirt-ui.io/managed": "true"},
             ),
-            data={"next_index": str(next_index + 1)},
+            data={"next_index": str(index + 1)},
         ),
     )
 
