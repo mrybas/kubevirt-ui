@@ -4,7 +4,7 @@
  * List tenants + Create Tenant wizard (multi-step)
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   Plus,
@@ -242,6 +242,13 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
   // Storage classes for T5 picker
   const storageClasses = storageClassesData?.items ?? [];
 
+  // Ceph discovery marks one class as the sensible default for the CSI
+  // passthrough (RBD + Immediate — see _suggest_ceph_sc on the backend).
+  const suggestedStorageClass =
+    discovery?.storage
+      .find(s => s.type === 'ceph')
+      ?.storage_classes.find(sc => sc.suggested)?.name ?? '';
+
   // Folder list — admins see all, non-admins see folders where they're listed
   const allFolders = foldersData?.items ?? [];
   const visibleFolders = user?.is_admin
@@ -261,6 +268,15 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [form.kubernetes_version]);
+
+  // Preselect the discovered storage class — once, and only while the field
+  // is still untouched, so a deliberate "(cluster default)" choice sticks.
+  const storageClassPreselected = useRef(false);
+  useEffect(() => {
+    if (!suggestedStorageClass || storageClassPreselected.current) return;
+    storageClassPreselected.current = true;
+    setForm(prev => (prev.storage_class ? prev : { ...prev, storage_class: suggestedStorageClass }));
+  }, [suggestedStorageClass]);
 
   // Reset environment + vpc when folder changes
   useEffect(() => {
@@ -312,6 +328,13 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                 params[p.id] = discovery.monitoring[0]!.write_url;
               } else if (p.id === 'LOKI_PUSH_URL' && discovery.logging.length > 0) {
                 params[p.id] = discovery.logging[0]!.push_url;
+              } else if (p.id === 'INFRA_STORAGE_CLASS_NAME') {
+                // Only reached when the CSI addon was ticked by hand — the
+                // backend fills these itself for the auto-added one.
+                const sc = form.storage_class || suggestedStorageClass;
+                if (sc) params[p.id] = sc;
+              } else if (p.id === 'INFRA_CLUSTER_NAMESPACE') {
+                params[p.id] = `tenant-${form.name}`;
               }
             }
           }
@@ -942,11 +965,19 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                           <option key={sc.name} value={sc.name}>
                             {sc.name}
                             {sc.is_default ? ' (default)' : ''}
+                            {sc.name === suggestedStorageClass ? ' — recommended' : ''}
                           </option>
                         ))}
                       </select>
                       <p className="text-xs text-surface-500 mt-1">
                         Storage class used for worker PVCs. Leave blank to use the cluster default.
+                        {suggestedStorageClass && (
+                          <>
+                            {' '}Discovered <span className="text-surface-300">{suggestedStorageClass}</span>{' '}
+                            (Ceph RBD) — recommended, since the CSI passthrough hotplugs the volume
+                            onto a VM.
+                          </>
+                        )}
                       </p>
                     </div>
 
@@ -999,13 +1030,21 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
               {discovery && (
                 <div className="p-3 bg-surface-800/50 rounded-lg border border-surface-700 mb-4 space-y-1">
                   <p className="text-xs font-semibold text-surface-400 uppercase tracking-wider mb-1">Auto-detected infrastructure</p>
-                  {discovery.storage.map(s => (
-                    <p key={s.api_url} className="text-xs text-emerald-400 flex items-center gap-1.5">
-                      <CheckCircle className="h-3 w-3" />
-                      Linstor — {s.pools.length} pool{s.pools.length !== 1 ? 's' : ''}
-                      ({s.pools.map(p => `${p.name}: ${p.free_gb}GB free`).join(', ')})
-                    </p>
-                  ))}
+                  {discovery.storage.map(s => {
+                    // Ceph has no REST endpoint to interrogate — its
+                    // StorageClasses are the discovery result.
+                    const label = s.type === 'ceph'
+                      ? `Ceph — ${s.storage_classes.length} storage class${s.storage_classes.length !== 1 ? 'es' : ''} `
+                        + `(${s.storage_classes.map(sc => sc.name).join(', ')})`
+                      : `Linstor — ${s.pools.length} pool${s.pools.length !== 1 ? 's' : ''} `
+                        + `(${s.pools.map(p => `${p.name}: ${p.free_gb}GB free`).join(', ')})`;
+                    return (
+                      <p key={s.type} className="text-xs text-emerald-400 flex items-center gap-1.5">
+                        <CheckCircle className="h-3 w-3" />
+                        {label}
+                      </p>
+                    );
+                  })}
                   {discovery.monitoring.map(m => (
                     <p key={m.write_url} className="text-xs text-emerald-400 flex items-center gap-1.5">
                       <CheckCircle className="h-3 w-3" />

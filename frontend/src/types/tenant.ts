@@ -145,10 +145,20 @@ export interface StoragePoolInfo {
   node_count: number;
 }
 
+export interface StorageClassInfo {
+  name: string;
+  provisioner: string;
+  volume_binding_mode: string;
+  is_default: boolean;
+  mode: string;         // 'block' (RBD) | 'filesystem' (CephFS) | ''
+  suggested: boolean;   // preselect this one for INFRA_STORAGE_CLASS_NAME
+}
+
 export interface StorageDiscovery {
-  type: string;
-  api_url: string;
+  type: string;         // 'linstor' | 'ceph'
+  api_url: string;      // empty for StorageClass-only backends (Ceph)
   pools: StoragePoolInfo[];
+  storage_classes: StorageClassInfo[];
 }
 
 export interface MonitoringDiscovery {

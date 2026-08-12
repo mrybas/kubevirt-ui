@@ -336,12 +336,27 @@ class StoragePoolInfo(BaseModel):
     node_count: int = 0
 
 
+class StorageClassInfo(BaseModel):
+    """A host-cluster StorageClass offered to the tenant wizard."""
+
+    name: str
+    provisioner: str = ""
+    volume_binding_mode: str = ""
+    is_default: bool = False
+    # RBD block vs CephFS — the CSI passthrough hotplugs the volume onto a
+    # VM, which only works for block.
+    mode: str = ""  # "block" | "filesystem" | ""
+    # The one the wizard should preselect for INFRA_STORAGE_CLASS_NAME.
+    suggested: bool = False
+
+
 class StorageDiscovery(BaseModel):
     """Storage backends discovered on host cluster."""
 
-    type: str  # "linstor"
-    api_url: str
+    type: str  # "linstor" | "ceph"
+    api_url: str = ""  # LINSTOR REST endpoint; empty for StorageClass-only backends
     pools: list[StoragePoolInfo] = Field(default_factory=list)
+    storage_classes: list[StorageClassInfo] = Field(default_factory=list)
 
 
 class MonitoringDiscovery(BaseModel):

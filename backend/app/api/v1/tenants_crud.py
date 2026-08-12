@@ -12,7 +12,7 @@ from typing import Any
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from kubernetes_asyncio.client import ApiException
+from kubernetes_asyncio.client import ApiException, StorageV1Api
 
 from app.core.auth import User, require_auth
 from app.core.errors import k8s_error_to_http
@@ -37,6 +37,7 @@ from app.models.tenant import (
     LoggingDiscovery,
     MonitoringDiscovery,
     RegistryDiscovery,
+    StorageClassInfo,
     StorageDiscovery,
     StoragePoolInfo,
     TenantAddon,
@@ -419,6 +420,105 @@ async def _discover_linstor(k8s) -> StorageDiscovery | None:
     return StorageDiscovery(type="linstor", api_url=api_url, pools=pools)
 
 
+# Rook publishes its CSI provisioners as `<rook-operator-ns>.rbd.csi.ceph.com`
+# / `<rook-operator-ns>.cephfs.csi.ceph.com`. The leading component is the
+# *namespace*, so matching a literal `rook-ceph.` prefix misses every
+# non-default install (the ceph lab runs `o0-rook-ceph.`) — match the suffix.
+CEPH_RBD_PROVISIONER_SUFFIX = ".rbd.csi.ceph.com"
+CEPH_FS_PROVISIONER_SUFFIX = ".cephfs.csi.ceph.com"
+
+DEFAULT_SC_ANNOTATION = "storageclass.kubernetes.io/is-default-class"
+DEFAULT_SC_ANNOTATION_BETA = "storageclass.beta.kubernetes.io/is-default-class"
+
+
+def _ceph_sc_mode(provisioner: str) -> str:
+    """"block" for RBD, "filesystem" for CephFS, "" for anything else."""
+    if provisioner.endswith(CEPH_RBD_PROVISIONER_SUFFIX):
+        return "block"
+    if provisioner.endswith(CEPH_FS_PROVISIONER_SUFFIX):
+        return "filesystem"
+    return ""
+
+
+def _suggest_ceph_sc(classes: list[StorageClassInfo]) -> StorageClassInfo | None:
+    """Pick the StorageClass the tenant wizard should preselect.
+
+    RBD before CephFS because the kubevirt-csi passthrough hotplugs the
+    volume onto a worker VM, and `Immediate` before `WaitForFirstConsumer`
+    because the infra-side PVC has no consuming pod to wait for — a WFFC
+    class leaves it Pending forever. Cluster-default wins ties.
+    """
+    def rank(sc: StorageClassInfo) -> tuple[int, int, int]:
+        return (
+            0 if sc.mode == "block" else 1,
+            0 if sc.volume_binding_mode == "Immediate" else 1,
+            0 if sc.is_default else 1,
+        )
+
+    return min(classes, key=rank) if classes else None
+
+
+async def _discover_ceph(k8s) -> StorageDiscovery | None:
+    """Discover Ceph-backed StorageClasses (Rook) on the host cluster.
+
+    Unlike LINSTOR there is no REST endpoint to interrogate — what the
+    tenant wizard needs is the StorageClass name for
+    `INFRA_STORAGE_CLASS_NAME`, so the StorageClass list *is* the discovery
+    result. Returns None when the cluster has no Ceph provisioner.
+    """
+    try:
+        storage_api = StorageV1Api(k8s._api_client)
+        result = await storage_api.list_storage_class()
+    except ApiException as e:
+        logger.debug(f"Could not list StorageClasses for Ceph discovery: {e}")
+        return None
+
+    classes: list[StorageClassInfo] = []
+    for sc in result.items:
+        provisioner = sc.provisioner or ""
+        mode = _ceph_sc_mode(provisioner)
+        if not mode:
+            continue
+        annotations = sc.metadata.annotations or {}
+        classes.append(StorageClassInfo(
+            name=sc.metadata.name,
+            provisioner=provisioner,
+            volume_binding_mode=sc.volume_binding_mode or "",
+            is_default=(
+                annotations.get(DEFAULT_SC_ANNOTATION) == "true"
+                or annotations.get(DEFAULT_SC_ANNOTATION_BETA) == "true"
+            ),
+            mode=mode,
+        ))
+
+    if not classes:
+        return None
+
+    suggested = _suggest_ceph_sc(classes)
+    if suggested is not None:
+        suggested.suggested = True
+
+    return StorageDiscovery(type="ceph", storage_classes=classes)
+
+
+async def suggested_infra_storage_class(k8s) -> str:
+    """Name of the StorageClass to use when the caller didn't pick one.
+
+    Used by the tenant create path so `enable_storage=True` without an
+    explicit `storage_class` doesn't fall through to an empty
+    `INFRA_STORAGE_CLASS_NAME` (which leaves the tenant CSI driver pointing
+    at the host cluster default — often not a Ceph class at all). Returns
+    "" when nothing suitable was found, preserving the old behaviour.
+    """
+    ceph = await _discover_ceph(k8s)
+    if not ceph:
+        return ""
+    for sc in ceph.storage_classes:
+        if sc.suggested:
+            return sc.name
+    return ""
+
+
 async def _discover_victoria_metrics(k8s) -> MonitoringDiscovery | None:
     """Discover VictoriaMetrics vminsert or vmsingle service for remote_write."""
     svc = await _find_service(k8s.core_api, _DISCOVERY_PATTERNS["victoria-metrics"])
@@ -499,6 +599,10 @@ async def discover_host_infrastructure(request: Request, user: User = Depends(re
     linstor = await _discover_linstor(k8s)
     if linstor:
         storage.append(linstor)
+
+    ceph = await _discover_ceph(k8s)
+    if ceph:
+        storage.append(ceph)
 
     vm = await _discover_victoria_metrics(k8s)
     if vm:
@@ -764,11 +868,25 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             csi_component = catalog.get_component(KUBEVIRT_CSI_ADDON_ID)
             if csi_component:
                 ns_for_quota = _tenant_ns(req.name)
+                # No explicit class → discover one rather than sending "",
+                # which makes the tenant CSI driver fall back to the host
+                # cluster default (frequently not a Ceph/RBD class).
+                infra_sc = req.storage_class
+                if not infra_sc:
+                    infra_sc = await suggested_infra_storage_class(k8s)
+                    logger.info(
+                        f"Tenant {req.name!r}: no storage_class given; "
+                        + (
+                            f"discovered {infra_sc!r}" if infra_sc
+                            else "none discovered, falling back to the host "
+                                 "cluster default"
+                        )
+                    )
                 all_addons.append(TenantAddon(
                     addon_id=KUBEVIRT_CSI_ADDON_ID,
                     parameters={
                         "INFRA_CLUSTER_NAMESPACE": ns_for_quota,
-                        "INFRA_STORAGE_CLASS_NAME": req.storage_class or "",
+                        "INFRA_STORAGE_CLASS_NAME": infra_sc,
                     },
                 ))
             else:
