@@ -127,13 +127,16 @@ rules:
       - secrets
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
-  # Events, Pods (read-only for monitoring / console)
+  # Events, Pods — read for monitoring/console, plus `delete` on pods:
+  # restarting a Kamaji control plane means deleting its pods, because Kamaji
+  # owns the Deployment and silently reverts the annotation a `rollout
+  # restart` writes (tenants_common.restart_control_plane_pods).
   - apiGroups: [""]
     resources:
       - events
       - pods
       - pods/log
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "delete"]
 
   # Services — read + proxy (LINSTOR, metrics)
   - apiGroups: [""]
@@ -180,13 +183,17 @@ rules:
   - apiGroups: ["apps"]
     resources:
       - daemonsets
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
-  # Apps — Deployments read-only (network.py:_find_kubeovn_namespace)
+  # Apps — Deployments: read for discovery (network.py:_find_kubeovn_namespace)
+  # and `patch` for the VpcDns service-network route. That route is what lets
+  # a VpcDns pod reach the kube-dns ClusterIP; without the verb, DNS in every
+  # custom VPC resolves nothing while each object still reports healthy
+  # (vpcs.py:_ensure_vpc_dns_service_route).
   - apiGroups: ["apps"]
     resources:
       - deployments
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
 
   # -----------------------------------------------------------------------
   # Networking (Kube-OVN)
@@ -207,6 +214,10 @@ rules:
       - ovn-dnat-rules
       - ovn-fips
       - security-groups
+      # FRR config an egress gateway peers BGP with. One shared object serves
+      # every gateway; without it a UI-created VPC is reachable by NAT only
+      # (bgp.py — BGPCONF_PLURAL).
+      - bgp-confs
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   - apiGroups: ["k8s.cni.cncf.io"]

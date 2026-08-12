@@ -50,6 +50,9 @@ services:
     volumes:
       - ./backend:/app
       - ./remote_k8s_kubeconfig:/app/kubeconfig:ro
+      # The RBAC contract test reads the chart to check that it grants what
+      # the backend calls — a mismatch is a runtime 403 no unit test can see.
+      - ./helm:/helm:ro
     environment:
       - KUBECONFIG=/app/kubeconfig
       - LOG_LEVEL=DEBUG
