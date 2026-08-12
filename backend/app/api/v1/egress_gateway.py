@@ -20,6 +20,11 @@ from kubernetes_asyncio.client import ApiException, V1ConfigMap, V1ObjectMeta
 from app.core.auth import User, require_auth, require_admin
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION, SYSTEM_NAMESPACE as _SYSTEM_NS
 from app.core.errors import k8s_error_to_http
+from app.core.vpc_peering import (
+    ensure_vpc_peering as _ensure_vpc_peering,
+    remove_vpc_peering as _remove_vpc_peering,
+    transit_prefix_len as _transit_prefix_len,
+)
 from app.models.egress_gateway import (
     AttachedVpcInfo,
     AttachTenantRequest,
@@ -701,53 +706,33 @@ async def attach_tenant_to_gateway(
     used_ips = {v.split(",")[0] for k, v in alloc_data.items() if k.startswith("vpc.")}
     used_ips.add(alloc_data.get("_gateway_ip", ""))
 
-    # Check if already attached
+    # An existing allocation is resumed, not short-circuited. Every step below
+    # is idempotent, so re-running them is free — whereas returning early here
+    # turns a retry after a half-finished attach into a silent no-op that
+    # reports success while no peering or route was ever created.
     alloc_key = f"vpc.{tenant_vpc_name}"
-    if alloc_key in alloc_data:
-        existing = alloc_data[alloc_key].split(",")
-        return AttachedVpcInfo(
-            vpc_name=tenant_vpc_name,
-            transit_ip=existing[0],
-            subnet_name=existing[1] if len(existing) > 1 else tenant_subnet_name,
-            cidr=existing[2] if len(existing) > 2 else tenant_cidr,
-            peering_name=f"{gateway_name}-to-{tenant_vpc_name}",
-        )
+    existing = [f for f in alloc_data.get(alloc_key, "").split(",") if f]
+    if existing:
+        tenant_transit_ip = existing[0]
+        if len(existing) > 1:
+            tenant_subnet_name = existing[1]
+        if len(existing) > 2:
+            tenant_cidr = existing[2]
+    else:
+        tenant_transit_ip = _allocate_transit_ip(transit_cidr, used_ips)
 
-    tenant_transit_ip = _allocate_transit_ip(transit_cidr, used_ips)
     gw_transit_ip = _gateway_transit_ip(transit_cidr)
 
-    # Save allocation
-    alloc_data[alloc_key] = f"{tenant_transit_ip},{tenant_subnet_name},{tenant_cidr}"
-    await _save_transit_allocator(k8s, gateway_name, alloc_data, resource_version)
-
-    # 2. Create VpcPeering
+    # 2. Peer the two VPCs. kube-ovn keeps peering in `vpc.spec.vpcPeerings[]`
+    # and wants it declared on both sides — there is no VpcPeering CRD.
     peering_name = f"{gateway_name}-to-{tenant_vpc_name}"
-    peering_manifest: dict[str, Any] = {
-        "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",
-        "kind": "VpcPeering",
-        "metadata": {
-            "name": peering_name,
-            "labels": {
-                MANAGED_LABEL: "true",
-                GATEWAY_LABEL: gateway_name,
-            },
-        },
-        "spec": {
-            "localVpc": gw_vpc_name,
-            "remoteVpc": tenant_vpc_name,
-            "localConnectIP": f"{gw_transit_ip}/24",
-            "remoteConnectIP": f"{tenant_transit_ip}/24",
-        },
-    }
-
-    try:
-        await k8s.custom_api.create_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpc-peerings",
-            body=peering_manifest,
-        )
-    except ApiException as e:
-        if e.status != 409:  # Ignore if already exists
-            raise k8s_error_to_http(e, "creating VPC peering")
+    peer_prefix = _transit_prefix_len(transit_cidr)
+    await _ensure_vpc_peering(
+        k8s, gw_vpc_name, tenant_vpc_name, f"{gw_transit_ip}/{peer_prefix}",
+    )
+    await _ensure_vpc_peering(
+        k8s, tenant_vpc_name, gw_vpc_name, f"{tenant_transit_ip}/{peer_prefix}",
+    )
 
     # 3. Add default route on tenant VPC: 0.0.0.0/0 → gateway transit IP
     await _add_static_route(k8s, tenant_vpc_name, "0.0.0.0/0", gw_transit_ip)
@@ -763,6 +748,12 @@ async def attach_tenant_to_gateway(
         k8s, tenant_subnet_name, tenant_cidr,
         [transit_cidr, gw_vpc_cidr],
     )
+
+    # 7. Record the allocation only once the wiring above is actually in place,
+    # so a failure leaves the VPC unattached rather than booked-but-unwired.
+    if not existing:
+        alloc_data[alloc_key] = f"{tenant_transit_ip},{tenant_subnet_name},{tenant_cidr}"
+        await _save_transit_allocator(k8s, gateway_name, alloc_data, resource_version)
 
     logger.info(
         f"Attached VPC '{tenant_vpc_name}' to egress gateway '{gateway_name}' "
@@ -808,16 +799,9 @@ async def detach_tenant_from_gateway(
     tenant_info = alloc_data.get(alloc_key, "")
     tenant_cidr = tenant_info.split(",")[2] if len(tenant_info.split(",")) > 2 else ""
 
-    # 1. Delete VpcPeering
-    peering_name = f"{gateway_name}-to-{tenant_vpc_name}"
-    try:
-        await k8s.custom_api.delete_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpc-peerings",
-            name=peering_name,
-        )
-    except ApiException as e:
-        if e.status != 404:
-            logger.warning(f"Failed to delete peering {peering_name}: {e}")
+    # 1. Drop the peering from both VPCs (it lives in spec.vpcPeerings)
+    await _remove_vpc_peering(k8s, gw_vpc_name, tenant_vpc_name)
+    await _remove_vpc_peering(k8s, tenant_vpc_name, gw_vpc_name)
 
     # 2. Remove return route from gateway VPC
     if tenant_cidr:
@@ -1057,22 +1041,20 @@ async def _cleanup_gateway_resources(k8s, gateway_name: str) -> None:
         if e.status != 404:
             logger.warning(f"Failed to delete VpcEgressGateway: {e}")
 
-    # Delete peerings
-    try:
-        result = await k8s.custom_api.list_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpc-peerings",
-            label_selector=label_sel,
-        )
-        for item in result.get("items", []):
-            try:
-                await k8s.custom_api.delete_cluster_custom_object(
-                    group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpc-peerings",
-                    name=item["metadata"]["name"],
-                )
-            except ApiException:
-                pass
-    except ApiException:
-        pass
+    # Drop the peering each attached tenant still holds against the gateway
+    # VPC. The gateway's own side goes with its VPC below, but a tenant left
+    # pointing at a deleted VPC keeps a dead default route.
+    gw_vpc_name = f"egw-{gateway_name}"
+    alloc_data, _ = await _get_transit_allocator(k8s, gateway_name)
+    for key in alloc_data:
+        if not key.startswith("vpc."):
+            continue
+        tenant_vpc = key[len("vpc."):]
+        try:
+            await _remove_vpc_peering(k8s, tenant_vpc, gw_vpc_name)
+            await _remove_static_route(k8s, tenant_vpc, "0.0.0.0/0")
+        except ApiException as e:
+            logger.warning(f"Failed to unpeer {tenant_vpc} from {gw_vpc_name}: {e}")
 
     # Delete subnets (transit + gw)
     try:

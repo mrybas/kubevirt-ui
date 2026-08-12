@@ -16,6 +16,9 @@ from app.core.constants import (
     KUBEOVN_SYSTEM_VPC as SYSTEM_VPC_NAME,
 )
 from app.core.errors import k8s_error_to_http
+from app.api.v1.vpcs import create_vpc_peering as create_vpc_peering_v2
+from app.core.vpc_peering import list_vpc_peerings, remove_vpc_peering
+from app.models.vpc import VpcPeeringCreateRequest
 from app.core.groups import get_user_namespaces, is_admin
 from app.models.network import (
     ProviderNetworkCreate,
@@ -1326,28 +1329,16 @@ async def _get_vpc_subnets(k8s, vpc_name: str) -> list[VpcSubnetInfo]:
 
 
 async def _get_vpc_peerings(k8s, vpc_name: str) -> list[VpcPeeringInfo]:
-    """Get peering connections involving a VPC."""
-    try:
-        result = await k8s.custom_api.list_cluster_custom_object(
-            group=KUBEOVN_API_GROUP,
-            version=KUBEOVN_API_VERSION,
-            plural="vpc-peerings",
-        )
-    except ApiException:
-        return []
+    """Get peering connections involving a VPC.
 
-    peerings = []
-    for item in result.get("items", []):
-        spec = item.get("spec", {})
-        local = spec.get("localVpc", "")
-        remote = spec.get("remoteVpc", "")
-        if local == vpc_name or remote == vpc_name:
-            peerings.append(VpcPeeringInfo(
-                name=item["metadata"]["name"],
-                local_vpc=local,
-                remote_vpc=remote,
-            ))
-    return peerings
+    Peerings live in `vpc.spec.vpcPeerings[]` on each side — kube-ovn has no
+    VpcPeering CRD, and querying one returns a 404 that reads exactly like
+    "this VPC has no peerings".
+    """
+    return [
+        VpcPeeringInfo(name=f"{local}-to-{remote}", local_vpc=local, remote_vpc=remote)
+        for local, remote in await list_vpc_peerings(k8s, vpc_name)
+    ]
 
 
 # ============================================================================
@@ -1555,19 +1546,17 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
     """Delete a VPC and cascade-delete its subnets and peerings."""
     k8s = request.app.state.k8s_client
 
-    # Delete peerings first
+    # Drop peering entries that OTHER VPCs still hold against this one — the
+    # entries on this VPC go away with the VPC itself, but a dangling remote
+    # side leaves kube-ovn trying to build a link to a switch that is gone.
     peerings = await _get_vpc_peerings(k8s, name)
     for p in peerings:
+        if p.local_vpc == name:
+            continue
         try:
-            await k8s.custom_api.delete_cluster_custom_object(
-                group=KUBEOVN_API_GROUP,
-                version=KUBEOVN_API_VERSION,
-                plural="vpc-peerings",
-                name=p.name,
-            )
+            await remove_vpc_peering(k8s, p.local_vpc, name)
         except ApiException as e:
-            if e.status != 404:
-                logger.warning(f"Failed to delete peering {p.name}: {e}")
+            logger.warning(f"Failed to remove peering {p.name}: {e}")
 
     # Delete subnets
     subnets = await _get_vpc_subnets(k8s, name)
@@ -1610,56 +1599,17 @@ async def create_vpc_peering(
 ) -> VpcPeeringInfo:
     """Create a VPC peering connection.
 
-    The path {name} VPC is always the local side. data.remote_vpc is the peer.
-    Both VPCs must exist.
+    Delegates to the `/vpcs/{name}/peerings` implementation rather than
+    writing the peering here: a peering is not just a link, it also needs
+    static routes on both sides and a policy route above the egress gateway's
+    29100 catch-all. A second half-implementation of that would produce
+    peerings that look created and silently hairpin.
     """
-    k8s = request.app.state.k8s_client
-
-    # Override local_vpc with the path parameter for consistency
-    data.local_vpc = name
-
-    # Validate both VPCs exist
-    for vpc_name in [data.local_vpc, data.remote_vpc]:
-        try:
-            await k8s.custom_api.get_cluster_custom_object(
-                group=KUBEOVN_API_GROUP,
-                version=KUBEOVN_API_VERSION,
-                plural="vpcs",
-                name=vpc_name,
-            )
-        except ApiException as e:
-            if e.status == 404:
-                raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
-            raise k8s_error_to_http(e, "network operation")
-
-    peering_name = f"{data.local_vpc}-to-{data.remote_vpc}"
-    peering_manifest: dict[str, Any] = {
-        "apiVersion": f"{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}",
-        "kind": "VpcPeering",
-        "metadata": {
-            "name": peering_name,
-            "labels": {"kubevirt-ui.io/managed": "true"},
-        },
-        "spec": {
-            "localVpc": data.local_vpc,
-            "remoteVpc": data.remote_vpc,
-        },
-    }
-
-    try:
-        await k8s.custom_api.create_cluster_custom_object(
-            group=KUBEOVN_API_GROUP,
-            version=KUBEOVN_API_VERSION,
-            plural="vpc-peerings",
-            body=peering_manifest,
-        )
-    except ApiException as e:
-        if e.status == 409:
-            raise HTTPException(status_code=409, detail=f"Peering '{peering_name}' already exists")
-        raise k8s_error_to_http(e, "network operation")
-
+    info = await create_vpc_peering_v2(
+        request, name, VpcPeeringCreateRequest(remote_vpc=data.remote_vpc), user=user,
+    )
     return VpcPeeringInfo(
-        name=peering_name,
-        local_vpc=data.local_vpc,
+        name=getattr(info, "name", f"{name}-to-{data.remote_vpc}"),
+        local_vpc=name,
         remote_vpc=data.remote_vpc,
     )
