@@ -37,6 +37,32 @@ logger = logging.getLogger(__name__)
 
 TALOS_TRUSTD_PORT = 50001
 
+# Default golden image for Talos workers, from the image factory.
+#
+#   .../image/<schematic>/<version>/nocloud-amd64.raw.xz
+#
+# Three parts of that URL are load-bearing:
+#
+#   * the schematic 3765679…b4ba is the *empty* one — no system extensions. A
+#     KubeVirt worker needs none; a different set of extensions means a
+#     different schematic, generated with
+#     `curl -X POST --data-binary 'customization: {}' https://factory.talos.dev/schematics`.
+#   * **nocloud** is the platform that reads its machine config from the
+#     cloud-init disk KubeVirt attaches. With any other image variant the
+#     config simply never arrives, and the node boots into nothing.
+#   * the Talos version pins the kubelet version with it, so it has to sit
+#     inside the tenant's compatibility window (Talos 1.13 → k8s 1.31–1.36).
+#
+# CDI pulls the .raw.xz directly and decompresses it — no conversion step. The
+# import is done once, centrally, and each worker gets a CSI clone: importing
+# over HTTP into every tenant namespace would depend on DNS inside the VPC,
+# which is exactly what is least reliable there.
+TALOS_GOLDEN_IMAGE_URL = (
+    "https://factory.talos.dev/image/"
+    "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
+    "/v1.13.8/nocloud-amd64.raw.xz"
+)
+
 CERT_MANAGER_GROUP = "cert-manager.io"
 CERT_MANAGER_VERSION = "v1"
 
@@ -410,6 +436,234 @@ def talos_bootstrap_ref(tenant: str) -> dict[str, str]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Cluster singletons — one per cluster, meaningless without the feature, so
+# ensured on demand exactly like the VpcDns prerequisites.
+# ---------------------------------------------------------------------------
+
+CAPI_OPERATOR_GROUP = "operator.cluster.x-k8s.io"
+CAPI_OPERATOR_VERSION = "v1alpha2"
+
+
+def build_bootstrap_provider() -> dict[str, Any]:
+    """The `BootstrapProvider talos` CR.
+
+    A thin object consumed by capi-operator: creating it is how you ask the
+    operator to install CABPT, which is what turns a TalosConfigTemplate into
+    actual bootstrap data. Without CABPT the template is accepted by nobody —
+    the Machine sits at WaitingForBootstrapData forever and no VM is built.
+    """
+    return {
+        "apiVersion": f"{CAPI_OPERATOR_GROUP}/{CAPI_OPERATOR_VERSION}",
+        "kind": "BootstrapProvider",
+        "metadata": {
+            "name": "talos",
+            "namespace": "capi-talos-bootstrap-system",
+            "labels": dict(MANAGED_LABEL),
+        },
+        "spec": {},
+    }
+
+
+def build_sni_router(vip: str, metallb_pool: str, shared_ip_key: str) -> list[dict[str, Any]]:
+    """Namespace, ConfigMap, Deployment and Service for the SNI router.
+
+    Needed because Talos always dials trustd on the fixed port 50001 taken
+    from `cluster.controlPlane.endpoint` — the per-tenant-port trick that
+    demultiplexes the apiserver does not apply. So tenants share one
+    `VIP:50001` and are told apart by SNI, which is only possible because the
+    endpoint is a name. nginx does the work with `stream` + `ssl_preread`: it
+    never terminates TLS, it only reads the requested name and forwards.
+
+    Verified on the lab with two tenants in two different VPCs on one
+    VIP:50001.
+    """
+    labels = {**MANAGED_LABEL, "app": "sni-router"}
+    nginx_conf = (
+        "events {}\n"
+        "stream {\n"
+        "    map $ssl_preread_server_name $backend {\n"
+        "        include /etc/nginx/routes/routes;\n"
+        "        default \"\";\n"
+        "    }\n"
+        "    server {\n"
+        f"        listen {TALOS_TRUSTD_PORT};\n"
+        "        ssl_preread on;\n"
+        "        proxy_pass $backend;\n"
+        "    }\n"
+        "}\n"
+    )
+    return [
+        {
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": {"name": SNI_ROUTER_NAMESPACE, "labels": labels},
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+                "name": SNI_ROUTER_CONFIGMAP,
+                "namespace": SNI_ROUTER_NAMESPACE,
+                "labels": labels,
+            },
+            # `routes` starts empty; each Talos tenant adds its own line.
+            "data": {"nginx.conf": nginx_conf, SNI_ROUTER_MAP_KEY: ""},
+        },
+        {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {
+                "name": SNI_ROUTER_CONFIGMAP,
+                "namespace": SNI_ROUTER_NAMESPACE,
+                "labels": labels,
+            },
+            "spec": {
+                "replicas": 1,
+                "selector": {"matchLabels": {"app": "sni-router"}},
+                "template": {
+                    "metadata": {"labels": {"app": "sni-router"}},
+                    "spec": {
+                        "containers": [{
+                            "name": "nginx",
+                            "image": "mirror.gcr.io/library/nginx:1.27-alpine",
+                            "ports": [{"containerPort": TALOS_TRUSTD_PORT}],
+                            "volumeMounts": [
+                                {
+                                    "name": "conf",
+                                    "mountPath": "/etc/nginx/nginx.conf",
+                                    "subPath": "nginx.conf",
+                                },
+                                {"name": "conf", "mountPath": "/etc/nginx/routes"},
+                            ],
+                            "resources": {
+                                "requests": {"cpu": "10m", "memory": "32Mi"},
+                                "limits": {"memory": "64Mi"},
+                            },
+                        }],
+                        "volumes": [{
+                            "name": "conf",
+                            "configMap": {"name": SNI_ROUTER_CONFIGMAP},
+                        }],
+                    },
+                },
+            },
+        },
+        {
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": SNI_ROUTER_CONFIGMAP,
+                "namespace": SNI_ROUTER_NAMESPACE,
+                "labels": labels,
+                "annotations": {
+                    # Shares the control-plane VIP: 50001 is free there
+                    # precisely because the per-tenant ports are the apiserver
+                    # and konnectivity ones.
+                    "metallb.universe.tf/address-pool": metallb_pool,
+                    "metallb.universe.tf/loadBalancerIPs": vip,
+                    "metallb.universe.tf/allow-shared-ip": shared_ip_key,
+                },
+            },
+            "spec": {
+                "type": "LoadBalancer",
+                "selector": {"app": "sni-router"},
+                "ports": [{
+                    "name": "trustd",
+                    "port": TALOS_TRUSTD_PORT,
+                    "targetPort": TALOS_TRUSTD_PORT,
+                    "protocol": "TCP",
+                }],
+            },
+        },
+    ]
+
+
+async def ensure_talos_cluster_singletons(
+    k8s, *, shared_vip: str | None, metallb_pool: str, shared_ip_key: str,
+) -> dict[str, str]:
+    """Ensure the cluster-wide objects a Talos tenant depends on.
+
+    Idempotent, on demand, at the first Talos tenant — the same pattern the
+    VpcDns prerequisites use. The SNI router is built only in shared-VIP mode:
+    with a VIP per tenant, port 50001 goes on that tenant's own Service and
+    the router has nothing to do.
+
+    The Talos golden image is deliberately NOT created here. Which namespace
+    it belongs in is the operator's choice, not something to hardcode into a
+    cluster singleton.
+    """
+    from kubernetes_asyncio import client as k8s_client
+
+    results: dict[str, str] = {}
+
+    try:
+        await k8s.custom_api.create_namespaced_custom_object(
+            group=CAPI_OPERATOR_GROUP, version=CAPI_OPERATOR_VERSION,
+            namespace="capi-talos-bootstrap-system",
+            plural="bootstrapproviders", body=build_bootstrap_provider(),
+        )
+        results["BootstrapProvider"] = "created"
+        logger.info("Requested CABPT via BootstrapProvider 'talos'")
+    except ApiException as e:
+        if e.status == 409:
+            results["BootstrapProvider"] = "exists"
+        elif e.status == 404:
+            # capi-operator absent, or its namespace missing. Not fatal here:
+            # `assert_cabpt_installed` gives the caller a precise error before
+            # anything is created.
+            results["BootstrapProvider"] = "unavailable"
+            logger.warning(
+                "capi-operator not present; cannot request CABPT automatically"
+            )
+        else:
+            results["BootstrapProvider"] = f"failed: {e.reason}"
+            logger.warning(f"Could not create BootstrapProvider: {e}")
+
+    if not shared_vip:
+        results["sni-router"] = "skipped"
+        return results
+
+    for obj in build_sni_router(shared_vip, metallb_pool, shared_ip_key):
+        kind = obj["kind"]
+        try:
+            if kind == "Namespace":
+                await k8s.core_api.create_namespace(
+                    body=k8s_client.V1Namespace(
+                        metadata=k8s_client.V1ObjectMeta(**obj["metadata"]),
+                    ),
+                )
+            elif kind == "ConfigMap":
+                await k8s.core_api.create_namespaced_config_map(
+                    namespace=SNI_ROUTER_NAMESPACE,
+                    body=k8s_client.V1ConfigMap(
+                        metadata=k8s_client.V1ObjectMeta(**obj["metadata"]),
+                        data=obj["data"],
+                    ),
+                )
+            elif kind == "Deployment":
+                await k8s.apps_api.create_namespaced_deployment(
+                    namespace=SNI_ROUTER_NAMESPACE, body=obj,
+                )
+            elif kind == "Service":
+                await k8s.core_api.create_namespaced_service(
+                    namespace=SNI_ROUTER_NAMESPACE, body=obj,
+                )
+            results[kind] = "created"
+        except ApiException as e:
+            if e.status == 409:
+                # Never re-apply the ConfigMap: it carries the live route map,
+                # and overwriting it would cut every other Talos tenant off
+                # from its signer.
+                results[kind] = "exists"
+            else:
+                results[kind] = f"failed: {e.reason}"
+                logger.warning(f"SNI router {kind} ensure failed: {e}")
+
+    logger.info(f"Talos cluster singletons: {results}")
+    return results
+
+
 async def read_talos_secrets(k8s, tenant: str, namespace: str) -> dict[str, str]:
     """Read back the tenant's Talos secrets, decoded.
 
@@ -425,6 +679,55 @@ async def read_talos_secrets(k8s, tenant: str, namespace: str) -> dict[str, str]
         key: base64.b64decode(value).decode("utf-8")
         for key, value in data.items()
     }
+
+
+def build_talos_golden_dv(
+    tenant: str, namespace: str, image_url: str, size: str, storage_class: str | None,
+) -> dict[str, Any]:
+    """DataVolume importing the Talos golden image for this tenant.
+
+    CDI fetches the .raw.xz and decompresses it — no conversion step. Workers
+    then CSI-clone this one PVC rather than each importing over HTTP, which
+    inside a VPC would depend on DNS being up before the node exists.
+    """
+    storage: dict[str, Any] = {"resources": {"requests": {"storage": size}}}
+    if storage_class:
+        storage["storageClassName"] = storage_class
+    return {
+        "apiVersion": "cdi.kubevirt.io/v1beta1",
+        "kind": "DataVolume",
+        "metadata": {
+            "name": f"{tenant}-talos-golden",
+            "namespace": namespace,
+            "labels": {
+                **MANAGED_LABEL,
+                "kubevirt-ui.io/tenant": tenant,
+                "kubevirt-ui.io/talos-golden": "true",
+            },
+        },
+        "spec": {"source": {"http": {"url": image_url}}, "storage": storage},
+    }
+
+
+async def ensure_talos_golden_image(
+    k8s, tenant: str, namespace: str, *,
+    image_url: str | None = None,
+    size: str = "20Gi",
+    storage_class: str | None = None,
+) -> None:
+    """Import the Talos golden image into the tenant namespace if absent."""
+    url = image_url or TALOS_GOLDEN_IMAGE_URL
+    body = build_talos_golden_dv(tenant, namespace, url, size, storage_class)
+    try:
+        await k8s.custom_api.create_namespaced_custom_object(
+            group="cdi.kubevirt.io", version="v1beta1", namespace=namespace,
+            plural="datavolumes", body=body,
+        )
+        logger.info(f"Importing Talos golden image for {tenant!r} from {url}")
+    except ApiException as e:
+        if e.status != 409:
+            raise
+        logger.info(f"Talos golden image for {tenant!r} already present")
 
 
 async def ensure_talos_tenant_objects(k8s, tenant: str, namespace: str) -> None:

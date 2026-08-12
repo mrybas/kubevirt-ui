@@ -42,9 +42,21 @@ from app.api.v1.tenants_talos import (
     talos_control_plane_additions,
 )
 
-# Image of the Talos CSR signer sidecar. Mirrored per deployment (registry
-# policy, not a user choice), so it is an env knob rather than a request field.
-TALOS_SIGNER_IMAGE_DEFAULT = "ghcr.io/clastix/talos-csr-signer:v0.1.0"
+# Image of the Talos CSR signer sidecar. Pinned by digest, not by tag:
+# upstream publishes no versioned tags at all — `latest` is the only one that
+# exists — so a tag here is a moving target on a single-vendor image with no
+# alternative. This digest is the build the lab verified end to end.
+#
+# The cost of getting it wrong is unusually quiet: with no signer, Talos nodes
+# still join and run workloads, but `apid` waits forever — the cluster is
+# manageable through Kubernetes and unmanageable through Talos.
+#
+# Mirroring it into an internal registry is a deployment policy rather than a
+# user choice, hence an env knob (TALOS_SIGNER_IMAGE) and not a request field.
+TALOS_SIGNER_IMAGE_DEFAULT = (
+    "ghcr.io/clastix/talos-csr-signer"
+    "@sha256:827b62b5fc2859d66f06f5c1f8d2473ab7109d0600d551269d8ddb98e4a39a18"
+)
 
 
 def _talos_signer_image() -> str:
@@ -443,6 +455,31 @@ def _build_machine_deployment_cr(req: TenantCreateRequest) -> dict[str, Any]:
     }
 
 
+def talos_golden_pvc_name(req: TenantCreateRequest) -> str:
+    """PVC the Talos workers clone their root disk from."""
+    return f"{req.name}-talos-golden"
+
+
+def _build_worker_root_volume(req: TenantCreateRequest) -> dict[str, Any]:
+    """Root volume for a worker VM.
+
+    cloud-init workers boot a CAPK containerDisk — unchanged. Talos cannot:
+    it boots a disk image, and its machine config arrives through the
+    cloud-init disk KubeVirt attaches (which is what the `nocloud` image
+    variant reads). So its root comes from a clone of the imported golden
+    image instead.
+    """
+    if req.worker_os == "talos":
+        return {
+            "name": "root",
+            "dataVolume": {"name": talos_golden_pvc_name(req)},
+        }
+    return {
+        "name": "root",
+        "containerDisk": {"image": _resolve_worker_container_disk_image(req)},
+    }
+
+
 def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, Any]:
     ns = _tenant_ns(req.name)
 
@@ -536,12 +573,13 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
                                     "networks": networks,
                                     "evictionStrategy": "External",
                                     "volumes": [
-                                        {
-                                            "name": "root",
-                                            "containerDisk": {
-                                                "image": _resolve_worker_container_disk_image(req),
-                                            },
-                                        },
+                                        # Talos boots a disk image, not a
+                                        # containerDisk: the golden image is a
+                                        # nocloud raw.xz that CDI imports and
+                                        # each worker clones. cloud-init
+                                        # workers keep the containerDisk they
+                                        # have always used.
+                                        _build_worker_root_volume(req),
                                         {
                                             "name": "data",
                                             "emptyDisk": {

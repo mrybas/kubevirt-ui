@@ -300,3 +300,81 @@ class TestWorkerBinding:
         # the first node joins and the second cannot.
         with pytest.raises(ValueError, match="10.0.2.2"):
             validate_worker_binding("masquerade")
+
+
+class TestGoldenImage:
+    def test_default_url_is_the_nocloud_variant(self) -> None:
+        # nocloud is the platform that reads its machine config from the
+        # cloud-init disk KubeVirt attaches; any other variant never gets one.
+        from app.api.v1.tenants_talos import TALOS_GOLDEN_IMAGE_URL
+
+        assert "nocloud" in TALOS_GOLDEN_IMAGE_URL
+        assert TALOS_GOLDEN_IMAGE_URL.endswith(".raw.xz")
+
+    def test_dv_imports_over_http_and_cdi_decompresses(self) -> None:
+        from app.api.v1.tenants_talos import build_talos_golden_dv
+
+        dv = build_talos_golden_dv(TENANT, NS, "https://x/y.raw.xz", "20Gi", None)
+        assert dv["spec"]["source"]["http"]["url"] == "https://x/y.raw.xz"
+
+    def test_storage_class_is_optional(self) -> None:
+        from app.api.v1.tenants_talos import build_talos_golden_dv
+
+        without = build_talos_golden_dv(TENANT, NS, "u", "20Gi", None)
+        with_sc = build_talos_golden_dv(TENANT, NS, "u", "20Gi", "ceph-block")
+        assert "storageClassName" not in without["spec"]["storage"]
+        assert with_sc["spec"]["storage"]["storageClassName"] == "ceph-block"
+
+
+class TestSignerImage:
+    def test_default_is_pinned_by_digest(self) -> None:
+        # Upstream publishes no versioned tags — `latest` is the only one —
+        # so a tag would be a moving target on a single-vendor image.
+        from app.api.v1.tenants_capi import TALOS_SIGNER_IMAGE_DEFAULT
+
+        assert "@sha256:" in TALOS_SIGNER_IMAGE_DEFAULT
+        assert ":latest" not in TALOS_SIGNER_IMAGE_DEFAULT
+
+
+class TestClusterSingletons:
+    def test_bootstrap_provider_is_the_thin_capi_operator_cr(self) -> None:
+        from app.api.v1.tenants_talos import build_bootstrap_provider
+
+        cr = build_bootstrap_provider()
+        assert cr["kind"] == "BootstrapProvider"
+        assert cr["metadata"]["name"] == "talos"
+
+    def test_sni_router_never_terminates_tls(self) -> None:
+        # It reads the requested name with ssl_preread and forwards; it has no
+        # certificate and must not need one.
+        from app.api.v1.tenants_talos import build_sni_router
+
+        cm = next(o for o in build_sni_router("10.0.0.1", "pool", "key")
+                  if o["kind"] == "ConfigMap")
+        conf = cm["data"]["nginx.conf"]
+        assert "ssl_preread on" in conf
+        assert "ssl_certificate" not in conf
+
+    def test_sni_router_listens_on_the_fixed_trustd_port(self) -> None:
+        from app.api.v1.tenants_talos import build_sni_router
+
+        svc = next(o for o in build_sni_router("10.0.0.1", "pool", "key")
+                   if o["kind"] == "Service")
+        assert svc["spec"]["ports"][0]["port"] == TALOS_TRUSTD_PORT
+
+    def test_sni_router_shares_the_control_plane_vip(self) -> None:
+        from app.api.v1.tenants_talos import build_sni_router
+
+        svc = next(o for o in build_sni_router("10.0.0.1", "pool", "key")
+                   if o["kind"] == "Service")
+        ann = svc["metadata"]["annotations"]
+        assert ann["metallb.universe.tf/loadBalancerIPs"] == "10.0.0.1"
+        assert ann["metallb.universe.tf/allow-shared-ip"] == "key"
+
+    def test_route_map_starts_empty(self) -> None:
+        # Tenants add their own lines; ensure must never clobber them later.
+        from app.api.v1.tenants_talos import SNI_ROUTER_MAP_KEY, build_sni_router
+
+        cm = next(o for o in build_sni_router("10.0.0.1", "pool", "key")
+                  if o["kind"] == "ConfigMap")
+        assert cm["data"][SNI_ROUTER_MAP_KEY] == ""

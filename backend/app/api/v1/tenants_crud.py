@@ -93,8 +93,11 @@ from app.api.v1.tenants_storage import (
     schedule_credential_replication,
 )
 from app.api.v1.tenants_cp_ports import release_cp_ports
+from app.api.v1.tenants_capi import _cp_demux_vip, _cp_metallb_pool, _cp_shared_ip_key
 from app.api.v1.tenants_talos import (
     assert_cabpt_installed,
+    ensure_talos_cluster_singletons,
+    ensure_talos_golden_image,
     ensure_talos_tenant_objects,
     update_sni_router_map,
     validate_worker_binding,
@@ -880,7 +883,19 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         #     route must land before the first worker boots, or that worker
         #     loops on its CSR — so it goes in here, not after the VMs.
         if req.worker_os == "talos":
+            await ensure_talos_cluster_singletons(
+                k8s,
+                shared_vip=_cp_demux_vip(),
+                metallb_pool=_cp_metallb_pool(),
+                shared_ip_key=_cp_shared_ip_key(),
+            )
             await ensure_talos_tenant_objects(k8s, req.name, ns)
+            await ensure_talos_golden_image(
+                k8s, req.name, ns,
+                image_url=req.worker_image_url or None,
+                size=req.worker_image_size,
+                storage_class=req.storage_class or None,
+            )
             await update_sni_router_map(k8s, req.name, ns, add=True)
 
         # 3. Create CAPI resources + Ingress.
