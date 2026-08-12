@@ -357,6 +357,65 @@ def _host_service_cidr() -> str | None:
     return _require_cluster_config().get("host_service_cidr")
 
 
+# Label Kamaji stamps on the control-plane pods of a TenantControlPlane.
+KAMAJI_CP_POD_LABEL = "kamaji.clastix.io/name"
+
+
+async def restart_control_plane_pods(k8s, tenant_name: str) -> int:
+    """Restart a tenant's control-plane pods by deleting them.
+
+    Deliberately NOT `rollout restart`. Kamaji owns the Deployment and reverts
+    the pod-template annotation a rollout writes, so the rollout reports
+    success while the pods keep their original start time:
+
+        $ kubectl -n <ns> rollout restart deployment <tcp>
+        deployment "<tcp>" successfully rolled out
+        $ kubectl -n <ns> get pods -l kamaji.clastix.io/name=<tcp> \\
+            -o custom-columns=START:.status.startTime
+        2026-08-12T13:52:46Z        # unchanged
+
+    Deleting the pods lets the Deployment recreate them, which is the only way
+    to make a control-plane container pick up new material on disk. It matters
+    for anything that reads a file once at startup and never watches it — the
+    Talos CSR signer being the case that found this: after a certificate
+    change it keeps serving the old one, and the symptom is misleading,
+    because the kubelet still joins fine (that is the apiserver's certificate,
+    which Kamaji reloads itself) while Talos waits on `apid` forever.
+
+    Returns the number of pods deleted; 0 means nothing matched, which is not
+    an error (the control plane may not be up yet).
+    """
+    ns = _tenant_ns(tenant_name)
+    selector = f"{KAMAJI_CP_POD_LABEL}={tenant_name}"
+    try:
+        pods = await k8s.core_api.list_namespaced_pod(
+            namespace=ns, label_selector=selector,
+        )
+    except ApiException as e:
+        logger.warning(
+            f"Could not list control-plane pods for tenant {tenant_name!r}: {e}"
+        )
+        raise
+
+    deleted = 0
+    for pod in pods.items:
+        name = pod.metadata.name
+        try:
+            await k8s.core_api.delete_namespaced_pod(name=name, namespace=ns)
+            deleted += 1
+        except ApiException as e:
+            if e.status == 404:
+                continue  # raced with something else deleting it
+            logger.warning(f"Could not delete control-plane pod {ns}/{name}: {e}")
+            raise
+
+    logger.info(
+        f"Restarted {deleted} control-plane pod(s) for tenant {tenant_name!r} "
+        f"(selector {selector})"
+    )
+    return deleted
+
+
 def find_tenant_cidr_conflicts(
     service_cidr: str,
     pod_cidr: str,
