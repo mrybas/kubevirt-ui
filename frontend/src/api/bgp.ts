@@ -10,6 +10,9 @@ import type {
   AnnouncementRequest,
   AnnouncementResponse,
   BGPSessionResponse,
+  BgpConfListResponse,
+  BgpConfRequest,
+  BgpConfResponse,
   GatewayConfigExample,
 } from '../types/bgp';
 
@@ -51,4 +54,16 @@ export type { GatewayConfigExample };
 
 export async function getGatewayConfigExamples(): Promise<GatewayConfigExample[]> {
   return apiRequest<GatewayConfigExample[]>(`${BASE}/gateway-config`);
+}
+
+export async function listBgpConfs(): Promise<BgpConfListResponse> {
+  return apiRequest<BgpConfListResponse>('/bgp/confs');
+}
+
+export async function upsertBgpConf(request: BgpConfRequest): Promise<BgpConfResponse> {
+  return apiRequest<BgpConfResponse>('/bgp/confs', { method: 'PUT', body: request });
+}
+
+export async function deleteBgpConf(name: string): Promise<void> {
+  await apiRequest<void>(`/bgp/confs/${name}`, { method: 'DELETE' });
 }

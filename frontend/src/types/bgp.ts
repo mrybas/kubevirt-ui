@@ -54,3 +54,39 @@ export interface GatewayConfigExample {
   description: string;
   config: string;
 }
+
+// ============================================================================
+// BgpConf — the FRR config a VpcEgressGateway peers with
+// ============================================================================
+//
+// Distinct from the speaker DaemonSet above: the speaker announces
+// pod/service/EIP routes from the nodes, BgpConf configures the FRR inside an
+// egress gateway, which announces the VPC's own subnets. One shared config
+// serves every gateway — router-id is left unset so FRR derives a unique one
+// per gateway from its internal address.
+
+export interface BgpConfRequest {
+  name?: string;
+  local_asn: number;
+  peer_asn: number;
+  neighbours: string[];
+  graceful_restart?: boolean;
+  hold_time?: string;
+  keepalive_time?: string;
+}
+
+export interface BgpConfResponse {
+  name: string;
+  local_asn: number;
+  peer_asn: number;
+  neighbours: string[];
+  graceful_restart: boolean;
+  hold_time: string;
+  keepalive_time: string;
+  router_id: string;
+}
+
+export interface BgpConfListResponse {
+  items: BgpConfResponse[];
+  total: number;
+}

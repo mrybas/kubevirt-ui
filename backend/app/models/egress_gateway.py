@@ -56,6 +56,32 @@ class EgressGatewayCreateRequest(BaseModel):
     )
     replicas: int = Field(2, ge=1, le=10, description="Number of egress gateway pod replicas")
     bfd_enabled: bool = Field(False, description="Enable BFD for fast failover (requires OVN BFD support)")
+    # --- BGP / routed tenants ------------------------------------------
+    bgp_conf: Optional[str] = Field(
+        None,
+        description=(
+            "Name of the BgpConf this gateway's FRR runs with (see "
+            "GET /bgp/confs). Without it the gateway never peers and the VPC "
+            "is reachable only via NAT plus hand-written static routes."
+        ),
+    )
+    snat: bool = Field(
+        True,
+        description=(
+            "Masquerade traffic behind the gateway address. Set false for a "
+            "routed tenant: SNAT hides the tenant prefix, which makes a BGP "
+            "announcement of that prefix pointless."
+        ),
+    )
+    external_ips: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Pin the gateway's external addresses instead of letting the "
+            "subnet allocate them. The upstream router needs a `neighbor "
+            "<addr>` stanza per gateway, so an unpredictable address means "
+            "the peering cannot be configured ahead of time."
+        ),
+    )
     node_selector: dict[str, str] = Field(
         default_factory=dict,
         description="Node selector for egress gateway pods",

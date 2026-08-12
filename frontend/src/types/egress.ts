@@ -53,6 +53,12 @@ export interface CreateEgressGatewayRequest {
   bfd_enabled: boolean;
   node_selector: Record<string, string>;
   exclude_ips?: string[];
+  /** BgpConf this gateway's FRR runs with. Without it the VPC never peers. */
+  bgp_conf?: string;
+  /** false = routed tenant; SNAT would hide the prefix the VPC announces. */
+  snat?: boolean;
+  /** Pin the external address so the upstream router's neighbor stanza is knowable. */
+  external_ips?: string[];
 }
 
 export interface AttachVpcRequest {

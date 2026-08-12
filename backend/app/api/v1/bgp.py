@@ -17,6 +17,9 @@ from app.core.errors import k8s_error_to_http
 from app.models.bgp import (
     AnnouncementRequest,
     AnnouncementResponse,
+    BgpConfListResponse,
+    BgpConfRequest,
+    BgpConfResponse,
     BGPSessionResponse,
     GatewayConfigExample,
     SpeakerDeployRequest,
@@ -759,3 +762,157 @@ async def get_gateway_config_examples(
             node_ips = ["<NODE_IP_1>", "<NODE_IP_2>"]
 
     return _generate_gateway_examples(cluster_as, neighbor_as, node_ips, gateway_ip)
+
+
+# ============================================================================
+# BgpConf — the FRR config a VpcEgressGateway peers with
+# ============================================================================
+#
+# Separate mechanism from the speaker DaemonSet above. The speaker announces
+# pod/service/EIP routes from the nodes; BgpConf configures the FRR running
+# inside each VpcEgressGateway, which is what announces the VPC's own subnets.
+# A gateway without `spec.bgpConf` never peers, so a UI-created VPC is
+# reachable only via NAT and hand-written static routes.
+
+BGPCONF_PLURAL = "bgp-confs"
+DEFAULT_BGPCONF_NAME = "lab-gateway-common"
+
+
+def _parse_bgpconf(item: dict[str, Any]) -> BgpConfResponse:
+    spec = item.get("spec", {})
+    return BgpConfResponse(
+        name=item.get("metadata", {}).get("name", ""),
+        local_asn=spec.get("localASN", 0),
+        peer_asn=spec.get("peerASN", 0),
+        neighbours=spec.get("neighbours", []),
+        graceful_restart=spec.get("gracefulRestart", True),
+        hold_time=spec.get("holdTime", ""),
+        keepalive_time=spec.get("keepaliveTime", ""),
+        router_id=spec.get("routerId", ""),
+    )
+
+
+def _build_bgpconf_spec(data: BgpConfRequest) -> dict[str, Any]:
+    """Spec for a BgpConf CR.
+
+    `routerId` is deliberately absent — see BgpConfRequest. FRR then derives
+    one per gateway from its internal address, so a single shared config works
+    for every gateway; pinning one here would hand them all the same id.
+    """
+    return {
+        "localASN": data.local_asn,
+        "peerASN": data.peer_asn,
+        "neighbours": data.neighbours,
+        "gracefulRestart": data.graceful_restart,
+        "holdTime": data.hold_time,
+        "keepaliveTime": data.keepalive_time,
+    }
+
+
+@router.get("/confs", response_model=BgpConfListResponse)
+async def list_bgp_confs(
+    request: Request, user: User = Depends(require_auth),
+) -> BgpConfListResponse:
+    """List BgpConf resources (the configs egress gateways can reference)."""
+    k8s = request.app.state.k8s_client
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural=BGPCONF_PLURAL,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            # CRD absent — kube-ovn too old, or the feature is not installed.
+            return BgpConfListResponse(items=[], total=0)
+        raise k8s_error_to_http(e, "listing BgpConf")
+
+    items = [_parse_bgpconf(i) for i in result.get("items", [])]
+    return BgpConfListResponse(items=items, total=len(items))
+
+
+@router.get("/confs/{name}", response_model=BgpConfResponse)
+async def get_bgp_conf(
+    request: Request, name: str, user: User = Depends(require_auth),
+) -> BgpConfResponse:
+    """Get one BgpConf."""
+    k8s = request.app.state.k8s_client
+    try:
+        item = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural=BGPCONF_PLURAL, name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=404, detail=f"BgpConf '{name}' not found")
+        raise k8s_error_to_http(e, "reading BgpConf")
+    return _parse_bgpconf(item)
+
+
+@router.put("/confs", response_model=BgpConfResponse)
+async def upsert_bgp_conf(
+    request: Request, data: BgpConfRequest, user: User = Depends(require_admin),
+) -> BgpConfResponse:
+    """Create or update the shared BgpConf.
+
+    Idempotent by design: this is the one object every egress gateway points
+    at, so re-running the platform setup should converge rather than 409.
+    """
+    k8s = request.app.state.k8s_client
+    manifest = {
+        "apiVersion": f"{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}",
+        "kind": "BgpConf",
+        "metadata": {
+            "name": data.name,
+            "labels": {"kubevirt-ui.io/managed": "true"},
+        },
+        "spec": _build_bgpconf_spec(data),
+    }
+
+    try:
+        existing = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural=BGPCONF_PLURAL, name=data.name,
+        )
+        manifest["metadata"]["resourceVersion"] = (
+            existing.get("metadata", {}).get("resourceVersion")
+        )
+        item = await k8s.custom_api.replace_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural=BGPCONF_PLURAL, name=data.name, body=manifest,
+        )
+        logger.info(f"Updated BgpConf {data.name!r}")
+    except ApiException as e:
+        if e.status != 404:
+            raise k8s_error_to_http(e, "updating BgpConf")
+        try:
+            item = await k8s.custom_api.create_cluster_custom_object(
+                group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+                plural=BGPCONF_PLURAL, body=manifest,
+            )
+            logger.info(f"Created BgpConf {data.name!r}")
+        except ApiException as create_err:
+            raise k8s_error_to_http(create_err, "creating BgpConf")
+
+    return _parse_bgpconf(item)
+
+
+@router.delete("/confs/{name}")
+async def delete_bgp_conf(
+    request: Request, name: str, user: User = Depends(require_admin),
+) -> dict[str, str]:
+    """Delete a BgpConf.
+
+    Gateways referencing it keep running but stop peering, so their VPCs fall
+    back to NAT-only reachability.
+    """
+    k8s = request.app.state.k8s_client
+    try:
+        await k8s.custom_api.delete_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural=BGPCONF_PLURAL, name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=404, detail=f"BgpConf '{name}' not found")
+        raise k8s_error_to_http(e, "deleting BgpConf")
+    return {"message": f"BgpConf '{name}' deleted"}

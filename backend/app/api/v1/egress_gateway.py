@@ -530,9 +530,18 @@ async def create_egress_gateway(
         "prefix": data.name,
         "internalSubnet": gw_subnet_name,
         "externalSubnet": external_subnet_name,
-        "policies": [{"snat": True, "subnets": [gw_subnet_name]}],
+        # These are the SOURCES whose egress goes through the gateway, not
+        # destinations — a 0.0.0.0/0 here would also match return traffic and
+        # bounce replies off the gateway.
+        "policies": [{"snat": data.snat, "subnets": [gw_subnet_name]}],
         "bfd": {"enabled": data.bfd_enabled},
     }
+    if data.external_ips:
+        veg_spec["externalIPs"] = data.external_ips
+    if data.bgp_conf:
+        # Makes the gateway run FRR and announce the VPC's subnets. Without
+        # it the VPC is NAT-only no matter what the upstream router is told.
+        veg_spec["bgpConf"] = data.bgp_conf
     if data.node_selector:
         veg_spec["nodeSelector"] = [{"matchLabels": data.node_selector}]
 
@@ -933,20 +942,47 @@ async def _update_veg_policies(
     add_cidr: str | None = None,
     remove_cidr: str | None = None,
 ) -> None:
-    """Add or remove a CIDR from VpcEgressGateway SNAT policies."""
+    """Add or remove a CIDR from the gateway's egress policies.
+
+    Policies carry source ranges under `ipBlocks` (or `subnets`, for a named
+    subnet). This used to write `{"cidr": ..., "snat": true}` — a key the CRD
+    has no such field for, so kube-ovn ignored it and an attached tenant's
+    traffic never actually went through the gateway, while the object looked
+    correctly patched.
+
+    `snat` is inherited from the gateway's existing policies rather than
+    forced on: a routed tenant runs snat=false on purpose, and hardcoding
+    true here would masquerade it back behind the gateway address and undo
+    the BGP announcement.
+    """
     veg = await _get_vpc_egress_gateway(k8s, gateway_name)
     if not veg:
         logger.warning(f"VpcEgressGateway '{gateway_name}' not found for policy update")
         return
 
     policies = veg.get("spec", {}).get("policies", [])
-    existing_cidrs = {p.get("cidr") for p in policies if isinstance(p, dict)}
+
+    def _blocks(policy: dict) -> list[str]:
+        return policy.get("ipBlocks", []) if isinstance(policy, dict) else []
+
+    existing_cidrs = {cidr for p in policies for cidr in _blocks(p)}
+    snat = next(
+        (p.get("snat", True) for p in policies if isinstance(p, dict)), True,
+    )
 
     if add_cidr and add_cidr not in existing_cidrs:
-        policies.append({"cidr": add_cidr, "snat": True})
+        policies.append({"snat": snat, "ipBlocks": [add_cidr]})
 
     if remove_cidr:
-        policies = [p for p in policies if p.get("cidr") != remove_cidr]
+        for policy in policies:
+            if isinstance(policy, dict) and remove_cidr in _blocks(policy):
+                policy["ipBlocks"] = [c for c in policy["ipBlocks"] if c != remove_cidr]
+        # Drop policies whose last ipBlock just went away, but keep
+        # subnet-based ones (they have no ipBlocks to begin with).
+        policies = [
+            p for p in policies
+            if not (isinstance(p, dict) and "ipBlocks" in p and not p["ipBlocks"])
+        ]
 
     patch = {"spec": {"policies": policies}}
 

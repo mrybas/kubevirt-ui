@@ -58,3 +58,72 @@ class GatewayConfigExample(BaseModel):
     title: str
     description: str
     config: str  # config file content
+
+
+# ============================================================================
+# BgpConf — FRR config for VpcEgressGateway
+# ============================================================================
+#
+# Distinct from the SpeakerDeployRequest above: `kube-ovn-speaker` is a
+# DaemonSet that announces pod/service/EIP routes from the nodes. `BgpConf` is
+# a cluster-scoped CR that configures the FRR running *inside* a
+# VpcEgressGateway, which is what announces a VPC's own subnets. A gateway
+# with no `spec.bgpConf` never peers at all.
+#
+# One BgpConf serves every gateway: ASNs, neighbours and timers are properties
+# of the upstream router, not of a VPC. Verified with four gateways sharing
+# one config — all four sessions Established, all routes present.
+
+
+class BgpConfRequest(BaseModel):
+    """Create/update the shared BGP configuration for egress gateways."""
+
+    name: str = Field(
+        "lab-gateway-common",
+        min_length=1,
+        max_length=63,
+        pattern=r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$",
+        description="BgpConf resource name. One shared config serves every gateway.",
+    )
+    local_asn: int = Field(..., ge=1, le=4294967295, description="Our ASN")
+    peer_asn: int = Field(..., ge=1, le=4294967295, description="Upstream router ASN")
+    neighbours: list[str] = Field(
+        ...,
+        min_length=1,
+        description="Upstream BGP neighbour addresses",
+    )
+    graceful_restart: bool = Field(True, description="Enable BGP graceful restart")
+    hold_time: str = Field("30s", description="BGP hold timer")
+    keepalive_time: str = Field("10s", description="BGP keepalive timer")
+
+    # NOTE: no router_id. Left unset, FRR derives one per gateway from its
+    # internal address, which is unique as long as VPC CIDRs do not overlap —
+    # and they cannot, because allocation is centralised and explicit CIDRs
+    # are checked for overlap on create. Pinning one here would give every
+    # gateway the same id, which the peer rejects within a single AS.
+
+    @field_validator("neighbours")
+    @classmethod
+    def validate_neighbours(cls, v: list[str]) -> list[str]:
+        for addr in v:
+            try:
+                ipaddress.ip_address(addr)
+            except ValueError as e:
+                raise ValueError(f"Invalid neighbour address {addr!r}: {e}")
+        return v
+
+
+class BgpConfResponse(BaseModel):
+    name: str
+    local_asn: int = 0
+    peer_asn: int = 0
+    neighbours: list[str] = []
+    graceful_restart: bool = True
+    hold_time: str = ""
+    keepalive_time: str = ""
+    router_id: str = ""  # only set if somebody pinned one out-of-band
+
+
+class BgpConfListResponse(BaseModel):
+    items: list[BgpConfResponse]
+    total: int
