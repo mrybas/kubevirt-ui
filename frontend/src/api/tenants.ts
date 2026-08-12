@@ -9,6 +9,8 @@ import type {
   TenantKubeconfigResponse,
   TenantListResponse,
   TenantScaleRequest,
+  TenantStorageReconcileResponse,
+  TenantStorageStatus,
 } from '@/types/tenant';
 import type { GoldenImageListResponse } from '@/types/template';
 
@@ -43,6 +45,18 @@ export async function getTenantKubeconfig(
   type: 'admin' | 'oidc' = 'admin',
 ): Promise<TenantKubeconfigResponse> {
   return apiRequest<TenantKubeconfigResponse>(`/tenants/${name}/kubeconfig?type=${type}`);
+}
+
+export async function getTenantStorageStatus(name: string): Promise<TenantStorageStatus> {
+  return apiRequest<TenantStorageStatus>(`/tenants/${name}/storage/status`);
+}
+
+export async function reconcileTenantStorage(
+  name: string,
+): Promise<TenantStorageReconcileResponse> {
+  return apiRequest<TenantStorageReconcileResponse>(`/tenants/${name}/storage/reconcile`, {
+    method: 'POST',
+  });
 }
 
 export async function getAddonCatalog(): Promise<AddonCatalog> {

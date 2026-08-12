@@ -42,7 +42,7 @@ from kubernetes_asyncio import client, config
 from kubernetes_asyncio.client import ApiException
 
 from app.core.kube_api_url import discover_external_api_url
-from app.models.tenant import TenantCreateRequest
+from app.models.tenant import TenantCreateRequest, TenantStorageStatus
 
 from app.api.v1.tenants_common import _tenant_ns
 
@@ -797,3 +797,143 @@ async def replicate_csi_credentials_to_tenant(k8s, tenant_name: str) -> bool:
         return True
     finally:
         await tenant_core.api_client.close()
+
+
+# ---------------------------------------------------------------------------
+# Storage wiring status + background completion
+# ---------------------------------------------------------------------------
+
+async def _secret_exists(core_api, name: str, ns: str) -> bool:
+    try:
+        await core_api.read_namespaced_secret(name=name, namespace=ns)
+        return True
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        raise
+
+
+async def get_storage_status(k8s, tenant_name: str) -> TenantStorageStatus:
+    """Report how far the CSI passthrough wiring got for one tenant.
+
+    Cheap enough to poll: three secret reads in the host cluster plus one
+    in the tenant (skipped when the tenant CP isn't reachable).
+    """
+    ns = _tenant_ns(tenant_name)
+    core_api = client.CoreV1Api(k8s._api_client)
+
+    host_ready = await _secret_exists(core_api, CSI_KUBECONFIG_SECRET_NAME, ns)
+    capk_ready = await _secret_exists(core_api, CAPK_KUBECONFIG_SECRET_NAME, ns)
+
+    if not host_ready:
+        return TenantStorageStatus(
+            tenant=tenant_name,
+            phase="disabled",
+            detail=(
+                "Tenant storage is not enabled — the host-side CSI "
+                "credentials were never created."
+            ),
+        )
+
+    tenant_core = await _build_tenant_core_api(k8s, tenant_name)
+    if tenant_core is None:
+        return TenantStorageStatus(
+            tenant=tenant_name,
+            phase="pending",
+            host_credentials_ready=True,
+            capk_credentials_ready=capk_ready,
+            detail=(
+                "Tenant control plane not reachable yet. The CSI controller "
+                "stays in ContainerCreating until the credentials land; "
+                "this finishes on its own, or run reconcile now."
+            ),
+        )
+
+    try:
+        replicated = await _secret_exists(
+            tenant_core, CSI_KUBECONFIG_SECRET_NAME, TENANT_DRIVER_NAMESPACE,
+        )
+    finally:
+        await tenant_core.api_client.close()
+
+    return TenantStorageStatus(
+        tenant=tenant_name,
+        phase="ready" if replicated else "pending",
+        host_credentials_ready=True,
+        capk_credentials_ready=capk_ready,
+        tenant_reachable=True,
+        credentials_replicated=replicated,
+        detail=(
+            "Storage wiring complete."
+            if replicated
+            else "Tenant is up but the credentials have not been replicated "
+                 "yet — run reconcile to finish now."
+        ),
+    )
+
+
+# Cumulative ~23 min, front-loaded: a tenant CP is usually reachable within
+# a couple of minutes, and anything past that is a real problem the operator
+# should see (the reconcile endpoint stays available either way).
+REPLICATION_RETRY_DELAYS_SEC = (20, 30, 30, 60, 60, 120, 180, 300, 300, 300)
+
+# Strong refs to in-flight retry tasks — asyncio only holds weak ones, so
+# without this the loop can be garbage-collected mid-wait.
+_replication_tasks: set[asyncio.Task] = set()
+
+
+async def _retry_credential_replication(k8s, tenant_name: str) -> None:
+    """Keep retrying replication until it lands, the tenant is gone, or we
+    run out of attempts. Never raises — this runs detached."""
+    ns = _tenant_ns(tenant_name)
+    for attempt, delay in enumerate(REPLICATION_RETRY_DELAYS_SEC, start=1):
+        await asyncio.sleep(delay)
+
+        try:
+            await k8s.core_api.read_namespace(name=ns)
+        except ApiException as e:
+            if e.status == 404:
+                logger.info(
+                    f"Tenant {tenant_name!r} disappeared — abandoning CSI "
+                    "credential replication"
+                )
+                return
+        except Exception as exc:
+            logger.warning(
+                f"Tenant {tenant_name!r}: could not check namespace before "
+                f"CSI replication retry {attempt}: {exc}"
+            )
+            continue
+
+        try:
+            if await replicate_csi_credentials_to_tenant(k8s, tenant_name):
+                logger.info(
+                    f"Tenant {tenant_name!r}: CSI credentials replicated on "
+                    f"background retry {attempt}"
+                )
+                return
+        except Exception as exc:
+            logger.warning(
+                f"Tenant {tenant_name!r}: CSI replication retry {attempt} "
+                f"failed: {exc}"
+            )
+
+    logger.warning(
+        f"Tenant {tenant_name!r}: CSI credentials still not replicated after "
+        f"{len(REPLICATION_RETRY_DELAYS_SEC)} attempts. The tenant's CSI "
+        "controller will stay in ContainerCreating until "
+        f"POST /tenants/{tenant_name}/storage/reconcile succeeds."
+    )
+
+
+def schedule_credential_replication(k8s, tenant_name: str) -> None:
+    """Fire-and-forget background completion of the storage wiring.
+
+    Create-time replication normally defers (cold control plane), and
+    leaving it there means the operator has to know to call reconcile. This
+    drives it to completion instead; the endpoint and the UI button remain
+    as the manual escape hatch.
+    """
+    task = asyncio.create_task(_retry_credential_replication(k8s, tenant_name))
+    _replication_tasks.add(task)
+    task.add_done_callback(_replication_tasks.discard)

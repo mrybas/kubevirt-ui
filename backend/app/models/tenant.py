@@ -336,6 +336,26 @@ class StoragePoolInfo(BaseModel):
     node_count: int = 0
 
 
+class TenantStorageStatus(BaseModel):
+    """State of the CSI passthrough wiring for one tenant.
+
+    `credentials_replicated` is the step that needs the tenant control
+    plane up, so it lags tenant create; until it flips the tenant's CSI
+    controller sits in ContainerCreating on a missing secret.
+    """
+
+    tenant: str
+    # "disabled" — storage was never enabled for this tenant
+    # "pending"  — host side done, tenant side not wired yet
+    # "ready"    — both sides wired
+    phase: str
+    host_credentials_ready: bool = False
+    capk_credentials_ready: bool = False
+    tenant_reachable: bool = False
+    credentials_replicated: bool = False
+    detail: str = ""
+
+
 class StorageClassInfo(BaseModel):
     """A host-cluster StorageClass offered to the tenant wizard."""
 

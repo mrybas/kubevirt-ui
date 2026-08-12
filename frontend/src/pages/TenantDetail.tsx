@@ -28,6 +28,7 @@ import {
   Square,
   RotateCw,
   Terminal,
+  HardDrive,
 } from 'lucide-react';
 import {
   useTenant,
@@ -39,6 +40,8 @@ import {
   useDisableAddon,
   useTenantImages,
   useDeleteTenantImage,
+  useTenantStorageStatus,
+  useReconcileTenantStorage,
 } from '../hooks/useTenants';
 import { useVMs, useStartVM, useStopVM, useRestartVM, useDeleteVM } from '../hooks/useVMs';
 import { ConfirmDeleteModal } from '../components/common/ConfirmDeleteModal';
@@ -79,6 +82,61 @@ function ConditionRow({ condition }: { condition: TenantCondition }) {
       <td className="py-2 pr-4 text-xs text-surface-400">{condition.reason}</td>
       <td className="py-2 text-xs text-surface-500">{condition.message}</td>
     </tr>
+  );
+}
+
+/**
+ * Storage wiring (kubevirt-csi passthrough).
+ *
+ * Replicating `infra-cluster-credentials` into the tenant needs its control
+ * plane up, so it lags create by minutes. Until it lands the tenant's CSI
+ * controller sits in ContainerCreating on a missing secret, which reads like
+ * a broken deploy — hence the explicit pending state. The backend retries in
+ * the background; the button is the manual escape hatch.
+ */
+function StorageWiringCard({ tenantName }: { tenantName: string }) {
+  const { data: status } = useTenantStorageStatus(tenantName);
+  const reconcile = useReconcileTenantStorage(tenantName);
+
+  if (!status || status.phase === 'disabled') return null;
+
+  if (status.phase === 'ready') {
+    return (
+      <div className="flex items-center gap-2 px-4 py-2 bg-emerald-500/5 border border-emerald-500/20 rounded-lg">
+        <HardDrive className="h-4 w-4 text-emerald-400 shrink-0" />
+        <p className="text-sm text-emerald-300">Storage wiring complete</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-start gap-3 p-4 bg-amber-500/5 border border-amber-500/20 rounded-lg">
+      <HardDrive className="h-5 w-5 text-amber-400 mt-0.5 shrink-0" />
+      <div className="flex-1">
+        <p className="text-sm text-amber-300 font-medium">Storage wiring pending</p>
+        <p className="text-xs text-amber-400/70 mt-1">{status.detail}</p>
+        {reconcile.isError && (
+          <p className="text-xs text-red-400 mt-1">
+            {reconcile.error instanceof Error ? reconcile.error.message : 'Reconcile failed'}
+          </p>
+        )}
+        {reconcile.isSuccess && !reconcile.data.credentials_replicated && (
+          <p className="text-xs text-amber-400/70 mt-1">{reconcile.data.detail}</p>
+        )}
+      </div>
+      <button
+        onClick={() => reconcile.mutate()}
+        disabled={reconcile.isPending}
+        className="btn-secondary text-sm shrink-0 disabled:opacity-50"
+      >
+        {reconcile.isPending ? (
+          <Loader2 className="h-4 w-4 animate-spin" />
+        ) : (
+          <RefreshCw className="h-4 w-4" />
+        )}
+        Reconcile now
+      </button>
+    </div>
   );
 }
 
@@ -357,6 +415,9 @@ export default function TenantDetail() {
         }
         return null;
       })()}
+
+      {/* Storage wiring (kubevirt-csi passthrough) */}
+      {name && <StorageWiringCard tenantName={name} />}
 
       {/* Workers + Scale */}
       <div className="card">

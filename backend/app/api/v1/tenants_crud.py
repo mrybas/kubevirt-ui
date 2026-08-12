@@ -48,6 +48,7 @@ from app.models.tenant import (
     TenantListResponse,
     TenantResponse,
     TenantScaleRequest,
+    TenantStorageStatus,
 )
 from app.models.template import GoldenImage, GoldenImageCreate, GoldenImageListResponse
 
@@ -86,7 +87,9 @@ from app.api.v1.tenants_storage import (
     CSI_KUBECONFIG_SECRET_NAME,
     create_csi_infrastructure_resources,
     delete_csi_cluster_role_binding,
+    get_storage_status,
     replicate_csi_credentials_to_tenant,
+    schedule_credential_replication,
 )
 from app.api.v1.tenants_cp_ports import release_cp_ports
 
@@ -910,19 +913,24 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         # defers to the storage-reconcile path (POST .../storage/reconcile)
         # — hence we swallow failures and never block tenant create.
         if req.enable_storage:
+            ok = False
             try:
                 ok = await replicate_csi_credentials_to_tenant(k8s, req.name)
-                if not ok:
-                    logger.info(
-                        f"Tenant {req.name!r}: CSI credential replication "
-                        "deferred (control plane not reachable yet); run "
-                        "POST /tenants/{name}/storage/reconcile once it's up."
-                    )
             except Exception as exc:
                 logger.warning(
                     f"Tenant {req.name!r}: CSI credential replication "
                     f"errored (non-fatal): {exc}"
                 )
+            if not ok:
+                # Retry in the background until the control plane comes up,
+                # so the tenant finishes wiring itself instead of sitting in
+                # ContainerCreating until somebody calls reconcile by hand.
+                logger.info(
+                    f"Tenant {req.name!r}: CSI credential replication "
+                    "deferred (control plane not reachable yet); retrying in "
+                    "the background"
+                )
+                schedule_credential_replication(k8s, req.name)
 
         # Return initial status
         return TenantResponse(
@@ -1194,6 +1202,25 @@ async def scale_tenant(
         raise k8s_error_to_http(e, "tenant operation")
 
     return await get_tenant(request, name)
+
+
+@router.get("/{name}/storage/status", response_model=TenantStorageStatus)
+async def get_tenant_storage_status(
+    request: Request, name: str, user: User = Depends(require_auth),
+) -> TenantStorageStatus:
+    """Report whether the CSI passthrough wiring finished for this tenant.
+
+    Backs the UI's storage-wiring indicator: the credential replication step
+    needs the tenant control plane up, so it lags create by a few minutes,
+    and while it's outstanding the tenant's CSI controller is stuck on a
+    missing secret — which reads like a broken deploy unless it's surfaced.
+    """
+    k8s = request.app.state.k8s_client
+    ns = _tenant_ns(name)
+    if not await _namespace_exists(k8s, ns):
+        raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
+
+    return await get_storage_status(k8s, name)
 
 
 @router.post("/{name}/storage/reconcile")

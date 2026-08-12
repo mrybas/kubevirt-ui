@@ -10,6 +10,8 @@ import {
   deleteTenant,
   scaleTenant,
   getTenantKubeconfig,
+  getTenantStorageStatus,
+  reconcileTenantStorage,
   getAddonCatalog,
   getDiscovery,
   enableAddon,
@@ -77,6 +79,28 @@ export function useTenantKubeconfig(name: string | undefined, type: 'admin' | 'o
     queryKey: ['tenants', name, 'kubeconfig', type],
     queryFn: () => getTenantKubeconfig(name!, type),
     enabled: false, // manual fetch only
+  });
+}
+
+export function useTenantStorageStatus(name: string | undefined) {
+  return useQuery({
+    queryKey: ['tenants', name, 'storage-status'],
+    queryFn: () => getTenantStorageStatus(name!),
+    enabled: !!name,
+    // The wiring completes on its own once the tenant CP is up (the backend
+    // retries in the background), so poll while it's outstanding.
+    refetchInterval: query => (query.state.data?.phase === 'pending' ? 15000 : false),
+  });
+}
+
+export function useReconcileTenantStorage(tenantName: string) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: () => reconcileTenantStorage(tenantName),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tenants', tenantName, 'storage-status'] });
+    },
   });
 }
 

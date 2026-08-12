@@ -145,6 +145,22 @@ export interface StoragePoolInfo {
   node_count: number;
 }
 
+export interface TenantStorageStatus {
+  tenant: string;
+  phase: 'disabled' | 'pending' | 'ready';
+  host_credentials_ready: boolean;
+  capk_credentials_ready: boolean;
+  tenant_reachable: boolean;
+  credentials_replicated: boolean;
+  detail: string;
+}
+
+export interface TenantStorageReconcileResponse {
+  tenant: string;
+  credentials_replicated: boolean;
+  detail: string;
+}
+
 export interface StorageClassInfo {
   name: string;
   provisioner: string;
