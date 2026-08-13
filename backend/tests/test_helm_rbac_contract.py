@@ -152,3 +152,69 @@ def test_the_template_is_parseable(rules: list[dict]) -> None:
     # Guards the stripping above: if the template grows a construct this
     # cannot handle, fail loudly here rather than silently checking nothing.
     assert len(rules) > 10
+
+
+# ---------------------------------------------------------------------------
+# Anti-escalation: we can only grant what we already hold
+# ---------------------------------------------------------------------------
+
+def _rules_we_grant() -> list[tuple[str, str, str, str]]:
+    """Every (group, resource, verb) the code puts into a Role it creates.
+
+    Derived from the builders themselves rather than restated here, because a
+    hand-kept list is exactly what drifted: the write verbs were added to
+    `_capk_role_rules` and the chart's ClusterRole was never widened to match.
+    """
+    from app.api.v1.tenants_storage import (
+        _capk_role_rules,
+        _csi_role_rules,
+    )
+
+    out: list[tuple[str, str, str, str]] = []
+    for source, builder in (
+        ("capk-infra", _capk_role_rules),
+        ("kubevirt-csi", _csi_role_rules),
+    ):
+        for rule in builder():
+            for group in rule.get("apiGroups", [""]):
+                for resource in rule.get("resources", []):
+                    for verb in rule.get("verbs", []):
+                        out.append((group, resource, verb, source))
+    return out
+
+
+@pytest.mark.parametrize(
+    "group,resource,verb,source",
+    _rules_we_grant(),
+    ids=lambda v: str(v),
+)
+def test_we_hold_every_permission_we_grant(
+    rules: list[dict], group: str, resource: str, verb: str, source: str,
+) -> None:
+    """Kubernetes refuses to let a subject grant rights it does not hold.
+
+    Creating a tenant with storage builds the namespaced `capk-infra` Role in
+    `tenant-<name>`, and the API server checks each rule against what the UI's
+    ServiceAccount holds *in that namespace* — which means the cluster-wide
+    ClusterRole, since the UI has no Role there. Verbs held only in the UI's
+    own namespaced Role do not count.
+
+    On the cluster that failure reads:
+
+        roles.rbac.authorization.k8s.io "capk-infra" is forbidden: user
+        "system:serviceaccount:kubevirt-ui-system:kubevirt-ui" is attempting
+        to grant RBAC permissions not currently held:
+        {APIGroups:[""], Resources:["events"], Verbs:["create" "patch"]}
+        {APIGroups:[""], Resources:["pods"], Verbs:["create" "update" "patch"]}
+        {APIGroups:[""], Resources:["services"], Verbs:["update" "patch" "delete"]}
+
+    and the UI reports only "Failed to create tenant". Nothing before this
+    point notices: the builders are unit-tested, the role bodies are correct,
+    and the chart is valid YAML.
+    """
+    assert _granted(rules, group, resource, verb), (
+        f"the {source} Role grants {group or 'core'}/{resource}:{verb}, which "
+        f"the chart's ClusterRole does not hold. Kubernetes will refuse to "
+        f"create that Role — add the verb to helm/kubevirt-ui/templates/"
+        f"rbac.yaml (ClusterRole, not the namespaced Role)."
+    )

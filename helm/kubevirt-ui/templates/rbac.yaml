@@ -136,14 +136,25 @@ rules:
       - events
       - pods
       - pods/log
-    verbs: ["get", "list", "watch", "delete"]
+    # The write verbs are here to satisfy Kubernetes' anti-escalation rule,
+    # not because the UI creates pods: it creates the namespaced `capk-infra`
+    # Role (tenants_storage._capk_role_rules) which grants CAPK
+    # pods/events/services writes in the tenant namespace, and RBAC refuses to
+    # grant a permission the granter does not itself hold cluster-wide. Held
+    # only in the namespaced Role, tenant creation dies with
+    #   roles "capk-infra" is forbidden: ... attempting to grant RBAC
+    #   permissions not currently held
+    # and the tenant never gets a worker. See test_helm_rbac_contract.py,
+    # which derives this set from the code rather than from memory.
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # Services — read + proxy (LINSTOR, metrics)
   - apiGroups: [""]
     resources:
       - services
       - services/proxy
-    verbs: ["get", "list", "watch", "create"]
+    # update/patch/delete for the same anti-escalation reason as pods above.
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # Endpoints — read-only; required by tenants_vpc flow which inspects DNS service
   # readiness before creating ClusterRole system:vpc-dns.  K8s anti-escalation

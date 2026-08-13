@@ -6,6 +6,7 @@ and Flux HelmRelease CRs per addon per tenant. Addon catalog read from ConfigMap
 
 import base64
 import copy
+import json
 import logging
 import uuid
 from typing import Any
@@ -108,6 +109,23 @@ KUBEVIRT_CSI_ADDON_ID = "kubevirt-csi-driver"
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+def _api_reason(e: ApiException) -> str:
+    """The API server's own sentence, without the surrounding envelope.
+
+    `str(ApiException)` is four lines of status line and response headers with
+    the message buried in a JSON body, which is not something to put in front
+    of a user. The `message` field is the part that says what to do.
+    """
+    try:
+        body = json.loads(e.body or "{}")
+    except (ValueError, TypeError):
+        body = {}
+    message = body.get("message") or e.reason or "unknown error"
+    # Anti-escalation refusals list the missing rules after a newline; keep
+    # them, they are the answer, but on one line.
+    return " ".join(str(message).split())
 
 
 # ---------------------------------------------------------------------------
@@ -1029,6 +1047,15 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         # ApiException/RuntimeError into a generic 500.
         if isinstance(e, HTTPException):
             raise
+        # An ApiException carries the only useful sentence there is — the API
+        # server's own reason. Swallowing it left the UI showing "Failed to
+        # create tenant" for an anti-escalation refusal that names the exact
+        # missing verbs, and the only way to learn them was the backend log.
+        if isinstance(e, ApiException):
+            raise HTTPException(
+                status_code=502 if e.status >= 500 else e.status,
+                detail=f"Failed to create tenant: {_api_reason(e)}",
+            ) from e
         raise HTTPException(status_code=500, detail="Failed to create tenant") from e
 
 
