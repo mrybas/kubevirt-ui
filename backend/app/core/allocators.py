@@ -192,6 +192,7 @@ async def _allocate_vpc_cidr_once(k8s) -> tuple[str, str]:
 # collide with anything routable.
 PEERING_LINK_BASE = "169.254.101.0"
 PEERING_LINK_MAX = 62  # /24 carved into /30s, minus the all-zeros one
+PEERING_LINK_CONFIGMAP = "kubevirt-ui-peering-links"
 
 
 def peering_link_addresses(index: int) -> tuple[str, str, str]:
@@ -234,14 +235,91 @@ async def allocate_peering_link(k8s) -> tuple[str, str, str]:
     Returns (local_ip, remote_ip, cidr). Skips links already referenced by a
     VPC's `vpcPeerings`, so it stays correct even when one was created by
     hand or the counter ConfigMap is lost.
+
+    Reserved through a counter ConfigMap with optimistic locking, the same way
+    VPC CIDRs are. Reading the used set and picking the first gap is not
+    enough: two peerings created at the same moment read the same state and
+    both chose 169.254.101.8/30 —
+
+        cc1 {'localConnectIP': '169.254.101.9/30',  'remoteVpc': 'cc2'}
+        cc3 {'localConnectIP': '169.254.101.9/30',  'remoteVpc': 'cc4'}
+
+    — two unrelated VPC routers holding the same address on what is supposed
+    to be a point-to-point link.
     """
-    used = set(await list_peering_link_cidrs(k8s))
-    for index in range(PEERING_LINK_MAX):
-        local, remote, cidr = peering_link_addresses(index)
-        if cidr not in used:
-            return local, remote, cidr
+    for attempt in range(MAX_RETRIES):
+        try:
+            return await _allocate_peering_link_once(k8s)
+        except ApiException as e:
+            if e.status == 409 and attempt < MAX_RETRIES - 1:
+                delay = BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    f"Peering link allocation conflict "
+                    f"(attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay:.1f}s..."
+                )
+                await asyncio.sleep(delay)
+                continue
+            raise
 
     raise HTTPException(
-        status_code=409,
-        detail=f"VPC peering link pool exhausted (max {PEERING_LINK_MAX} links)",
+        status_code=409, detail="Peering link allocation failed after retries",
     )
+
+
+async def _allocate_peering_link_once(k8s) -> tuple[str, str, str]:
+    """Single attempt: pick the lowest free /30 and reserve it."""
+    try:
+        cm = await k8s.core_api.read_namespaced_config_map(
+            name=PEERING_LINK_CONFIGMAP, namespace=SYSTEM_NAMESPACE,
+        )
+        next_index = int((cm.data or {}).get("next_index", "0"))
+        resource_version = cm.metadata.resource_version
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        cm = await k8s.core_api.create_namespaced_config_map(
+            namespace=SYSTEM_NAMESPACE,
+            body=V1ConfigMap(
+                metadata=V1ObjectMeta(
+                    name=PEERING_LINK_CONFIGMAP,
+                    labels={"kubevirt-ui.io/managed": "true"},
+                ),
+                data={"next_index": "0"},
+            ),
+        )
+        next_index = 0
+        resource_version = cm.metadata.resource_version
+
+    # The counter is not authoritative on its own — a peering can be written
+    # by hand, and deleting one frees its link without moving the counter.
+    used = set(await list_peering_link_cidrs(k8s))
+
+    index = next_index
+    while index < PEERING_LINK_MAX:
+        local, remote, cidr = peering_link_addresses(index)
+        if cidr not in used:
+            break
+        index += 1
+    else:
+        raise HTTPException(
+            status_code=409,
+            detail=f"VPC peering link pool exhausted (max {PEERING_LINK_MAX} links)",
+        )
+
+    # Reserve it. A racing caller that read the same resourceVersion loses
+    # here with a 409 and retries against the moved counter.
+    await k8s.core_api.replace_namespaced_config_map(
+        name=PEERING_LINK_CONFIGMAP,
+        namespace=SYSTEM_NAMESPACE,
+        body=V1ConfigMap(
+            metadata=V1ObjectMeta(
+                name=PEERING_LINK_CONFIGMAP,
+                namespace=SYSTEM_NAMESPACE,
+                resource_version=resource_version,
+                labels={"kubevirt-ui.io/managed": "true"},
+            ),
+            data={"next_index": str(index + 1)},
+        ),
+    )
+
+    return local, remote, cidr
