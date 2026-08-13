@@ -82,16 +82,63 @@ _TOKEN_ALPHABET = string.ascii_lowercase + string.digits
 # exactly (the certificate's SAN, the worker's endpoint, the ingress HostSNI).
 # ---------------------------------------------------------------------------
 
+def talos_service_name(tenant: str) -> str:
+    """The Service Talos treats as the control plane.
+
+    Not Kamaji's own Service, deliberately. Talos dials trustd on port 50001
+    of whatever host is in `cluster.controlPlane.endpoint`, and Kamaji cannot
+    put a second port on the Service it manages: `KamajiControlPlane.spec.
+    network` has no field for it, `TenantControlPlane.spec.networkProfile`
+    carries a single `port`, and a port added by hand is reconciled away in
+    under a minute (measured). Cozystack forks the operator over exactly
+    this.
+
+    A Service of our own avoids all of it: same selector, both ports, nothing
+    upstream has to change.
+    """
+    return f"{tenant}-talos"
+
+
 def signer_dns_names(tenant: str, namespace: str) -> list[str]:
     """The DNS names the signer certificate must carry.
 
-    Both forms: Talos dials the short one, in-cluster clients resolve the
-    long one, and the certificate has to satisfy whichever is presented.
+    Both forms of the Talos Service name: the worker dials the short one and
+    puts it in the TLS SNI, in-cluster clients resolve the long one, and the
+    certificate has to satisfy whichever is presented.
     """
+    svc = talos_service_name(tenant)
     return [
-        f"{tenant}.{namespace}.svc",
-        f"{tenant}.{namespace}.svc.cluster.local",
+        f"{svc}.{namespace}.svc",
+        f"{svc}.{namespace}.svc.cluster.local",
     ]
+
+
+def build_talos_service(tenant: str, namespace: str, api_port: int) -> dict[str, Any]:
+    """The Service that answers on both ports Talos needs.
+
+    6443 so the worker reaches the apiserver, 50001 so it reaches trustd —
+    one host, because Talos derives the second from the first and will not be
+    told otherwise.
+    """
+    return {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {
+            "name": talos_service_name(tenant),
+            "namespace": namespace,
+            "labels": {**MANAGED_LABEL, "kubevirt-ui.io/tenant": tenant},
+        },
+        "spec": {
+            "type": "ClusterIP",
+            "selector": {"kamaji.clastix.io/name": tenant},
+            "ports": [
+                {"name": "kube-apiserver", "port": api_port,
+                 "targetPort": api_port, "protocol": "TCP"},
+                {"name": "trustd", "port": TALOS_TRUSTD_PORT,
+                 "targetPort": TALOS_TRUSTD_PORT, "protocol": "TCP"},
+            ],
+        },
+    }
 
 
 def worker_endpoint(tenant: str, namespace: str, api_port: int) -> str:
@@ -101,7 +148,7 @@ def worker_endpoint(tenant: str, namespace: str, api_port: int) -> str:
     one listener on port 50001. An IP endpoint sends no SNI at all, so the
     ingress has nothing to match `HostSNI` against.
     """
-    return f"https://{tenant}.{namespace}.svc:{api_port}"
+    return f"https://{talos_service_name(tenant)}.{namespace}.svc:{api_port}"
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +711,9 @@ async def ensure_talos_golden_image(
         logger.info(f"Talos golden image for {tenant!r} already present")
 
 
-async def ensure_talos_tenant_objects(k8s, tenant: str, namespace: str) -> None:
+async def ensure_talos_tenant_objects(
+    k8s, tenant: str, namespace: str, api_port: int = 6443,
+) -> None:
     """Create the per-tenant Talos objects that must exist before the CAPI ones.
 
     Ordering matters: the control plane mounts the signer certificate, and the
@@ -677,6 +726,20 @@ async def ensure_talos_tenant_objects(k8s, tenant: str, namespace: str) -> None:
     from kubernetes_asyncio import client as k8s_client
 
     core = k8s.core_api
+
+    # The Service the worker treats as its control plane — both ports on one
+    # host, because Talos derives the trustd address from the apiserver one.
+    svc_body = build_talos_service(tenant, namespace, api_port)
+    try:
+        await core.create_namespaced_service(
+            namespace=namespace, body=svc_body,
+        )
+        logger.info(f"Created Talos control-plane Service for tenant {tenant!r}")
+    except ApiException as e:
+        if e.status != 409:
+            raise
+        logger.info(f"Talos Service for tenant {tenant!r} already exists")
+
     secret_body = build_talos_secrets(tenant, namespace)
     try:
         await core.create_namespaced_secret(

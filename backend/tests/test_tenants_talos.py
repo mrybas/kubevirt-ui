@@ -13,6 +13,7 @@ from kubernetes_asyncio.client import ApiException
 
 from app.api.v1 import tenants_talos
 from app.api.v1.tenants_talos import (
+    talos_service_name,
     TALOS_TRUSTD_PORT,
     build_bootstrap_token_secret,
     build_talos_pki,
@@ -33,8 +34,11 @@ VIP = "10.198.190.10"
 class TestNaming:
     def test_signer_carries_both_dns_forms(self) -> None:
         # Talos dials the short name; in-cluster clients resolve the long one.
+        # Both name the Service we own, not Kamaji's — that is the host that
+        # answers on 50001 as well as 6443.
+        svc = talos_service_name(TENANT)
         assert signer_dns_names(TENANT, NS) == [
-            f"{TENANT}.{NS}.svc", f"{TENANT}.{NS}.svc.cluster.local",
+            f"{svc}.{NS}.svc", f"{svc}.{NS}.svc.cluster.local",
         ]
 
     def test_worker_endpoint_is_a_name_not_an_address(self) -> None:
@@ -43,7 +47,7 @@ class TestNaming:
         import ipaddress
 
         endpoint = worker_endpoint(TENANT, NS, 6443)
-        assert endpoint == f"https://{TENANT}.{NS}.svc:6443"
+        assert endpoint == f"https://{talos_service_name(TENANT)}.{NS}.svc:6443"
 
         host = endpoint.split("//")[1].rsplit(":", 1)[0]
         with pytest.raises(ValueError):
@@ -441,3 +445,43 @@ class TestSignerInvocation:
         assert mounts["talos-ca-certs"] == "/etc/talos-ca"
         assert volumes["talos-signer-certs"] == "t1-talos-signer"
         assert volumes["talos-ca-certs"] == "t1-talos-ca"
+
+
+class TestTalosControlPlaneService:
+    """Talos dials trustd on port 50001 of whatever host is in
+    `cluster.controlPlane.endpoint`, and Kamaji cannot put a second port on
+    the Service it manages: `KamajiControlPlane.spec.network` has no field for
+    it, `TenantControlPlane.spec.networkProfile` carries a single `port`, and a
+    port added by hand is reconciled away in under a minute (measured on the
+    lab). Hence a Service of our own, with both ports."""
+
+    def _svc(self):
+        from app.api.v1.tenants_talos import build_talos_service
+
+        return build_talos_service("t1", "tenant-t1", 6443)
+
+    def _ports(self) -> dict[str, int]:
+        return {p["name"]: p["port"] for p in self._svc()["spec"]["ports"]}
+
+    def test_it_answers_on_both_ports(self) -> None:
+        from app.api.v1.tenants_talos import TALOS_TRUSTD_PORT
+
+        ports = self._ports()
+        assert ports["kube-apiserver"] == 6443
+        assert ports["trustd"] == TALOS_TRUSTD_PORT
+
+    def test_it_selects_the_kamaji_control_plane_pods(self) -> None:
+        assert self._svc()["spec"]["selector"] == {"kamaji.clastix.io/name": "t1"}
+
+    def test_the_worker_endpoint_names_this_service(self) -> None:
+        from app.api.v1.tenants_talos import worker_endpoint
+
+        host = worker_endpoint("t1", "tenant-t1", 6443).split("//")[1].rsplit(":", 1)[0]
+        assert host == f"{self._svc()['metadata']['name']}.tenant-t1.svc"
+
+    def test_the_signer_certificate_answers_to_that_name(self) -> None:
+        # Otherwise the join fails TLS before trustd is ever reached.
+        from app.api.v1.tenants_talos import signer_dns_names, worker_endpoint
+
+        host = worker_endpoint("t1", "tenant-t1", 6443).split("//")[1].rsplit(":", 1)[0]
+        assert host in signer_dns_names("t1", "tenant-t1")
