@@ -279,6 +279,11 @@ rules:
       - "kubevirt-ui-editor"
       - "kubevirt-ui-viewer"
       - "kubevirt-ui-ns-viewer"
+      # Shared across tenants, replaced in place by
+      # tenants_storage._ensure_cluster_role. Missing here, tenant creation
+      # dies at "cannot update resource clusterroles ... at the cluster scope"
+      # after the namespace and half the identities already exist.
+      - "kubevirt-csi-cluster"
     verbs: ["update", "patch", "delete"]
 
   # ClusterRoleBinding mutations — kept broad because per-user CRBs are generated

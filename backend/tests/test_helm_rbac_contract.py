@@ -218,3 +218,57 @@ def test_we_hold_every_permission_we_grant(
         f"create that Role — add the verb to helm/kubevirt-ui/templates/"
         f"rbac.yaml (ClusterRole, not the namespaced Role)."
     )
+
+
+# ---------------------------------------------------------------------------
+# Cluster-scoped objects the backend manages by name
+# ---------------------------------------------------------------------------
+
+def _cluster_scoped_names_we_write() -> list[tuple[str, str]]:
+    """(constant, name) for every cluster-scoped RBAC object the code replaces.
+
+    The chart deliberately scopes ClusterRole writes with `resourceNames`,
+    which is the right call — and it means every new managed name has to be
+    added there or the write is refused at the cluster scope. That is not
+    something to remember; it is something to check.
+    """
+    from app.api.v1 import tenants_storage
+
+    return [("CSI_CLUSTER_ROLE_NAME", tenants_storage.CSI_CLUSTER_ROLE_NAME)]
+
+
+def _write_allowlist(rules: list[dict]) -> set[str]:
+    names: set[str] = set()
+    for rule in rules:
+        if "clusterroles" not in (rule.get("resources") or []):
+            continue
+        verbs = set(rule.get("verbs") or [])
+        if not verbs & {"update", "patch", "*"}:
+            continue
+        listed = rule.get("resourceNames")
+        if listed is None:
+            # An unscoped write rule covers everything.
+            return {"*"}
+        names.update(listed)
+    return names
+
+
+@pytest.mark.parametrize("constant,name", _cluster_scoped_names_we_write())
+def test_managed_cluster_roles_are_writable(
+    rules: list[dict], constant: str, name: str,
+) -> None:
+    """On the cluster the omission reads:
+
+        clusterroles.rbac.authorization.k8s.io "kubevirt-csi-cluster" is
+        forbidden: User "system:serviceaccount:kubevirt-ui-system:kubevirt-ui"
+        cannot update resource "clusterroles" ... at the cluster scope
+
+    and it lands mid-way through tenant creation, after the namespace and
+    several identities already exist.
+    """
+    allowed = _write_allowlist(rules)
+    assert "*" in allowed or name in allowed, (
+        f"{constant} = {name!r} is replaced by the backend but is not in the "
+        f"ClusterRole write allowlist in helm/kubevirt-ui/templates/rbac.yaml "
+        f"(resourceNames of the clusterroles update/patch/delete rule)."
+    )
