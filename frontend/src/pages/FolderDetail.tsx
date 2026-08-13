@@ -45,6 +45,10 @@ import { FolderAccessTab } from '../components/folders/FolderAccessTab';
 import { CustomSelect } from '../components/common/CustomSelect';
 import { ConfirmDeleteModal } from '../components/common/ConfirmDeleteModal';
 import type { FolderEnvironment, FolderRole } from '../types/folder';
+import type { ByteUnit } from '../utils/quantity';
+import {
+  BYTE_UNITS, formatBytes, parseQuantity, sliderStep, trimNumber,
+} from '../utils/quantity';
 import { FOLDER_ROLE_LABELS, FOLDER_ROLE_DESCRIPTIONS } from '../types/folder';
 
 type Tab = 'overview' | 'children' | 'environments' | 'members' | 'access' | 'images' | 'vms';
@@ -679,12 +683,31 @@ function MembersTab({ folderName }: { folderName: string }) {
  * name, three quota fields, the folder's remaining headroom, and — once you
  * ask for more than is free — a slider per sibling. That is a form, not a row.
  *
+ * Memory and storage are entered as a number plus a unit, and the sliders
+ * move in that unit. A slider over bytes is unusable: 16Gi is 17179869184, so
+ * the thumb steps in amounts nobody asked for and the label reads as noise.
+ *
+ * Sub-folders donate on the same terms as environments — a child folder's
+ * declared quota is reserved out of the parent whether or not anything runs
+ * in it, so it is exactly as much a place to take room from.
+ *
  * The reallocation travels with the create in one request. Shrinking a
  * sibling and then failing to create what the room was for would leave
  * someone smaller for nothing, so the server validates the whole plan first
  * and gives the room back if the create fails.
  */
-function AddEnvironmentModal({
+
+type Dim = 'cpu' | 'memory' | 'storage';
+
+interface Donor {
+  key: string;
+  label: string;
+  kind: 'environment' | 'folder';
+  /** Current quota per dimension, in cores/bytes; 0 when it holds none. */
+  held: Record<Dim, number>;
+}
+
+export function AddEnvironmentModal({
   folder,
   onClose,
 }: {
@@ -695,43 +718,95 @@ function AddEnvironmentModal({
   const [cpu, setCpu] = useState('');
   const [memory, setMemory] = useState('');
   const [storage, setStorage] = useState('');
-  const [takeFrom, setTakeFrom] = useState<Record<string, number>>({});
+  const [memUnit, setMemUnit] = useState<ByteUnit>('Gi');
+  const [storUnit, setStorUnit] = useState<ByteUnit>('Gi');
+  // Per dimension, per donor, how much to take — in cores/bytes.
+  const [takeFrom, setTakeFrom] = useState<Record<Dim, Record<string, number>>>({
+    cpu: {}, memory: {}, storage: {},
+  });
   const [error, setError] = useState<string | null>(null);
 
   const addEnv = useAddFolderEnvironment(folder.name);
   const { data: headroom } = useFolderQuotaHeadroom(folder.name);
 
-  // Sliders are CPU-only on purpose. Memory and storage are entered in units
-  // and a slider over bytes is a worse control than a field; the shortfall
-  // message names the number for those instead.
-  const freeCpu = headroom?.free.cpu ?? null;
-  const wantCpu = cpu ? Number(cpu) : 0;
+  const unitOf = (dim: Dim): ByteUnit => (dim === 'memory' ? memUnit : storUnit);
 
-  const donors = (folder.environments ?? [])
-    .map(env => ({ name: env.environment, cpu: Number(env.quota_cpu ?? 0) }))
-    .filter(d => d.cpu > 0);
+  /** What the form asks for, in cores/bytes. */
+  const wanted: Record<Dim, number> = {
+    cpu: parseQuantity(cpu) ?? 0,
+    memory: memory ? (Number(memory) || 0) * BYTE_UNITS[memUnit] : 0,
+    storage: storage ? (Number(storage) || 0) * BYTE_UNITS[storUnit] : 0,
+  };
 
-  const taken = Object.values(takeFrom).reduce((a, b) => a + b, 0);
-  const shortfall = freeCpu === null ? 0 : Math.max(0, wantCpu - freeCpu - taken);
-  const canSubmit = name.trim() !== '' && shortfall === 0 && !addEnv.isPending;
+  const donors: Donor[] = [
+    ...(folder.environments ?? []).map(env => ({
+      key: `env:${env.environment}`,
+      label: env.environment,
+      kind: 'environment' as const,
+      held: {
+        cpu: parseQuantity(env.quota_cpu) ?? 0,
+        memory: parseQuantity(env.quota_memory) ?? 0,
+        storage: parseQuantity(env.quota_storage) ?? 0,
+      },
+    })),
+    ...(folder.children ?? []).map(child => ({
+      key: `folder:${child.name}`,
+      label: `${child.display_name || child.name} (sub-folder)`,
+      kind: 'folder' as const,
+      held: {
+        cpu: parseQuantity(child.quota?.cpu) ?? 0,
+        memory: parseQuantity(child.quota?.memory) ?? 0,
+        storage: parseQuantity(child.quota?.storage) ?? 0,
+      },
+    })),
+  ];
+
+  const shortfallOf = (dim: Dim): number => {
+    const free = headroom?.free[dim] ?? null;
+    if (free === null) return 0;   // the folder does not cap this dimension
+    const taken = Object.values(takeFrom[dim]).reduce((a, b) => a + b, 0);
+    return Math.max(0, wanted[dim] - free - taken);
+  };
+
+  const shortfalls: Record<Dim, number> = {
+    cpu: shortfallOf('cpu'), memory: shortfallOf('memory'), storage: shortfallOf('storage'),
+  };
+  const short = (['cpu', 'memory', 'storage'] as Dim[]).filter(d => shortfalls[d] > 0);
+  const canSubmit = name.trim() !== '' && short.length === 0 && !addEnv.isPending;
+
+  const setTake = (dim: Dim, key: string, amount: number) =>
+    setTakeFrom(prev => ({ ...prev, [dim]: { ...prev[dim], [key]: amount } }));
 
   const handleSubmit = async () => {
     const env = name.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
     if (!env) return;
     setError(null);
+
+    // One entry per donor carrying only the dimensions actually taken from
+    // it. The server merges into the donor's current quota, so a donor that
+    // gives memory keeps the CPU nobody mentioned.
     const reallocate = donors
-      .filter(d => (takeFrom[d.name] ?? 0) > 0)
-      .map(d => ({
-        source: d.name,
-        kind: 'environment' as const,
-        cpu: String(d.cpu - (takeFrom[d.name] ?? 0)),
-      }));
+      .filter(d => (['cpu', 'memory', 'storage'] as Dim[]).some(dim => (takeFrom[dim][d.key] ?? 0) > 0))
+      .map(d => {
+        const left: Record<string, string> = {};
+        if ((takeFrom.cpu[d.key] ?? 0) > 0) {
+          left.cpu = trimNumber(d.held.cpu - takeFrom.cpu[d.key]);
+        }
+        if ((takeFrom.memory[d.key] ?? 0) > 0) {
+          left.memory = formatBytes(d.held.memory - takeFrom.memory[d.key], memUnit);
+        }
+        if ((takeFrom.storage[d.key] ?? 0) > 0) {
+          left.storage = formatBytes(d.held.storage - takeFrom.storage[d.key], storUnit);
+        }
+        return { source: d.key.split(':')[1], kind: d.kind, ...left };
+      });
+
     try {
       await addEnv.mutateAsync({
         environment: env,
         quota_cpu: cpu || undefined,
-        quota_memory: memory || undefined,
-        quota_storage: storage || undefined,
+        quota_memory: memory ? `${memory}${memUnit}` : undefined,
+        quota_storage: storage ? `${storage}${storUnit}` : undefined,
         ...(reallocate.length ? { reallocate } : {}),
       });
       onClose();
@@ -740,9 +815,55 @@ function AddEnvironmentModal({
     }
   };
 
+  const DIM_LABEL: Record<Dim, string> = { cpu: 'CPU', memory: 'memory', storage: 'storage' };
+
+  const renderShort = (dim: Dim) => {
+    const eligible = donors.filter(d => d.held[dim] > 0);
+    const amount = dim === 'cpu'
+      ? `${trimNumber(shortfalls[dim])} CPU`
+      : `${formatBytes(shortfalls[dim], unitOf(dim))} of ${DIM_LABEL[dim]}`;
+
+    if (eligible.length === 0) {
+      return (
+        <p key={dim} className="text-xs text-amber-400">
+          {amount} short, and nothing else in this folder holds a {DIM_LABEL[dim]}
+          {' '}quota to take it from. Raise the folder ceiling instead.
+        </p>
+      );
+    }
+
+    return (
+      <div key={dim} className="p-3 bg-amber-900/10 border border-amber-800/30 rounded-lg space-y-3">
+        <p className="text-xs text-amber-300/90">{amount} short. Take it from:</p>
+        {eligible.map(d => {
+          const unit = unitOf(dim);
+          const taken = takeFrom[dim][d.key] ?? 0;
+          const step = dim === 'cpu' ? 1 : sliderStep(d.held[dim], unit);
+          const show = (v: number) => (dim === 'cpu' ? trimNumber(v) : formatBytes(v, unit));
+          return (
+            <div key={d.key} className="flex items-center gap-3">
+              <span className="text-xs text-surface-300 w-28 truncate" title={d.label}>
+                {d.label}
+              </span>
+              <input
+                type="range" min={0} max={d.held[dim]} step={step} value={taken}
+                aria-label={`Take ${DIM_LABEL[dim]} from ${d.label}`}
+                onChange={(e) => setTake(dim, d.key, Number(e.target.value))}
+                className="flex-1"
+              />
+              <span className="text-xs text-surface-400 w-36 text-right">
+                −{show(taken)} → leaves {show(d.held[dim] - taken)}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
-      <div className="bg-surface-800 border border-surface-700 rounded-xl w-full max-w-lg mx-4 shadow-2xl">
+      <div className="bg-surface-800 border border-surface-700 rounded-xl w-full max-w-xl mx-4 shadow-2xl max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between p-5 border-b border-surface-700">
           <h2 className="text-lg font-semibold text-surface-100">Add Environment</h2>
           <button onClick={onClose} className="p-1 text-surface-400 hover:text-surface-200">
@@ -788,18 +909,37 @@ function AddEnvironmentModal({
           )}
 
           <div className="grid grid-cols-3 gap-2">
-            <input
-              type="text" value={cpu} onChange={(e) => setCpu(e.target.value)}
-              placeholder="CPU e.g. 8" className="input" aria-label="Environment CPU quota"
-            />
-            <input
-              type="text" value={memory} onChange={(e) => setMemory(e.target.value)}
-              placeholder="Memory e.g. 16Gi" className="input" aria-label="Environment memory quota"
-            />
-            <input
-              type="text" value={storage} onChange={(e) => setStorage(e.target.value)}
-              placeholder="Storage e.g. 100Gi" className="input" aria-label="Environment storage quota"
-            />
+            <div>
+              <label className="block text-xs text-surface-400 mb-1">CPU</label>
+              <input
+                type="text" value={cpu} onChange={(e) => setCpu(e.target.value)}
+                placeholder="e.g. 8" className="input w-full" aria-label="Environment CPU quota"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-surface-400 mb-1">Memory</label>
+              <div className="flex gap-1">
+                <input
+                  type="number" min={0} value={memory}
+                  onChange={(e) => setMemory(e.target.value)}
+                  placeholder="16" className="input w-full"
+                  aria-label="Environment memory quota"
+                />
+                <UnitToggle value={memUnit} onChange={setMemUnit} label="Memory unit" />
+              </div>
+            </div>
+            <div>
+              <label className="block text-xs text-surface-400 mb-1">Storage</label>
+              <div className="flex gap-1">
+                <input
+                  type="number" min={0} value={storage}
+                  onChange={(e) => setStorage(e.target.value)}
+                  placeholder="100" className="input w-full"
+                  aria-label="Environment storage quota"
+                />
+                <UnitToggle value={storUnit} onChange={setStorUnit} label="Storage unit" />
+              </div>
+            </div>
           </div>
           <p className="text-xs text-surface-500">
             Enforced by Kubernetes as a ResourceQuota on the namespace — it
@@ -807,37 +947,7 @@ function AddEnvironmentModal({
             quota.
           </p>
 
-          {shortfall > 0 && donors.length > 0 && (
-            <div className="p-3 bg-amber-900/10 border border-amber-800/30 rounded-lg space-y-3">
-              <p className="text-xs text-amber-300/90">
-                {fmtQuota(shortfall)} CPU short. Take it from another environment:
-              </p>
-              {donors.map(d => (
-                <div key={d.name} className="flex items-center gap-3">
-                  <span className="text-xs text-surface-300 w-24 truncate">{d.name}</span>
-                  <input
-                    type="range" min={0} max={d.cpu} step={1}
-                    value={takeFrom[d.name] ?? 0}
-                    aria-label={`Take CPU from ${d.name}`}
-                    onChange={(e) => setTakeFrom({
-                      ...takeFrom, [d.name]: Number(e.target.value),
-                    })}
-                    className="flex-1"
-                  />
-                  <span className="text-xs text-surface-400 w-32 text-right">
-                    −{takeFrom[d.name] ?? 0} → leaves {d.cpu - (takeFrom[d.name] ?? 0)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {shortfall > 0 && donors.length === 0 && (
-            <p className="text-xs text-amber-400">
-              {fmtQuota(shortfall)} CPU short, and no other environment holds a
-              CPU quota to take it from. Raise the folder ceiling instead.
-            </p>
-          )}
+          {short.map(renderShort)}
 
           {error && <p className="text-sm text-red-400">{error}</p>}
         </div>
@@ -849,6 +959,36 @@ function AddEnvironmentModal({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Mi/Gi, as two buttons — a two-option select is a worse control than a pair. */
+function UnitToggle({
+  value, onChange, label,
+}: {
+  value: ByteUnit;
+  onChange: (u: ByteUnit) => void;
+  label: string;
+}) {
+  return (
+    <div className="flex rounded-lg border border-surface-600 overflow-hidden" role="group" aria-label={label}>
+      {(['Mi', 'Gi'] as ByteUnit[]).map(u => (
+        <button
+          key={u}
+          type="button"
+          onClick={() => onChange(u)}
+          aria-pressed={value === u}
+          className={clsx(
+            'px-2 text-xs',
+            value === u
+              ? 'bg-primary-600 text-white'
+              : 'bg-surface-900 text-surface-400 hover:text-surface-200',
+          )}
+        >
+          {u}
+        </button>
+      ))}
     </div>
   );
 }

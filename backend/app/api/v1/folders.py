@@ -1292,31 +1292,38 @@ async def _apply_reallocations(
     The caller restores from that list if the thing the room was freed for
     then fails to be created — a half-applied rebalance leaves someone
     smaller for nothing.
+
+    A field the caller left out keeps its current value. The quota is
+    replaced wholesale underneath, so taking memory from a sibling while
+    saying nothing about its CPU would have wiped the CPU — silent damage to
+    a namespace nobody was editing.
     """
     undo: list[tuple[Any, dict[str, str] | None]] = []
     for item in reallocate:
+        asked = {"cpu": item.cpu, "memory": item.memory, "storage": item.storage}
+
         if item.kind == "folder":
             meta = folders.get(item.source)
             if meta is None:
                 raise HTTPException(
                     status_code=404, detail=f"Sub-folder '{item.source}' not found",
                 )
-            undo.append((item, dict(meta.get("quota") or {}) or None))
-            new_quota = {
-                k: v for k, v in
-                {"cpu": item.cpu, "memory": item.memory, "storage": item.storage}.items()
-                if v
-            }
-            meta["quota"] = new_quota or None
+            current = dict(meta.get("quota") or {})
+            undo.append((item, current or None))
+            merged = {**current, **{k: v for k, v in asked.items() if v is not None}}
+            meta["quota"] = {k: v for k, v in merged.items() if v} or None
             await _save_folder_meta(
                 k8s_client, item.source,
                 {k: v for k, v in meta.items() if not k.startswith("_")},
             )
         else:
             ns_name = _ns_name(folder_name, item.source)
-            undo.append((item, await _read_env_quota(k8s_client, ns_name)))
+            current = await _read_env_quota(k8s_client, ns_name)
+            undo.append((item, current))
+            merged = {**current, **{k: v for k, v in asked.items() if v is not None}}
             await _write_env_quota(
-                k8s_client, ns_name, item.cpu, item.memory, item.storage,
+                k8s_client, ns_name,
+                merged.get("cpu"), merged.get("memory"), merged.get("storage"),
             )
     return undo
 

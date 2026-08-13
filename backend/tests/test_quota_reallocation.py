@@ -145,3 +145,67 @@ def test_add_environment_validates_before_it_shrinks_anything() -> None:
     assert "_undo_reallocations" in src, (
         "a failed create must give the room back"
     )
+
+
+@pytest.mark.asyncio
+class TestPartialReallocation:
+    """A donor giving one dimension must not lose the others.
+
+    The quota is replaced wholesale underneath: taking 4Gi of memory from an
+    environment while saying nothing about its CPU wrote a quota with no
+    requests.cpu at all — the namespace lost a cap nobody was editing.
+    """
+
+    def _k8s(self, current: dict[str, str]) -> MagicMock:
+        from app.api.v1 import folders as folders_mod
+
+        k8s = MagicMock()
+        quota = MagicMock()
+        quota.spec.hard = {
+            **({"requests.cpu": current["cpu"]} if "cpu" in current else {}),
+            **({"requests.memory": current["memory"]} if "memory" in current else {}),
+            **({"requests.storage": current["storage"]} if "storage" in current else {}),
+        }
+        k8s.core_api.list_namespaced_resource_quota = AsyncMock(
+            return_value=MagicMock(items=[quota]),
+        )
+        k8s.core_api.replace_namespaced_resource_quota = AsyncMock()
+        return k8s
+
+    async def test_taking_memory_leaves_cpu_alone(self) -> None:
+        from app.api.v1.folders import _apply_reallocations
+
+        k8s = self._k8s({"cpu": "8", "memory": "16Gi"})
+        await _apply_reallocations(k8s, {}, "lab", [_item("dev", memory="12Gi")])
+
+        hard = k8s.core_api.replace_namespaced_resource_quota.await_args.kwargs["body"]["spec"]["hard"]
+        assert hard["requests.memory"] == "12Gi"
+        assert hard["requests.cpu"] == "8", "CPU was never mentioned and must survive"
+
+    async def test_taking_cpu_leaves_storage_alone(self) -> None:
+        from app.api.v1.folders import _apply_reallocations
+
+        k8s = self._k8s({"cpu": "8", "storage": "100Gi"})
+        await _apply_reallocations(k8s, {}, "lab", [_item("dev", cpu="5")])
+
+        hard = k8s.core_api.replace_namespaced_resource_quota.await_args.kwargs["body"]["spec"]["hard"]
+        assert hard["requests.cpu"] == "5"
+        assert hard["requests.storage"] == "100Gi"
+
+    async def test_a_subfolder_keeps_its_untouched_dimensions_too(self) -> None:
+        from app.api.v1 import folders as folders_mod
+        from app.api.v1.folders import _apply_reallocations
+
+        saved: dict = {}
+
+        async def _save(_k8s, name, meta):
+            saved.update(meta)
+
+        folders = {"kid": {"parent_id": "lab", "quota": {"cpu": "4", "memory": "8Gi"}}}
+        k8s = MagicMock()
+        import unittest.mock as m
+        with m.patch.object(folders_mod, "_save_folder_meta", _save):
+            await _apply_reallocations(
+                k8s, folders, "lab", [_item("kid", kind="folder", cpu="2")],
+            )
+        assert saved["quota"] == {"cpu": "2", "memory": "8Gi"}
