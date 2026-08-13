@@ -683,3 +683,32 @@ class TestKubeletBootstrapToken:
         source = inspect.getsource(tenant_reconciler)
         assert "_ensure_talos_bootstrap_token(k8s, name, ns)" in source
         assert "ensure_kubelet_bootstrap_token" in source
+
+
+class TestClusterTokenIsSetForTheKubelet:
+    """`machine.token` authenticates the machine to trustd; `cluster.token` is
+    what Talos writes into the kubelet's bootstrap-kubeconfig. With only the
+    first, the kubelet has nothing to present and exits on a loop —
+
+        No valid client certificate is found and the server is responsive
+
+    — while the node never files a CSR."""
+
+    def _config(self):
+        from app.api.v1.tenants_talos import build_talos_worker_config
+
+        return build_talos_worker_config(
+            "t1", "tenant-t1", api_port=6443, control_plane_vip="10.0.0.1",
+            machine_token="abcdef.0123456789abcdef", cluster_id="id",
+            cluster_secret="secret", pod_cidr="10.244.0.0/16",
+            service_cidr="10.112.0.0/12",
+        )
+
+    def test_the_kubelet_gets_a_bootstrap_token(self) -> None:
+        assert self._config()["cluster"]["token"] == "abcdef.0123456789abcdef"
+
+    def test_it_is_the_same_token_trustd_uses(self) -> None:
+        # The bootstrap-token Secret placed in the tenant is derived from the
+        # same value; a different one would not be recognised.
+        cfg = self._config()
+        assert cfg["cluster"]["token"] == cfg["machine"]["token"]

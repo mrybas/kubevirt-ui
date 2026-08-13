@@ -518,6 +518,19 @@ def build_talos_worker_config(
         "cluster": {
             "id": cluster_id,
             "secret": cluster_secret,
+            # The kubelet's bootstrap credential, and a different field from
+            # `machine.token` above: that one authenticates the machine to
+            # trustd, this one is what Talos writes into the kubelet's
+            # bootstrap-kubeconfig. Setting only the first leaves the kubelet
+            # with nothing to present, and it exits on a loop with
+            #
+            #   No valid client certificate is found and the server is
+            #   responsive, exiting.
+            #
+            # while the node never files a CSR. Same value on purpose — it is
+            # the token the `bootstrap-token-<id>` Secret in the tenant's
+            # kube-system carries.
+            "token": machine_token,
             "controlPlane": {
                 "endpoint": worker_endpoint(tenant, namespace, api_port),
             },
