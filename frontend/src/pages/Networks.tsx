@@ -5,10 +5,12 @@ import { PageTitle } from '@/components/common/PageTitle';
 import VPCs from './VPCs';
 import { Network as UserNetworks } from './Network';
 import { SystemNetworks } from './SystemNetworks';
+import { Underlay } from './Underlay';
 
 const TABS = [
   { id: 'vpcs', label: 'VPCs', subtitle: 'Virtual Private Clouds for network isolation' },
   { id: 'subnets', label: 'Subnets', subtitle: 'User-defined subnets and networks' },
+  { id: 'underlay', label: 'Underlay', subtitle: 'Physical fabric VPC egress gateways attach to' },
   { id: 'system', label: 'System', subtitle: 'System-level Kube-OVN networks' },
 ] as const;
 
@@ -69,6 +71,7 @@ export function Networks() {
             onCreateOpened={() => setCreateSubnetSignal(false)}
           />
         )}
+        {activeTab === 'underlay' && <Underlay />}
         {activeTab === 'system' && <SystemNetworks />}
       </div>
     </div>

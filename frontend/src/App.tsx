@@ -172,6 +172,7 @@ function AppRoutes() {
                     <Route path="/network" element={<RequireAdmin><Networks /></RequireAdmin>} />
                     <Route path="/network/vpcs" element={<RequireAdmin><Navigate to="/network?tab=vpcs" replace /></RequireAdmin>} />
                     <Route path="/network/subnets" element={<RequireAdmin><Navigate to="/network?tab=subnets" replace /></RequireAdmin>} />
+                    <Route path="/network/underlay" element={<RequireAdmin><Navigate to="/network?tab=underlay" replace /></RequireAdmin>} />
                     <Route path="/network/system" element={<RequireAdmin><Navigate to="/network?tab=system" replace /></RequireAdmin>} />
                     <Route path="/network/subnets/create" element={<RequireAdmin><Navigate to="/network?tab=subnets&create=true" replace /></RequireAdmin>} />
                     <Route path="/network/subnets/:name" element={<RequireAdmin><NetworkDetail /></RequireAdmin>} />
