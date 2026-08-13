@@ -140,7 +140,7 @@ function AuthInitializer({ children }: { children: React.ReactNode }) {
 }
 
 function AppRoutes() {
-  const { data: features } = useFeatures();
+  const { data: features, isLoading: featuresLoading } = useFeatures();
 
   return (
     <Routes>
@@ -195,8 +195,19 @@ function AppRoutes() {
                     <Route path="/folders" element={<Folders />} />
                     <Route path="/folders/new" element={<Navigate to="/folders?create=true" replace />} />
                     <Route path="/folders/:name" element={<FolderDetail />} />
-                    {/* Tenants — admin only, and only when feature enabled */}
-                    {features?.enableTenants ? (
+                    {/* Tenants — admin only, and only when feature enabled.
+                        While the flag is still being fetched the route must
+                        render nothing rather than redirect: a `<Navigate>`
+                        here races the features request, and opening /tenants
+                        directly bounces to the dashboard and rewrites the URL
+                        with it, so a reload does not recover — it just races
+                        again. */}
+                    {featuresLoading ? (
+                      <>
+                        <Route path="/tenants" element={null} />
+                        <Route path="/tenants/:name" element={null} />
+                      </>
+                    ) : features?.enableTenants ? (
                       <>
                         <Route path="/tenants" element={<RequireAdmin><Tenants /></RequireAdmin>} />
                         <Route path="/tenants/:name" element={<RequireAdmin><TenantDetail /></RequireAdmin>} />
