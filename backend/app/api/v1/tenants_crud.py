@@ -13,6 +13,7 @@ from typing import Any
 
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException, StorageV1Api
 
 from app.core.auth import User, require_auth
@@ -73,7 +74,13 @@ from app.api.v1.tenants_common import (
     _create_namespace,
     assert_tenant_cidrs_free,
 )
-from app.api.v1.folders import reconcile_namespace_rbac
+from app.api.v1.folders import (
+    _ensure_folders_configmap,
+    _parse_all_folders,
+    assert_within_folder_quota,
+    parse_quantity,
+    reconcile_namespace_rbac,
+)
 
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.api.v1.tenants_capi import (
@@ -109,6 +116,12 @@ KUBEVIRT_CSI_ADDON_ID = "kubevirt-csi-driver"
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Rough per-replica allowance for a Kamaji control plane: five small
+# containers that declare requests but no limits.
+_CP_CPU = 0.5
+_CP_MEMORY = 1024 ** 3
+
 
 
 def _api_reason(e: ApiException) -> str:
@@ -794,6 +807,53 @@ async def list_tenants(
         raise k8s_error_to_http(e, "tenant operation")
 
 
+def _tenant_quota(req: Any) -> dict[str, str]:
+    """What a tenant asks of its folder: its workers, plus its control plane.
+
+    Sized from the request rather than measured afterwards, so the folder
+    ceiling can refuse a tenant that does not fit before any of it exists.
+    The control-plane allowance is per replica and deliberately rough — the
+    Kamaji pods are small and declare no limits of their own.
+    """
+    cpu = req.worker_count * req.worker_vcpu + req.control_plane_replicas * _CP_CPU
+    memory = (
+        req.worker_count * (parse_quantity(req.worker_memory) or 0)
+        + req.control_plane_replicas * _CP_MEMORY
+    )
+    storage = req.worker_count * (parse_quantity(req.worker_disk) or 0)
+    return {
+        "cpu": f"{cpu:g}",
+        "memory": f"{int(memory)}",
+        "storage": f"{int(storage)}",
+    }
+
+
+async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
+    """Put the tenant's own quota on its namespace.
+
+    It is what makes the tenant visible to the folder ceiling at all —
+    `_own_env_quota` sums ResourceQuota objects across namespaces carrying the
+    folder label, and a tenant namespace carries it.
+    """
+    body = client.V1ResourceQuota(
+        metadata=client.V1ObjectMeta(
+            name=f"{ns}-quota", labels={"kubevirt-ui.io/managed": "true"},
+        ),
+        spec=client.V1ResourceQuotaSpec(hard={
+            "requests.cpu": quota["cpu"],
+            "requests.memory": quota["memory"],
+            "requests.storage": quota["storage"],
+            "limits.cpu": quota["cpu"],
+            "limits.memory": quota["memory"],
+        }),
+    )
+    try:
+        await k8s.core_api.create_namespaced_resource_quota(namespace=ns, body=body)
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+
 @router.post("", response_model=TenantResponse, status_code=201)
 async def create_tenant(request: Request, req: TenantCreateRequest, user: User = Depends(require_auth)) -> TenantResponse:
     """Create a new tenant cluster."""
@@ -910,10 +970,25 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         #    automatically participates in Phase 2 folder-level authz.
         #    Tenant ns lives on the cluster default overlay — no
         #    ovn.kubernetes.io/logical_switch pre-stamp, no VPC attach.
+        # The tenant's namespace carries the folder label, so whatever quota
+        # sits on it counts toward that folder's ceiling. Without one a tenant
+        # was invisible to the ceiling entirely: two tenants of 2 vCPU / 2Gi
+        # each ran inside folder `acme` while `acme-dev` reported only the
+        # standalone VM's usage. Sized first, checked against the ceiling
+        # before anything exists, then written onto the namespace.
+        tenant_quota = _tenant_quota(req)
+        if req.folder:
+            all_folders = _parse_all_folders(await _ensure_folders_configmap(k8s))
+            await assert_within_folder_quota(
+                k8s, all_folders, req.folder,
+                tenant_quota["cpu"], tenant_quota["memory"], tenant_quota["storage"],
+            )
+
         await _create_namespace(
             k8s, ns, req.name, req.worker_type,
             folder=req.folder, environment=req.environment,
         )
+        await _write_tenant_quota(k8s, ns, tenant_quota)
 
         # 1b. T2 — materialise folder Phase 2 RoleBindings on the tenant ns
         #     so users with folder/env access can see worker VMs in /vms.
