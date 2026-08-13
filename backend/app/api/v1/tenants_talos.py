@@ -421,6 +421,7 @@ def build_talos_worker_config(
     pod_cidr: str,
     service_cidr: str,
     ca_cert_b64: str = "",
+    k8s_ca_cert_b64: str = "",
 ) -> dict[str, Any]:
     """Talos machine config for a worker node.
 
@@ -488,7 +489,37 @@ def build_talos_worker_config(
         # Talos reads; `ca` is kept for older releases.
         config["machine"]["ca"] = {"crt": ca_cert_b64}
         config["machine"]["acceptedCAs"] = [{"crt": ca_cert_b64}]
+
+    if k8s_ca_cert_b64:
+        # A different CA from the one above, and both are needed. The machine
+        # CA is Talos's own; this is the *Kubernetes* CA the kubelet must
+        # trust to talk to the tenant apiserver. Without it Talos accepts the
+        # config, starts, and then never brings the kubelet up:
+        #
+        #   secrets.KubeletController: missing accepted Kubernetes CAs
+        #
+        # Certificate only — a worker signs nothing.
+        config["cluster"]["ca"] = {"crt": k8s_ca_cert_b64}
+        config["cluster"]["acceptedCAs"] = [{"crt": k8s_ca_cert_b64}]
+
     return config
+
+
+async def read_tenant_k8s_ca_cert(k8s, tenant: str, namespace: str) -> str:
+    """The tenant cluster's Kubernetes CA certificate, base64 as Talos wants.
+
+    Kamaji keeps it in `<tenant>-ca`; the Secret already stores it encoded, so
+    the value passes through untouched.
+    """
+    try:
+        secret = await k8s.core_api.read_namespaced_secret(
+            name=f"{tenant}-ca", namespace=namespace,
+        )
+    except ApiException as e:
+        logger.warning(f"Kubernetes CA secret for tenant {tenant!r} unreadable: {e}")
+        return ""
+
+    return (secret.data or {}).get("ca.crt", "")
 
 
 async def read_talos_ca_cert(k8s, tenant: str, namespace: str) -> str:

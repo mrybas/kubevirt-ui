@@ -560,3 +560,48 @@ class TestWorkerConfigCarriesTheCA:
         source = inspect.getsource(tenants_capi)
         assert "read_talos_ca_cert(k8s, req.name, ns)" in source
         assert "ca_cert_b64=talos_ca" in source
+
+
+class TestWorkerConfigCarriesTheKubernetesCA:
+    """Two different CAs, both required. `machine.ca` is Talos's own;
+    `cluster.ca` is the Kubernetes CA the kubelet must trust to reach the
+    tenant apiserver. With only the first, Talos accepts the config, starts,
+    and never brings the kubelet up:
+
+        secrets.KubeletController: missing accepted Kubernetes CAs
+    """
+
+    def _config(self, k8s_ca: str = "a2M="):
+        from app.api.v1.tenants_talos import build_talos_worker_config
+
+        return build_talos_worker_config(
+            "t1", "tenant-t1", api_port=6443, control_plane_vip="10.0.0.1",
+            machine_token="aaaaaa.bbbbbbbbbbbbbbbb", cluster_id="id",
+            cluster_secret="secret", pod_cidr="10.244.0.0/16",
+            service_cidr="10.112.0.0/12", ca_cert_b64="dGFsb3M=",
+            k8s_ca_cert_b64=k8s_ca,
+        )
+
+    def test_the_two_cas_are_distinct_and_both_present(self) -> None:
+        cfg = self._config()
+
+        assert cfg["machine"]["ca"]["crt"] == "dGFsb3M="
+        assert cfg["cluster"]["ca"]["crt"] == "a2M="
+        assert cfg["cluster"]["acceptedCAs"] == [{"crt": "a2M="}]
+
+    def test_no_kubernetes_ca_key_reaches_the_worker(self) -> None:
+        assert "key" not in self._config()["cluster"]["ca"]
+
+    def test_an_absent_kubernetes_ca_leaves_the_fields_out(self) -> None:
+        cluster = self._config(k8s_ca="")["cluster"]
+
+        assert "ca" not in cluster
+        assert "acceptedCAs" not in cluster
+
+    def test_the_capi_path_reads_it_from_the_kamaji_secret(self) -> None:
+        import inspect
+
+        from app.api.v1 import tenants_capi, tenants_talos
+
+        assert 'f"{tenant}-ca"' in inspect.getsource(tenants_talos.read_tenant_k8s_ca_cert)
+        assert "k8s_ca_cert_b64=k8s_ca" in inspect.getsource(tenants_capi)
