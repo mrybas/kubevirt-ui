@@ -445,7 +445,48 @@ CAPI_OPERATOR_GROUP = "operator.cluster.x-k8s.io"
 CAPI_OPERATOR_VERSION = "v1alpha2"
 
 
-def build_bootstrap_provider() -> dict[str, Any]:
+TALOS_PROVIDER_FALLBACK_NS = "capi-talos-bootstrap-system"
+
+
+async def find_capi_operator_namespace(k8s) -> str:
+    """Where capi-operator expects provider objects on THIS cluster.
+
+    The namespace is a deployment choice, not a constant: the operator watches
+    provider CRs wherever they are, and a cluster that installs it under a
+    prefix (`o0-capi` here) keeps its providers there too. Hardcoding
+    `capi-talos-bootstrap-system` means the create lands in a namespace that
+    does not exist, 404s, and Talos support silently reports itself
+    "unavailable" while a perfectly healthy capi-operator sits next door.
+
+    Follows the cluster's own convention — the namespace of a provider it
+    already has — and falls back to the operator's own namespace.
+    """
+    try:
+        existing = await k8s.custom_api.list_cluster_custom_object(
+            group=CAPI_OPERATOR_GROUP, version=CAPI_OPERATOR_VERSION,
+            plural="bootstrapproviders",
+        )
+        for item in existing.get("items", []):
+            ns = item.get("metadata", {}).get("namespace")
+            if ns:
+                return ns
+    except ApiException as e:
+        logger.warning(f"Could not list BootstrapProviders: {e}")
+
+    try:
+        deployments = await k8s.apps_api.list_deployment_for_all_namespaces(
+            label_selector="control-plane=controller-manager",
+        )
+        for dep in deployments.items or []:
+            if "capi-operator" in (dep.metadata.name or ""):
+                return dep.metadata.namespace
+    except ApiException as e:
+        logger.warning(f"Could not locate the capi-operator deployment: {e}")
+
+    return TALOS_PROVIDER_FALLBACK_NS
+
+
+def build_bootstrap_provider(namespace: str = TALOS_PROVIDER_FALLBACK_NS) -> dict[str, Any]:
     """The `BootstrapProvider talos` CR.
 
     A thin object consumed by capi-operator: creating it is how you ask the
@@ -458,7 +499,7 @@ def build_bootstrap_provider() -> dict[str, Any]:
         "kind": "BootstrapProvider",
         "metadata": {
             "name": "talos",
-            "namespace": "capi-talos-bootstrap-system",
+            "namespace": namespace,
             "labels": dict(MANAGED_LABEL),
         },
         "spec": {},
@@ -475,13 +516,14 @@ async def ensure_talos_bootstrap_provider(k8s) -> str:
 
     Returns what happened, for the caller to log.
     """
+    namespace = await find_capi_operator_namespace(k8s)
     try:
         await k8s.custom_api.create_namespaced_custom_object(
             group=CAPI_OPERATOR_GROUP, version=CAPI_OPERATOR_VERSION,
-            namespace="capi-talos-bootstrap-system",
-            plural="bootstrapproviders", body=build_bootstrap_provider(),
+            namespace=namespace,
+            plural="bootstrapproviders", body=build_bootstrap_provider(namespace),
         )
-        logger.info("Requested CABPT via BootstrapProvider 'talos'")
+        logger.info(f"Requested CABPT via BootstrapProvider 'talos' in {namespace}")
         return "created"
     except ApiException as e:
         if e.status == 409:
@@ -664,14 +706,37 @@ async def assert_cabpt_installed(k8s) -> None:
         )
     except ApiException as e:
         if e.status == 404:
+            # Missing is not the same as unobtainable: capi-operator installs
+            # CABPT from a BootstrapProvider object, which is something the UI
+            # can ask for itself. Do that, then still refuse *this* request —
+            # the provider takes a moment to come up, and half-creating a
+            # tenant against a CRD that does not exist yet is exactly what
+            # this check exists to prevent.
+            outcome = await ensure_talos_bootstrap_provider(k8s)
+
+            if outcome in ("created", "exists"):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Talos workers need the Talos bootstrap provider "
+                        f"(CABPT), which was missing. It has been requested "
+                        f"from capi-operator ({outcome}); the provider takes "
+                        "under a minute to install. Retry this tenant then — "
+                        "or choose Standard (cloud-init) workers to create it "
+                        "now."
+                    ),
+                )
+
             raise HTTPException(
                 status_code=422,
                 detail=(
                     "Talos workers need the Talos bootstrap provider (CABPT): "
                     f"{CABPT_PLURAL}.{CABPT_GROUP} is not installed on this "
-                    "cluster. Install it (capi-operator BootstrapProvider "
-                    "'talos') or choose worker_os='cloud-init'. Without it the "
-                    "workers would wait for bootstrap data forever."
+                    "cluster, and capi-operator is not available to install it "
+                    f"({outcome}). Install capi-operator and the Talos "
+                    "BootstrapProvider, or choose worker_os='cloud-init'. "
+                    "Without it the workers would wait for bootstrap data "
+                    "forever."
                 ),
             )
         # Anything else (403, transient) is not proof of absence — let the

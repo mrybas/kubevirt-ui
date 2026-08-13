@@ -285,3 +285,67 @@ class TestGoldenImageSourceGuard:
         source = inspect.getsource(tenants_talos.ensure_talos_golden_image)
         assert 'startswith(("http://", "https://"))' in source
         assert "TALOS_GOLDEN_IMAGE_URL" in source
+
+
+class TestBootstrapProviderNamespace:
+    """capi-operator's namespace is a deployment choice, not a constant. This
+    cluster runs it under `o0-capi` with its kubeadm provider alongside;
+    creating the Talos provider in a hardcoded `capi-talos-bootstrap-system`
+    404s, and Talos support then reports itself "unavailable" while a healthy
+    operator sits next door."""
+
+    def _k8s(self, providers=None, deployments=None):
+        from unittest.mock import AsyncMock, MagicMock
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(
+            return_value={"items": providers if providers is not None else []},
+        )
+        deps = MagicMock()
+        deps.items = deployments or []
+        k8s.apps_api.list_deployment_for_all_namespaces = AsyncMock(return_value=deps)
+        return k8s
+
+    def _deployment(self, name, namespace):
+        from unittest.mock import MagicMock
+
+        dep = MagicMock()
+        dep.metadata.name = name
+        dep.metadata.namespace = namespace
+        return dep
+
+    @pytest.mark.asyncio
+    async def test_follows_the_namespace_of_an_existing_provider(self) -> None:
+        from app.api.v1.tenants_talos import find_capi_operator_namespace
+
+        k8s = self._k8s(providers=[{"metadata": {"name": "kubeadm", "namespace": "o0-capi"}}])
+
+        assert await find_capi_operator_namespace(k8s) == "o0-capi"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_operator_deployment(self) -> None:
+        from app.api.v1.tenants_talos import find_capi_operator_namespace
+
+        k8s = self._k8s(
+            providers=[],
+            deployments=[self._deployment("capi-operator-cluster-api-operator", "o0-capi")],
+        )
+
+        assert await find_capi_operator_namespace(k8s) == "o0-capi"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_the_upstream_default_when_nothing_is_found(self) -> None:
+        from app.api.v1.tenants_talos import (
+            TALOS_PROVIDER_FALLBACK_NS,
+            find_capi_operator_namespace,
+        )
+
+        assert await find_capi_operator_namespace(self._k8s()) == TALOS_PROVIDER_FALLBACK_NS
+
+    def test_the_manifest_is_built_for_the_namespace_it_is_created_in(self) -> None:
+        from app.api.v1.tenants_talos import build_bootstrap_provider
+
+        body = build_bootstrap_provider("o0-capi")
+
+        assert body["metadata"]["namespace"] == "o0-capi"
+        assert body["metadata"]["name"] == "talos"
