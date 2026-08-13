@@ -1,8 +1,9 @@
 """API v1 router aggregation."""
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from app.config import get_settings
+from app.core.auth import require_auth
 from app.api.v1.auth import router as auth_router
 from app.api.v1.cluster import router as cluster_router
 from app.api.v1.users import users_router, groups_router
@@ -46,15 +47,28 @@ async def get_features():
     return {"enableTenants": settings.enable_tenants}
 
 
+# Everything except /auth sits behind authentication.
+#
+# Per-route dependencies were the convention here, and 18 routes across
+# projects, storage and metrics simply never got one — anonymous callers could
+# delete namespaces, delete DataVolumes and run arbitrary PromQL. Worse,
+# `create_project` read `request.state.user`, which nothing in the app ever
+# sets, so the code *looked* guarded. A router-level dependency is the only
+# form that cannot be forgotten by the next endpoint.
+#
+# With AUTH_TYPE=none `require_auth` resolves to the anonymous admin, so a lab
+# deployment behaves exactly as before; this bites only where auth is on.
+protected = APIRouter(dependencies=[Depends(require_auth)])
+
 # Include all v1 routers
 router.include_router(auth_router, prefix="/auth", tags=["Authentication"])
-router.include_router(metrics_router, prefix="/metrics", tags=["Metrics"])
-router.include_router(profile_router, prefix="/profile", tags=["Profile"])
-router.include_router(folders_router, prefix="/folders", tags=["Folders"])
-router.include_router(projects_router, prefix="/projects", tags=["Projects"])
+protected.include_router(metrics_router, prefix="/metrics", tags=["Metrics"])
+protected.include_router(profile_router, prefix="/profile", tags=["Profile"])
+protected.include_router(folders_router, prefix="/folders", tags=["Folders"])
+protected.include_router(projects_router, prefix="/projects", tags=["Projects"])
 
 if settings.enable_tenants:
-    router.include_router(tenants_router, prefix="/tenants", tags=["Tenants"])
+    protected.include_router(tenants_router, prefix="/tenants", tags=["Tenants"])
 else:
 
     _tenants_fallback = APIRouter()
@@ -63,46 +77,48 @@ else:
     async def tenants_disabled(path: str):
         raise HTTPException(status_code=403, detail="Tenants feature is disabled")
 
-    router.include_router(_tenants_fallback, prefix="/tenants", tags=["Tenants"])
-router.include_router(teams_router, prefix="/teams", tags=["Teams"])
-router.include_router(users_router, prefix="/users", tags=["Users"])
-router.include_router(groups_router, prefix="/groups", tags=["Groups"])
-router.include_router(ldap_router, prefix="/ldap", tags=["LDAP"])
+    protected.include_router(_tenants_fallback, prefix="/tenants", tags=["Tenants"])
+protected.include_router(teams_router, prefix="/teams", tags=["Teams"])
+protected.include_router(users_router, prefix="/users", tags=["Users"])
+protected.include_router(groups_router, prefix="/groups", tags=["Groups"])
+protected.include_router(ldap_router, prefix="/ldap", tags=["LDAP"])
 
 # VM Templates and Images
-router.include_router(templates_router, prefix="/templates", tags=["VM Templates"])
-router.include_router(images_router, prefix="/images", tags=["Images"])
+protected.include_router(templates_router, prefix="/templates", tags=["VM Templates"])
+protected.include_router(images_router, prefix="/images", tags=["Images"])
 
 # Network Management (Kube-OVN)
-router.include_router(network_router, prefix="/network", tags=["Network"])
-router.include_router(vpc_underlay_router, prefix="/network", tags=["Network"])
-router.include_router(vpcs_router, prefix="/vpcs", tags=["VPCs"])
-router.include_router(security_groups_router, prefix="/security-groups", tags=["Security Groups"])
-router.include_router(egress_gateway_router, prefix="/egress-gateways", tags=["Egress Gateways"])
-router.include_router(ovn_gateway_router, prefix="/ovn-gateways", tags=["OVN Gateways"])
-router.include_router(subnet_acls_router, prefix="/subnets", tags=["Subnet ACLs"])
-router.include_router(hubble_router, prefix="/hubble", tags=["Hubble"])
-router.include_router(cilium_policy_router, prefix="/cilium-policies", tags=["Cilium Policies"])
-router.include_router(security_baseline_router, prefix="/security-baseline", tags=["Security Baseline"])
-router.include_router(bgp_router, prefix="/bgp", tags=["BGP"])
+protected.include_router(network_router, prefix="/network", tags=["Network"])
+protected.include_router(vpc_underlay_router, prefix="/network", tags=["Network"])
+protected.include_router(vpcs_router, prefix="/vpcs", tags=["VPCs"])
+protected.include_router(security_groups_router, prefix="/security-groups", tags=["Security Groups"])
+protected.include_router(egress_gateway_router, prefix="/egress-gateways", tags=["Egress Gateways"])
+protected.include_router(ovn_gateway_router, prefix="/ovn-gateways", tags=["OVN Gateways"])
+protected.include_router(subnet_acls_router, prefix="/subnets", tags=["Subnet ACLs"])
+protected.include_router(hubble_router, prefix="/hubble", tags=["Hubble"])
+protected.include_router(cilium_policy_router, prefix="/cilium-policies", tags=["Cilium Policies"])
+protected.include_router(security_baseline_router, prefix="/security-baseline", tags=["Security Baseline"])
+protected.include_router(bgp_router, prefix="/bgp", tags=["BGP"])
 
 # Cluster-wide VMs endpoint
-router.include_router(vms_router, prefix="/vms", tags=["Virtual Machines"])
+protected.include_router(vms_router, prefix="/vms", tags=["Virtual Machines"])
 
 # Namespaced resources — VM CRUD + sub-modules share the same prefix
-router.include_router(vms_router, prefix="/namespaces/{namespace}/vms", tags=["Virtual Machines"])
-router.include_router(vm_actions_router, prefix="/namespaces/{namespace}/vms", tags=["VM Actions"])
-router.include_router(vm_disks_router, prefix="/namespaces/{namespace}/vms", tags=["VM Disks"])
-router.include_router(vm_console_router, prefix="/namespaces/{namespace}/vms", tags=["VM Console"])
-router.include_router(vm_snapshots_router, prefix="/namespaces/{namespace}/vms", tags=["VM Snapshots"])
-router.include_router(vm_network_router, prefix="/namespaces/{namespace}/vms", tags=["VM Network"])
-router.include_router(storage_router, prefix="/namespaces/{namespace}/storage", tags=["Storage"])
-router.include_router(disks_router, prefix="/namespaces/{namespace}/disks", tags=["Persistent Disks"])
-router.include_router(snapshots_router, prefix="/namespaces/{namespace}/snapshots", tags=["Volume Snapshots"])
-router.include_router(schedules_router, prefix="/namespaces/{namespace}/schedules", tags=["Scheduled Actions"])
-router.include_router(namespaces_router, prefix="/namespaces", tags=["Namespaces"])
-router.include_router(cluster_router, prefix="/cluster", tags=["Cluster"])
-router.include_router(velero_backups_router, prefix="/velero", tags=["Velero Backups"])
+protected.include_router(vms_router, prefix="/namespaces/{namespace}/vms", tags=["Virtual Machines"])
+protected.include_router(vm_actions_router, prefix="/namespaces/{namespace}/vms", tags=["VM Actions"])
+protected.include_router(vm_disks_router, prefix="/namespaces/{namespace}/vms", tags=["VM Disks"])
+protected.include_router(vm_console_router, prefix="/namespaces/{namespace}/vms", tags=["VM Console"])
+protected.include_router(vm_snapshots_router, prefix="/namespaces/{namespace}/vms", tags=["VM Snapshots"])
+protected.include_router(vm_network_router, prefix="/namespaces/{namespace}/vms", tags=["VM Network"])
+protected.include_router(storage_router, prefix="/namespaces/{namespace}/storage", tags=["Storage"])
+protected.include_router(disks_router, prefix="/namespaces/{namespace}/disks", tags=["Persistent Disks"])
+protected.include_router(snapshots_router, prefix="/namespaces/{namespace}/snapshots", tags=["Volume Snapshots"])
+protected.include_router(schedules_router, prefix="/namespaces/{namespace}/schedules", tags=["Scheduled Actions"])
+protected.include_router(namespaces_router, prefix="/namespaces", tags=["Namespaces"])
+protected.include_router(cluster_router, prefix="/cluster", tags=["Cluster"])
+protected.include_router(velero_backups_router, prefix="/velero", tags=["Velero Backups"])
 
 # Cluster-wide storage classes endpoint
-router.include_router(storage_router, prefix="/storage", tags=["Storage"])
+protected.include_router(storage_router, prefix="/storage", tags=["Storage"])
+
+router.include_router(protected)
