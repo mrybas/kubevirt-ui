@@ -490,7 +490,14 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
         <form onSubmit={handleSubmit} className="p-6 space-y-4">
           {error && (
             <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm">
-              Failed to {isEditMode ? 'update' : 'create'} template. Please try again.
+              {/*
+                The server's reason, not a shrug. "Please try again" was the
+                only thing shown for a 409 "Template ubuntu-small already
+                exists" — advice that could not work, for a conflict with a
+                template the wizard filters out of its own list.
+              */}
+              Failed to {isEditMode ? 'update' : 'create'} template:{' '}
+              {error instanceof Error ? error.message : String(error)}
             </div>
           )}
           

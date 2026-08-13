@@ -219,10 +219,27 @@ async def create_template(
                 raise
         
         # Check if template already exists
+        #
+        # Templates are keyed by name in one cluster-wide ConfigMap while the
+        # wizard only shows those whose image lives in the selected project.
+        # A collision is therefore usually with a template the user cannot
+        # see — most often one left pointing at a namespace that is gone — so
+        # the message says where the existing one points.
         if template.name in cm.data:
+            try:
+                existing = json.loads(cm.data[template.name])
+                where = (
+                    f" (it uses image '{existing.get('golden_image_name')}' in "
+                    f"project '{existing.get('golden_image_namespace')}')"
+                )
+            except Exception:
+                where = ""
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Template {template.name} already exists",
+                detail=(
+                    f"Template '{template.name}' already exists{where}. "
+                    f"Pick another name, or delete that template first."
+                ),
             )
         
         # Validate that the golden_image exists in the specified namespace

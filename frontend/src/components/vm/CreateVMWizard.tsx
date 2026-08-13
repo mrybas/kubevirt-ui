@@ -836,7 +836,10 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
         
         {!batchProgress && createVM.error && (
           <div className="bg-red-500/10 border border-red-500/50 rounded-lg p-3 text-red-400 text-sm">
-            Failed to create VM. Please try again.
+            Failed to create VM:{' '}
+            {createVM.error instanceof Error
+              ? createVM.error.message
+              : String(createVM.error)}
           </div>
         )}
       </div>
