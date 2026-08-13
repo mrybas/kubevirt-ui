@@ -44,6 +44,13 @@ CILIUM_EXEMPT_NAME = "cilium-gateway-exempt"
 
 EXTERNAL_GW_LABEL = "ovn.kubernetes.io/external-gw"
 
+# Where to find an image that is certainly present on the gateway nodes: the
+# kube-ovn CNI runs there, and it carries iproute2 because it uses it itself.
+KUBEOVN_CNI_DAEMONSET = "kube-ovn-cni"
+# Only if that lookup fails. Public and therefore rottable — the previous
+# default stopped serving a layer and the watcher never started.
+_FALLBACK_WATCHER_IMAGE = "docker.io/library/busybox:1.36"
+
 # The ProviderNetwork controller initialises the OVS bridge per node and only
 # then reports the node ready, so right after a create there is nothing to
 # label yet. Measured at ~20s on the lab.
@@ -103,7 +110,18 @@ class VpcUnderlayRequest(BaseModel):
             "swallowed. Turn off where the link is known to stay up."
         ),
     )
-    link_watcher_image: str = "mirror.gcr.io/library/busybox:1.36"
+    link_watcher_image: str = Field(
+        "",
+        description=(
+            "Image for the link watcher. Empty means reuse the image kube-ovn's "
+            "own CNI DaemonSet is running, which is already pulled on exactly "
+            "the nodes this watcher runs on and carries iproute2. A named "
+            "public image is a dependency that can rot: "
+            "mirror.gcr.io/library/busybox:1.36 stopped serving one of its "
+            "layers and the watcher sat in ImagePullBackOff — desired 3, "
+            "ready 0 — which looks like a healthy DaemonSet in every summary."
+        ),
+    )
     cilium_source_ip_exempt: bool = Field(
         False,
         description=(
@@ -246,12 +264,17 @@ def _workaround_meta(name: str, namespace: str, reason: str, remove_when: str) -
     }
 
 
-def build_link_watcher(data: VpcUnderlayRequest, kubeovn_ns: str) -> dict[str, Any]:
+def build_link_watcher(
+    data: VpcUnderlayRequest, kubeovn_ns: str, image: str = "",
+) -> dict[str, Any]:
     """DaemonSet that keeps the provider NIC administratively up.
 
     A workaround, deliberately labelled as one. `ip link set up` on an
     already-up interface is a no-op, so the loop costs nothing; it exists
     only because kube-ovn never rechecks the link after bridge init.
+
+    `image` is the resolved image — normally kube-ovn's own, discovered by the
+    caller. An explicit `link_watcher_image` in the request wins over it.
     """
     script = (
         "while true; do\n"
@@ -283,7 +306,7 @@ def build_link_watcher(data: VpcUnderlayRequest, kubeovn_ns: str) -> dict[str, A
                     "tolerations": [{"operator": "Exists"}],
                     "containers": [{
                         "name": "link-up",
-                        "image": data.link_watcher_image,
+                        "image": data.link_watcher_image or image or _FALLBACK_WATCHER_IMAGE,
                         "securityContext": {"privileged": True},
                         "command": ["/bin/sh", "-c"],
                         "args": [script],
@@ -436,6 +459,49 @@ async def _ready_nodes(k8s, provider_network_name: str, *, wait: bool) -> list[s
     return []
 
 
+async def _kubeovn_cni_image(k8s, kubeovn_ns: str) -> str:
+    """The image kube-ovn's own CNI DaemonSet runs, or "" if unreadable."""
+    try:
+        ds = await k8s.apps_api.read_namespaced_daemon_set(
+            name=KUBEOVN_CNI_DAEMONSET, namespace=kubeovn_ns,
+        )
+    except ApiException as e:
+        logger.warning(f"Underlay: could not read {KUBEOVN_CNI_DAEMONSET}: {e}")
+        return ""
+    containers = ds.spec.template.spec.containers or []
+    return containers[0].image if containers else ""
+
+
+def _daemonset_state(ds) -> UnderlayObject:
+    """Whether the DaemonSet is doing anything, not whether it exists.
+
+    Both ways it can exist and do nothing are the same class of failure this
+    fabric keeps producing: scheduled nowhere (no node carries the label), or
+    scheduled and never started (the image stopped being pullable). Either
+    reads as a healthy DaemonSet in every summary that counts objects.
+    """
+    status = ds.status
+    desired = getattr(status, "desired_number_scheduled", 0) or 0
+    ready = getattr(status, "number_ready", 0) or 0
+    meta = ds.metadata
+    if desired == 0:
+        return UnderlayObject(
+            kind="DaemonSet", name=meta.name, namespace=meta.namespace,
+            state="failed", workaround=True,
+            detail="scheduled on no node — nothing matches its nodeSelector",
+        )
+    if ready == 0:
+        return UnderlayObject(
+            kind="DaemonSet", name=meta.name, namespace=meta.namespace,
+            state="failed", workaround=True,
+            detail=f"0/{desired} pods ready — check image pulls and events",
+        )
+    return UnderlayObject(
+        kind="DaemonSet", name=meta.name, namespace=meta.namespace,
+        state="exists", workaround=True, detail=f"{ready}/{desired} ready",
+    )
+
+
 async def _label_gateway_nodes(k8s, provider_network_name: str) -> UnderlayObject:
     """Mark the nodes that carry the provider NIC.
 
@@ -556,7 +622,10 @@ async def ensure_vpc_underlay(
     ]
 
     if data.link_watcher:
-        objects.append(await _ensure_daemonset(k8s, build_link_watcher(data, kubeovn_ns)))
+        image = await _kubeovn_cni_image(k8s, kubeovn_ns)
+        objects.append(await _ensure_daemonset(
+            k8s, build_link_watcher(data, kubeovn_ns, image),
+        ))
     else:
         objects.append(UnderlayObject(
             kind="DaemonSet", name=LINK_WATCHER_NAME, namespace=kubeovn_ns,
@@ -641,20 +710,27 @@ async def get_vpc_underlay(
             ),
         ))
 
-    for ds_name, ds_ns in ((LINK_WATCHER_NAME, kubeovn_ns), (CILIUM_EXEMPT_NAME, None)):
-        if ds_ns is None:
-            continue
-        try:
-            await k8s.apps_api.read_namespaced_daemon_set(name=ds_name, namespace=ds_ns)
+    # Found by their marker label rather than by name in a known namespace:
+    # the Cilium one lives wherever Cilium does, which this endpoint is never
+    # told, so it used to be skipped entirely and never appeared here at all.
+    try:
+        found = await k8s.apps_api.list_daemon_set_for_all_namespaces(
+            label_selector=f"{WORKAROUND_LABEL}=true",
+        )
+        seen = {ds.metadata.name: ds for ds in found.items}
+    except ApiException as e:
+        logger.warning(f"Underlay: could not list workaround DaemonSets: {e}")
+        seen = {}
+
+    for ds_name, default_ns in ((LINK_WATCHER_NAME, kubeovn_ns), (CILIUM_EXEMPT_NAME, "")):
+        ds = seen.get(ds_name)
+        if ds is None:
             objects.append(UnderlayObject(
-                kind="DaemonSet", name=ds_name, namespace=ds_ns,
-                state="exists", workaround=True,
-            ))
-        except ApiException:
-            objects.append(UnderlayObject(
-                kind="DaemonSet", name=ds_name, namespace=ds_ns,
+                kind="DaemonSet", name=ds_name, namespace=default_ns,
                 state="missing", workaround=True,
             ))
+            continue
+        objects.append(_daemonset_state(ds))
 
     # The workarounds are optional; the fabric is what decides readiness.
     fabric = [o for o in objects if not o.workaround]

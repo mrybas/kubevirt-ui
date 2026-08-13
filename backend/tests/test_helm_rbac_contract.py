@@ -84,6 +84,8 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     ("apps", "daemonsets", "create", "vpc_underlay._ensure_daemonset"),
     ("apps", "daemonsets", "patch", "vpc_underlay._ensure_daemonset (reconcile)"),
     ("", "nodes", "patch", "vpc_underlay._label_gateway_nodes"),
+    ("apps", "daemonsets", "get", "vpc_underlay._kubeovn_cni_image"),
+    ("apps", "daemonsets", "list", "vpc_underlay.get (workaround DaemonSets)"),
     # --- Talos tenants: PKI via cert-manager for the CSR signer ---
     ("cert-manager.io", "issuers", "create", "tenants_talos.build_talos_pki"),
     ("cert-manager.io", "certificates", "create", "tenants_talos.build_talos_pki"),

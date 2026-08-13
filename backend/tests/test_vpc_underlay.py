@@ -31,6 +31,7 @@ from app.api.v1.vpc_underlay import (
     build_link_watcher,
     build_provider_network,
     build_vlan,
+    _daemonset_state,
     ensure_vpc_underlay,
     get_vpc_underlay,
     subnet_provider,
@@ -176,6 +177,9 @@ class TestEnsureEndpoint:
         node.metadata.labels = {}
         k8s.core_api.read_node = AsyncMock(return_value=node)
         k8s.core_api.patch_node = AsyncMock()
+        cni = MagicMock()
+        cni.spec.template.spec.containers = [MagicMock(image="kubeovn/kube-ovn:v1.16.0")]
+        k8s.apps_api.read_namespaced_daemon_set = AsyncMock(return_value=cni)
         return k8s
 
     def _request(self, k8s: MagicMock) -> MagicMock:
@@ -380,6 +384,9 @@ class TestGatewayNodesAreLabelled:
         node.metadata.labels = labels or {}
         k8s.core_api.read_node = AsyncMock(return_value=node)
         k8s.core_api.patch_node = AsyncMock()
+        cni = MagicMock()
+        cni.spec.template.spec.containers = [MagicMock(image="kubeovn/kube-ovn:v1.16.0")]
+        k8s.apps_api.read_namespaced_daemon_set = AsyncMock(return_value=cni)
         return k8s
 
     def _request(self, k8s: MagicMock) -> MagicMock:
@@ -434,7 +441,9 @@ class TestGatewayNodesAreLabelled:
     async def test_get_reports_an_unlabelled_cluster(self) -> None:
         k8s = MagicMock()
         k8s.custom_api.get_cluster_custom_object = AsyncMock(return_value={})
-        k8s.apps_api.read_namespaced_daemon_set = AsyncMock()
+        k8s.apps_api.list_daemon_set_for_all_namespaces = AsyncMock(
+            return_value=MagicMock(items=[]),
+        )
         k8s.core_api.list_node = AsyncMock(return_value=MagicMock(items=[]))
 
         result = await get_vpc_underlay(request=self._request(k8s), user=MagicMock())
@@ -444,3 +453,181 @@ class TestGatewayNodesAreLabelled:
         assert result.ready is False, (
             "a fabric with no gateway nodes cannot host a gateway"
         )
+
+
+@pytest.mark.asyncio
+class TestTheWatcherCanActuallyStart:
+    """Existing is not running, and the difference is the whole point.
+
+    The watcher shipped pinned to `mirror.gcr.io/library/busybox:1.36`. That
+    mirror stopped serving one of the image's layers, so on a fresh cluster
+    every pod sat in ImagePullBackOff:
+
+        Failed to pull image "mirror.gcr.io/library/busybox:1.36": ...
+        could not fetch content descriptor sha256:034d65... not found
+
+    DaemonSet: desired 3, current 3, ready 0. Object created, endpoint green,
+    provider link unwatched.
+    """
+
+    def _k8s(self, cni_image: str = "kubeovn/kube-ovn:v1.16.0") -> MagicMock:
+        k8s = MagicMock()
+        k8s.custom_api.create_cluster_custom_object = AsyncMock()
+        k8s.custom_api.create_namespaced_custom_object = AsyncMock()
+        k8s.custom_api.get_cluster_custom_object = AsyncMock(
+            return_value={"status": {"readyNodes": ["worker-1"]}},
+        )
+        node = MagicMock()
+        node.metadata.labels = {}
+        k8s.core_api.read_node = AsyncMock(return_value=node)
+        k8s.core_api.patch_node = AsyncMock()
+        k8s.apps_api.create_namespaced_daemon_set = AsyncMock()
+        if cni_image:
+            cni = MagicMock()
+            cni.spec.template.spec.containers = [MagicMock(image=cni_image)]
+            k8s.apps_api.read_namespaced_daemon_set = AsyncMock(return_value=cni)
+        else:
+            k8s.apps_api.read_namespaced_daemon_set = AsyncMock(
+                side_effect=ApiException(status=404, reason="NotFound"),
+            )
+        return k8s
+
+    def _request(self, k8s: MagicMock) -> MagicMock:
+        request = MagicMock()
+        request.app.state.k8s_client = k8s
+        return request
+
+    @pytest.fixture(autouse=True)
+    def _ns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import app.api.v1.network as network_mod
+
+        async def _f(_k8s: object) -> str:
+            return KUBEOVN_NS
+
+        monkeypatch.setattr(network_mod, "_find_kubeovn_namespace", _f)
+
+    async def test_reuses_the_image_already_on_those_nodes(self) -> None:
+        k8s = self._k8s(cni_image="kubeovn/kube-ovn:v1.16.0")
+
+        await ensure_vpc_underlay(
+            request=self._request(k8s), data=_req(), user=MagicMock(),
+        )
+
+        body = k8s.apps_api.create_namespaced_daemon_set.await_args.kwargs["body"]
+        image = body["spec"]["template"]["spec"]["containers"][0]["image"]
+        assert image == "kubeovn/kube-ovn:v1.16.0"
+
+    async def test_an_explicit_image_still_wins(self) -> None:
+        k8s = self._k8s()
+
+        await ensure_vpc_underlay(
+            request=self._request(k8s),
+            data=_req(link_watcher_image="registry.internal/busybox:1.36"),
+            user=MagicMock(),
+        )
+
+        body = k8s.apps_api.create_namespaced_daemon_set.await_args.kwargs["body"]
+        assert body["spec"]["template"]["spec"]["containers"][0]["image"] == (
+            "registry.internal/busybox:1.36"
+        )
+
+    async def test_no_default_reaches_a_mirror_that_can_rot(self) -> None:
+        # Not a hard rule against public images — a rule against the one that
+        # already failed, and against silently shipping an unpinned default.
+        k8s = self._k8s(cni_image="")
+
+        await ensure_vpc_underlay(
+            request=self._request(k8s), data=_req(), user=MagicMock(),
+        )
+
+        body = k8s.apps_api.create_namespaced_daemon_set.await_args.kwargs["body"]
+        image = body["spec"]["template"]["spec"]["containers"][0]["image"]
+        assert "mirror.gcr.io" not in image
+        assert image  # something must be set; an empty image is not a fallback
+
+
+class TestDaemonSetStateIsAboutPodsNotObjects:
+    def _ds(self, desired: int, ready: int) -> MagicMock:
+        ds = MagicMock()
+        ds.metadata.name = LINK_WATCHER_NAME
+        ds.metadata.namespace = KUBEOVN_NS
+        ds.status.desired_number_scheduled = desired
+        ds.status.number_ready = ready
+        return ds
+
+    def test_scheduled_nowhere_is_a_failure(self) -> None:
+        obj = _daemonset_state(self._ds(desired=0, ready=0))
+        assert obj.state == "failed"
+        assert "no node" in obj.detail
+
+    def test_scheduled_but_never_started_is_a_failure(self) -> None:
+        obj = _daemonset_state(self._ds(desired=3, ready=0))
+        assert obj.state == "failed"
+        assert "0/3" in obj.detail
+
+    def test_running_says_how_many(self) -> None:
+        obj = _daemonset_state(self._ds(desired=3, ready=3))
+        assert obj.state == "exists"
+        assert "3/3" in obj.detail
+
+
+@pytest.mark.asyncio
+class TestGetReportsWhatIsRunning:
+    """The read path has to use the pod counts, not just find the object.
+
+    Both DaemonSets were also looked up by name in a fixed namespace, and the
+    Cilium one lives wherever Cilium does — a namespace this endpoint is never
+    told. It was skipped outright, so it never appeared in the status at all,
+    working or not.
+    """
+
+    def _request(self, k8s: MagicMock) -> MagicMock:
+        request = MagicMock()
+        request.app.state.k8s_client = k8s
+        return request
+
+    @pytest.fixture(autouse=True)
+    def _ns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import app.api.v1.network as network_mod
+
+        async def _f(_k8s: object) -> str:
+            return KUBEOVN_NS
+
+        monkeypatch.setattr(network_mod, "_find_kubeovn_namespace", _f)
+
+    def _k8s(self, daemonsets: list) -> MagicMock:
+        k8s = MagicMock()
+        k8s.custom_api.get_cluster_custom_object = AsyncMock(return_value={})
+        node = MagicMock()
+        node.metadata.name = "worker-1"
+        k8s.core_api.list_node = AsyncMock(return_value=MagicMock(items=[node]))
+        k8s.apps_api.list_daemon_set_for_all_namespaces = AsyncMock(
+            return_value=MagicMock(items=daemonsets),
+        )
+        return k8s
+
+    def _ds(self, name: str, ns: str, desired: int, ready: int) -> MagicMock:
+        ds = MagicMock()
+        ds.metadata.name = name
+        ds.metadata.namespace = ns
+        ds.status.desired_number_scheduled = desired
+        ds.status.number_ready = ready
+        return ds
+
+    async def test_a_watcher_that_never_started_is_not_reported_as_present(self) -> None:
+        k8s = self._k8s([self._ds(LINK_WATCHER_NAME, KUBEOVN_NS, 3, 0)])
+
+        result = await get_vpc_underlay(request=self._request(k8s), user=MagicMock())
+
+        watcher = next(o for o in result.objects if o.name == LINK_WATCHER_NAME)
+        assert watcher.state == "failed"
+        assert "0/3" in watcher.detail
+
+    async def test_the_cilium_workaround_is_found_wherever_it_lives(self) -> None:
+        k8s = self._k8s([self._ds(CILIUM_EXEMPT_NAME, "o0-cilium", 6, 6)])
+
+        result = await get_vpc_underlay(request=self._request(k8s), user=MagicMock())
+
+        exempt = next(o for o in result.objects if o.name == CILIUM_EXEMPT_NAME)
+        assert exempt.namespace == "o0-cilium"
+        assert exempt.state == "exists"
