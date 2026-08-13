@@ -705,6 +705,16 @@ interface Donor {
   kind: 'environment' | 'folder';
   /** Current quota per dimension, in cores/bytes; 0 when it holds none. */
   held: Record<Dim, number>;
+  /**
+   * What the donor is already sitting on — running VMs for an environment,
+   * the subtree's own reservations for a sub-folder.
+   *
+   * A neighbour capped at 30Gi with 26Gi in use has 4Gi to give, not 30. The
+   * API server accepts a quota set below its own usage and then refuses
+   * everything new, so a slider that offered the whole 30 would quietly
+   * freeze that namespace.
+   */
+  floor: Record<Dim, number>;
 }
 
 export function AddEnvironmentModal({
@@ -748,6 +758,11 @@ export function AddEnvironmentModal({
         memory: parseQuantity(env.quota_memory) ?? 0,
         storage: parseQuantity(env.quota_storage) ?? 0,
       },
+      floor: {
+        cpu: parseQuantity(env.used_cpu) ?? 0,
+        memory: parseQuantity(env.used_memory) ?? 0,
+        storage: parseQuantity(env.used_storage) ?? 0,
+      },
     })),
     ...(folder.children ?? []).map(child => ({
       key: `folder:${child.name}`,
@@ -758,8 +773,16 @@ export function AddEnvironmentModal({
         memory: parseQuantity(child.quota?.memory) ?? 0,
         storage: parseQuantity(child.quota?.storage) ?? 0,
       },
+      floor: {
+        cpu: parseQuantity(child.allocated?.cpu) ?? 0,
+        memory: parseQuantity(child.allocated?.memory) ?? 0,
+        storage: parseQuantity(child.allocated?.storage) ?? 0,
+      },
     })),
   ];
+
+  /** Everything above what the donor is already using. */
+  const givable = (d: Donor, dim: Dim): number => Math.max(0, d.held[dim] - d.floor[dim]);
 
   const shortfallOf = (dim: Dim): number => {
     const free = headroom?.free[dim] ?? null;
@@ -834,7 +857,8 @@ export function AddEnvironmentModal({
   const DIM_LABEL: Record<Dim, string> = { cpu: 'CPU', memory: 'memory', storage: 'storage' };
 
   const renderShort = (dim: Dim) => {
-    const eligible = donors.filter(d => d.held[dim] > 0);
+    const eligible = donors.filter(d => givable(d, dim) > 0);
+    const frozen = donors.filter(d => d.held[dim] > 0 && givable(d, dim) === 0);
     const free = headroom?.free[dim] ?? 0;
     const gap = wanted[dim] - free;
     const show = (v: number) => (dim === 'cpu' ? trimNumber(v) : formatBytes(v, unitOf(dim)));
@@ -843,8 +867,11 @@ export function AddEnvironmentModal({
     if (eligible.length === 0) {
       return (
         <p key={dim} className="text-xs text-amber-400">
-          {amount} short, and nothing else in this folder holds a {DIM_LABEL[dim]}
-          {' '}quota to take it from. Raise the folder ceiling instead.
+          {amount} short, and nothing else in this folder has {DIM_LABEL[dim]} to
+          spare{frozen.length > 0 && (
+            <> — {frozen.map(d => d.label).join(', ')} {frozen.length > 1 ? 'are' : 'is'}
+            {' '}using everything {frozen.length > 1 ? 'they hold' : 'it holds'}</>
+          )}. Raise the folder ceiling instead.
         </p>
       );
     }
@@ -862,20 +889,24 @@ export function AddEnvironmentModal({
         {eligible.map(d => {
           const unit = unitOf(dim);
           const taken = takeFrom[dim][d.key] ?? 0;
-          const step = dim === 'cpu' ? 1 : sliderStep(d.held[dim], unit);
+          const spare = givable(d, dim);
+          const step = dim === 'cpu' ? 1 : sliderStep(spare, unit);
           return (
             <div key={d.key} className="flex items-center gap-3">
               <span className="text-xs text-surface-300 w-28 truncate" title={d.label}>
                 {d.label}
               </span>
               <input
-                type="range" min={0} max={d.held[dim]} step={step} value={taken}
+                type="range" min={0} max={spare} step={step} value={taken}
                 aria-label={`Take ${DIM_LABEL[dim]} from ${d.label}`}
                 onChange={(e) => setTake(dim, d.key, Number(e.target.value))}
                 className="flex-1"
               />
-              <span className="text-xs text-surface-400 w-36 text-right">
+              <span className="text-xs text-surface-400 w-44 text-right">
                 −{show(taken)} → leaves {show(d.held[dim] - taken)}
+                {d.floor[dim] > 0 && (
+                  <span className="text-surface-500"> ({show(d.floor[dim])} in use)</span>
+                )}
               </span>
             </div>
           );

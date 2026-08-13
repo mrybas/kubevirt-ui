@@ -118,6 +118,11 @@ class FolderResponse(BaseModel):
     created_at: str | None = None
     quota: FolderQuota | None = None
 
+    # What this folder's subtree already holds — its own environments plus its
+    # children. The floor under any attempt to shrink the quota: room that is
+    # spoken for cannot be handed to someone else.
+    allocated: dict[str, str] | None = None
+
     # Ancestor chain from root to this folder (not including self)
     path: list[str] = []
 
@@ -175,6 +180,12 @@ class FolderEnvironmentResponse(BaseModel):
     quota_cpu: str | None = None
     quota_memory: str | None = None
     quota_storage: str | None = None
+
+    # What the quota already has spoken for. The floor under any attempt to
+    # shrink it — room that is in use cannot be handed to someone else.
+    used_cpu: str | None = None
+    used_memory: str | None = None
+    used_storage: str | None = None
 
 
 class QuotaReallocation(BaseModel):

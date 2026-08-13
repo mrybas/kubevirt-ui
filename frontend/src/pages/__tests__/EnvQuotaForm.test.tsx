@@ -52,6 +52,11 @@ const folder: any = {
       environment: 'dev', name: 'lab-dev',
       quota_cpu: '5', quota_memory: '16Gi', quota_storage: '100Gi',
     },
+    {
+      environment: 'busy', name: 'lab-busy',
+      quota_cpu: '4', quota_memory: '30Gi', quota_storage: '10Gi',
+      used_cpu: '4', used_memory: '26Gi', used_storage: '10Gi',
+    },
   ],
 };
 
@@ -225,5 +230,62 @@ describe('the donor panel stays put', () => {
 
     expect(screen.getByText(/−2Gi → leaves 14Gi/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
+  });
+});
+
+describe('a donor can only give what it is not using', () => {
+  /**
+   * A neighbour capped at 30Gi with 26Gi in use has 4Gi to give. Kubernetes
+   * accepts a quota set below its own usage and then refuses everything new,
+   * so a slider offering the whole 30Gi would quietly freeze that namespace.
+   */
+  it('caps the slider at the idle part', () => {
+    open();
+    fireEvent.change(name(), { target: { value: 'qa' } });
+    fireEvent.change(mem(), { target: { value: '8' } });
+
+    const busy = screen.getByLabelText('Take memory from busy') as HTMLInputElement;
+    expect(Number(busy.max)).toBe(4 * 2 ** 30);
+  });
+
+  it('says how much of the donor is in use', () => {
+    open();
+    fireEvent.change(name(), { target: { value: 'qa' } });
+    fireEvent.change(mem(), { target: { value: '8' } });
+    expect(screen.getByText(/26Gi in use/)).toBeInTheDocument();
+  });
+
+  it('drops a donor with nothing spare', () => {
+    open();
+    fireEvent.change(name(), { target: { value: 'qa' } });
+    fireEvent.change(stor(), { target: { value: '5' } });
+
+    expect(screen.queryByLabelText('Take storage from busy')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Take storage from dev')).toBeInTheDocument();
+  });
+
+  it('says why when the only holder is using all of it', () => {
+    // A folder where `busy` is the only environment holding storage.
+    headroom = { quota: { storage: '10Gi' }, allocated: {}, free: { cpu: null, memory: null, storage: 0 } };
+    render(
+      <AddEnvironmentModal
+        folder={{ ...folder, children: [], environments: [folder.environments[1]] } as any}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.change(name(), { target: { value: 'qa' } });
+    fireEvent.change(stor(), { target: { value: '5' } });
+
+    expect(screen.getByText(/busy is using everything it holds/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
+  });
+
+  it('CPU is no different', () => {
+    open();
+    fireEvent.change(name(), { target: { value: 'qa' } });
+    fireEvent.change(cpu(), { target: { value: '3' } });
+
+    expect(screen.queryByLabelText('Take CPU from busy')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Take CPU from dev')).toBeInTheDocument();
   });
 });

@@ -21,6 +21,10 @@ export interface FolderEnvironment {
   quota_cpu: string | null;
   quota_memory: string | null;
   quota_storage: string | null;
+  /** What the quota already has spoken for — the floor under shrinking it. */
+  used_cpu?: string | null;
+  used_memory?: string | null;
+  used_storage?: string | null;
 }
 
 export interface Folder {
@@ -31,6 +35,8 @@ export interface Folder {
   created_by: string | null;
   created_at: string | null;
   quota: FolderQuota | null;
+  /** What this folder's subtree already holds; the floor under its quota. */
+  allocated?: { cpu?: string; memory?: string; storage?: string } | null;
   path: string[];           // Ancestor chain from root (not including self)
   children: Folder[];       // Nested children (populated in tree mode)
   environments: FolderEnvironment[];

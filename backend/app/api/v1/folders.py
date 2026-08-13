@@ -10,6 +10,7 @@ Architecture:
 import json
 import logging
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -286,8 +287,15 @@ async def _get_env_stats(k8s_client: Any, namespace: str) -> dict[str, Any]:
 
 
 async def _get_env_quotas(k8s_client: Any, ns: str) -> dict:
+    """What the environment caps and what it is already consuming.
+
+    `status.used` is the floor under any attempt to shrink this quota: a
+    slider that offers to take 30Gi from a neighbour holding 30Gi with 26Gi in
+    use is offering something that cannot be given.
+    """
     q: dict[str, str | None] = {
         "quota_cpu": None, "quota_memory": None, "quota_storage": None,
+        "used_cpu": None, "used_memory": None, "used_storage": None,
     }
     try:
         quotas = await k8s_client.core_api.list_namespaced_resource_quota(namespace=ns)
@@ -296,9 +304,43 @@ async def _get_env_quotas(k8s_client: Any, ns: str) -> dict:
                 q["quota_cpu"] = q["quota_cpu"] or quota.spec.hard.get("requests.cpu")
                 q["quota_memory"] = q["quota_memory"] or quota.spec.hard.get("requests.memory")
                 q["quota_storage"] = q["quota_storage"] or quota.spec.hard.get("requests.storage")
+            used = (quota.status.used if quota.status else None) or {}
+            q["used_cpu"] = q["used_cpu"] or used.get("requests.cpu")
+            q["used_memory"] = q["used_memory"] or used.get("requests.memory")
+            q["used_storage"] = q["used_storage"] or used.get("requests.storage")
     except ApiException:
         pass
     return q
+
+
+async def _env_quota_used(k8s_client: Any, ns: str) -> dict[str, float]:
+    """What the environment's ResourceQuota reports as consumed, as numbers."""
+    used = {"cpu": 0.0, "memory": 0.0, "storage": 0.0}
+    try:
+        quotas = await k8s_client.core_api.list_namespaced_resource_quota(namespace=ns)
+    except ApiException:
+        return used
+    for quota in quotas.items:
+        status = (quota.status.used if quota.status else None) or {}
+        for key, field in (
+            ("requests.cpu", "cpu"),
+            ("requests.memory", "memory"),
+            ("requests.storage", "storage"),
+        ):
+            value = parse_quantity(status.get(key))
+            if value:
+                used[field] = max(used[field], value)
+    return used
+
+
+def _format_quantity(field: str, value: float) -> str:
+    """A number back into something a person reads in an error message."""
+    if field == "cpu":
+        return f"{value:g}"
+    for suffix, unit in (("Gi", 1024 ** 3), ("Mi", 1024 ** 2), ("Ki", 1024)):
+        if value >= unit:
+            return f"{value / unit:g}{suffix}"
+    return f"{value:g}"
 
 
 async def _build_env_response(
@@ -905,6 +947,9 @@ async def get_folder(request: Request, name: str, user: User = Depends(require_a
     children = []
     for cname, cmeta in folders.items():
         if cmeta.get("parent_id") == name:
+            # What the child's subtree already holds, so a caller that wants
+            # to take room back knows how little of it is actually free.
+            child_alloc = await _allocated_env_quota(k8s_client, folders, cname)
             children.append(FolderResponse(
                 name=cname,
                 display_name=cmeta.get("display_name", cname),
@@ -913,6 +958,9 @@ async def get_folder(request: Request, name: str, user: User = Depends(require_a
                 created_by=cmeta.get("created_by"),
                 created_at=cmeta.get("created_at"),
                 quota=FolderQuota(**cmeta["quota"]) if cmeta.get("quota") else None,
+                allocated={
+                    f: _format_quantity(f, v) for f, v in child_alloc.items() if v
+                } or None,
                 path=path + [name],
             ))
 
@@ -1139,22 +1187,49 @@ async def _allocated_env_quota(
     environments have claimed it yet. A child without one contributes whatever
     its subtree has actually allocated, which is the honest figure when
     nothing has been promised.
+
+    Per dimension, not per child. Treating "declares a quota" as one decision
+    for the whole child let a sub-folder capped in CPU alone spend unlimited
+    memory: the parent reserved 0 memory for it and never looked at its
+    subtree, so `lab` (32Gi, none free) took a 64Gi environment inside `kid2`
+    without a word. Reproduced on the cluster before this was written.
     """
     totals = await _own_env_quota(k8s_client, folder_name)
 
     for child in _direct_children(folders, folder_name):
         child_quota = (folders.get(child) or {}).get("quota") or {}
-        if child_quota:
-            for field in totals:
-                value = parse_quantity(child_quota.get(field))
-                if value:
-                    totals[field] += value
-        else:
+        declared = {f: parse_quantity(child_quota.get(f)) for f in totals}
+        nested = None
+        if any(v is None for v in declared.values()):
             nested = await _allocated_env_quota(k8s_client, folders, child)
-            for field in totals:
-                totals[field] += nested[field]
+        for field in totals:
+            value = declared[field]
+            totals[field] += value if value is not None else nested[field]
 
     return totals
+
+
+def _ceiling_holder(
+    folders: dict[str, dict], folder_name: str, field: str,
+) -> tuple[str, float] | None:
+    """The nearest folder at or above this one that caps `field`.
+
+    A folder that does not cap a dimension does not stop it: its parent counts
+    the subtree's actual allocation for that dimension, so the parent's
+    ceiling is the one the request has to fit under. Climbing is what makes
+    that ceiling reachable — checking the target folder alone let anything
+    through as long as the folder itself was silent about the dimension.
+    """
+    seen: set[str] = set()
+    name: str | None = folder_name
+    while name and name not in seen:
+        seen.add(name)
+        meta = folders.get(name) or {}
+        limit = parse_quantity((meta.get("quota") or {}).get(field))
+        if limit is not None:
+            return name, limit
+        name = meta.get("parent_id")
+    return None
 
 
 
@@ -1176,24 +1251,32 @@ async def assert_child_folder_within_parent(
     if not quota:
         return
 
-    ceiling = (folders[parent].get("quota") or {})
-    if not ceiling:
-        return
-
-    allocated = await _allocated_env_quota(k8s_client, folders, parent)
-
-    # This child's current reservation is not competing with itself.
     current = meta.get("quota") or {}
-    for field in allocated:
-        value = parse_quantity(current.get(field))
-        if value:
-            allocated[field] -= value
+    allocations: dict[str, dict[str, float]] = {}
 
     for field, label in (("cpu", "CPU"), ("memory", "memory"), ("storage", "storage")):
         want = parse_quantity(quota.get(field))
-        limit = parse_quantity(ceiling.get(field))
-        if want is None or limit is None:
+        if want is None:
             continue
+        # Same climb as for environments: a parent silent about a dimension
+        # passes it up to whoever does cap it.
+        found = _ceiling_holder(folders, parent, field)
+        if found is None:
+            continue
+        holder, limit = found
+        if holder not in allocations:
+            allocations[holder] = await _allocated_env_quota(
+                k8s_client, folders, holder,
+            )
+        allocated = dict(allocations[holder])
+
+        # This child's current reservation is not competing with itself.
+        held = parse_quantity(current.get(field))
+        if held:
+            allocated[field] -= held
+
+        parent_ceiling = (folders.get(holder) or {}).get("quota") or {}
+        ceiling, parent = parent_ceiling, holder
         free = limit - allocated[field]
         if want > free + 1e-9:
             raise HTTPException(
@@ -1283,6 +1366,47 @@ async def _write_env_quota(
         )
 
 
+async def _assert_not_below_use(
+    k8s_client: Any, folders: dict[str, dict], folder_name: str,
+    item: Any, asked: dict[str, str | None],
+) -> None:
+    """Refuse to take room a donor is already sitting on.
+
+    A neighbour capped at 30Gi with 26Gi in use has 4Gi to give, not 30. The
+    API server does not stop this — a ResourceQuota may be set below its own
+    `status.used`; it simply refuses everything new afterwards — so the
+    namespace would keep its VMs and be unable to start another one, with
+    nothing in the UI saying why.
+
+    Enforced here rather than in the dialog so `kubectl`- and API-driven
+    callers meet the same floor.
+    """
+    if item.kind == "folder":
+        # A sub-folder cannot be cut below what its own subtree already holds.
+        floor = await _allocated_env_quota(k8s_client, folders, item.source)
+        where = f"sub-folder '{item.source}'"
+    else:
+        floor = await _env_quota_used(
+            k8s_client, _ns_name(folder_name, item.source),
+        )
+        where = f"environment '{item.source}'"
+
+    for field, label in (("cpu", "CPU"), ("memory", "memory"), ("storage", "storage")):
+        want = parse_quantity(asked.get(field))
+        if want is None:
+            continue
+        in_use = floor[field]
+        if want + 1e-9 < in_use:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{where} is using {_format_quantity(field, in_use)} of "
+                    f"{label} already; it cannot be cut to "
+                    f"{_format_quantity(field, want)}."
+                ),
+            )
+
+
 async def _apply_reallocations(
     k8s_client: Any, folders: dict[str, dict], folder_name: str,
     reallocate: list[Any],
@@ -1301,6 +1425,7 @@ async def _apply_reallocations(
     undo: list[tuple[Any, dict[str, str] | None]] = []
     for item in reallocate:
         asked = {"cpu": item.cpu, "memory": item.memory, "storage": item.storage}
+        await _assert_not_below_use(k8s_client, folders, folder_name, item, asked)
 
         if item.kind == "folder":
             meta = folders.get(item.source)
@@ -1384,15 +1509,36 @@ async def assert_within_folder_quota(
     obey it too — the whole reason the quota moves onto real ResourceQuota
     objects.
 
-    A folder without a quota constrains nothing, which is the state every
-    folder is in until someone sets one.
+    A folder without a quota constrains nothing on its own — but its parent
+    still counts what its environments hold, so the check climbs to whichever
+    ancestor actually caps the dimension.
     """
-    meta = folders.get(folder_name) or {}
-    ceiling = meta.get("quota") or {}
-    if not ceiling:
+    requested = {
+        "cpu": parse_quantity(quota_cpu),
+        "memory": parse_quantity(quota_memory),
+        "storage": parse_quantity(quota_storage),
+    }
+    if all(v is None for v in requested.values()):
         return
 
-    allocated = await _allocated_env_quota(k8s_client, folders, folder_name)
+    holders: dict[str, tuple[str, float]] = {}
+    for field in ("cpu", "memory", "storage"):
+        if requested[field] is None:
+            continue
+        found = _ceiling_holder(folders, folder_name, field)
+        if found is not None:
+            holders[field] = found
+    if not holders:
+        return
+
+    allocations: dict[str, dict[str, float]] = {}
+    for holder, _ in holders.values():
+        if holder not in allocations:
+            allocations[holder] = await _allocated_env_quota(
+                k8s_client, folders, holder,
+            )
+
+    excluded = {"cpu": 0.0, "memory": 0.0, "storage": 0.0}
     if exclude_namespace:
         # Re-allocating an existing environment: its current quota is not
         # competing with itself.
@@ -1409,21 +1555,19 @@ async def assert_within_folder_quota(
                 ):
                     value = parse_quantity(hard.get(key))
                     if value:
-                        allocated[field] -= value
+                        excluded[field] += value
         except ApiException:
             pass
 
-    requested = {
-        "cpu": parse_quantity(quota_cpu),
-        "memory": parse_quantity(quota_memory),
-        "storage": parse_quantity(quota_storage),
-    }
-
     for field, label in (("cpu", "CPU"), ("memory", "memory"), ("storage", "storage")):
         want = requested[field]
-        limit = parse_quantity(ceiling.get(field))
-        if want is None or limit is None:
+        if field not in holders:
             continue
+        folder_name, limit = holders[field]
+        allocated = {
+            f: v - excluded[f] for f, v in allocations[folder_name].items()
+        }
+        ceiling = (folders.get(folder_name) or {}).get("quota") or {}
         free = limit - allocated[field]
         if want > free + 1e-9:
             raise HTTPException(
@@ -1684,6 +1828,13 @@ async def set_environment_quota(
     await assert_within_folder_quota(
         k8s_client, folders, name, body.cpu, body.memory, body.storage,
         exclude_namespace=ns_name,
+    )
+    # Lowering a quota under what the namespace already holds is the same
+    # move as taking that room for someone else, and just as impossible.
+    await _assert_not_below_use(
+        k8s_client, folders, name,
+        SimpleNamespace(kind="environment", source=environment),
+        {"cpu": body.cpu, "memory": body.memory, "storage": body.storage},
     )
     await _write_env_quota(k8s_client, ns_name, body.cpu, body.memory, body.storage)
     return {"environment": environment, "quota": {

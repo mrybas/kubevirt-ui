@@ -10,6 +10,7 @@ environment namespace — and the folder number becomes the ceiling those must
 sum under. Checked in the backend so `kubectl` and the API obey it too.
 """
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,16 +27,29 @@ FOLDERS = {"team": {"quota": {"cpu": "16", "memory": "32Gi", "storage": "200Gi"}
 NO_QUOTA = {"team": {}}
 
 
-def _quota(cpu: str | None = None, mem: str | None = None, storage: str | None = None):
+def _quota(
+    cpu: str | None = None, mem: str | None = None, storage: str | None = None,
+    memory: str | None = None,
+    used_cpu: str | None = None, used_memory: str | None = None,
+    used_storage: str | None = None,
+):
     hard = {}
     if cpu:
         hard["requests.cpu"] = cpu
-    if mem:
-        hard["requests.memory"] = mem
+    if mem or memory:
+        hard["requests.memory"] = mem or memory
     if storage:
         hard["requests.storage"] = storage
+    used = {}
+    if used_cpu:
+        used["requests.cpu"] = used_cpu
+    if used_memory:
+        used["requests.memory"] = used_memory
+    if used_storage:
+        used["requests.storage"] = used_storage
     q = MagicMock()
     q.spec.hard = hard
+    q.status.used = used
     return q
 
 
@@ -62,6 +76,8 @@ def _k8s(per_ns: dict[str, list]) -> MagicMock:
         return MagicMock(items=per_ns.get(namespace, []))
 
     k8s.core_api.list_namespaced_resource_quota = AsyncMock(side_effect=_list)
+    k8s.core_api.replace_namespaced_resource_quota = AsyncMock()
+    k8s.core_api.create_namespaced_resource_quota = AsyncMock()
     return k8s
 
 
@@ -253,3 +269,136 @@ def test_both_folder_write_paths_check_the_parent() -> None:
         assert "assert_child_folder_within_parent" in inspect.getsource(fn), (
             f"{fn.__name__} can set a sub-folder quota without counting siblings"
         )
+
+
+@pytest.mark.asyncio
+class TestSubfolderPerDimension:
+    """A sub-folder capped in one dimension must not be free in the others.
+
+    Reproduced on the cluster: `lab` capped at 32Gi with nothing free took a
+    64Gi environment inside sub-folder `kid2`, because `kid2` declared a CPU
+    quota and the parent read that as "this child is accounted for".
+    """
+
+    def _folders(self) -> dict[str, dict]:
+        return {
+            "lab": {"parent_id": None, "quota": {"cpu": "16", "memory": "32Gi"}},
+            "kid": {"parent_id": "lab", "quota": {"cpu": "2"}},
+        }
+
+    async def test_the_parent_counts_the_child_subtree_it_did_not_cap(self) -> None:
+        from app.api.v1.folders import _allocated_env_quota
+
+        k8s = _k8s({"kid-a": [_quota(memory="8Gi")], "lab-dev": [_quota(memory="4Gi")]})
+        totals = await _allocated_env_quota(k8s, self._folders(), "lab")
+
+        assert totals["cpu"] == 2, "the declared CPU is reserved whole"
+        assert totals["memory"] == 12 * 1024 ** 3, (
+            "the child declares no memory, so its subtree's actual use counts"
+        )
+
+    async def test_an_environment_under_it_hits_the_grandparent_ceiling(self) -> None:
+        from app.api.v1.folders import assert_within_folder_quota
+
+        k8s = _k8s({"kid-a": [_quota(memory="8Gi")], "lab-dev": [_quota(memory="20Gi")]})
+        with pytest.raises(HTTPException) as e:
+            await assert_within_folder_quota(
+                k8s, self._folders(), "kid", None, "8Gi", None,
+            )
+        assert e.value.status_code == 409
+        assert "lab" in e.value.detail
+
+    async def test_and_still_allows_what_fits(self) -> None:
+        from app.api.v1.folders import assert_within_folder_quota
+
+        k8s = _k8s({"kid-a": [_quota(memory="8Gi")], "lab-dev": [_quota(memory="20Gi")]})
+        await assert_within_folder_quota(k8s, self._folders(), "kid", None, "4Gi", None)
+
+    async def test_storage_climbs_the_same_way(self) -> None:
+        from app.api.v1.folders import assert_within_folder_quota
+
+        folders = {
+            "lab": {"parent_id": None, "quota": {"storage": "200Gi"}},
+            "kid": {"parent_id": "lab", "quota": {"cpu": "2"}},
+        }
+        k8s = _k8s({"lab-dev": [_quota(storage="180Gi")]})
+        with pytest.raises(HTTPException) as e:
+            await assert_within_folder_quota(k8s, folders, "kid", None, None, "40Gi")
+        assert "200Gi" in e.value.detail
+
+    async def test_a_subfolder_quota_climbs_too(self) -> None:
+        from app.api.v1.folders import assert_child_folder_within_parent
+
+        folders = {
+            "lab": {"parent_id": None, "quota": {"memory": "32Gi"}},
+            "kid": {"parent_id": "lab", "quota": {"cpu": "2"}},
+            "grand": {"parent_id": "kid", "quota": None},
+        }
+        k8s = _k8s({"lab-dev": [_quota(memory="30Gi")]})
+        with pytest.raises(HTTPException) as e:
+            await assert_child_folder_within_parent(
+                k8s, folders, "grand", {"memory": "8Gi"},
+            )
+        assert e.value.status_code == 409
+
+
+@pytest.mark.asyncio
+class TestCannotTakeWhatIsInUse:
+    """Only the idle part of a quota can be handed to someone else.
+
+    A neighbour capped at 30Gi with 26Gi in use has 4Gi to give. Kubernetes
+    accepts a quota set below its own `status.used` and simply refuses
+    everything new afterwards, so the namespace would keep its VMs and be
+    unable to start another, with nothing saying why.
+    """
+
+    async def test_refuses_to_cut_an_environment_below_its_use(self) -> None:
+        from app.api.v1.folders import _apply_reallocations
+
+        k8s = _k8s({"lab-dev": [_quota(memory="30Gi", used_memory="26Gi")]})
+        item = SimpleNamespace(
+            source="dev", kind="environment", cpu=None, memory="8Gi", storage=None,
+        )
+        with pytest.raises(HTTPException) as e:
+            await _apply_reallocations(k8s, {}, "lab", [item])
+        assert e.value.status_code == 409
+        assert "26Gi" in e.value.detail
+
+    async def test_allows_taking_the_idle_part(self) -> None:
+        from app.api.v1.folders import _apply_reallocations
+
+        k8s = _k8s({"lab-dev": [_quota(memory="30Gi", used_memory="26Gi")]})
+        item = SimpleNamespace(
+            source="dev", kind="environment", cpu=None, memory="26Gi", storage=None,
+        )
+        await _apply_reallocations(k8s, {}, "lab", [item])
+        assert k8s.core_api.replace_namespaced_resource_quota.await_count == 1
+
+    async def test_storage_and_cpu_too(self) -> None:
+        from app.api.v1.folders import _apply_reallocations
+
+        k8s = _k8s({"lab-dev": [_quota(cpu="8", storage="100Gi",
+                                       used_cpu="6", used_storage="80Gi")]})
+        for field, value in (("cpu", "4"), ("storage", "50Gi")):
+            item = SimpleNamespace(
+                source="dev", kind="environment",
+                cpu=value if field == "cpu" else None,
+                memory=None,
+                storage=value if field == "storage" else None,
+            )
+            with pytest.raises(HTTPException):
+                await _apply_reallocations(k8s, {}, "lab", [item])
+
+    async def test_a_subfolder_cannot_be_cut_below_its_subtree(self) -> None:
+        from app.api.v1.folders import _apply_reallocations
+
+        folders = {
+            "lab": {"parent_id": None, "quota": {"cpu": "16"}},
+            "kid": {"parent_id": "lab", "quota": {"cpu": "8"}},
+        }
+        k8s = _k8s({"kid-a": [_quota(cpu="6")]})
+        item = SimpleNamespace(source="kid", kind="folder", cpu="2",
+                               memory=None, storage=None)
+        with pytest.raises(HTTPException) as e:
+            await _apply_reallocations(k8s, folders, "lab", [item])
+        assert "6" in e.value.detail
