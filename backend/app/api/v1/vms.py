@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import secrets
 import uuid
 from typing import Any, Literal
 
@@ -69,6 +70,28 @@ class VMNetworkRequest(BaseModel):
 # The cluster's own VPC — pods there reach the standard CoreDNS.
 from app.core.constants import KUBEOVN_SYSTEM_VPC as SYSTEM_VPC_NAME  # noqa: E402
 
+
+
+def allocate_mac() -> str:
+    """A MAC that belongs to the VM object, not to one boot of it.
+
+    KubeVirt generates a MAC when the VMI starts and it lives only on the
+    VMI, so a VM restored from a backup comes up with a different one.
+    Ubuntu's cloud-init writes netplan matching the MAC it saw at first boot,
+    so the restored guest has an interface it does not recognise:
+
+        enp1s0  DOWN  b6:68:8e:58:ba:1d
+        netplan: match: macaddress: "6a:aa:5d:81:45:49"
+
+    — no address, no DNS, no network at all, while Velero reports Completed
+    and the VMI reports Running with an IP the guest never used. Verified on
+    the cluster by restoring `web1` from a Velero backup.
+
+    Written into the VM's own spec at creation, which is what a backup
+    captures, so the restored VM keeps the identity its guest was configured
+    for. 0x02 in the first octet: locally administered, unicast.
+    """
+    return "02:" + ":".join(f"{b:02x}" for b in secrets.token_bytes(5))
 
 
 def build_vpc_dns_spec(namespace: str, vip: str) -> dict[str, Any]:
@@ -1403,7 +1426,10 @@ async def create_vm_from_template(
                     if idx == 0:
                         multus_entry["default"] = True
                     net_specs.append({"name": iface_name, "multus": multus_entry})
-                    iface_specs.append({"name": iface_name, "bridge": {}})
+                    iface_specs.append({
+                        "name": iface_name, "bridge": {},
+                        "macAddress": allocate_mac(),
+                    })
                     has_bridge = True
                 else:
                     # VPC overlay: default pod network. Bind defaults to
@@ -1428,7 +1454,10 @@ async def create_vm_from_template(
                         if vm_request.network_binding == "masquerade"
                         else "bridge"
                     )
-                    iface_specs.append({"name": iface_name, vpc_binding: {}})
+                    iface_specs.append({
+                        "name": iface_name, vpc_binding: {},
+                        "macAddress": allocate_mac(),
+                    })
                     if vpc_binding == "bridge":
                         has_bridge = True
                     # `ovn-cluster` is the cluster's own VPC: its pods reach
@@ -1485,7 +1514,8 @@ async def create_vm_from_template(
                     {"name": "default", "multus": {"networkName": network_config["multus_network"]}}
                 ]
                 vm_spec["domain"]["devices"]["interfaces"] = [
-                    {"name": "default", "bridge": {}}
+                    {"name": "default", "bridge": {},
+                     "macAddress": allocate_mac()}
                 ]
         
         # Build template metadata. We deliberately do NOT set
