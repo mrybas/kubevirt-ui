@@ -193,7 +193,7 @@ async def get_current_user_info(user: User = Depends(require_auth)) -> UserInfoR
         email=user.email,
         username=user.username,
         groups=user.groups,
-        is_admin=is_admin(user.groups),
+        is_admin=is_admin(user.groups, user),
     )
 
 
@@ -247,6 +247,7 @@ async def _ensure_service_account(
     username: str,
     groups: list[str],
     api_server_url: str = "https://kubernetes.default.svc",
+    email: str = "",
 ) -> str:
     """Create ServiceAccount + ClusterRoleBinding for user, return a bound token."""
     from kubernetes_asyncio.client import (
@@ -310,8 +311,14 @@ async def _ensure_service_account(
             raise
 
     # 3. Determine role from groups (admin group names from ADMIN_GROUPS env)
+    from types import SimpleNamespace
+
     from app.core.groups import is_admin as _is_admin
-    user_is_admin = _is_admin(groups)
+
+    # The identity matters, not just the groups: an admin named via
+    # ADMIN_USERS must get the admin binding here too, or their kubeconfig
+    # silently comes back with a user's rights while the UI shows admin.
+    user_is_admin = _is_admin(groups, SimpleNamespace(username=username, email=email))
     binding_name = f"{sa_name}-binding"
     subject = RbacV1Subject(kind="ServiceAccount", name=sa_name, namespace=SA_NAMESPACE)
 
@@ -503,6 +510,7 @@ async def get_kubeconfig(
         sa_name = _sanitize_sa_name(username)
         sa_token = await _ensure_service_account(
             k8s_client, sa_name, username, user.groups,
+            email=user.email or "",
             # Audience MUST match the apiserver's self-identity (in-cluster
             # URL) — using the external URL here would produce tokens the
             # apiserver rejects with "audiences not accepted".
@@ -510,7 +518,7 @@ async def get_kubeconfig(
         )
 
         # Set default namespace for non-admin users
-        user_is_admin_flag = is_admin(user.groups)
+        user_is_admin_flag = is_admin(user.groups, user)
         allowed_ns = await get_user_namespaces(k8s_client, user) if not user_is_admin_flag else []
         context_entry: dict[str, Any] = {
             "cluster": cluster_name,

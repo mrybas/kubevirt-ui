@@ -71,3 +71,34 @@ class TestNamedAdmins:
         named("e2e-admin@lab.local")
 
         assert not is_admin([])
+
+
+class TestEveryDecisionPointHonoursNamedAdmins:
+    """A named admin must be admin everywhere, not only where someone
+    remembered to pass the user. `/auth/me` decides what the SPA renders and
+    `_ensure_service_account` decides what the downloaded kubeconfig can do —
+    if either keeps the group-only form, the UI and the kubeconfig disagree
+    with the API about who you are."""
+
+    def test_no_call_site_still_asks_by_groups_alone(self) -> None:
+        import pathlib
+
+        app_dir = pathlib.Path(__file__).resolve().parent.parent / "app"
+        offenders = [
+            f"{p.relative_to(app_dir.parent)}"
+            for p in app_dir.rglob("*.py")
+            if "is_admin(user.groups)" in p.read_text()
+        ]
+
+        assert not offenders, (
+            "these call sites drop the user and so ignore ADMIN_USERS: "
+            f"{offenders}"
+        )
+
+    def test_the_kubeconfig_binding_takes_the_identity(self) -> None:
+        import inspect
+
+        from app.api.v1 import auth
+
+        source = inspect.getsource(auth._ensure_service_account)
+        assert "SimpleNamespace(username=username, email=email)" in source

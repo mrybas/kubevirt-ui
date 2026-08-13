@@ -756,7 +756,7 @@ async def list_subnets(request: Request, user: User = Depends(require_auth)) -> 
 
     # For non-admin users, compute the set of visible VPC names upfront so we
     # can filter subnets in a single pass. Admins see everything.
-    user_is_admin = is_admin(user.groups)
+    user_is_admin = is_admin(user.groups, user)
     visible_vpcs: set[str] | None = None
     if not user_is_admin:
         visible_vpcs = await _user_visible_vpc_names(k8s, user)
@@ -1377,7 +1377,7 @@ async def list_vpcs(request: Request, tenant: str | None = None, user: User = De
     # extra API calls for VPCs the user can't see. The network.py VpcResponse
     # model doesn't carry the namespaces list, so inspect the raw items.
     items = result.get("items", [])
-    if not is_admin(user.groups):
+    if not is_admin(user.groups, user):
         user_ns = set(await get_user_namespaces(k8s, user))
         items = [
             it for it in items

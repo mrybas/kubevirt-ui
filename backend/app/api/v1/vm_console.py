@@ -54,7 +54,7 @@ async def _ws_authenticate(websocket: WebSocket, namespace: str | None = None) -
     # is_admin internally, so the explicit early-return is just a
     # cheap path for the common case.
     if namespace:
-        if is_admin(user.groups):
+        if is_admin(user.groups, user):
             return True
 
         k8s_client = websocket.app.state.k8s_client
