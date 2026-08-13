@@ -1105,7 +1105,7 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     peer_cidrs: list[str] = []
     if data.isolated:
         supernet = get_settings().tenant_supernet
-        peer_cidrs = await _tenant_vpc_cidrs(k8s_client, exclude=data.name)
+        peer_cidrs = await _tenant_vpc_cidrs(k8s, exclude=data.name)
         if peer_cidrs or supernet:
             isolation_acls = build_isolation_acls(
                 subnet_cidr=cidr,
@@ -1332,7 +1332,7 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     # literal matches, so re-scope every isolated VPC to the new peer set.
     if data.isolated:
         try:
-            n = await reconcile_isolation_acls(k8s_client)
+            n = await reconcile_isolation_acls(k8s)
             logger.info(f"Isolation ACLs re-scoped on {n} VPC subnet(s)")
         except Exception as e:
             logger.warning(f"Isolation reconcile after creating {data.name!r} failed: {e}")

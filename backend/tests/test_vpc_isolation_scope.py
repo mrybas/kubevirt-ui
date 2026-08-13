@@ -118,3 +118,20 @@ class TestReconcileTeachesTheOldVpcsAboutTheNewOne:
 
         assert await reconcile_isolation_acls(k8s) == 0
         k8s.custom_api.patch_cluster_custom_object.assert_not_awaited()
+
+
+def test_the_create_path_passes_the_client_it_actually_has():
+    """`create_vpc` binds the client as `k8s`; the reconcile call used
+    `k8s_client` and blew up with NameError at the end of a successful create,
+    surfacing in the UI as a bare "Request failed:".
+    """
+    from pathlib import Path
+
+    src = Path("app/api/v1/vpcs.py").read_text()
+    start = src.index("async def create_vpc(")
+    end = src.index("\n@router", start)
+    body = src[start:end]
+    assert "reconcile_isolation_acls(k8s)" in body
+    # The only legitimate mention is where the client is bound.
+    assert body.count("k8s_client") == 1
+    assert "k8s = request.app.state.k8s_client" in body
