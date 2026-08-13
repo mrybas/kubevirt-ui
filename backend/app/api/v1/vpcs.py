@@ -8,6 +8,7 @@ Dedicated VPC router covering:
 
 import ipaddress
 import json
+import asyncio
 import logging
 from typing import Any
 
@@ -1287,6 +1288,7 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
 # traffic hairpins out to the upstream router anyway. The peering only takes
 # effect once a higher-priority allow sits above it.
 PEERING_POLICY_PRIORITY = 31001
+_PEERING_PATCH_RETRIES = 5
 
 
 async def _vpc_subnet_cidrs(k8s, vpc_name: str) -> list[str]:
@@ -1417,10 +1419,13 @@ async def create_vpc_peering(
     applied: list[str] = []
     for vpc_name, patch in patches.items():
         try:
-            await k8s.custom_api.patch_cluster_custom_object(
-                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
-                name=vpc_name, body={"spec": patch},
-                _content_type="application/merge-patch+json",
+            await _apply_peering_side(
+                k8s, vpc_name,
+                data.remote_vpc if vpc_name == name else name,
+                local_ip if vpc_name == name else remote_ip,
+                link_cidr,
+                remote_cidrs if vpc_name == name else local_cidrs,
+                remote_ip if vpc_name == name else local_ip,
             )
             applied.append(vpc_name)
         except ApiException as e:
@@ -1447,6 +1452,55 @@ async def create_vpc_peering(
         local_connect_ip=local_ip,
         remote_connect_ip=remote_ip,
     )
+
+
+
+async def _apply_peering_side(
+    k8s, vpc_name: str, peer: str, connect_ip: str, link_cidr: str,
+    peer_cidrs: list[str], next_hop: str,
+) -> None:
+    """Write one side of a peering, re-reading the spec on every attempt.
+
+    `spec.vpcPeerings` is a list, and a merge patch replaces it wholesale. Two
+    peerings touching the same VPC at the same time each computed their list
+    from the same read, so the second patch dropped the first entry — both
+    calls returned 201 and half the links quietly did not exist:
+
+        peering cc1<->cc2, cc3<->cc4, cc1<->cc3, cc2<->cc4 created together
+        left four entries on the cluster where there should have been eight.
+
+    `metadata.resourceVersion` in the body makes the API server refuse a patch
+    computed from a stale read, and the retry recomputes against the winner.
+    """
+    for attempt in range(_PEERING_PATCH_RETRIES):
+        item = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
+            name=vpc_name,
+        )
+        spec = item.get("spec", {}) or {}
+        patch = _peering_side_patch(
+            spec, peer, connect_ip, link_cidr, peer_cidrs, next_hop,
+        )
+        body = {
+            "metadata": {"resourceVersion": item["metadata"]["resourceVersion"]},
+            "spec": patch,
+        }
+        try:
+            await k8s.custom_api.patch_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
+                name=vpc_name, body=body,
+                _content_type="application/merge-patch+json",
+            )
+            return
+        except ApiException as e:
+            if e.status == 409 and attempt < _PEERING_PATCH_RETRIES - 1:
+                logger.info(
+                    f"Peering patch on {vpc_name!r} raced another writer "
+                    f"(attempt {attempt + 1}); recomputing"
+                )
+                await asyncio.sleep(0.1 * (2 ** attempt))
+                continue
+            raise
 
 
 def _other(this: str, a: str, b: str) -> str:
