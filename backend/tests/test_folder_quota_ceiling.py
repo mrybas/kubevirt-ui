@@ -402,3 +402,51 @@ class TestCannotTakeWhatIsInUse:
         with pytest.raises(HTTPException) as e:
             await _apply_reallocations(k8s, folders, "lab", [item])
         assert "6" in e.value.detail
+
+
+@pytest.mark.asyncio
+class TestRefusalReadsAsQuantities:
+    """The numbers in a 409 are what the person typed, not bytes.
+
+    Seen in the browser: "memory quota 32Gi for folder 'lab' is already
+    1.03079e+11 allocated; -6.87195e+10 is free" — three unreadable figures
+    and a negative amount of free room.
+    """
+
+    async def test_the_environment_refusal(self) -> None:
+        from app.api.v1.folders import assert_within_folder_quota
+
+        folders = {"lab": {"parent_id": None, "quota": {"memory": "32Gi"}}}
+        k8s = _k8s({"lab-dev": [_quota(memory="30Gi")]})
+        with pytest.raises(HTTPException) as e:
+            await assert_within_folder_quota(k8s, folders, "lab", None, "8Gi", None)
+
+        assert "30Gi allocated" in e.value.detail
+        assert "2Gi is free" in e.value.detail
+        assert "asks for 8Gi" in e.value.detail
+        assert "e+" not in e.value.detail
+
+    async def test_never_reports_a_negative_amount_of_free_room(self) -> None:
+        from app.api.v1.folders import assert_within_folder_quota
+
+        folders = {"lab": {"parent_id": None, "quota": {"memory": "32Gi"}}}
+        k8s = _k8s({"lab-dev": [_quota(memory="96Gi")]})
+        with pytest.raises(HTTPException) as e:
+            await assert_within_folder_quota(k8s, folders, "lab", None, "1Gi", None)
+
+        assert "0 is free" in e.value.detail
+        assert "-" not in e.value.detail
+
+    async def test_the_subfolder_refusal(self) -> None:
+        from app.api.v1.folders import assert_child_folder_within_parent
+
+        folders = {
+            "lab": {"parent_id": None, "quota": {"memory": "32Gi"}},
+            "kid": {"parent_id": "lab", "quota": None},
+        }
+        k8s = _k8s({"lab-dev": [_quota(memory="30Gi")]})
+        with pytest.raises(HTTPException) as e:
+            await assert_child_folder_within_parent(k8s, folders, "kid", {"memory": "8Gi"})
+
+        assert "30Gi allocated" in e.value.detail
+        assert "e+" not in e.value.detail

@@ -1283,9 +1283,11 @@ async def assert_child_folder_within_parent(
                 status_code=409,
                 detail=(
                     f"{label} quota {ceiling.get(field)} of parent folder "
-                    f"'{parent}' is already {allocated[field]:g} allocated to "
-                    f"its environments and other sub-folders; {free:g} is free "
-                    f"and '{child_name}' asks for {want:g}."
+                    f"'{parent}' is already "
+                    f"{_format_quantity(field, allocated[field])} allocated to "
+                    f"its environments and other sub-folders; "
+                    f"{_format_quantity(field, max(free, 0))} is free and "
+                    f"'{child_name}' asks for {_format_quantity(field, want)}."
                 ),
             )
 
@@ -1574,9 +1576,11 @@ async def assert_within_folder_quota(
                 status_code=409,
                 detail=(
                     f"{label} quota {ceiling.get(field)} for folder "
-                    f"'{folder_name}' is already {allocated[field]:g} allocated; "
-                    f"{free:g} is free and this environment asks for "
-                    f"{want:g}. Lower it, or take the difference from another "
+                    f"'{folder_name}' is already "
+                    f"{_format_quantity(field, allocated[field])} allocated; "
+                    f"{_format_quantity(field, max(free, 0))} is free and this "
+                    f"environment asks for {_format_quantity(field, want)}. "
+                    f"Lower it, or take the difference from another "
                     f"environment first."
                 ),
             )
