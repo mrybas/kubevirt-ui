@@ -91,15 +91,20 @@ def build_vpc_dns_spec(namespace: str, vip: str) -> dict[str, Any]:
     }
 
 
-def _vpc_dns_vip_or_none() -> str | None:
+async def _vpc_dns_vip_or_none(k8s) -> str | None:
     """The per-cluster VpcDns CoreDNS VIP, or None when it is not configured.
 
-    A missing VIP must not fail VM creation: the VM still boots, it just keeps
-    the cluster resolver — which is the behaviour that shipped.
+    The cluster config is loaded lazily and `_vpcdns_vip()` refuses to guess:
+    without the await it raises "must be awaited before this call", which is
+    how the first version of this silently left every VM on cluster DNS.
+
+    A missing VIP still must not fail VM creation — the VM boots and keeps the
+    cluster resolver, which is the behaviour that shipped.
     """
     try:
-        from app.api.v1.tenants_common import _vpcdns_vip
+        from app.api.v1.tenants_common import _ensure_cluster_config, _vpcdns_vip
 
+        await _ensure_cluster_config(k8s)
         return _vpcdns_vip() or None
     except Exception as e:  # cluster config absent or incomplete
         logger.warning(f"VPC DNS VIP unavailable, leaving cluster DNS on the VM: {e}")
@@ -1468,7 +1473,7 @@ async def create_vm_from_template(
             # guest, because the guest is served by the launcher, not by OVN.
             # So the launcher pod is told directly.
             if vpc_dns_needed and not vm_spec.get("dnsConfig"):
-                vip = _vpc_dns_vip_or_none()
+                vip = await _vpc_dns_vip_or_none(k8s_client)
                 if vip:
                     vm_spec.update(build_vpc_dns_spec(namespace, vip))
 

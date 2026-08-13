@@ -39,33 +39,74 @@ def vip(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(vms_mod, "_vpc_dns_vip_or_none", lambda: VIP)
 
 
-def test_the_vip_helper_survives_a_missing_cluster_config(
+def _stub_config(monkeypatch: pytest.MonkeyPatch, vip):
+    """Replace the lazy cluster-config load and the VIP getter."""
+    import app.api.v1.tenants_common as tc
+
+    async def _ensure(_k8s):
+        return {}
+
+    monkeypatch.setattr(tc, "_ensure_cluster_config", _ensure)
+    if callable(vip):
+        monkeypatch.setattr(tc, "_vpcdns_vip", vip)
+    else:
+        monkeypatch.setattr(tc, "_vpcdns_vip", lambda: vip)
+
+
+@pytest.mark.asyncio
+async def test_the_vip_helper_survives_a_missing_cluster_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A VM must still be creatable when the VIP is not configured."""
-    import app.api.v1.tenants_common as tc
-
     def _boom() -> str:
         raise RuntimeError("cluster config not loaded")
 
-    monkeypatch.setattr(tc, "_vpcdns_vip", _boom)
-    assert vms_mod._vpc_dns_vip_or_none() is None
+    _stub_config(monkeypatch, _boom)
+    assert await vms_mod._vpc_dns_vip_or_none(MagicMock()) is None
 
 
-def test_the_vip_helper_returns_the_configured_vip(
+@pytest.mark.asyncio
+async def test_the_vip_helper_returns_the_configured_vip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _stub_config(monkeypatch, VIP)
+    assert await vms_mod._vpc_dns_vip_or_none(MagicMock()) == VIP
+
+
+@pytest.mark.asyncio
+async def test_an_empty_vip_reads_as_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_config(monkeypatch, "")
+    assert await vms_mod._vpc_dns_vip_or_none(MagicMock()) is None
+
+
+@pytest.mark.asyncio
+async def test_it_loads_the_cluster_config_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config is lazy; without the await the VIP getter refuses.
+
+    That is exactly how the first version of this shipped: it logged
+    "_ensure_cluster_config(k8s) must be awaited before this call" and left
+    every VM on the cluster resolver.
+    """
     import app.api.v1.tenants_common as tc
 
-    monkeypatch.setattr(tc, "_vpcdns_vip", lambda: VIP)
-    assert vms_mod._vpc_dns_vip_or_none() == VIP
+    loaded = []
 
+    async def _ensure(_k8s):
+        loaded.append(True)
+        return {}
 
-def test_an_empty_vip_reads_as_absent(monkeypatch: pytest.MonkeyPatch) -> None:
-    import app.api.v1.tenants_common as tc
+    monkeypatch.setattr(tc, "_ensure_cluster_config", _ensure)
+    monkeypatch.setattr(
+        tc, "_vpcdns_vip",
+        lambda: VIP if loaded else (_ for _ in ()).throw(
+            RuntimeError("_ensure_cluster_config(k8s) must be awaited before this call")
+        ),
+    )
 
-    monkeypatch.setattr(tc, "_vpcdns_vip", lambda: "")
-    assert vms_mod._vpc_dns_vip_or_none() is None
+    assert await vms_mod._vpc_dns_vip_or_none(MagicMock()) == VIP
+    assert loaded, "the cluster config was never loaded"
 
 
 def test_the_spec_names_the_vip_and_keeps_cluster_search_domains() -> None:
@@ -106,4 +147,7 @@ def test_the_vm_path_actually_applies_it() -> None:
     assert "build_vpc_dns_spec" in src, "the VPC branch never sets the resolver"
     assert 'not vm_spec.get("dnsConfig")' in src, (
         "an explicit dnsConfig from the caller must win"
+    )
+    assert "await _vpc_dns_vip_or_none(" in src, (
+        "the VIP lookup must be awaited — the cluster config is lazy"
     )
