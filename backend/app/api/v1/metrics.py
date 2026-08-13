@@ -330,6 +330,38 @@ async def metrics_status(request: Request, user: User = Depends(require_auth)) -
     }
 
 
+
+# PromQL is a query language with cost, not a read-only view. Authentication
+# (router-level now) stops anonymous callers; these bounds stop an authenticated
+# one from taking VictoriaMetrics — and the platform's monitoring — down with a
+# single wide range query. Numbers are generous for a dashboard and hostile to
+# a scrape of the whole retention window.
+MAX_QUERY_CHARS = 2048
+MAX_RANGE_SECONDS = 32 * 24 * 3600  # 32 days: a month view, not a year
+
+
+def _reject_oversized_query(query: str) -> None:
+    if len(query) > MAX_QUERY_CHARS:
+        raise HTTPException(
+            status_code=413,
+            detail=f"PromQL query too long ({len(query)} chars, max {MAX_QUERY_CHARS})",
+        )
+
+
+def _reject_oversized_range(start: float, end: float) -> None:
+    if end < start:
+        raise HTTPException(status_code=422, detail="end is before start")
+    span = end - start
+    if span > MAX_RANGE_SECONDS:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"range too wide ({int(span)}s, max {MAX_RANGE_SECONDS}s) — "
+                f"narrow the window or increase the step"
+            ),
+        )
+
+
 @router.get("/query")
 async def metrics_query(
     request: Request,
@@ -337,6 +369,7 @@ async def metrics_query(
     time: str | None = Query(None, description="Evaluation timestamp (Unix or RFC3339)"),
 ) -> dict:
     """Execute an instant PromQL query."""
+    _reject_oversized_query(query)
     k8s_client = request.app.state.k8s_client
 
     params: dict[str, str] = {"query": query}
@@ -362,6 +395,8 @@ async def metrics_query_range(
     step: str | None = Query(None, description="Step duration (e.g. 15s, 1m, 5m). Auto-calculated if omitted."),
 ) -> dict:
     """Execute a range PromQL query. Step is auto-calculated if omitted."""
+    _reject_oversized_query(query)
+    _reject_oversized_range(start, end)
     k8s_client = request.app.state.k8s_client
 
     resolved_step = step or _auto_step(start, end)
