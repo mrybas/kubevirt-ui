@@ -9,6 +9,8 @@ Architecture:
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -175,6 +177,21 @@ class FolderEnvironmentResponse(BaseModel):
     quota_storage: str | None = None
 
 
+class QuotaReallocation(BaseModel):
+    """Room taken from a sibling to make space for something new.
+
+    Carries the sibling's *new* quota rather than a delta: a delta has to be
+    applied to a number the client read a moment ago, and two admins
+    rebalancing at once would each subtract from a stale total.
+    """
+
+    source: str
+    kind: Literal["environment", "folder"] = "environment"
+    cpu: str | None = None
+    memory: str | None = None
+    storage: str | None = None
+
+
 class AddFolderEnvironmentRequest(BaseModel):
     """Request to add an environment (namespace) to a folder."""
 
@@ -188,6 +205,18 @@ class AddFolderEnvironmentRequest(BaseModel):
     quota_cpu: str | None = None
     quota_memory: str | None = None
     quota_storage: str | None = None
+
+    # Sibling quotas to shrink first, so "I need more than is free" is one
+    # request instead of a rebalance the user has to remember to finish.
+    reallocate: list[QuotaReallocation] = []
+
+
+class SetEnvironmentQuotaRequest(BaseModel):
+    """Replace one environment's quota."""
+
+    cpu: str | None = None
+    memory: str | None = None
+    storage: str | None = None
 
 
 # ---------------------------------------------------------------------------

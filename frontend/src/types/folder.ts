@@ -76,6 +76,8 @@ export interface MoveFolderRequest {
 }
 
 export interface AddFolderEnvironmentRequest {
+  /** Sibling quotas to shrink first, applied in the same request. */
+  reallocate?: import('../api/folders').QuotaReallocation[];
   environment: string;
   quota_cpu?: string;
   quota_memory?: string;

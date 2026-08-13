@@ -82,6 +82,23 @@ export async function addFolderEnvironment(
   });
 }
 
+export interface QuotaReallocation {
+  source: string;
+  kind?: 'environment' | 'folder';
+  cpu?: string;
+  memory?: string;
+  storage?: string;
+}
+
+export async function setEnvironmentQuota(
+  folderName: string, environment: string,
+  quota: { cpu?: string; memory?: string; storage?: string },
+): Promise<unknown> {
+  return apiRequest(`/folders/${folderName}/environments/${environment}/quota`, {
+    method: 'PUT', body: quota,
+  });
+}
+
 export async function removeFolderEnvironment(
   folderName: string,
   environment: string

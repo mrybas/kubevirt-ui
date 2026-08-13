@@ -421,28 +421,8 @@ function fmtBytes(v: number | null): string {
 
 function EnvironmentsTab({ folder }: { folder: NonNullable<ReturnType<typeof useFolder>['data']> }) {
   const [showAdd, setShowAdd] = useState(false);
-  const [newEnvName, setNewEnvName] = useState('');
   const [deleteModalEnv, setDeleteModalEnv] = useState<FolderEnvironment | null>(null);
-  const [quotaCpu, setQuotaCpu] = useState('');
-  const [quotaMemory, setQuotaMemory] = useState('');
-  const [quotaStorage, setQuotaStorage] = useState('');
-  const addEnv = useAddFolderEnvironment(folder.name);
-  const { data: headroom } = useFolderQuotaHeadroom(folder.name);
   const removeEnv = useRemoveFolderEnvironment(folder.name);
-
-  const handleAdd = async () => {
-    const trimmed = newEnvName.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
-    if (!trimmed) return;
-    await addEnv.mutateAsync({
-      environment: trimmed,
-      quota_cpu: quotaCpu || undefined,
-      quota_memory: quotaMemory || undefined,
-      quota_storage: quotaStorage || undefined,
-    });
-    setNewEnvName('');
-    setQuotaCpu(''); setQuotaMemory(''); setQuotaStorage('');
-    setShowAdd(false);
-  };
 
   const handleRemove = (env: FolderEnvironment) => {
     setDeleteModalEnv(env);
@@ -506,87 +486,16 @@ function EnvironmentsTab({ folder }: { folder: NonNullable<ReturnType<typeof use
             ))}
           </div>
 
-          {showAdd ? (
-            <div className="space-y-2">
-            {/* The quota becomes a real ResourceQuota on the namespace, so it
-                binds kubectl too — and it is checked against what the folder
-                ceiling has left, sub-folders included. Showing the remainder
-                here means the form and the server agree about the number. */}
-            {headroom?.quota && (
-              <div className="text-xs text-surface-400">
-                Folder ceiling:{' '}
-                {headroom.quota.cpu && (
-                  <span className="mr-3">
-                    CPU {headroom.quota.cpu} · free{' '}
-                    <span className="text-surface-200">{fmtQuota(headroom.free.cpu)}</span>
-                  </span>
-                )}
-                {headroom.quota.memory && (
-                  <span className="mr-3">
-                    memory {headroom.quota.memory} · free{' '}
-                    <span className="text-surface-200">{fmtBytes(headroom.free.memory)}</span>
-                  </span>
-                )}
-                {headroom.quota.storage && (
-                  <span>
-                    storage {headroom.quota.storage} · free{' '}
-                    <span className="text-surface-200">{fmtBytes(headroom.free.storage)}</span>
-                  </span>
-                )}
-              </div>
-            )}
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={newEnvName}
-                onChange={(e) => setNewEnvName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
-                placeholder="Environment name (e.g. dev, staging)"
-                className="flex-1 input"
-                onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
-                autoFocus
-              />
-              <button
-                onClick={handleAdd}
-                disabled={!newEnvName.trim() || addEnv.isPending}
-                className="btn-primary text-sm"
-              >
-                {addEnv.isPending ? '...' : 'Add'}
-              </button>
-              <button
-                onClick={() => { setShowAdd(false); setNewEnvName(''); }}
-                className="p-2 text-surface-400 hover:text-surface-200"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="grid grid-cols-3 gap-2">
-              <input
-                type="text" value={quotaCpu} onChange={(e) => setQuotaCpu(e.target.value)}
-                placeholder="CPU e.g. 8" className="input" aria-label="Environment CPU quota"
-              />
-              <input
-                type="text" value={quotaMemory} onChange={(e) => setQuotaMemory(e.target.value)}
-                placeholder="Memory e.g. 16Gi" className="input" aria-label="Environment memory quota"
-              />
-              <input
-                type="text" value={quotaStorage} onChange={(e) => setQuotaStorage(e.target.value)}
-                placeholder="Storage e.g. 100Gi" className="input" aria-label="Environment storage quota"
-              />
-            </div>
-            <p className="text-xs text-surface-500">
-              Enforced by Kubernetes as a ResourceQuota on the namespace — it
-              applies to kubectl as well, not only to this UI. Leave empty for
-              no quota.
-            </p>
-            </div>
-          ) : (
-            <button
-              onClick={() => setShowAdd(true)}
-              className="flex items-center gap-1.5 text-sm text-surface-500 hover:text-primary-400 transition-colors"
-            >
-              <Plus className="w-4 h-4" />
-              Add Environment
-            </button>
+          <button
+            onClick={() => setShowAdd(true)}
+            className="flex items-center gap-1.5 text-sm text-surface-500 hover:text-primary-400 transition-colors"
+          >
+            <Plus className="w-4 h-4" />
+            Add Environment
+          </button>
+
+          {showAdd && (
+            <AddEnvironmentModal folder={folder} onClose={() => setShowAdd(false)} />
           )}
         </>
       )}
@@ -762,6 +671,188 @@ function MembersTab({ folderName }: { folderName: string }) {
     </div>
   );
 }
+
+/**
+ * Creating an environment, including taking the room from a sibling.
+ *
+ * A dialog rather than the inline row it replaced: the row had to carry a
+ * name, three quota fields, the folder's remaining headroom, and — once you
+ * ask for more than is free — a slider per sibling. That is a form, not a row.
+ *
+ * The reallocation travels with the create in one request. Shrinking a
+ * sibling and then failing to create what the room was for would leave
+ * someone smaller for nothing, so the server validates the whole plan first
+ * and gives the room back if the create fails.
+ */
+function AddEnvironmentModal({
+  folder,
+  onClose,
+}: {
+  folder: NonNullable<ReturnType<typeof useFolder>['data']>;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState('');
+  const [cpu, setCpu] = useState('');
+  const [memory, setMemory] = useState('');
+  const [storage, setStorage] = useState('');
+  const [takeFrom, setTakeFrom] = useState<Record<string, number>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  const addEnv = useAddFolderEnvironment(folder.name);
+  const { data: headroom } = useFolderQuotaHeadroom(folder.name);
+
+  // Sliders are CPU-only on purpose. Memory and storage are entered in units
+  // and a slider over bytes is a worse control than a field; the shortfall
+  // message names the number for those instead.
+  const freeCpu = headroom?.free.cpu ?? null;
+  const wantCpu = cpu ? Number(cpu) : 0;
+
+  const donors = (folder.environments ?? [])
+    .map(env => ({ name: env.environment, cpu: Number(env.quota_cpu ?? 0) }))
+    .filter(d => d.cpu > 0);
+
+  const taken = Object.values(takeFrom).reduce((a, b) => a + b, 0);
+  const shortfall = freeCpu === null ? 0 : Math.max(0, wantCpu - freeCpu - taken);
+  const canSubmit = name.trim() !== '' && shortfall === 0 && !addEnv.isPending;
+
+  const handleSubmit = async () => {
+    const env = name.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
+    if (!env) return;
+    setError(null);
+    const reallocate = donors
+      .filter(d => (takeFrom[d.name] ?? 0) > 0)
+      .map(d => ({
+        source: d.name,
+        kind: 'environment' as const,
+        cpu: String(d.cpu - (takeFrom[d.name] ?? 0)),
+      }));
+    try {
+      await addEnv.mutateAsync({
+        environment: env,
+        quota_cpu: cpu || undefined,
+        quota_memory: memory || undefined,
+        quota_storage: storage || undefined,
+        ...(reallocate.length ? { reallocate } : {}),
+      });
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to create the environment');
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+      <div className="bg-surface-800 border border-surface-700 rounded-xl w-full max-w-lg mx-4 shadow-2xl">
+        <div className="flex items-center justify-between p-5 border-b border-surface-700">
+          <h2 className="text-lg font-semibold text-surface-100">Add Environment</h2>
+          <button onClick={onClose} className="p-1 text-surface-400 hover:text-surface-200">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-5 space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-surface-300 mb-1">Name *</label>
+            <input
+              type="text" value={name} autoFocus
+              onChange={(e) => setName(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
+              placeholder="dev, staging, prod" className="input w-full"
+            />
+            <p className="text-xs text-surface-500 mt-1">
+              Namespace: <span className="font-mono">{folder.name}-{name || '…'}</span>
+            </p>
+          </div>
+
+          {headroom?.quota && (
+            <div className="text-xs text-surface-400">
+              Folder ceiling:{' '}
+              {headroom.quota.cpu && (
+                <span className="mr-3">
+                  CPU {headroom.quota.cpu} · free{' '}
+                  <span className="text-surface-200">{fmtQuota(headroom.free.cpu)}</span>
+                </span>
+              )}
+              {headroom.quota.memory && (
+                <span className="mr-3">
+                  memory {headroom.quota.memory} · free{' '}
+                  <span className="text-surface-200">{fmtBytes(headroom.free.memory)}</span>
+                </span>
+              )}
+              {headroom.quota.storage && (
+                <span>
+                  storage {headroom.quota.storage} · free{' '}
+                  <span className="text-surface-200">{fmtBytes(headroom.free.storage)}</span>
+                </span>
+              )}
+            </div>
+          )}
+
+          <div className="grid grid-cols-3 gap-2">
+            <input
+              type="text" value={cpu} onChange={(e) => setCpu(e.target.value)}
+              placeholder="CPU e.g. 8" className="input" aria-label="Environment CPU quota"
+            />
+            <input
+              type="text" value={memory} onChange={(e) => setMemory(e.target.value)}
+              placeholder="Memory e.g. 16Gi" className="input" aria-label="Environment memory quota"
+            />
+            <input
+              type="text" value={storage} onChange={(e) => setStorage(e.target.value)}
+              placeholder="Storage e.g. 100Gi" className="input" aria-label="Environment storage quota"
+            />
+          </div>
+          <p className="text-xs text-surface-500">
+            Enforced by Kubernetes as a ResourceQuota on the namespace — it
+            applies to kubectl as well, not only to this UI. Leave empty for no
+            quota.
+          </p>
+
+          {shortfall > 0 && donors.length > 0 && (
+            <div className="p-3 bg-amber-900/10 border border-amber-800/30 rounded-lg space-y-3">
+              <p className="text-xs text-amber-300/90">
+                {fmtQuota(shortfall)} CPU short. Take it from another environment:
+              </p>
+              {donors.map(d => (
+                <div key={d.name} className="flex items-center gap-3">
+                  <span className="text-xs text-surface-300 w-24 truncate">{d.name}</span>
+                  <input
+                    type="range" min={0} max={d.cpu} step={1}
+                    value={takeFrom[d.name] ?? 0}
+                    aria-label={`Take CPU from ${d.name}`}
+                    onChange={(e) => setTakeFrom({
+                      ...takeFrom, [d.name]: Number(e.target.value),
+                    })}
+                    className="flex-1"
+                  />
+                  <span className="text-xs text-surface-400 w-32 text-right">
+                    −{takeFrom[d.name] ?? 0} → leaves {d.cpu - (takeFrom[d.name] ?? 0)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {shortfall > 0 && donors.length === 0 && (
+            <p className="text-xs text-amber-400">
+              {fmtQuota(shortfall)} CPU short, and no other environment holds a
+              CPU quota to take it from. Raise the folder ceiling instead.
+            </p>
+          )}
+
+          {error && <p className="text-sm text-red-400">{error}</p>}
+        </div>
+
+        <div className="flex justify-end gap-3 p-5 border-t border-surface-700">
+          <button onClick={onClose} className="btn-secondary">Cancel</button>
+          <button onClick={handleSubmit} disabled={!canSubmit} className="btn-primary">
+            {addEnv.isPending ? 'Creating...' : 'Create'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 
 function RoleBadge({ role }: { role: FolderRole }) {
   const styles: Record<FolderRole, string> = {

@@ -34,6 +34,7 @@ from app.models.folder import (
     FolderQuota,
     FolderEnvironmentResponse,
     AddFolderEnvironmentRequest,
+    SetEnvironmentQuotaRequest,
     FolderAccessEntry,
     FolderAccessListResponse,
     AddFolderAccessRequest,
@@ -1206,6 +1207,163 @@ async def assert_child_folder_within_parent(
             )
 
 
+
+async def _read_env_quota(k8s_client: Any, ns_name: str) -> dict[str, str]:
+    """The quota currently on an environment, as the fields we manage."""
+    out: dict[str, str] = {}
+    try:
+        quotas = await k8s_client.core_api.list_namespaced_resource_quota(namespace=ns_name)
+    except ApiException:
+        return out
+    for quota in quotas.items:
+        hard = (quota.spec.hard if quota.spec else None) or {}
+        for key, field in (
+            ("requests.cpu", "cpu"),
+            ("requests.memory", "memory"),
+            ("requests.storage", "storage"),
+        ):
+            if hard.get(key):
+                out[field] = hard[key]
+    return out
+
+
+def _quota_hard(cpu: str | None, memory: str | None, storage: str | None) -> dict[str, str]:
+    """`spec.hard` for a quota, requests and limits together.
+
+    Both, deliberately: a quota naming only requests lets a caller declare a
+    small request and an unbounded limit and take the node anyway.
+    """
+    hard: dict[str, str] = {}
+    if cpu:
+        hard["requests.cpu"] = cpu
+        hard["limits.cpu"] = cpu
+    if memory:
+        hard["requests.memory"] = memory
+        hard["limits.memory"] = memory
+    if storage:
+        hard["requests.storage"] = storage
+    return hard
+
+
+async def _write_env_quota(
+    k8s_client: Any, ns_name: str,
+    cpu: str | None, memory: str | None, storage: str | None,
+) -> None:
+    """Replace an environment's ResourceQuota, or delete it when cleared."""
+    name = f"{ns_name}-quota"
+    hard = _quota_hard(cpu, memory, storage)
+    if not hard:
+        try:
+            await k8s_client.core_api.delete_namespaced_resource_quota(
+                name=name, namespace=ns_name,
+            )
+        except ApiException as e:
+            if e.status != 404:
+                raise
+        return
+
+    body = {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+            "name": name, "namespace": ns_name,
+            "labels": {ENV_MANAGED_LABEL: "true"},
+        },
+        "spec": {"hard": hard},
+    }
+    try:
+        await k8s_client.core_api.replace_namespaced_resource_quota(
+            name=name, namespace=ns_name, body=body,
+        )
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        await k8s_client.core_api.create_namespaced_resource_quota(
+            namespace=ns_name, body=body,
+        )
+
+
+async def _apply_reallocations(
+    k8s_client: Any, folders: dict[str, dict], folder_name: str,
+    reallocate: list[Any],
+) -> list[tuple[Any, dict[str, str] | None]]:
+    """Shrink the named siblings, returning what they held before.
+
+    The caller restores from that list if the thing the room was freed for
+    then fails to be created — a half-applied rebalance leaves someone
+    smaller for nothing.
+    """
+    undo: list[tuple[Any, dict[str, str] | None]] = []
+    for item in reallocate:
+        if item.kind == "folder":
+            meta = folders.get(item.source)
+            if meta is None:
+                raise HTTPException(
+                    status_code=404, detail=f"Sub-folder '{item.source}' not found",
+                )
+            undo.append((item, dict(meta.get("quota") or {}) or None))
+            new_quota = {
+                k: v for k, v in
+                {"cpu": item.cpu, "memory": item.memory, "storage": item.storage}.items()
+                if v
+            }
+            meta["quota"] = new_quota or None
+            await _save_folder_meta(
+                k8s_client, item.source,
+                {k: v for k, v in meta.items() if not k.startswith("_")},
+            )
+        else:
+            ns_name = _ns_name(folder_name, item.source)
+            undo.append((item, await _read_env_quota(k8s_client, ns_name)))
+            await _write_env_quota(
+                k8s_client, ns_name, item.cpu, item.memory, item.storage,
+            )
+    return undo
+
+
+async def _undo_reallocations(
+    k8s_client: Any, folders: dict[str, dict], folder_name: str,
+    undo: list[tuple[Any, dict[str, str] | None]],
+) -> None:
+    for item, previous in reversed(undo):
+        try:
+            if item.kind == "folder":
+                meta = folders.get(item.source) or {}
+                meta["quota"] = previous or None
+                await _save_folder_meta(
+                    k8s_client, item.source,
+                    {k: v for k, v in meta.items() if not k.startswith("_")},
+                )
+            else:
+                prev = previous or {}
+                await _write_env_quota(
+                    k8s_client, _ns_name(folder_name, item.source),
+                    prev.get("cpu"), prev.get("memory"), prev.get("storage"),
+                )
+        except Exception as e:
+            logger.warning(
+                f"Could not restore quota of {item.source!r} after a failed "
+                f"reallocation: {e}"
+            )
+
+
+def _plan_frees(
+    allocated: dict[str, float], reallocate: list[Any],
+    before: dict[str, dict[str, str]],
+) -> dict[str, float]:
+    """Allocation after the planned shrinks, before the new request."""
+    out = dict(allocated)
+    for item in reallocate:
+        old = before.get(item.source, {})
+        for field, new_value in (
+            ("cpu", item.cpu), ("memory", item.memory), ("storage", item.storage),
+        ):
+            was = parse_quantity(old.get(field)) or 0.0
+            now = parse_quantity(new_value) or 0.0
+            out[field] += now - was
+    return out
+
+
 async def assert_within_folder_quota(
     k8s_client: Any, folders: dict[str, dict], folder_name: str,
     quota_cpu: str | None, quota_memory: str | None, quota_storage: str | None,
@@ -1415,10 +1573,50 @@ async def add_environment(
     if name not in folders:
         raise HTTPException(status_code=404, detail="Folder not found")
 
-    return await _create_environment_ns(
-        k8s_client, folders, name, env.environment,
-        env.quota_cpu, env.quota_memory, env.quota_storage,
-    )
+    # Validate the whole plan before touching anything: shrinking a sibling
+    # and then failing to create what the room was for leaves someone smaller
+    # for nothing.
+    before: dict[str, dict[str, str]] = {}
+    for item in env.reallocate:
+        if item.kind == "folder":
+            before[item.source] = dict((folders.get(item.source) or {}).get("quota") or {})
+        else:
+            before[item.source] = await _read_env_quota(
+                k8s_client, _ns_name(name, item.source),
+            )
+
+    if env.reallocate:
+        allocated = await _allocated_env_quota(k8s_client, folders, name)
+        planned = _plan_frees(allocated, env.reallocate, before)
+        ceiling = (folders[name].get("quota") or {})
+        for field, label in (("cpu", "CPU"), ("memory", "memory"), ("storage", "storage")):
+            want = parse_quantity(
+                {"cpu": env.quota_cpu, "memory": env.quota_memory,
+                 "storage": env.quota_storage}[field]
+            )
+            limit = parse_quantity(ceiling.get(field))
+            if want is None or limit is None:
+                continue
+            free = limit - planned[field]
+            if want > free + 1e-9:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Even after the reallocation the {label} ceiling "
+                        f"{ceiling.get(field)} of '{name}' leaves {free:g} free "
+                        f"and this environment asks for {want:g}."
+                    ),
+                )
+
+    undo = await _apply_reallocations(k8s_client, folders, name, env.reallocate)
+    try:
+        return await _create_environment_ns(
+            k8s_client, folders, name, env.environment,
+            env.quota_cpu, env.quota_memory, env.quota_storage,
+        )
+    except Exception:
+        await _undo_reallocations(k8s_client, folders, name, undo)
+        raise
 
 
 @router.get("/{name}/quota-headroom")
@@ -1446,6 +1644,44 @@ async def get_folder_quota_headroom(
         out["allocated"][field] = allocated[field]
         out["free"][field] = None if limit is None else max(0.0, limit - allocated[field])
     return out
+
+
+@router.put("/{name}/environments/{environment}/quota")
+async def set_environment_quota(
+    request: Request, name: str, environment: str,
+    body: SetEnvironmentQuotaRequest,
+    user: User = Depends(require_folder_admin()),
+):
+    """Replace one environment's quota.
+
+    The half of rebalancing that had no route at all: environments could be
+    created with a quota and deleted, never re-sized, so freeing room from a
+    sibling meant deleting it.
+    """
+    k8s_client = request.app.state.k8s_client
+    data = await _ensure_folders_configmap(k8s_client)
+    folders = _parse_all_folders(data)
+    if name not in folders:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    ns_name = _ns_name(name, environment)
+    try:
+        await k8s_client.core_api.read_namespace(name=ns_name)
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=404, detail=f"Environment '{environment}' not found",
+            )
+        raise
+
+    await assert_within_folder_quota(
+        k8s_client, folders, name, body.cpu, body.memory, body.storage,
+        exclude_namespace=ns_name,
+    )
+    await _write_env_quota(k8s_client, ns_name, body.cpu, body.memory, body.storage)
+    return {"environment": environment, "quota": {
+        "cpu": body.cpu, "memory": body.memory, "storage": body.storage,
+    }}
 
 
 @router.delete("/{name}/environments/{environment}", status_code=204)
