@@ -1395,6 +1395,7 @@ async def create_vm_from_template(
             static_ips: list[str] = []
             has_bridge = False  # tracks whether any NIC uses bridge binding
             vpc_dns_needed = False  # any NIC on a VPC overlay (not the cluster VPC)
+            primary_mac: str | None = None  # MAC of NIC 0, for the OVN port
 
             for idx, nic in enumerate(nic_list):
                 subnet_name = nic.subnet
@@ -1426,9 +1427,11 @@ async def create_vm_from_template(
                     if idx == 0:
                         multus_entry["default"] = True
                     net_specs.append({"name": iface_name, "multus": multus_entry})
+                    mac = allocate_mac()
+                    if idx == 0:
+                        primary_mac = mac
                     iface_specs.append({
-                        "name": iface_name, "bridge": {},
-                        "macAddress": allocate_mac(),
+                        "name": iface_name, "bridge": {}, "macAddress": mac,
                     })
                     has_bridge = True
                 else:
@@ -1454,9 +1457,10 @@ async def create_vm_from_template(
                         if vm_request.network_binding == "masquerade"
                         else "bridge"
                     )
+                    mac = allocate_mac()
+                    primary_mac = mac
                     iface_specs.append({
-                        "name": iface_name, vpc_binding: {},
-                        "macAddress": allocate_mac(),
+                        "name": iface_name, vpc_binding: {}, "macAddress": mac,
                     })
                     if vpc_binding == "bridge":
                         has_bridge = True
@@ -1483,6 +1487,18 @@ async def create_vm_from_template(
             # VLAN-backed primaries it also gives DHCP/IPAM scoping. Works for both.
             first_subnet = nic_list[0].subnet
             template_annotations["ovn.kubernetes.io/logical_switch"] = first_subnet
+
+            # The OVN port has to be given the same MAC the guest will use.
+            #
+            # With bridge binding the guest's own frames go on the wire, and
+            # kube-ovn binds the logical switch port to the MAC it allocated —
+            # so a VM whose interface carries a different MAC comes up with an
+            # address and no reachable network. Measured on the cluster after
+            # pinning the MAC without this annotation: guest 02:f3:2d:80:64:96,
+            # OVN port 96:77:a8:8c:7b:3b, and a pod on the same subnet could
+            # not open tcp/22 on the VM at all.
+            if primary_mac:
+                template_annotations["ovn.kubernetes.io/mac_address"] = primary_mac
 
             # Static IPs via Kube-OVN annotation (comma-separated for multi-NIC)
             if static_ips:
@@ -1513,9 +1529,10 @@ async def create_vm_from_template(
                 vm_spec["networks"] = [
                     {"name": "default", "multus": {"networkName": network_config["multus_network"]}}
                 ]
+                fallback_mac = allocate_mac()
+                template_annotations["ovn.kubernetes.io/mac_address"] = fallback_mac
                 vm_spec["domain"]["devices"]["interfaces"] = [
-                    {"name": "default", "bridge": {},
-                     "macAddress": allocate_mac()}
+                    {"name": "default", "bridge": {}, "macAddress": fallback_mac}
                 ]
         
         # Build template metadata. We deliberately do NOT set

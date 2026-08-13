@@ -71,3 +71,41 @@ class TestEveryNicCarriesOne:
             r'vm_spec\["domain"\]\["devices"\]\["interfaces"\] = \[\s*\{[^]]*\]', src, re.S,
         )
         assert fallback and "macAddress" in fallback.group(0)
+
+
+class TestTheOvnPortGetsTheSameMac:
+    """Pinning the guest MAC alone leaves the VM unreachable.
+
+    With bridge binding the guest's frames go on the wire, and kube-ovn binds
+    the logical switch port to the MAC *it* allocated. Measured on the cluster
+    after pinning the MAC without telling kube-ovn:
+
+        guest    02:f3:2d:80:64:96   (interface UP, 10.100.0.8/24)
+        OVN port 96:77:a8:8c:7b:3b
+        a pod on the same subnet: tcp/22 on the VM unreachable, DNS rc=2
+
+    So the same MAC has to be requested for the port via the
+    `ovn.kubernetes.io/mac_address` annotation.
+    """
+
+    def test_the_annotation_is_stamped_from_the_primary_nic(self) -> None:
+        from pathlib import Path
+
+        src = Path("app/api/v1/vms.py").read_text()
+        assert 'template_annotations["ovn.kubernetes.io/mac_address"] = primary_mac' in src
+        # …and it is the MAC that actually went onto interface 0.
+        assert "primary_mac = mac" in src
+
+    def test_it_sits_next_to_the_logical_switch_annotation(self) -> None:
+        from pathlib import Path
+
+        src = Path("app/api/v1/vms.py").read_text()
+        switch = src.index('template_annotations["ovn.kubernetes.io/logical_switch"]')
+        mac = src.index('template_annotations["ovn.kubernetes.io/mac_address"] = primary_mac')
+        assert 0 < mac - switch < 1500, "the port's MAC must be set on the same path"
+
+    def test_the_fallback_nic_stamps_it_too(self) -> None:
+        from pathlib import Path
+
+        src = Path("app/api/v1/vms.py").read_text()
+        assert 'template_annotations["ovn.kubernetes.io/mac_address"] = fallback_mac' in src
