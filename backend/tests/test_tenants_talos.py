@@ -630,3 +630,56 @@ class TestKubeletVersionPinning:
 
     def test_without_a_version_the_image_is_left_to_talos(self) -> None:
         assert "image" not in self._kubelet(version="")
+
+
+class TestKubeletBootstrapToken:
+    """Talos hands the worker one token for two jobs: trustd authenticates the
+    machine with it, and the kubelet uses the same value as a kubeadm-format
+    bootstrap credential. Kamaji creates the RBAC around the second but not the
+    Secret, and nothing was creating it — so the node came up a ghost: the
+    signer issued its certificate, apid and the kubelet reported healthy, and
+    `kubectl get nodes` stayed empty because the TLS bootstrap had nothing to
+    authenticate with and never filed a CSR."""
+
+    def test_the_secret_is_the_kubeadm_shape(self) -> None:
+        from app.api.v1.tenants_talos import build_bootstrap_token_secret
+
+        body = build_bootstrap_token_secret("abcdef", "0123456789abcdef")
+
+        assert body["metadata"]["name"] == "bootstrap-token-abcdef"
+        assert body["metadata"]["namespace"] == "kube-system"
+        assert body["type"] == "bootstrap.kubernetes.io/token"
+        assert body["stringData"]["token-id"] == "abcdef"
+        assert body["stringData"]["token-secret"] == "0123456789abcdef"
+        assert body["stringData"]["usage-bootstrap-authentication"] == "true"
+
+    def test_it_grants_the_node_bootstrapper_group(self) -> None:
+        from app.api.v1.tenants_talos import build_bootstrap_token_secret
+
+        body = build_bootstrap_token_secret("abcdef", "0123456789abcdef")
+
+        assert body["stringData"]["auth-extra-groups"] == (
+            "system:bootstrappers:kubeadm:default-node-token"
+        )
+
+    def test_the_token_it_uses_is_the_machine_token(self) -> None:
+        # The same value trustd authenticates with — splitting it any other
+        # way hands the kubelet a credential the apiserver does not know.
+        import inspect
+
+        from app.api.v1 import tenants_talos
+
+        source = inspect.getsource(tenants_talos.ensure_kubelet_bootstrap_token)
+        assert 'secrets.get("machine.token"' in source
+        assert 'machine_token.split(".", 1)' in source
+
+    def test_the_reconciler_places_it(self) -> None:
+        # Not at create time: the tenant API is cold until the control plane
+        # is Ready.
+        import inspect
+
+        from app.core import tenant_reconciler
+
+        source = inspect.getsource(tenant_reconciler)
+        assert "_ensure_talos_bootstrap_token(k8s, name, ns)" in source
+        assert "ensure_kubelet_bootstrap_token" in source

@@ -224,6 +224,56 @@ def build_bootstrap_token_secret(token_id: str, token_secret: str) -> dict[str, 
     }
 
 
+
+async def ensure_kubelet_bootstrap_token(k8s, tenant: str, namespace: str) -> bool:
+    """Put the kubelet's bootstrap token INSIDE the tenant cluster.
+
+    Talos hands the worker one token for two jobs: trustd authenticates the
+    machine with it, and the kubelet uses the same value as a kubeadm-format
+    bootstrap credential. The first half works as soon as the signer is up.
+    The second needs a `bootstrap-token-<id>` Secret in the *tenant's*
+    kube-system, and Kamaji creates the RBAC around it but not the Secret.
+
+    Without it the node is a ghost: the signer issues its certificate, apid
+    and the kubelet both come up healthy, and `kubectl get nodes` stays empty
+    because the kubelet's TLS bootstrap has nothing to authenticate with, so
+    no CSR is ever filed.
+
+    Runs from the reconciler rather than at create time — the tenant API is
+    cold until the control plane is Ready. Returns True once the token is in
+    place, False while the tenant is unreachable.
+    """
+    from app.api.v1.tenants_storage import _build_tenant_core_api
+
+    try:
+        secrets = await read_talos_secrets(k8s, tenant, namespace)
+    except ApiException:
+        return False
+
+    machine_token = secrets.get("machine.token", "")
+    if "." not in machine_token:
+        logger.warning(f"Tenant {tenant!r}: machine token is not id.secret")
+        return False
+
+    token_id, token_secret = machine_token.split(".", 1)
+    tenant_core = await _build_tenant_core_api(k8s, tenant)
+    if tenant_core is None:
+        return False
+
+    body = build_bootstrap_token_secret(token_id, token_secret)
+    try:
+        await tenant_core.create_namespaced_secret(namespace="kube-system", body=body)
+        logger.info(f"Tenant {tenant!r}: created kubelet bootstrap token {token_id}")
+        return True
+    except ApiException as e:
+        if e.status == 409:
+            return True  # already there — the token never rotates
+        logger.warning(f"Tenant {tenant!r}: bootstrap token create failed: {e}")
+        return False
+    finally:
+        await tenant_core.api_client.close()
+
+
 # ---------------------------------------------------------------------------
 # PKI
 # ---------------------------------------------------------------------------

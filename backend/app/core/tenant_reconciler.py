@@ -206,6 +206,16 @@ async def _create_required_addon(
     logger.info(f"Reconciler created HelmRelease {tenant_name}-{component.id} in {ns}")
 
 
+async def _ensure_talos_bootstrap_token(k8s: K8sClient, name: str, ns: str) -> None:
+    """Best-effort: only Talos tenants have the secret this reads."""
+    from app.api.v1.tenants_talos import ensure_kubelet_bootstrap_token
+
+    try:
+        await ensure_kubelet_bootstrap_token(k8s, name, ns)
+    except Exception as e:  # never let it break addon reconciliation
+        logger.warning(f"Tenant {name}: kubelet bootstrap token not placed: {e}")
+
+
 async def _reconcile_tenant(
     k8s: K8sClient,
     cluster: dict[str, Any],
@@ -223,6 +233,11 @@ async def _reconcile_tenant(
     # Check kubeconfig secret exists
     if not await _kubeconfig_secret_exists(k8s, name, ns):
         return
+
+    # Talos workers need their kubelet bootstrap token inside the tenant, and
+    # the tenant API is cold until now — so it is placed here rather than at
+    # create time. No-op for tenants that have no Talos secrets.
+    await _ensure_talos_bootstrap_token(k8s, name, ns)
 
     # Get existing addon HelmReleases
     existing_ids = await _get_existing_addon_ids(k8s, name, ns)
