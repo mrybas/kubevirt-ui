@@ -16,9 +16,11 @@ The allowlist below is deliberately tiny and every entry carries a reason.
 Adding to it should feel like a decision, not a formality.
 """
 
+import inspect
+
 import pytest
 from fastapi import FastAPI
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute
 
 from app.api.v1.router import router
 
@@ -91,3 +93,68 @@ def test_public_routes_all_exist() -> None:
     paths = {r.path for r in _routes()}
     stale = set(PUBLIC_ROUTES) - paths
     assert not stale, f"PUBLIC_ROUTES lists routes that do not exist: {stale}"
+
+
+# ---------------------------------------------------------------------------
+# WebSockets
+# ---------------------------------------------------------------------------
+
+def _ws_routes() -> list[APIWebSocketRoute]:
+    return [r for r in _app().routes if isinstance(r, APIWebSocketRoute)]
+
+
+def test_there_are_websocket_routes_to_check() -> None:
+    # The consoles are the only ones today; a zero here would make the rest of
+    # this section pass by describing nothing.
+    assert _ws_routes(), "no WebSocket routes found — has the console moved?"
+
+
+@pytest.mark.parametrize(
+    "route", _ws_routes(), ids=lambda r: f"WS {r.path}",
+)
+def test_websocket_routes_carry_no_http_dependency(route: APIWebSocketRoute) -> None:
+    """A WebSocket cannot resolve `HTTPBearer`, and mounting it under the
+    authenticated router does not fail loudly — it fails at connect time:
+
+        TypeError: HTTPBearer.__call__() missing 1 required positional argument
+
+    The socket closes with 1006 and the console spins forever. That is what
+    happened when the consoles were moved under `protected`, and no test saw
+    it because this file only walked `APIRoute`.
+    """
+    names = set()
+    stack = list(route.dependant.dependencies)
+    while stack:
+        dep = stack.pop()
+        call = getattr(dep, "call", None)
+        if call is not None:
+            names.add(getattr(call, "__name__", ""))
+        stack.extend(getattr(dep, "dependencies", []))
+
+    forbidden = names & {"require_auth", "require_admin", "get_current_user"}
+    assert not forbidden, (
+        f"WS {route.path} depends on {sorted(forbidden)}, which resolves "
+        "through HTTPBearer and cannot be given a WebSocket. Authenticate "
+        "inside the handler instead (see vm_console._ws_authenticate)."
+    )
+
+
+@pytest.mark.parametrize(
+    "route", _ws_routes(), ids=lambda r: f"WS {r.path}",
+)
+def test_websocket_routes_authenticate_themselves(route: APIWebSocketRoute) -> None:
+    """Exempt from the dependency is not exempt from authentication.
+
+    Read from the handler's own source rather than from a decorator, because
+    the thing that must not be lost is the call itself.
+    """
+    source = inspect.getsource(route.endpoint)
+    assert "_ws_authenticate" in source, (
+        f"WS {route.path} never calls _ws_authenticate — it is reachable by "
+        "anyone who knows the URL."
+    )
+    # The call has to gate the connection, not merely happen.
+    assert "if not await _ws_authenticate" in source, (
+        f"WS {route.path} calls _ws_authenticate but does not act on the "
+        "result."
+    )

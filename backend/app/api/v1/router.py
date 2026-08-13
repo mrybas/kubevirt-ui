@@ -107,7 +107,23 @@ protected.include_router(vms_router, prefix="/vms", tags=["Virtual Machines"])
 protected.include_router(vms_router, prefix="/namespaces/{namespace}/vms", tags=["Virtual Machines"])
 protected.include_router(vm_actions_router, prefix="/namespaces/{namespace}/vms", tags=["VM Actions"])
 protected.include_router(vm_disks_router, prefix="/namespaces/{namespace}/vms", tags=["VM Disks"])
-protected.include_router(vm_console_router, prefix="/namespaces/{namespace}/vms", tags=["VM Console"])
+# The consoles are WebSockets and authenticate themselves, in
+# `vm_console._ws_authenticate`, from a `token` query parameter.
+#
+# They must NOT sit behind the router-level dependency. It resolves through
+# `HTTPBearer`, which takes an HTTP Request and is handed a WebSocket instead:
+#
+#   TypeError: HTTPBearer.__call__() missing 1 required positional argument
+#
+# — raised before the handler runs, so every console closed with 1006 and the
+# UI sat on "Connecting to console..." forever. A browser cannot set an
+# Authorization header on a WebSocket at all, which is why the token travels
+# in the query string; there is no header for `HTTPBearer` to have read.
+#
+# Exempt from the *dependency*, not from authentication — see
+# `test_route_auth_contract.py`, which walks the WebSocket routes separately
+# and fails if one of them stops authenticating.
+router.include_router(vm_console_router, prefix="/namespaces/{namespace}/vms", tags=["VM Console"])
 protected.include_router(vm_snapshots_router, prefix="/namespaces/{namespace}/vms", tags=["VM Snapshots"])
 protected.include_router(vm_network_router, prefix="/namespaces/{namespace}/vms", tags=["VM Network"])
 protected.include_router(storage_router, prefix="/namespaces/{namespace}/storage", tags=["Storage"])
