@@ -53,6 +53,7 @@ from app.models.tenant import (
 from app.models.template import GoldenImage, GoldenImageCreate, GoldenImageListResponse
 
 from app.api.v1.tenants_common import (
+    require_tenant_access,
     CAPI_GROUP,
     CAPI_VERSION,
     FLUX_HELM_GROUP,
@@ -1035,6 +1036,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
 async def get_tenant(request: Request, name: str, user: User = Depends(require_auth)) -> TenantResponse:
     """Get tenant details."""
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="viewer")
     await _ensure_cluster_config(k8s)
     ns = _tenant_ns(name)
 
@@ -1080,6 +1082,7 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
       3. Delete the tenant ns — cascade does the rest.
     """
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="admin")
     ns = _tenant_ns(name)
 
     if not await _namespace_exists(k8s, ns):
@@ -1207,6 +1210,7 @@ async def scale_tenant(
 ) -> TenantResponse:
     """Scale and/or resize tenant worker nodes."""
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="member")
     ns = _tenant_ns(name)
     md_name = f"{name}-workers"
 
@@ -1256,6 +1260,7 @@ async def get_tenant_storage_status(
     missing secret — which reads like a broken deploy unless it's surfaced.
     """
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="viewer")
     ns = _tenant_ns(name)
     if not await _namespace_exists(k8s, ns):
         raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
@@ -1277,6 +1282,7 @@ async def reconcile_tenant_storage(
     finishes the wiring. Idempotent — safe to call repeatedly.
     """
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="member")
     ns = _tenant_ns(name)
     if not await _namespace_exists(k8s, ns):
         raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
@@ -1308,6 +1314,7 @@ async def get_tenant_kubeconfig(
     type=oidc   → OIDC kubeconfig for end-users (uses current user's token or exec plugin)
     """
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="admin")
     await _ensure_cluster_config(k8s)
     ns = _tenant_ns(name)
 
@@ -1467,6 +1474,7 @@ async def enable_addon(
 ) -> TenantAddonStatus:
     """Enable an addon for a tenant."""
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="member")
     ns = _tenant_ns(name)
     catalog = await _get_addon_catalog(k8s)
 
@@ -1557,6 +1565,7 @@ async def enable_addon(
 async def disable_addon(request: Request, name: str, addon_id: str, user: User = Depends(require_auth)) -> None:
     """Disable an addon for a tenant."""
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="member")
     ns = _tenant_ns(name)
 
     # Check it's not required
@@ -1589,6 +1598,7 @@ async def update_addon_params(
 ) -> TenantAddonStatus:
     """Update addon parameters (patch HelmRelease values)."""
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="member")
     ns = _tenant_ns(name)
     catalog = await _get_addon_catalog(k8s)
 
@@ -1695,6 +1705,7 @@ def _parse_tenant_image_dv(dv: dict[str, Any]) -> GoldenImage:
 async def list_tenant_images(request: Request, name: str, user: User = Depends(require_auth)) -> GoldenImageListResponse:
     """List images (DataVolumes) in a tenant namespace."""
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="viewer")
     ns = _tenant_ns(name)
 
     if not await _namespace_exists(k8s, ns):
@@ -1721,6 +1732,7 @@ async def create_tenant_image(
 ) -> GoldenImage:
     """Import a new image into a tenant namespace."""
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="member")
     ns = _tenant_ns(name)
 
     if not await _namespace_exists(k8s, ns):
@@ -1806,6 +1818,7 @@ async def create_tenant_image(
 async def delete_tenant_image(request: Request, name: str, image_name: str, user: User = Depends(require_auth)) -> None:
     """Delete an image from a tenant namespace."""
     k8s = request.app.state.k8s_client
+    await require_tenant_access(k8s, user, name, level="member")
     ns = _tenant_ns(name)
 
     if not await _namespace_exists(k8s, ns):

@@ -6,6 +6,18 @@ bookkeeping and must never be able to skip it.
 """
 
 from types import SimpleNamespace
+from app.core.auth import User
+
+
+def _admin_user() -> User:
+    """These tests exercise delete mechanics, not authorisation — the caller is
+    a platform admin so `require_tenant_access` short-circuits."""
+    return User(
+        id="admin", email="admin@local", username="admin",
+        groups=["kubevirt-ui-admins"],
+    )
+
+
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -59,7 +71,7 @@ async def test_namespace_is_deleted_even_if_a_cleanup_step_fails(
         AsyncMock(side_effect=ApiException(status=500, reason="boom")),
     )
 
-    await tenants_crud.delete_tenant(request_obj, "demo", user=MagicMock())
+    await tenants_crud.delete_tenant(request_obj, "demo", user=_admin_user())
 
     k8s.core_api.delete_namespace.assert_awaited_once_with(name="tenant-demo")
 
@@ -68,7 +80,7 @@ async def test_namespace_is_deleted_even_if_a_cleanup_step_fails(
 async def test_deletes_capi_cluster_before_the_namespace(
     request_obj: SimpleNamespace, k8s: MagicMock,
 ) -> None:
-    await tenants_crud.delete_tenant(request_obj, "demo", user=MagicMock())
+    await tenants_crud.delete_tenant(request_obj, "demo", user=_admin_user())
 
     k8s.custom_api.delete_namespaced_custom_object.assert_awaited_once()
     kwargs = k8s.custom_api.delete_namespaced_custom_object.await_args.kwargs
@@ -87,7 +99,7 @@ async def test_missing_namespace_is_404(
     )
 
     with pytest.raises(Exception) as exc_info:
-        await tenants_crud.delete_tenant(request_obj, "demo", user=MagicMock())
+        await tenants_crud.delete_tenant(request_obj, "demo", user=_admin_user())
 
     assert getattr(exc_info.value, "status_code", None) == 404
     k8s.core_api.delete_namespace.assert_not_awaited()
@@ -103,4 +115,4 @@ async def test_already_gone_namespace_is_not_an_error(
         side_effect=ApiException(status=404, reason="Not Found"),
     )
 
-    await tenants_crud.delete_tenant(request_obj, "demo", user=MagicMock())
+    await tenants_crud.delete_tenant(request_obj, "demo", user=_admin_user())

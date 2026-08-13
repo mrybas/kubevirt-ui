@@ -607,3 +607,79 @@ async def _create_namespace(
         ),
     )
     await k8s.core_api.create_namespace(body=body)
+
+# ---------------------------------------------------------------------------
+# Per-tenant authorisation
+# ---------------------------------------------------------------------------
+
+async def require_tenant_access(
+    k8s, user, tenant: str, *, level: str = "member",
+) -> dict:
+    """Authorise a caller against ONE tenant, by its folder/environment role.
+
+    `require_auth` alone is not authorisation. Every object endpoint under
+    `/tenants/{name}` carried only that, so any logged-in account could read
+    another tenant's **admin** kubeconfig, scale it, or delete it outright —
+    while the collection endpoints (`GET /tenants`, `POST /tenants`) filtered
+    and checked correctly. The check was lost exactly at the
+    collection → object boundary.
+
+    The tenant's namespace carries `kubevirt-ui.io/folder` and
+    `kubevirt-ui.io/environment`; the roles come from the folder's access
+    block, same source the collection endpoints use.
+
+    levels: "viewer" to read, "member" to change, "admin" for destructive or
+    credential-bearing operations (delete, kubeconfig).
+
+    Returns the folder metadata so callers need not load it twice.
+    """
+    from fastapi import HTTPException
+
+    from app.core.groups import (
+        is_admin,
+        is_env_admin,
+        is_folder_admin,
+        is_folder_member,
+        is_folder_viewer,
+        load_folder,
+    )
+
+    if is_admin(user.groups):
+        return {}
+
+    ns = _tenant_ns(tenant)
+    try:
+        ns_obj = await k8s.core_api.read_namespace(name=ns)
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=404, detail=f"Tenant '{tenant}' not found")
+        raise
+
+    labels = (ns_obj.metadata.labels or {}) if ns_obj.metadata else {}
+    folder = labels.get("kubevirt-ui.io/folder", "")
+    environment = labels.get("kubevirt-ui.io/environment", "")
+
+    if not folder:
+        # A tenant with no folder cannot be reasoned about — refuse rather
+        # than fall open, which is how this class of hole happens.
+        raise HTTPException(
+            status_code=403,
+            detail=f"Tenant '{tenant}' has no folder; refusing to authorise",
+        )
+
+    folder_meta = await load_folder(k8s, folder)
+
+    allowed = {
+        "viewer": is_folder_viewer(user, folder_meta),
+        "member": is_folder_member(user, folder_meta),
+        "admin": is_folder_admin(user, folder_meta)
+                 or (bool(environment) and is_env_admin(user, folder_meta, environment)),
+    }[level]
+
+    if not allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"{level} role on folder '{folder}' required for tenant '{tenant}'",
+        )
+
+    return folder_meta
