@@ -19,6 +19,7 @@ import {
   useCreateSubnet,
 } from '../../hooks/useNetwork';
 import { useCreateVpc } from '../../hooks/useVpcs';
+import { addVpcPeering } from '../../api/vpcs';
 import { useFoldersFlat } from '../../hooks/useFolders';
 import { listNodes } from '../../api/cluster';
 import { useNamespaces } from '../../hooks/useNamespaces';
@@ -88,7 +89,7 @@ const initialState: WizardState = {
   vpcName: '',
   vpcSubnetCidr: '10.100.0.0/24',
   vpcEnableNat: true,
-  vpcEnablePeering: true,
+  vpcEnablePeering: false,
   // Closed by default — every tenant prefix reaches the same upstream router,
   // so an un-isolated VPC is visible to every other tenant from the moment it
   // exists.
@@ -183,6 +184,9 @@ function calculateExcludeIps(
 }
 
 // Step IDs for dynamic step list
+// The built-in VPC the cluster's own pods live in.
+const HOST_CLUSTER_VPC = 'ovn-cluster';
+
 type StepId = 'type' | 'provider' | 'vlan' | 'subnet' | 'review' | 'vpc-config' | 'vpc-peering' | 'vpc-review';
 
 const STEP_LABELS: Record<StepId, string> = {
@@ -423,7 +427,22 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
         ...(state.vpcFolder ? { folder: state.vpcFolder } : {}),
         ...(state.vpcEnvironment ? { environment: state.vpcEnvironment } : {}),
       });
-      // TODO: if peering enabled, create peering with ovn-cluster (default VPC)
+      // The toggle used to end here, at a TODO. The step rendered, the review
+      // said "Enabled", and nothing was ever peered — so report a failure here
+      // rather than closing on it: the VPC exists, the connectivity does not.
+      if (state.vpcEnablePeering) {
+        try {
+          await addVpcPeering(state.vpcName, { remote_vpc: HOST_CLUSTER_VPC });
+        } catch (err) {
+          setError(
+            `VPC ${state.vpcName} was created, but peering it with ` +
+            `${HOST_CLUSTER_VPC} failed: ` +
+            (err instanceof Error ? err.message : 'unknown error') +
+            '. Add the peering from the VPC page.',
+          );
+          return;
+        }
+      }
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create VPC');
@@ -1423,6 +1442,24 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                   <span className="font-medium text-surface-100">Connectivity</span>
                 </div>
                 <dl className="grid grid-cols-2 gap-2 text-sm">
+                  <dt className="text-surface-400">Isolated:</dt>
+                  <dd className="text-surface-200">
+                    {state.vpcIsolated ? (
+                      <span className="text-emerald-400">
+                        Yes — traffic to and from other tenant VPCs is blocked
+                      </span>
+                    ) : (
+                      <span className="text-amber-400">
+                        No — other tenant VPCs can reach this one
+                      </span>
+                    )}
+                  </dd>
+                  {state.vpcIsolated && state.vpcSharedCidrs.trim() && (
+                    <>
+                      <dt className="text-surface-400">Reachable while isolated:</dt>
+                      <dd className="text-surface-200 font-mono">{state.vpcSharedCidrs}</dd>
+                    </>
+                  )}
                   <dt className="text-surface-400">Host Cluster Peering:</dt>
                   <dd className="text-surface-200">
                     {state.vpcEnablePeering ? (
