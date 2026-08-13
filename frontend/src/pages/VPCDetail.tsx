@@ -19,7 +19,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes, useVpcDns, useUpdateVpcDns, useRecreateVpcDns, useVpcDnsPolicy, useUpdateVpcDnsPolicy, useRecreateVpcDnsPolicy } from '../hooks/useVpcs';
+import { useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes, useVpcDns, useUpdateVpcDns, useRecreateVpcDns, useVpcDnsPolicy, useUpdateVpcDnsPolicy, useRecreateVpcDnsPolicy, useDisableVpcDnsPolicy } from '../hooks/useVpcs';
 import { useEgressGateways, useDetachVpc } from '../hooks/useEgressGateways';
 import { ApiError } from '../api/client';
 import { notify } from '../store/notifications';
@@ -840,6 +840,7 @@ function DnsPolicyTab({ vpcName }: { vpcName: string }) {
   const { data: policy, isLoading, error } = useVpcDnsPolicy(vpcName);
   const updatePolicy = useUpdateVpcDnsPolicy(vpcName);
   const recreatePolicy = useRecreateVpcDnsPolicy(vpcName);
+  const disablePolicy = useDisableVpcDnsPolicy(vpcName);
 
   const [draft, setDraft] = useState('');
   const [parseError, setParseError] = useState<string | null>(null);
@@ -966,6 +967,18 @@ function DnsPolicyTab({ vpcName }: { vpcName: string }) {
                 title="Discard current and recreate default policy"
               >
                 {recreatePolicy.isPending ? 'Recreating...' : 'Recreate default'}
+              </button>
+              {/* VMs get their resolver written into the VM spec itself, so
+                  this policy is only for plain pods placed on a VPC subnet.
+                  A cluster without those — or one that would rather not run
+                  Kyverno — can turn it off and keep working VMs. */}
+              <button
+                onClick={() => disablePolicy.mutate()}
+                disabled={disablePolicy.isPending || isEditing}
+                className="btn-secondary text-sm"
+                title="Delete the Kyverno policy. VM DNS is unaffected — it is written into the VM spec."
+              >
+                {disablePolicy.isPending ? 'Disabling...' : 'Disable injection'}
               </button>
             </div>
           </div>

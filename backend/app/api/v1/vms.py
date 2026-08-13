@@ -65,6 +65,47 @@ class VMNetworkRequest(BaseModel):
     static_ip: str | None = Field(None, description="Static IP address (optional)")
 
 
+
+# The cluster's own VPC — pods there reach the standard CoreDNS.
+from app.core.constants import KUBEOVN_SYSTEM_VPC as SYSTEM_VPC_NAME  # noqa: E402
+
+
+
+def build_vpc_dns_spec(namespace: str, vip: str) -> dict[str, Any]:
+    """The dnsPolicy/dnsConfig a VM on a VPC overlay needs.
+
+    Mirrors what the Kyverno injection policy writes for pods, so a cluster
+    running both does not end up with two different answers.
+    """
+    return {
+        "dnsPolicy": "None",
+        "dnsConfig": {
+            "nameservers": [vip],
+            "searches": [
+                f"{namespace}.svc.cluster.local",
+                "svc.cluster.local",
+                "cluster.local",
+            ],
+            "options": [{"name": "ndots", "value": "5"}],
+        },
+    }
+
+
+def _vpc_dns_vip_or_none() -> str | None:
+    """The per-cluster VpcDns CoreDNS VIP, or None when it is not configured.
+
+    A missing VIP must not fail VM creation: the VM still boots, it just keeps
+    the cluster resolver — which is the behaviour that shipped.
+    """
+    try:
+        from app.api.v1.tenants_common import _vpcdns_vip
+
+        return _vpcdns_vip() or None
+    except Exception as e:  # cluster config absent or incomplete
+        logger.warning(f"VPC DNS VIP unavailable, leaving cluster DNS on the VM: {e}")
+        return None
+
+
 class VMFromTemplateRequest(BaseModel):
     """Request to create VM from template."""
 
@@ -1325,6 +1366,7 @@ async def create_vm_from_template(
             iface_specs: list[dict[str, Any]] = []
             static_ips: list[str] = []
             has_bridge = False  # tracks whether any NIC uses bridge binding
+            vpc_dns_needed = False  # any NIC on a VPC overlay (not the cluster VPC)
 
             for idx, nic in enumerate(nic_list):
                 subnet_name = nic.subnet
@@ -1334,6 +1376,7 @@ async def create_vm_from_template(
                 #                                                ovn.kubernetes.io/logical_switch annotation
                 # The VPC pattern mirrors tenants_capi._build_kubevirt_machine_template_cr.
                 vlan_name: str | None = None
+                subnet_obj: dict[str, Any] | None = None
                 try:
                     subnet_obj = await custom_api.get_cluster_custom_object(
                         group="kubeovn.io",
@@ -1383,6 +1426,12 @@ async def create_vm_from_template(
                     iface_specs.append({"name": iface_name, vpc_binding: {}})
                     if vpc_binding == "bridge":
                         has_bridge = True
+                    # `ovn-cluster` is the cluster's own VPC: its pods reach
+                    # the standard CoreDNS, so leave those alone.
+                    if (subnet_obj or {}).get("spec", {}).get("vpc") not in (
+                        None, "", SYSTEM_VPC_NAME,
+                    ):
+                        vpc_dns_needed = True
 
                 if nic.static_ip:
                     static_ips.append(nic.static_ip)
@@ -1404,6 +1453,24 @@ async def create_vm_from_template(
             # Static IPs via Kube-OVN annotation (comma-separated for multi-NIC)
             if static_ips:
                 template_annotations["ovn.kubernetes.io/ip_address"] = ",".join(static_ips)
+
+            # DNS for guests on a VPC overlay. With bridge binding KubeVirt
+            # hands the guest the launcher pod's resolver, and that pod gets
+            # the cluster CoreDNS ClusterIP — which has no route from inside a
+            # VPC. Measured in the guest:
+            #
+            #   resolvectl status  -> Current DNS Server: 10.96.0.10
+            #   getent hosts one.one.one.one          -> (nothing)
+            #   getent hosts kubernetes.default.svc.. -> (nothing)
+            #
+            # The subnet's own DHCP offers the right address
+            # (dhcpV4Options ... dns_server=10.96.0.200) and never reaches the
+            # guest, because the guest is served by the launcher, not by OVN.
+            # So the launcher pod is told directly.
+            if vpc_dns_needed and not vm_spec.get("dnsConfig"):
+                vip = _vpc_dns_vip_or_none()
+                if vip:
+                    vm_spec.update(build_vpc_dns_spec(namespace, vip))
 
         else:
             # Check template network config

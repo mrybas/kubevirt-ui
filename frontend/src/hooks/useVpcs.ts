@@ -18,6 +18,7 @@ import {
   getVpcDnsPolicy,
   updateVpcDnsPolicy,
   recreateVpcDnsPolicy,
+  disableVpcDnsPolicy,
 } from '../api/vpcs';
 import type { CreateVpcRequest, AddVpcPeeringRequest, UpdateVpcRoutesRequest, UpdateVpcDnsRequest } from '../types/vpc';
 import { ApiError } from '../api/client';
@@ -130,6 +131,16 @@ export function useRecreateVpcDns(vpcName: string) {
     mutationFn: () => recreateVpcDns(vpcName),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['vpcs', vpcName, 'dns'] });
+    },
+  });
+}
+
+export function useDisableVpcDnsPolicy(vpcName: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: () => disableVpcDnsPolicy(vpcName),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['vpcs', vpcName, 'dns-policy'] });
     },
   });
 }

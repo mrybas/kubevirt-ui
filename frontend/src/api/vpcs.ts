@@ -77,6 +77,10 @@ export async function updateVpcDnsPolicy(
   });
 }
 
+export async function disableVpcDnsPolicy(vpcName: string): Promise<void> {
+  await apiRequest<void>(`/vpcs/${vpcName}/dns-policy`, { method: 'DELETE' });
+}
+
 export async function recreateVpcDnsPolicy(vpcName: string): Promise<Record<string, unknown>> {
   return apiRequest<Record<string, unknown>>(`/vpcs/${vpcName}/dns-policy/recreate`, {
     method: 'POST',

@@ -1986,6 +1986,26 @@ async def get_vpc_dns_policy(
         raise k8s_error_to_http(e, "ClusterPolicy lookup")
 
 
+@router.delete("/{vpc_name}/dns-policy", status_code=204)
+async def disable_vpc_dns_policy(
+    request: Request, vpc_name: str,
+    user: User = Depends(require_admin),
+) -> None:
+    """Remove the per-VPC Kyverno DNS-injection ClusterPolicy.
+
+    The policy rewrites the resolver of *pods* landing on this VPC's subnets.
+    VMs no longer depend on it — `vms.build_vpc_dns_spec` writes the same
+    dnsConfig straight into the VM, so a VM keeps working with the policy
+    gone. Deleting it is therefore a normal choice on a cluster that runs no
+    plain pods inside its VPCs, or one that would rather not run Kyverno at
+    all; `PUT` (or recreating the VPC's default) brings it back.
+    """
+    k8s = request.app.state.k8s_client
+    if not await _vpc_exists(k8s, vpc_name):
+        raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
+    await _delete_vpc_dns_policy(k8s, vpc_name)
+
+
 @router.put("/{vpc_name}/dns-policy")
 async def update_vpc_dns_policy(
     request: Request, vpc_name: str, body: dict[str, Any],
