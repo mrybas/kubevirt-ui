@@ -122,18 +122,18 @@ class VpcUnderlayRequest(BaseModel):
             "ready 0 — which looks like a healthy DaemonSet in every summary."
         ),
     )
-    cilium_source_ip_exempt: bool = Field(
-        False,
+    cilium_source_ip_exempt: bool | None = Field(
+        None,
         description=(
             "Deploy the cilium-gateway-exempt DaemonSet. Only needed when "
             "Cilium runs in chaining mode: it enforces that an endpoint emits "
             "only its own source address, and an egress gateway is a router "
             "forwarding replies from the whole internet, which Cilium drops "
-            "as 'Invalid source ip'. Off by default — it is a no-op cost on "
-            "clusters without Cilium."
+            "as 'Invalid source ip'. Left unset it is decided by looking at "
+            "the cluster: Cilium's own ConfigMap says whether it chains."
         ),
     )
-    cilium_namespace: str = "kube-system"
+    cilium_namespace: str = ""
     cilium_image: str = "quay.io/cilium/cilium:v1.20.0"
 
     @field_validator("interface", "provider_network_name", "vlan_name", "subnet_name")
@@ -337,6 +337,31 @@ _CILIUM_EXEMPT_SCRIPT = """while true; do
   sleep 15
 done
 """
+
+
+async def detect_cilium(k8s: Any) -> tuple[bool, str]:
+    """Whether Cilium is chaining, and the namespace it lives in.
+
+    The form defaulted the answer to "no" and the namespace to `kube-system`.
+    On this cluster Cilium chains (`cni-chaining-mode: generic-veth`) and lives
+    in `o0-cilium`, so the build reported the workaround as
+    "skipped — not chaining Cilium" while ticking the box by hand still put the
+    DaemonSet in an empty namespace. Both answers are in the cluster already.
+    """
+    for ns_candidate in (None,):  # search all namespaces
+        try:
+            cms = await k8s.core_api.list_config_map_for_all_namespaces(
+                field_selector="metadata.name=cilium-config",
+            )
+        except Exception as e:
+            logger.warning(f"Could not read cilium-config: {e}")
+            return False, "kube-system"
+        for cm in cms.items:
+            data = cm.data or {}
+            mode = (data.get("cni-chaining-mode") or "").strip().lower()
+            chaining = bool(mode) and mode != "none"
+            return chaining, cm.metadata.namespace
+    return False, "kube-system"
 
 
 def build_cilium_exempt(data: VpcUnderlayRequest) -> dict[str, Any]:
@@ -604,6 +629,13 @@ async def ensure_vpc_underlay(
     from app.api.v1.network import _find_kubeovn_namespace
     kubeovn_ns = await _find_kubeovn_namespace(k8s)
 
+    # Both Cilium answers come from the cluster unless the caller insisted.
+    chaining, cilium_ns = await detect_cilium(k8s)
+    if data.cilium_source_ip_exempt is None:
+        data.cilium_source_ip_exempt = chaining
+    if not data.cilium_namespace:
+        data.cilium_namespace = cilium_ns
+
     objects: list[UnderlayObject] = [
         await _ensure_cluster_obj(
             k8s, "provider-networks", build_provider_network(data), "ProviderNetwork",
@@ -639,7 +671,11 @@ async def ensure_vpc_underlay(
         objects.append(UnderlayObject(
             kind="DaemonSet", name=CILIUM_EXEMPT_NAME, namespace=data.cilium_namespace,
             state="skipped", workaround=True,
-            detail="cilium_source_ip_exempt=false — not chaining Cilium",
+            detail=(
+                "not needed — Cilium is not chaining on this cluster"
+                if not chaining else
+                "cilium_source_ip_exempt=false — asked for explicitly"
+            ),
         ))
 
     failed = [o for o in objects if o.state == "failed"]

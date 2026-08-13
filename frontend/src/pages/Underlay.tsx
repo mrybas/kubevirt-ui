@@ -38,7 +38,8 @@ interface FormState {
   vlan_name: string;
   subnet_name: string;
   link_watcher: boolean;
-  cilium_source_ip_exempt: boolean;
+  /** null = let the backend read cilium-config and decide. */
+  cilium_source_ip_exempt: boolean | null;
   cilium_namespace: string;
 }
 
@@ -53,8 +54,12 @@ const DEFAULTS: FormState = {
   vlan_name: 'vlan-external',
   subnet_name: 'ext-sub',
   link_watcher: true,
-  cilium_source_ip_exempt: false,
-  cilium_namespace: 'kube-system',
+  // Both left unset: the cluster's own cilium-config says whether Cilium
+  // chains and which namespace it runs in. Defaulting to false/kube-system
+  // here skipped the workaround on a cluster that needed it and offered
+  // the wrong namespace when it was ticked by hand.
+  cilium_source_ip_exempt: null,
+  cilium_namespace: '',
 };
 
 function StateIcon({ state }: { state: string }) {
@@ -374,20 +379,27 @@ export function Underlay() {
                 <input
                   type="checkbox"
                   className="mt-1"
-                  checked={form.cilium_source_ip_exempt}
+                  checked={form.cilium_source_ip_exempt === true}
+                  ref={(el) => {
+                    // Unset is a third state: the server reads cilium-config
+                    // and decides. Showing it as plain "off" is what let a
+                    // cluster that chains Cilium be built without the
+                    // workaround, reported as "not chaining Cilium".
+                    if (el) el.indeterminate = form.cilium_source_ip_exempt === null;
+                  }}
                   onChange={(e) => set('cilium_source_ip_exempt', e.target.checked)}
                 />
                 <span className="text-sm text-surface-300">
                   Deploy <span className="font-mono">cilium-gateway-exempt</span>
                   <span className="block text-xs text-surface-500">
-                    Needed when Cilium runs in chaining mode: it requires an endpoint to emit
-                    only its own source address, and an egress gateway forwards replies from
-                    the whole internet, which Cilium drops as "Invalid source ip".
+                    {form.cilium_source_ip_exempt === null
+                      ? 'Decided from the cluster: deployed when cilium-config says Cilium chains.'
+                      : 'Needed when Cilium runs in chaining mode: it requires an endpoint to emit only its own source address, and an egress gateway forwards replies from the whole internet, which Cilium drops as "Invalid source ip".'}
                   </span>
                 </span>
               </label>
 
-              {form.cilium_source_ip_exempt && (
+              {form.cilium_source_ip_exempt === true && (
                 <div>
                   <label className="block text-sm text-surface-300 mb-2">Cilium namespace</label>
                   <input

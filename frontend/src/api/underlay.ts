@@ -32,7 +32,7 @@ export interface EnsureUnderlayRequest {
   vlan_name: string;
   subnet_name: string;
   link_watcher: boolean;
-  cilium_source_ip_exempt: boolean;
+  cilium_source_ip_exempt: boolean | null;
   cilium_namespace: string;
 }
 

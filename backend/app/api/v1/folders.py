@@ -1543,6 +1543,7 @@ async def assert_within_folder_quota(
     k8s_client: Any, folders: dict[str, dict], folder_name: str,
     quota_cpu: str | None, quota_memory: str | None, quota_storage: str | None,
     exclude_namespace: str | None = None,
+    asking: str = "this environment",
 ) -> None:
     """Refuse an environment quota that would overrun the folder's.
 
@@ -1619,8 +1620,8 @@ async def assert_within_folder_quota(
                     f"{label} quota {ceiling.get(field)} for folder "
                     f"'{folder_name}' is already "
                     f"{_format_quantity(field, allocated[field])} allocated; "
-                    f"{_format_quantity(field, max(free, 0))} is free and this "
-                    f"environment asks for {_format_quantity(field, want)}. "
+                    f"{_format_quantity(field, max(free, 0))} is free and "
+                    f"{asking} asks for {_format_quantity(field, want)}. "
                     f"Lower it, or take the difference from another "
                     f"environment first."
                 ),

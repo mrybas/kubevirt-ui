@@ -459,7 +459,7 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                 <p className="text-xs text-surface-500 mt-1">Lowercase letters, numbers, hyphens only</p>
               </div>
               <div>
-                <label className="block text-sm text-surface-300 mb-1">Display Name</label>
+                <label className="block text-sm text-surface-300 mb-1">Display Name *</label>
                 <input
                   type="text"
                   value={form.display_name}

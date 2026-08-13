@@ -982,6 +982,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             await assert_within_folder_quota(
                 k8s, all_folders, req.folder,
                 tenant_quota["cpu"], tenant_quota["memory"], tenant_quota["storage"],
+                asking=f"tenant '{req.name}'",
             )
 
         await _create_namespace(
