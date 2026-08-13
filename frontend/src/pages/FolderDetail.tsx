@@ -889,11 +889,28 @@ function EditFolderModal({
 }) {
   const [displayName, setDisplayName] = useState(folder.display_name);
   const [description, setDescription] = useState(folder.description ?? '');
+  // Quota could be set when the folder was created and never afterwards: the
+  // detail page shows a quota panel and the edit dialog had no way to reach
+  // it, so "No quota configured" was a permanent state for every existing
+  // folder. `PATCH /folders/{name}` has always accepted a quota.
+  const [quotaCpu, setQuotaCpu] = useState(folder.quota?.cpu ?? '');
+  const [quotaMemory, setQuotaMemory] = useState(folder.quota?.memory ?? '');
+  const [quotaStorage, setQuotaStorage] = useState(folder.quota?.storage ?? '');
   const updateFolder = useUpdateFolder();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    await updateFolder.mutateAsync({ name: folder.name, request: { display_name: displayName, description } });
+    const quota = (quotaCpu || quotaMemory || quotaStorage)
+      ? {
+          cpu: quotaCpu || undefined,
+          memory: quotaMemory || undefined,
+          storage: quotaStorage || undefined,
+        }
+      : undefined;
+    await updateFolder.mutateAsync({
+      name: folder.name,
+      request: { display_name: displayName, description, ...(quota ? { quota } : {}) },
+    });
     onClose();
   };
 
@@ -914,6 +931,27 @@ function EditFolderModal({
           <div>
             <label className="block text-sm font-medium text-surface-300 mb-1">Description</label>
             <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} className="input w-full resize-none" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-surface-300 mb-1">Quota</label>
+            <div className="grid grid-cols-3 gap-2">
+              <input
+                type="text" value={quotaCpu} onChange={(e) => setQuotaCpu(e.target.value)}
+                placeholder="CPU e.g. 16" className="input w-full" aria-label="Quota CPU"
+              />
+              <input
+                type="text" value={quotaMemory} onChange={(e) => setQuotaMemory(e.target.value)}
+                placeholder="Memory e.g. 32Gi" className="input w-full" aria-label="Quota memory"
+              />
+              <input
+                type="text" value={quotaStorage} onChange={(e) => setQuotaStorage(e.target.value)}
+                placeholder="Storage e.g. 200Gi" className="input w-full" aria-label="Quota storage"
+              />
+            </div>
+            <p className="text-xs text-surface-500 mt-1">
+              A budget shown when creating VMs in this folder, not a limit the
+              cluster enforces. Leave all three empty for no quota.
+            </p>
           </div>
           <div className="flex justify-end gap-3 pt-2">
             <button type="button" onClick={onClose} className="btn-secondary">Cancel</button>
