@@ -255,3 +255,33 @@ class TestClusterSingletons:
         cr = build_bootstrap_provider()
         assert cr["kind"] == "BootstrapProvider"
         assert cr["metadata"]["name"] == "talos"
+
+
+class TestGoldenImageSourceGuard:
+    """The wizard's worker image field is shared with the cloud-init path,
+    where it holds a CAPK container-disk reference. CDI takes the Talos golden
+    image as an HTTP source and rejects anything that is not a URL — after the
+    tenant's Talos secrets and PKI are already written, so the failure leaves
+    half a tenant behind."""
+
+    def test_a_registry_reference_falls_back_to_the_known_good_image(self) -> None:
+        from app.api.v1.tenants_talos import TALOS_GOLDEN_IMAGE_URL, build_talos_golden_dv
+
+        # What the guard must produce for a container-disk reference.
+        dv = build_talos_golden_dv("t1", "ns", TALOS_GOLDEN_IMAGE_URL, "20Gi", None)
+        assert dv["spec"]["source"]["http"]["url"].startswith("https://")
+
+    def test_the_default_image_is_an_http_url(self) -> None:
+        from app.api.v1.tenants_talos import TALOS_GOLDEN_IMAGE_URL
+
+        assert TALOS_GOLDEN_IMAGE_URL.startswith(("http://", "https://"))
+        assert TALOS_GOLDEN_IMAGE_URL.endswith(".raw.xz")
+
+    def test_the_guard_rejects_non_url_sources(self) -> None:
+        import inspect
+
+        from app.api.v1 import tenants_talos
+
+        source = inspect.getsource(tenants_talos.ensure_talos_golden_image)
+        assert 'startswith(("http://", "https://"))' in source
+        assert "TALOS_GOLDEN_IMAGE_URL" in source

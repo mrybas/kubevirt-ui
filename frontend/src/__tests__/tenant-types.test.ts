@@ -157,3 +157,42 @@ describe('Tenant response type', () => {
     expect(tenant.worker_type).toBe('vm');
   });
 });
+
+/**
+ * A Talos worker boots a raw disk image the backend imports over HTTP. The
+ * wizard's worker image field holds a CAPK *container disk* reference, which
+ * belongs to the cloud-init path only — sending it on the Talos path makes CDI
+ * reject the DataVolume:
+ *
+ *   admission webhook "datavolume-validate.cdi.kubevirt.io" denied the request:
+ *   spec.source Invalid source URL: quay.io/capk/ubuntu-2404-container-disk:v1.32.1
+ *
+ * and by then the tenant's Talos secrets and PKI are already written, so the
+ * failure leaves half a tenant behind.
+ */
+describe('worker image is only sent on the cloud-init path', () => {
+  function imageFields(form: { worker_image_url: string; worker_os: 'cloud-init' | 'talos' }) {
+    return {
+      ...(form.worker_image_url && form.worker_os === 'cloud-init'
+        ? { worker_image_url: form.worker_image_url, worker_image_source_type: 'registry' as const }
+        : {}),
+    };
+  }
+
+  const CAPK = 'quay.io/capk/ubuntu-2404-container-disk:v1.32.1';
+
+  it('carries the container disk for cloud-init workers', () => {
+    expect(imageFields({ worker_image_url: CAPK, worker_os: 'cloud-init' })).toEqual({
+      worker_image_url: CAPK,
+      worker_image_source_type: 'registry',
+    });
+  });
+
+  it('drops it for Talos workers', () => {
+    expect(imageFields({ worker_image_url: CAPK, worker_os: 'talos' })).toEqual({});
+  });
+
+  it('sends nothing when the field is empty', () => {
+    expect(imageFields({ worker_image_url: '', worker_os: 'cloud-init' })).toEqual({});
+  });
+});

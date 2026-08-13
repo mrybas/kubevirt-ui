@@ -387,6 +387,18 @@ rules:
   - apiGroups: ["bootstrap.cluster.x-k8s.io"]
     resources:
       - kubeadmconfigtemplates
+      # Talos workers carry their machine config in a TalosConfigTemplate
+      # instead — the wizard offers the choice, so both have to be grantable.
+      - talosconfigtemplates
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # Choosing Talos workers means installing the Talos bootstrap provider
+  # (CABPT) if it is absent. Without this the tenant is created halfway —
+  # secrets and PKI land, the provider does not — and the user sees only
+  # "Failed to create tenant".
+  - apiGroups: ["operator.cluster.x-k8s.io"]
+    resources:
+      - bootstrapproviders
     verbs: ["get", "list", "watch", "create", "update", "patch"]
 
   - apiGroups: ["controlplane.cluster.x-k8s.io"]

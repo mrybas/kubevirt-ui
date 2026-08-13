@@ -551,6 +551,26 @@ async def ensure_talos_golden_image(
 ) -> None:
     """Import the Talos golden image into the tenant namespace if absent."""
     url = image_url or TALOS_GOLDEN_IMAGE_URL
+
+    # The wizard's worker image field is shared with the cloud-init path,
+    # where it holds a CAPK *container disk* reference. CDI takes this one as
+    # an HTTP source and rejects anything that is not a URL:
+    #
+    #   admission webhook "datavolume-validate.cdi.kubevirt.io" denied the
+    #   request: spec.source Invalid source URL:
+    #   quay.io/capk/ubuntu-2404-container-disk:v1.32.1
+    #
+    # By then the tenant's Talos secrets and PKI are already written, so the
+    # failure leaves half a tenant behind. A registry reference here can only
+    # be the wrong field carried over — fall back to the known-good image.
+    if not url.startswith(("http://", "https://")):
+        logger.warning(
+            f"Talos golden image for tenant {tenant!r} was given {url!r}, which "
+            f"is not an HTTP(S) URL — using {TALOS_GOLDEN_IMAGE_URL} instead. "
+            f"A container-disk reference belongs to the cloud-init worker path.",
+        )
+        url = TALOS_GOLDEN_IMAGE_URL
+
     body = build_talos_golden_dv(tenant, namespace, url, size, storage_class)
     try:
         await k8s.custom_api.create_namespaced_custom_object(

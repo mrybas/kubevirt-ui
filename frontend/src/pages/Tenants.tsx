@@ -267,6 +267,7 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
 
   // Autoderive worker_image_url when kubernetes_version changes (T10)
   useEffect(() => {
+    if (form.worker_os !== 'cloud-init') return;
     const derived = deriveCapkUrl(form.kubernetes_version);
     if (derived && (form.worker_image_url === '' || isCapkUrl(form.worker_image_url))) {
       setForm(prev => ({ ...prev, worker_image_url: derived }));
@@ -379,7 +380,11 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
       ...(form.environment ? { environment: form.environment } : {}),
       // Network: explicit VPC choice (empty = default cluster network)
       ...(form.vpc_name ? { vpc_name: form.vpc_name } : {}),
-      ...(form.worker_image_url ? {
+      // Only the cloud-init path takes a container disk. A Talos worker boots
+      // a raw image the backend imports over HTTP, and sending this field
+      // there makes CDI reject the DataVolume — after the tenant's Talos
+      // secrets and PKI have already been written.
+      ...(form.worker_image_url && form.worker_os === 'cloud-init' ? {
         worker_image_url: form.worker_image_url,
         worker_image_source_type: 'registry' as const,
       } : {}),
@@ -809,7 +814,12 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                 </p>
               </div>
 
-              {/* T10: Worker Container Image (CAPK OCI disk) */}
+              {/* T10: Worker Container Image (CAPK OCI disk).
+                  Cloud-init only: a Talos worker boots a raw disk image the
+                  backend imports over HTTP, and a container-disk reference
+                  handed to that path is rejected by CDI after the tenant's
+                  secrets and PKI are already written. */}
+              {form.worker_os === 'cloud-init' && (
               <div className="space-y-2">
                 <label className="block text-sm text-surface-300">
                   Worker Image URL
@@ -863,6 +873,7 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                   </div>
                 </div>
               </div>
+              )}
 
               {/* Image Pull Secrets */}
               <div className="space-y-2">

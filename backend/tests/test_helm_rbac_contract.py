@@ -43,6 +43,17 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     # --- VpcDns: route the service network so the ClusterIP is reachable ---
     ("apps", "deployments", "patch", "vpcs._ensure_vpc_dns_service_route"),
     ("apps", "deployments", "get", "network._find_kubeovn_namespace"),
+    # --- Talos workers: provider install + per-machine config template ---
+    # Both 403'd on a live cluster while every unit test passed; the tenant
+    # got as far as writing its Talos secrets and PKI before dying.
+    ("operator.cluster.x-k8s.io", "bootstrapproviders", "create",
+     "tenants_talos._ensure_talos_bootstrap_provider"),
+    ("operator.cluster.x-k8s.io", "bootstrapproviders", "get",
+     "tenants_talos._ensure_talos_bootstrap_provider"),
+    ("bootstrap.cluster.x-k8s.io", "talosconfigtemplates", "create",
+     "tenants_capi (Talos worker path)"),
+    ("bootstrap.cluster.x-k8s.io", "talosconfigtemplates", "patch",
+     "tenants_capi (Talos worker path)"),
     # --- BGP peering for egress gateways ---
     ("kubeovn.io", "bgp-confs", "get", "bgp.get_bgp_conf"),
     ("kubeovn.io", "bgp-confs", "list", "bgp.list_bgp_confs"),
