@@ -13,6 +13,7 @@ import {
   moveFolder,
   addFolderEnvironment,
   removeFolderEnvironment,
+  getFolderQuotaHeadroom,
   listFolderAccess,
   addFolderAccess,
   removeFolderAccess,
@@ -89,6 +90,14 @@ export function useMoveFolder() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['folders'] });
     },
+  });
+}
+
+export function useFolderQuotaHeadroom(folderName: string | undefined) {
+  return useQuery({
+    queryKey: ['folders', folderName, 'quota-headroom'],
+    queryFn: () => getFolderQuotaHeadroom(folderName!),
+    enabled: !!folderName,
   });
 }
 

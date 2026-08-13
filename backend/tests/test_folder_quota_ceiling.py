@@ -17,6 +17,7 @@ from fastapi import HTTPException
 
 from app.api.v1.folders import (
     _allocated_env_quota,
+    _own_env_quota,
     assert_within_folder_quota,
     parse_quantity,
 )
@@ -39,10 +40,23 @@ def _quota(cpu: str | None = None, mem: str | None = None, storage: str | None =
 
 
 def _k8s(per_ns: dict[str, list]) -> MagicMock:
+    """A fake that honours the label selector, as the real API server does.
+
+    Namespaces are named `{folder}-{env}` (`folders._ns_name`), so the folder
+    a namespace belongs to is its name up to the last dash. Ignoring the
+    selector made every folder see every namespace and double-counted the
+    subtree.
+    """
     k8s = MagicMock()
-    k8s.list_namespaces = AsyncMock(
-        return_value=[{"name": n} for n in per_ns],
-    )
+
+    async def _list_namespaces(label_selector: str = ""):
+        folder = label_selector.split("=")[-1] if label_selector else None
+        return [
+            {"name": n} for n in per_ns
+            if folder is None or n.rsplit("-", 1)[0] == folder
+        ]
+
+    k8s.list_namespaces = AsyncMock(side_effect=_list_namespaces)
 
     async def _list(namespace: str):
         return MagicMock(items=per_ns.get(namespace, []))
@@ -117,7 +131,7 @@ class TestCeiling:
     async def test_unreadable_namespaces_do_not_silently_free_the_budget(self) -> None:
         k8s = MagicMock()
         k8s.list_namespaces = AsyncMock(side_effect=RuntimeError("no access"))
-        totals = await _allocated_env_quota(k8s, "team")
+        totals = await _own_env_quota(k8s, "team")
         assert totals == {"cpu": 0.0, "memory": 0.0, "storage": 0.0}
 
 
@@ -149,3 +163,93 @@ def test_the_quota_comes_with_a_limitrange() -> None:
     src = inspect.getsource(folders_mod._create_environment_ns)
     assert "create_namespaced_limit_range" in src
     assert "defaultRequest" in src
+
+
+# ---------------------------------------------------------------------------
+# Sub-folders spend the parent's budget
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestSubfolders:
+    """`_validate_child_quota` compares one child against the parent and stops.
+
+    So a parent capped at 16 CPU accepted two children of 16: each was
+    individually "not more than the parent", and nothing ever added them up.
+    A sub-folder's environments were invisible to the parent's ceiling too,
+    because the sum only looked at namespaces labelled with the parent.
+    """
+
+    TREE = {
+        "top": {"quota": {"cpu": "16", "memory": "32Gi"}},
+        "kid": {"parent_id": "top", "quota": {"cpu": "10"}},
+        "kid2": {"parent_id": "top"},
+    }
+
+    async def test_a_declared_child_quota_is_reserved_from_the_parent(self) -> None:
+        k8s = _k8s({})  # no environments anywhere
+        allocated = await _allocated_env_quota(k8s, self.TREE, "top")
+        assert allocated["cpu"] == 10, (
+            "the child's own ceiling is a promise the parent already made"
+        )
+
+    async def test_a_child_without_a_quota_contributes_its_actual_use(self) -> None:
+        tree = {"top": {"quota": {"cpu": "16"}}, "kid2": {"parent_id": "top"}}
+        k8s = _k8s({"kid2-dev": [_quota(cpu="3")]})
+        allocated = await _allocated_env_quota(k8s, tree, "top")
+        assert allocated["cpu"] == 3
+
+    async def test_grandchildren_count_too(self) -> None:
+        tree = {
+            "top": {"quota": {"cpu": "16"}},
+            "kid": {"parent_id": "top"},
+            "grandkid": {"parent_id": "kid"},
+        }
+        k8s = _k8s({"grandkid-dev": [_quota(cpu="5")]})
+        allocated = await _allocated_env_quota(k8s, tree, "top")
+        assert allocated["cpu"] == 5
+
+    async def test_an_environment_is_refused_when_a_subfolder_took_the_room(self) -> None:
+        # top=16, kid reserved 10, top's own dev has 4 -> 2 free.
+        k8s = _k8s({"top-dev": [_quota(cpu="4")]})
+        with pytest.raises(HTTPException) as exc:
+            await assert_within_folder_quota(k8s, self.TREE, "top", "5", None, None)
+        assert "2 is free" in str(exc.value.detail)
+
+    async def test_two_siblings_cannot_both_take_the_whole_parent(self) -> None:
+        from app.api.v1.folders import assert_child_folder_within_parent
+
+        tree = {"top": {"quota": {"cpu": "16"}}, "a": {"parent_id": "top", "quota": {"cpu": "16"}},
+                "b": {"parent_id": "top"}}
+        k8s = _k8s({})
+        with pytest.raises(HTTPException) as exc:
+            await assert_child_folder_within_parent(k8s, tree, "b", {"cpu": "16"})
+        assert exc.value.status_code == 409
+        assert "sub-folders" in str(exc.value.detail)
+
+    async def test_raising_a_child_quota_does_not_compete_with_itself(self) -> None:
+        from app.api.v1.folders import assert_child_folder_within_parent
+
+        tree = {"top": {"quota": {"cpu": "16"}}, "a": {"parent_id": "top", "quota": {"cpu": "10"}}}
+        k8s = _k8s({})
+        # 10 -> 14 under a 16 ceiling: fine unless its own 10 is counted twice.
+        await assert_child_folder_within_parent(k8s, tree, "a", {"cpu": "14"})
+
+    async def test_a_root_folder_has_no_parent_to_answer_to(self) -> None:
+        from app.api.v1.folders import assert_child_folder_within_parent
+
+        k8s = _k8s({})
+        await assert_child_folder_within_parent(
+            k8s, {"top": {"quota": {"cpu": "16"}}}, "top", {"cpu": "999"},
+        )
+
+
+def test_both_folder_write_paths_check_the_parent() -> None:
+    """Create and update both hand out sub-folder quota."""
+    import inspect
+
+    from app.api.v1 import folders as folders_mod
+
+    for fn in (folders_mod.create_folder, folders_mod.update_folder):
+        assert "assert_child_folder_within_parent" in inspect.getsource(fn), (
+            f"{fn.__name__} can set a sub-folder quota without counting siblings"
+        )

@@ -58,6 +58,19 @@ export async function moveFolder(name: string, request: MoveFolderRequest): Prom
   });
 }
 
+export interface FolderQuotaHeadroom {
+  quota: { cpu?: string; memory?: string; storage?: string } | null;
+  allocated: { cpu: number; memory: number; storage: number };
+  /** null for a dimension the folder does not cap. */
+  free: { cpu: number | null; memory: number | null; storage: number | null };
+}
+
+export async function getFolderQuotaHeadroom(
+  folderName: string,
+): Promise<FolderQuotaHeadroom> {
+  return apiRequest<FolderQuotaHeadroom>(`/folders/${folderName}/quota-headroom`);
+}
+
 // Environments
 export async function addFolderEnvironment(
   folderName: string,

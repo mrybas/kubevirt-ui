@@ -33,6 +33,7 @@ import {
   useUpdateFolder,
   useMoveFolder,
   useAddFolderEnvironment,
+  useFolderQuotaHeadroom,
   useRemoveFolderEnvironment,
   useFolderAccess,
   useAddFolderAccess,
@@ -403,18 +404,43 @@ function ChildrenTab({
 // EnvironmentsTab
 // ---------------------------------------------------------------------------
 
+/** Quantities come back from the API as plain numbers. */
+function fmtQuota(v: number | null): string {
+  if (v === null) return '—';
+  return Number.isInteger(v) ? String(v) : v.toFixed(2).replace(/\.?0+$/, '');
+}
+
+function fmtBytes(v: number | null): string {
+  if (v === null) return '—';
+  const gi = v / 2 ** 30;
+  if (gi >= 1) return `${fmtQuota(gi)}Gi`;
+  const mi = v / 2 ** 20;
+  return `${fmtQuota(mi)}Mi`;
+}
+
+
 function EnvironmentsTab({ folder }: { folder: NonNullable<ReturnType<typeof useFolder>['data']> }) {
   const [showAdd, setShowAdd] = useState(false);
   const [newEnvName, setNewEnvName] = useState('');
   const [deleteModalEnv, setDeleteModalEnv] = useState<FolderEnvironment | null>(null);
+  const [quotaCpu, setQuotaCpu] = useState('');
+  const [quotaMemory, setQuotaMemory] = useState('');
+  const [quotaStorage, setQuotaStorage] = useState('');
   const addEnv = useAddFolderEnvironment(folder.name);
+  const { data: headroom } = useFolderQuotaHeadroom(folder.name);
   const removeEnv = useRemoveFolderEnvironment(folder.name);
 
   const handleAdd = async () => {
     const trimmed = newEnvName.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
     if (!trimmed) return;
-    await addEnv.mutateAsync({ environment: trimmed });
+    await addEnv.mutateAsync({
+      environment: trimmed,
+      quota_cpu: quotaCpu || undefined,
+      quota_memory: quotaMemory || undefined,
+      quota_storage: quotaStorage || undefined,
+    });
     setNewEnvName('');
+    setQuotaCpu(''); setQuotaMemory(''); setQuotaStorage('');
     setShowAdd(false);
   };
 
@@ -481,6 +507,34 @@ function EnvironmentsTab({ folder }: { folder: NonNullable<ReturnType<typeof use
           </div>
 
           {showAdd ? (
+            <div className="space-y-2">
+            {/* The quota becomes a real ResourceQuota on the namespace, so it
+                binds kubectl too — and it is checked against what the folder
+                ceiling has left, sub-folders included. Showing the remainder
+                here means the form and the server agree about the number. */}
+            {headroom?.quota && (
+              <div className="text-xs text-surface-400">
+                Folder ceiling:{' '}
+                {headroom.quota.cpu && (
+                  <span className="mr-3">
+                    CPU {headroom.quota.cpu} · free{' '}
+                    <span className="text-surface-200">{fmtQuota(headroom.free.cpu)}</span>
+                  </span>
+                )}
+                {headroom.quota.memory && (
+                  <span className="mr-3">
+                    memory {headroom.quota.memory} · free{' '}
+                    <span className="text-surface-200">{fmtBytes(headroom.free.memory)}</span>
+                  </span>
+                )}
+                {headroom.quota.storage && (
+                  <span>
+                    storage {headroom.quota.storage} · free{' '}
+                    <span className="text-surface-200">{fmtBytes(headroom.free.storage)}</span>
+                  </span>
+                )}
+              </div>
+            )}
             <div className="flex items-center gap-2">
               <input
                 type="text"
@@ -504,6 +558,26 @@ function EnvironmentsTab({ folder }: { folder: NonNullable<ReturnType<typeof use
               >
                 <X className="w-4 h-4" />
               </button>
+            </div>
+            <div className="grid grid-cols-3 gap-2">
+              <input
+                type="text" value={quotaCpu} onChange={(e) => setQuotaCpu(e.target.value)}
+                placeholder="CPU e.g. 8" className="input" aria-label="Environment CPU quota"
+              />
+              <input
+                type="text" value={quotaMemory} onChange={(e) => setQuotaMemory(e.target.value)}
+                placeholder="Memory e.g. 16Gi" className="input" aria-label="Environment memory quota"
+              />
+              <input
+                type="text" value={quotaStorage} onChange={(e) => setQuotaStorage(e.target.value)}
+                placeholder="Storage e.g. 100Gi" className="input" aria-label="Environment storage quota"
+              />
+            </div>
+            <p className="text-xs text-surface-500">
+              Enforced by Kubernetes as a ResourceQuota on the namespace — it
+              applies to kubectl as well, not only to this UI. Leave empty for
+              no quota.
+            </p>
             </div>
           ) : (
             <button

@@ -819,6 +819,14 @@ async def create_folder(request: Request, folder: FolderCreateRequest, user: Use
         parent_quota = parent_meta.get("quota")
         if parent_quota:
             _validate_child_quota(folder.quota, FolderQuota(**parent_quota))
+            # Siblings count too: two children of 16 each under a parent of 16
+            # both pass the comparison above.
+            await assert_child_folder_within_parent(
+                k8s_client,
+                {**folders, folder.name: {"parent_id": folder.parent_id}},
+                folder.name,
+                folder.quota.model_dump(exclude_none=True) if folder.quota else None,
+            )
 
     now = datetime.now(timezone.utc).isoformat()
     meta: dict[str, Any] = {
@@ -949,6 +957,11 @@ async def update_folder(request: Request, name: str, update: FolderUpdateRequest
             parent_quota_data = folders[parent_id].get("quota")
             if parent_quota_data:
                 _validate_child_quota(update.quota, FolderQuota(**parent_quota_data))
+        # ...and against what the parent has left, not only against its total.
+        await assert_child_folder_within_parent(
+            k8s_client, folders, name,
+            update.quota.model_dump(exclude_none=True),
+        )
         q = update.quota.model_dump(exclude_none=True)
         meta["quota"] = q if q else None
 
@@ -1070,12 +1083,12 @@ def parse_quantity(value: str | None) -> float | None:
         return None
 
 
-async def _allocated_env_quota(k8s_client: Any, folder_name: str) -> dict[str, float]:
-    """Sum of the quotas already handed to this folder's environments.
+async def _own_env_quota(k8s_client: Any, folder_name: str) -> dict[str, float]:
+    """Sum of the quotas handed to this folder's own environments.
 
-    Read from the ResourceQuota objects rather than from any bookkeeping of
-    our own: they are what the API server enforces, and an admin editing one
-    with kubectl must count.
+    Read from the ResourceQuota objects rather than from bookkeeping of our
+    own: they are what the API server enforces, and an admin editing one with
+    kubectl must count.
     """
     totals = {"cpu": 0.0, "memory": 0.0, "storage": 0.0}
     try:
@@ -1107,6 +1120,92 @@ async def _allocated_env_quota(k8s_client: Any, folder_name: str) -> dict[str, f
     return totals
 
 
+def _direct_children(folders: dict[str, dict], folder_name: str) -> list[str]:
+    return [n for n, m in folders.items() if m.get("parent_id") == folder_name]
+
+
+async def _allocated_env_quota(
+    k8s_client: Any, folders: dict[str, dict], folder_name: str,
+) -> dict[str, float]:
+    """Everything a folder's ceiling already covers, sub-folders included.
+
+    A sub-folder spends its parent's budget: without this, `lab` capped at 16
+    CPU could hold two children of 16 each, because the only check compared
+    one child against the parent and never the children against each other.
+
+    A child that declares a quota reserves exactly that much — its own ceiling
+    is the promise the parent has already made to it, whether or not its
+    environments have claimed it yet. A child without one contributes whatever
+    its subtree has actually allocated, which is the honest figure when
+    nothing has been promised.
+    """
+    totals = await _own_env_quota(k8s_client, folder_name)
+
+    for child in _direct_children(folders, folder_name):
+        child_quota = (folders.get(child) or {}).get("quota") or {}
+        if child_quota:
+            for field in totals:
+                value = parse_quantity(child_quota.get(field))
+                if value:
+                    totals[field] += value
+        else:
+            nested = await _allocated_env_quota(k8s_client, folders, child)
+            for field in totals:
+                totals[field] += nested[field]
+
+    return totals
+
+
+
+async def assert_child_folder_within_parent(
+    k8s_client: Any, folders: dict[str, dict], child_name: str,
+    quota: dict[str, str] | None,
+) -> None:
+    """Refuse a sub-folder quota the parent cannot cover.
+
+    `_validate_child_quota` compares one child against the parent and stops
+    there, so a parent capped at 16 CPU accepted two children of 16 — each
+    was individually "not more than the parent". The siblings have to be
+    counted, and so do the parent's own environments.
+    """
+    meta = folders.get(child_name) or {}
+    parent = meta.get("parent_id")
+    if not parent or parent not in folders:
+        return
+    if not quota:
+        return
+
+    ceiling = (folders[parent].get("quota") or {})
+    if not ceiling:
+        return
+
+    allocated = await _allocated_env_quota(k8s_client, folders, parent)
+
+    # This child's current reservation is not competing with itself.
+    current = meta.get("quota") or {}
+    for field in allocated:
+        value = parse_quantity(current.get(field))
+        if value:
+            allocated[field] -= value
+
+    for field, label in (("cpu", "CPU"), ("memory", "memory"), ("storage", "storage")):
+        want = parse_quantity(quota.get(field))
+        limit = parse_quantity(ceiling.get(field))
+        if want is None or limit is None:
+            continue
+        free = limit - allocated[field]
+        if want > free + 1e-9:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{label} quota {ceiling.get(field)} of parent folder "
+                    f"'{parent}' is already {allocated[field]:g} allocated to "
+                    f"its environments and other sub-folders; {free:g} is free "
+                    f"and '{child_name}' asks for {want:g}."
+                ),
+            )
+
+
 async def assert_within_folder_quota(
     k8s_client: Any, folders: dict[str, dict], folder_name: str,
     quota_cpu: str | None, quota_memory: str | None, quota_storage: str | None,
@@ -1128,7 +1227,7 @@ async def assert_within_folder_quota(
     if not ceiling:
         return
 
-    allocated = await _allocated_env_quota(k8s_client, folder_name)
+    allocated = await _allocated_env_quota(k8s_client, folders, folder_name)
     if exclude_namespace:
         # Re-allocating an existing environment: its current quota is not
         # competing with itself.
@@ -1320,6 +1419,33 @@ async def add_environment(
         k8s_client, folders, name, env.environment,
         env.quota_cpu, env.quota_memory, env.quota_storage,
     )
+
+
+@router.get("/{name}/quota-headroom")
+async def get_folder_quota_headroom(
+    request: Request, name: str, user: User = Depends(require_auth),
+):
+    """What the folder's ceiling still has free.
+
+    The number the UI needs while someone types an environment quota, and the
+    same arithmetic the create path refuses on — so the form and the server
+    cannot disagree about how much is left.
+    """
+    k8s_client = request.app.state.k8s_client
+    data = await _ensure_folders_configmap(k8s_client)
+    folders = _parse_all_folders(data)
+    if name not in folders:
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    ceiling = (folders[name].get("quota") or {})
+    allocated = await _allocated_env_quota(k8s_client, folders, name)
+
+    out: dict[str, Any] = {"quota": ceiling or None, "allocated": {}, "free": {}}
+    for field in ("cpu", "memory", "storage"):
+        limit = parse_quantity(ceiling.get(field))
+        out["allocated"][field] = allocated[field]
+        out["free"][field] = None if limit is None else max(0.0, limit - allocated[field])
+    return out
 
 
 @router.delete("/{name}/environments/{environment}", status_code=204)
