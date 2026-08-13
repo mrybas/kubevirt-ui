@@ -384,3 +384,60 @@ class TestSignerReachesTheControlPlane:
 
         assert "talos-csr-signer" in names
         assert additions["additionalVolumes"]
+
+
+class TestSignerInvocation:
+    """The flags are the image's, verified against `talos-csr-signer --help`
+    on ghcr.io/clastix/talos-csr-signer. Getting one wrong is not subtle: the
+    binary exits `unknown flag: --listen` and crash-loops, while the tenant
+    stays Ready and the worker waits for a certificate that never comes."""
+
+    def _sidecar(self) -> dict:
+        from app.api.v1.tenants_talos import build_signer_sidecar
+
+        return build_signer_sidecar("t1", "signer:latest")
+
+    def _flags(self) -> dict[str, str]:
+        return dict(
+            arg.lstrip("-").split("=", 1) for arg in self._sidecar()["args"]
+        )
+
+    def test_only_flags_the_binary_accepts(self) -> None:
+        accepted = {
+            "ca-cert-path", "ca-key-path", "port",
+            "tls-cert-path", "tls-key-path",
+        }
+        assert set(self._flags()) <= accepted
+
+    def test_it_listens_on_the_port_talos_dials(self) -> None:
+        from app.api.v1.tenants_talos import TALOS_TRUSTD_PORT
+
+        assert self._flags()["port"] == str(TALOS_TRUSTD_PORT)
+
+    def test_the_ca_key_is_mounted_not_just_the_certificate(self) -> None:
+        # Signing needs the key; with only the certificate the signer starts
+        # and then cannot issue anything.
+        flags = self._flags()
+        assert flags["ca-key-path"].endswith("tls.key")
+        assert flags["ca-cert-path"].endswith("tls.crt")
+
+    def test_the_token_comes_from_the_tenant_secret_as_env(self) -> None:
+        # There is no shell in the image (distroless), so it cannot be
+        # interpolated into an argument — the binary reads TALOS_TOKEN.
+        env = {e["name"]: e for e in self._sidecar()["env"]}
+
+        assert "TALOS_TOKEN" in env
+        ref = env["TALOS_TOKEN"]["valueFrom"]["secretKeyRef"]
+        assert ref["name"] == "t1-talos-secrets"
+        assert ref["key"] == "machine.token"
+
+    def test_both_secrets_are_mounted(self) -> None:
+        from app.api.v1.tenants_talos import build_signer_volume
+
+        mounts = {m["name"]: m["mountPath"] for m in self._sidecar()["volumeMounts"]}
+        volumes = {v["name"]: v["secret"]["secretName"] for v in build_signer_volume("t1")}
+
+        assert mounts["talos-signer-certs"] == "/etc/talos-signer"
+        assert mounts["talos-ca-certs"] == "/etc/talos-ca"
+        assert volumes["talos-signer-certs"] == "t1-talos-signer"
+        assert volumes["talos-ca-certs"] == "t1-talos-ca"

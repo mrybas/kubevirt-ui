@@ -252,22 +252,53 @@ def build_talos_pki(tenant: str, namespace: str) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def build_signer_sidecar(tenant: str, signer_image: str) -> dict[str, Any]:
-    """The talos-csr-signer container that runs beside the apiserver."""
+    """The talos-csr-signer container that runs beside the apiserver.
+
+    Flag names are the image's, not ours — `talos-csr-signer --help`:
+
+        --ca-cert-path, --ca-key-path, --port, --talos-token,
+        --tls-cert-path, --tls-key-path
+
+    Getting one wrong is not a subtle failure: the binary exits with
+    `unknown flag: --listen` and the container crash-loops, while the tenant
+    itself stays Ready and the worker waits for a certificate forever.
+
+    Three secrets, not one. The server certificate proves the signer's
+    identity to the worker; the CA **key** is what actually signs the CSR
+    (mounting only the CA certificate leaves it unable to issue anything);
+    and the Talos machine token is how a worker proves it belongs to this
+    tenant at all.
+    """
     return {
         "name": "talos-csr-signer",
         "image": signer_image,
         "args": [
-            f"--listen=:{TALOS_TRUSTD_PORT}",
-            "--tls-cert=/etc/talos-signer/tls.crt",
-            "--tls-key=/etc/talos-signer/tls.key",
-            "--ca-cert=/etc/talos-signer/ca.crt",
+            f"--port={TALOS_TRUSTD_PORT}",
+            "--tls-cert-path=/etc/talos-signer/tls.crt",
+            "--tls-key-path=/etc/talos-signer/tls.key",
+            "--ca-cert-path=/etc/talos-ca/tls.crt",
+            "--ca-key-path=/etc/talos-ca/tls.key",
         ],
-        "ports": [{"name": "trustd", "containerPort": TALOS_TRUSTD_PORT}],
-        "volumeMounts": [{
-            "name": "talos-signer-certs",
-            "mountPath": "/etc/talos-signer",
-            "readOnly": True,
+        "env": [{
+            "name": "TALOS_TOKEN",
+            "valueFrom": {"secretKeyRef": {
+                "name": f"{tenant}-talos-secrets",
+                "key": "machine.token",
+            }},
         }],
+        "ports": [{"name": "trustd", "containerPort": TALOS_TRUSTD_PORT}],
+        "volumeMounts": [
+            {
+                "name": "talos-signer-certs",
+                "mountPath": "/etc/talos-signer",
+                "readOnly": True,
+            },
+            {
+                "name": "talos-ca-certs",
+                "mountPath": "/etc/talos-ca",
+                "readOnly": True,
+            },
+        ],
         "resources": {
             "requests": {"cpu": "10m", "memory": "32Mi"},
             "limits": {"memory": "128Mi"},
@@ -275,11 +306,18 @@ def build_signer_sidecar(tenant: str, signer_image: str) -> dict[str, Any]:
     }
 
 
-def build_signer_volume(tenant: str) -> dict[str, Any]:
-    return {
-        "name": "talos-signer-certs",
-        "secret": {"secretName": f"{tenant}-talos-signer"},
-    }
+def build_signer_volume(tenant: str) -> list[dict[str, Any]]:
+    """Both secrets the signer mounts: its server certificate and the CA."""
+    return [
+        {
+            "name": "talos-signer-certs",
+            "secret": {"secretName": f"{tenant}-talos-signer"},
+        },
+        {
+            "name": "talos-ca-certs",
+            "secret": {"secretName": f"{tenant}-talos-ca"},
+        },
+    ]
 
 
 def talos_control_plane_additions(
@@ -298,7 +336,7 @@ def talos_control_plane_additions(
     """
     additions: dict[str, Any] = {
         "additionalContainers": [build_signer_sidecar(tenant, signer_image)],
-        "additionalVolumes": [build_signer_volume(tenant)],
+        "additionalVolumes": build_signer_volume(tenant),
         # The apiserver certificate must answer to the same names the worker
         # dials, or the join fails TLS before trustd is ever reached.
         "certSANs": signer_dns_names(tenant, namespace),
