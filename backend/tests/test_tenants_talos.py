@@ -605,3 +605,28 @@ class TestWorkerConfigCarriesTheKubernetesCA:
 
         assert 'f"{tenant}-ca"' in inspect.getsource(tenants_talos.read_tenant_k8s_ca_cert)
         assert "k8s_ca_cert_b64=k8s_ca" in inspect.getsource(tenants_capi)
+
+
+class TestKubeletVersionPinning:
+    """Talos ships the kubelet matching ITS release — 1.13.8 carries v1.36.2 —
+    which against a v1.32 tenant control plane is four minors of skew. The node
+    boots, apid and the kubelet both report healthy, and it never registers."""
+
+    def _kubelet(self, version: str = "v1.32.1"):
+        from app.api.v1.tenants_talos import build_talos_worker_config
+
+        return build_talos_worker_config(
+            "t1", "tenant-t1", api_port=6443, control_plane_vip="10.0.0.1",
+            machine_token="aaaaaa.bbbbbbbbbbbbbbbb", cluster_id="id",
+            cluster_secret="secret", pod_cidr="10.244.0.0/16",
+            service_cidr="10.112.0.0/12", kubernetes_version=version,
+        )["machine"]["kubelet"]
+
+    def test_the_kubelet_matches_the_tenant_version(self) -> None:
+        assert self._kubelet()["image"] == "ghcr.io/siderolabs/kubelet:v1.32.1"
+
+    def test_certificate_rotation_stays_on(self) -> None:
+        assert self._kubelet()["extraArgs"]["rotate-certificates"] == "true"
+
+    def test_without_a_version_the_image_is_left_to_talos(self) -> None:
+        assert "image" not in self._kubelet(version="")

@@ -1331,6 +1331,7 @@ async def _create_capi_resources(
                     service_cidr=req.service_cidr,
                     ca_cert_b64=talos_ca,
                     k8s_ca_cert_b64=k8s_ca,
+                    kubernetes_version=req.kubernetes_version,
                 ),
                 default_flow_style=False, sort_keys=False,
             )

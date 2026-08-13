@@ -422,6 +422,7 @@ def build_talos_worker_config(
     service_cidr: str,
     ca_cert_b64: str = "",
     k8s_ca_cert_b64: str = "",
+    kubernetes_version: str = "",
 ) -> dict[str, Any]:
     """Talos machine config for a worker node.
 
@@ -455,6 +456,13 @@ def build_talos_worker_config(
                 # Without rotation the kubelet's client certificate expires
                 # and the node silently stops being able to talk to the API.
                 "extraArgs": {"rotate-certificates": "true"},
+                # Pinned to the tenant's Kubernetes version, not left to the
+                # image. Talos ships whatever kubelet matches ITS release —
+                # 1.13.8 carries v1.36.2 — and against a v1.32 control plane
+                # that is four minors of skew: the node boots, apid and the
+                # kubelet both report healthy, and it never registers.
+                **({"image": f"ghcr.io/siderolabs/kubelet:{kubernetes_version}"}
+                   if kubernetes_version else {}),
             },
         },
         "cluster": {
