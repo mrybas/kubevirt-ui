@@ -349,3 +349,38 @@ class TestBootstrapProviderNamespace:
 
         assert body["metadata"]["namespace"] == "o0-capi"
         assert body["metadata"]["name"] == "talos"
+
+
+class TestSignerReachesTheControlPlane:
+    """KamajiControlPlane names the sidecar fields `extraContainers` /
+    `extraVolumes`; TenantControlPlane calls the same things
+    `additionalContainers` / `additionalVolumes`. Using the TCP names on a KCP
+    is not an error the API reports — unknown fields are pruned silently, the
+    tenant comes up Ready, and the signer is simply absent. The Talos worker
+    then waits for a certificate nothing will ever issue.
+
+    Measured on the lab before the fix: control plane 5/5 Running with
+    kube-apiserver, kube-scheduler, kube-controller-manager, kine and
+    konnectivity-server — and no talos-csr-signer.
+    """
+
+    def test_the_capi_path_writes_the_kamajicontrolplane_field_names(self) -> None:
+        import inspect
+
+        from app.api.v1 import tenants_capi
+
+        source = inspect.getsource(tenants_capi)
+        assert 'spec["deployment"]["extraContainers"]' in source
+        assert 'spec["deployment"]["extraVolumes"]' in source
+        assert 'spec["deployment"]["additionalContainers"]' not in source
+
+    def test_the_additions_still_carry_the_signer(self) -> None:
+        from app.api.v1.tenants_talos import talos_control_plane_additions
+
+        additions = talos_control_plane_additions(
+            "t1", "tenant-t1", "signer:latest", shared_vip=False,
+        )
+        names = [c["name"] for c in additions["additionalContainers"]]
+
+        assert "talos-csr-signer" in names
+        assert additions["additionalVolumes"]

@@ -80,11 +80,17 @@ class TestTalosSwapsTheBootstrapProvider:
 
 class TestTalosControlPlane:
     def test_signer_sidecar_and_volume_are_added(self) -> None:
+        # Under the KamajiControlPlane names. TenantControlPlane calls the same
+        # things `additionalContainers`/`additionalVolumes`, and using those
+        # here is not an error the API reports: unknown fields are pruned
+        # silently, so the tenant comes up Ready with no signer at all and the
+        # Talos worker waits forever for a certificate.
         spec = _build_kamaji_cp_cr(_req(worker_os="talos"))["spec"]
 
-        containers = spec["deployment"]["additionalContainers"]
+        containers = spec["deployment"]["extraContainers"]
         assert containers[0]["name"] == "talos-csr-signer"
-        assert spec["deployment"]["additionalVolumes"]
+        assert spec["deployment"]["extraVolumes"]
+        assert "additionalContainers" not in spec["deployment"]
 
     def test_worker_dns_names_are_added_to_cert_sans(self) -> None:
         # Without these the join fails TLS before trustd is reached.

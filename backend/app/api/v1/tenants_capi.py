@@ -334,8 +334,15 @@ def _build_kamaji_cp_cr(
             req.name, _tenant_ns(req.name), _talos_signer_image(),
             shared_vip=advertise_vip is not None,
         )
-        spec["deployment"]["additionalContainers"] = talos_add["additionalContainers"]
-        spec["deployment"]["additionalVolumes"] = talos_add["additionalVolumes"]
+        # KamajiControlPlane names these `extraContainers`/`extraVolumes`;
+        # TenantControlPlane calls the same things `additionalContainers`/
+        # `additionalVolumes`. Writing the TCP names here is not an error the
+        # API reports — unknown fields are pruned silently, so the object
+        # applies cleanly, the tenant comes up Ready, and the signer sidecar
+        # simply is not there. The worker then waits for a certificate that
+        # nothing will ever issue.
+        spec["deployment"]["extraContainers"] = talos_add["additionalContainers"]
+        spec["deployment"]["extraVolumes"] = talos_add["additionalVolumes"]
         spec["network"]["certSANs"] = [
             *spec["network"]["certSANs"], *talos_add["certSANs"],
         ]
