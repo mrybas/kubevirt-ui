@@ -107,6 +107,26 @@ def _build_speaker_daemonset(
                                     "name": "POD_IP",
                                     "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}},
                                 },
+                                {
+                                    # Required, not optional: kube-ovn-speaker
+                                    # refuses to start without it —
+                                    #   missing required flags: --node-name must be
+                                    #   specified (usually via NODE_NAME env from
+                                    #   downward API)
+                                    # — and the DaemonSet reports Running pods that
+                                    # immediately crash-loop, so the UI shows a
+                                    # deployed speaker that never opens a session.
+                                    "name": "NODE_NAME",
+                                    "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}},
+                                },
+                                {
+                                    "name": "POD_NAME",
+                                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}},
+                                },
+                                {
+                                    "name": "POD_NAMESPACE",
+                                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}},
+                                },
                             ],
                             "volumeMounts": [
                                 {
@@ -129,6 +149,33 @@ def _build_speaker_daemonset(
             },
         },
     }
+
+
+def _speaker_pod_status(pod: Any) -> str:
+    """What the speaker pod is actually doing, not just its phase.
+
+    A crash-looping speaker sits in phase `Running` for as long as its
+    container keeps being restarted, so reporting the phase alone showed a
+    healthy green "Running" for pods that had never once started — which is
+    exactly how a speaker missing NODE_NAME presented: deployed, Running, and
+    no session ever opening. The container state is the honest answer.
+    """
+    status = getattr(pod, "status", None)
+    if status is None:
+        return "Unknown"
+
+    for cs in (status.container_statuses or []):
+        state = cs.state
+        if state is None:
+            continue
+        if state.waiting and state.waiting.reason:
+            return state.waiting.reason          # CrashLoopBackOff, ImagePullBackOff
+        if state.terminated and state.terminated.reason:
+            return state.terminated.reason       # Error, Completed
+        if state.running and not cs.ready:
+            return "Starting"
+
+    return status.phase or "Unknown"
 
 
 def _parse_speaker_args(ds: Any) -> dict[str, Any]:
@@ -334,7 +381,7 @@ async def _get_speaker_status(k8s, namespace: str) -> SpeakerStatusResponse:
             pods_info.append({
                 "name": pod.metadata.name,
                 "node": pod.spec.node_name or "",
-                "status": pod.status.phase if pod.status else "Unknown",
+                "status": _speaker_pod_status(pod),
             })
     except ApiException:
         pass
