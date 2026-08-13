@@ -1486,7 +1486,16 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                       <span className="text-surface-200">{form.worker_memory}</span>
                       <span className="text-surface-500">Disk</span>
                       <span className="text-surface-200">{form.worker_disk}</span>
-                      {form.worker_image_url && (
+                      <span className="text-surface-500">Worker OS</span>
+                      <span className="text-surface-200">
+                        {form.worker_os === 'talos' ? 'Talos' : 'Standard (cloud-init)'}
+                      </span>
+                      {/* The CAPK disk is only sent for cloud-init workers
+                          (see handleSubmit). Printing it under Talos claimed
+                          the workers would boot an Ubuntu image when they
+                          actually boot the Talos golden DataVolume — the
+                          review naming something the build never uses. */}
+                      {form.worker_os === 'cloud-init' && form.worker_image_url && (
                         <>
                           <span className="text-surface-500">Image</span>
                           <span className="text-surface-200 font-mono truncate" title={form.worker_image_url}>
