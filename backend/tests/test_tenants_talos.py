@@ -217,12 +217,13 @@ class TestWorkerBinding:
 
 
 class TestGoldenImage:
-    def test_default_url_is_the_nocloud_variant(self) -> None:
-        # nocloud is the platform that reads its machine config from the
-        # cloud-init disk KubeVirt attaches; any other variant never gets one.
+    def test_default_url_matches_the_disk_capk_attaches(self) -> None:
+        # CAPK attaches `cloudInitConfigDrive` (config-2), which the openstack
+        # variant reads. nocloud looks for `cidata`, never finds it, and the
+        # worker sits in maintenance mode instead of joining.
         from app.api.v1.tenants_talos import TALOS_GOLDEN_IMAGE_URL
 
-        assert "nocloud" in TALOS_GOLDEN_IMAGE_URL
+        assert "openstack" in TALOS_GOLDEN_IMAGE_URL
         assert TALOS_GOLDEN_IMAGE_URL.endswith(".raw.xz")
 
     def test_dv_imports_over_http_and_cdi_decompresses(self) -> None:
@@ -485,3 +486,28 @@ class TestTalosControlPlaneService:
 
         host = worker_endpoint("t1", "tenant-t1", 6443).split("//")[1].rsplit(":", 1)[0]
         assert host in signer_dns_names("t1", "tenant-t1")
+
+
+class TestGoldenImagePlatform:
+    """The image platform has to match the disk CAPK attaches, and CAPK
+    attaches `cloudInitConfigDrive` — an OpenStack config-2 disk. The nocloud
+    variant looks for `cidata`, does not find it, and drops into maintenance
+    mode waiting for `talosctl apply-config`:
+
+        volume "platform/cidata/config" phase "waiting -> missing"
+        entering maintenance service
+
+    which reads as a worker that boots fine and never joins. Measured on the
+    lab from the worker's serial console.
+    """
+
+    def test_the_image_reads_a_config_drive(self) -> None:
+        from app.api.v1.tenants_talos import TALOS_GOLDEN_IMAGE_URL
+
+        assert "openstack-amd64" in TALOS_GOLDEN_IMAGE_URL
+        assert "nocloud" not in TALOS_GOLDEN_IMAGE_URL
+
+    def test_it_is_still_a_raw_image_cdi_can_import(self) -> None:
+        from app.api.v1.tenants_talos import TALOS_GOLDEN_IMAGE_URL
+
+        assert TALOS_GOLDEN_IMAGE_URL.endswith(".raw.xz")

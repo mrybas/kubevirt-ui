@@ -42,7 +42,7 @@ TALOS_TRUSTD_PORT = 50001
 
 # Default golden image for Talos workers, from the image factory.
 #
-#   .../image/<schematic>/<version>/nocloud-amd64.raw.xz
+#   .../image/<schematic>/<version>/openstack-amd64.raw.xz
 #
 # Three parts of that URL are load-bearing:
 #
@@ -50,9 +50,16 @@ TALOS_TRUSTD_PORT = 50001
 #     KubeVirt worker needs none; a different set of extensions means a
 #     different schematic, generated with
 #     `curl -X POST --data-binary 'customization: {}' https://factory.talos.dev/schematics`.
-#   * **nocloud** is the platform that reads its machine config from the
-#     cloud-init disk KubeVirt attaches. With any other image variant the
-#     config simply never arrives, and the node boots into nothing.
+#   * the **platform** must match the disk CAPK actually attaches, and CAPK
+#     attaches `cloudInitConfigDrive` — an OpenStack config-2 disk. The
+#     nocloud variant looks for a `cidata` disk instead, does not find one,
+#     and drops into maintenance mode waiting for `talosctl apply-config`:
+#
+#         volume "platform/cidata/config" phase "waiting -> missing"
+#         entering maintenance service
+#
+#     which reads as a worker that boots fine and never joins. `openstack` is
+#     the variant that reads config-2.
 #   * the Talos version pins the kubelet version with it, so it has to sit
 #     inside the tenant's compatibility window (Talos 1.13 → k8s 1.31–1.36).
 #
@@ -63,7 +70,7 @@ TALOS_TRUSTD_PORT = 50001
 TALOS_GOLDEN_IMAGE_URL = (
     "https://factory.talos.dev/image/"
     "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
-    "/v1.13.8/nocloud-amd64.raw.xz"
+    "/v1.13.8/openstack-amd64.raw.xz"
 )
 
 CERT_MANAGER_GROUP = "cert-manager.io"
