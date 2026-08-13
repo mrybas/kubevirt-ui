@@ -101,8 +101,17 @@ function AuthInitializer({ children }: { children: React.ReactNode }) {
         const config = await getAuthConfig();
         setConfig(config);
 
-        // If no auth required, we're done
+        // With auth disabled there is no login to learn the identity from, so
+        // ask the backend directly. Skipping this leaves `user` null forever,
+        // and every `user?.is_admin` check in the app then reads as "not an
+        // admin" — which is how the tenant wizard came to report "No folders
+        // available" on a cluster that had one.
         if (config.type === 'none') {
+          try {
+            setUser(await getCurrentUser());
+          } catch (e) {
+            console.error('Failed to load the anonymous identity:', e);
+          }
           setLoading(false);
           return;
         }

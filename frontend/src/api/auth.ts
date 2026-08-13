@@ -21,9 +21,12 @@ export async function refreshToken(refreshToken: string): Promise<TokenResponse>
   });
 }
 
-export async function getCurrentUser(accessToken: string): Promise<UserInfo> {
+export async function getCurrentUser(accessToken?: string): Promise<UserInfo> {
+  // The token is optional on purpose: with auth disabled there is none, and
+  // the backend still answers with the anonymous identity it grants — which
+  // is the only way the frontend learns it is an admin in that mode.
   return apiRequest<UserInfo>('/auth/me', {
-    headers: { Authorization: `Bearer ${accessToken}` },
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
   });
 }
 
