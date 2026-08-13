@@ -17,6 +17,7 @@ when it is, delete them rather than inheriting them forever.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -40,6 +41,14 @@ WORKAROUND_REMOVE_WHEN = "kubevirt-ui.io/workaround-remove-when"
 
 LINK_WATCHER_NAME = "provider-link-up"
 CILIUM_EXEMPT_NAME = "cilium-gateway-exempt"
+
+EXTERNAL_GW_LABEL = "ovn.kubernetes.io/external-gw"
+
+# The ProviderNetwork controller initialises the OVS bridge per node and only
+# then reports the node ready, so right after a create there is nothing to
+# label yet. Measured at ~20s on the lab.
+_READY_NODE_POLL_SECONDS = 2
+_READY_NODE_POLL_ATTEMPTS = 20
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +414,77 @@ async def _ensure_namespaced_obj(
         )
 
 
+async def _ready_nodes(k8s, provider_network_name: str, *, wait: bool) -> list[str]:
+    """Nodes whose OVS bridge for this provider network came up.
+
+    Optionally waits, because the caller has just created the ProviderNetwork
+    and the controller has not visited the nodes yet.
+    """
+    attempts = _READY_NODE_POLL_ATTEMPTS if wait else 1
+    for attempt in range(attempts):
+        try:
+            pn = await k8s.custom_api.get_cluster_custom_object(
+                group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+                plural="provider-networks", name=provider_network_name,
+            )
+        except ApiException:
+            return []
+        nodes = pn.get("status", {}).get("readyNodes") or []
+        if nodes or attempt == attempts - 1:
+            return list(nodes)
+        await asyncio.sleep(_READY_NODE_POLL_SECONDS)
+    return []
+
+
+async def _label_gateway_nodes(k8s, provider_network_name: str) -> UnderlayObject:
+    """Mark the nodes that carry the provider NIC.
+
+    Everything that has to land on those nodes selects on this label — the
+    link watcher here, and kube-ovn's own gateway placement. Without it the
+    link-watcher DaemonSet is created, schedules nowhere, and reports 0/0
+    desired: the fabric looks complete and nothing is watching the link.
+
+    Reported as fabric rather than as a workaround: a provider network whose
+    nodes are unlabelled cannot host a gateway at all.
+    """
+    nodes = await _ready_nodes(k8s, provider_network_name, wait=True)
+    if not nodes:
+        return UnderlayObject(
+            kind="NodeLabel", name=EXTERNAL_GW_LABEL, state="failed",
+            detail=(
+                f"ProviderNetwork/{provider_network_name} reports no ready nodes. "
+                "Check that the interface exists on the workers and that the OVS "
+                "bridge initialised (ProviderNetwork .status.conditions)."
+            ),
+        )
+
+    labelled, failed = [], []
+    for node_name in nodes:
+        try:
+            node = await k8s.core_api.read_node(name=node_name)
+            if (node.metadata.labels or {}).get(EXTERNAL_GW_LABEL) == "true":
+                continue
+            await k8s.core_api.patch_node(
+                name=node_name,
+                body={"metadata": {"labels": {EXTERNAL_GW_LABEL: "true"}}},
+            )
+            labelled.append(node_name)
+        except ApiException as e:
+            logger.warning(f"Underlay: could not label node {node_name}: {e}")
+            failed.append(node_name)
+
+    if failed:
+        return UnderlayObject(
+            kind="NodeLabel", name=EXTERNAL_GW_LABEL, state="failed",
+            detail=f"could not label: {', '.join(failed)}",
+        )
+    return UnderlayObject(
+        kind="NodeLabel", name=EXTERNAL_GW_LABEL,
+        state="created" if labelled else "exists",
+        detail=f"{len(nodes)} node(s) carry the provider NIC: {', '.join(nodes)}",
+    )
+
+
 async def _ensure_daemonset(k8s, body: dict[str, Any]) -> UnderlayObject:
     name = body["metadata"]["name"]
     ns = body["metadata"]["namespace"]
@@ -470,6 +550,9 @@ async def ensure_vpc_underlay(
         await _ensure_cluster_obj(
             k8s, "subnets", build_external_subnet(data, kubeovn_ns), "Subnet",
         ),
+        # After the ProviderNetwork, because it is the source of the node list,
+        # and before the link watcher, which selects on the label.
+        await _label_gateway_nodes(k8s, data.provider_network_name),
     ]
 
     if data.link_watcher:
@@ -536,6 +619,27 @@ async def get_vpc_underlay(
         await _cluster_state("vlans", vlan_name, "Vlan"),
         await _cluster_state("subnets", subnet_name, "Subnet"),
     ]
+
+    # A fabric whose nodes are unlabelled hosts nothing, and the omission is
+    # invisible from the objects above — the DaemonSet exists at 0/0 desired.
+    try:
+        nodes = await k8s.core_api.list_node(label_selector=f"{EXTERNAL_GW_LABEL}=true")
+        names = [n.metadata.name for n in nodes.items]
+    except ApiException as e:
+        objects.append(UnderlayObject(
+            kind="NodeLabel", name=EXTERNAL_GW_LABEL, state="failed", detail=str(e.reason),
+        ))
+    else:
+        objects.append(UnderlayObject(
+            kind="NodeLabel", name=EXTERNAL_GW_LABEL,
+            state="exists" if names else "missing",
+            detail=(
+                f"{len(names)} node(s): {', '.join(names)}"
+                if names
+                else "no node carries the provider NIC label — gateways and the "
+                     "link watcher have nowhere to run"
+            ),
+        ))
 
     for ds_name, ds_ns in ((LINK_WATCHER_NAME, kubeovn_ns), (CILIUM_EXEMPT_NAME, None)):
         if ds_ns is None:

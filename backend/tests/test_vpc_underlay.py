@@ -19,6 +19,7 @@ from pydantic import ValidationError
 
 from app.api.v1.vpc_underlay import (
     CILIUM_EXEMPT_NAME,
+    EXTERNAL_GW_LABEL,
     LINK_WATCHER_NAME,
     WORKAROUND_LABEL,
     WORKAROUND_REASON,
@@ -31,6 +32,7 @@ from app.api.v1.vpc_underlay import (
     build_provider_network,
     build_vlan,
     ensure_vpc_underlay,
+    get_vpc_underlay,
     subnet_provider,
 )
 
@@ -160,11 +162,20 @@ class TestWorkaroundsAreLabelled:
 
 @pytest.mark.asyncio
 class TestEnsureEndpoint:
-    def _k8s(self) -> MagicMock:
+    def _k8s(self, ready_nodes: list[str] | None = None) -> MagicMock:
         k8s = MagicMock()
         k8s.custom_api.create_cluster_custom_object = AsyncMock()
         k8s.custom_api.create_namespaced_custom_object = AsyncMock()
         k8s.apps_api.create_namespaced_daemon_set = AsyncMock()
+        # The ProviderNetwork is read back for the node list.
+        nodes = ["worker-1", "worker-2"] if ready_nodes is None else ready_nodes
+        k8s.custom_api.get_cluster_custom_object = AsyncMock(
+            return_value={"status": {"readyNodes": nodes}},
+        )
+        node = MagicMock()
+        node.metadata.labels = {}
+        k8s.core_api.read_node = AsyncMock(return_value=node)
+        k8s.core_api.patch_node = AsyncMock()
         return k8s
 
     def _request(self, k8s: MagicMock) -> MagicMock:
@@ -190,6 +201,7 @@ class TestEnsureEndpoint:
         kinds = {o.kind for o in result.objects if not o.workaround}
         assert kinds == {
             "ProviderNetwork", "Vlan", "NetworkAttachmentDefinition", "Subnet",
+            "NodeLabel",
         }
         assert result.ready is True
 
@@ -206,6 +218,9 @@ class TestEnsureEndpoint:
             side_effect=ApiException(status=409, reason="AlreadyExists"),
         )
         k8s.apps_api.patch_namespaced_daemon_set = AsyncMock()
+        already = MagicMock()
+        already.metadata.labels = {EXTERNAL_GW_LABEL: "true"}
+        k8s.core_api.read_node = AsyncMock(return_value=already)
 
         result = await ensure_vpc_underlay(
             request=self._request(k8s), data=_req(), user=MagicMock(),
@@ -213,6 +228,7 @@ class TestEnsureEndpoint:
 
         assert result.ready is True
         assert all(o.state in ("exists", "skipped") for o in result.objects)
+        k8s.core_api.patch_node.assert_not_awaited()
 
     async def test_existing_daemonset_is_reconciled_not_recreated(self) -> None:
         k8s = self._k8s()
@@ -240,7 +256,7 @@ class TestEnsureEndpoint:
         )
 
         assert result.ready is False
-        assert len(result.objects) == 6  # nothing skipped silently
+        assert len(result.objects) == 7  # nothing skipped silently
 
     async def test_workarounds_are_opt_out(self) -> None:
         k8s = self._k8s()
@@ -335,3 +351,96 @@ class TestEveryLabelIsAcceptableToTheApiServer:
             reason = meta["annotations"][WORKAROUND_REASON]
             assert " " in reason, "the reason should still be a sentence"
             assert len(reason) > 20
+
+
+@pytest.mark.asyncio
+class TestGatewayNodesAreLabelled:
+    """The link watcher selects on a label nothing was setting.
+
+    `provider-link-up` carries `nodeSelector: ovn.kubernetes.io/external-gw`,
+    and building the fabric through the endpoint never applied that label. The
+    DaemonSet is created, matches no node, and sits at 0/0 desired: the fabric
+    reports itself built, the provider NIC drops back DOWN with nobody
+    watching, and every frame is swallowed with OVS still listing the port.
+
+    Measured on the lab: after a successful build,
+    `kubectl get nodes -l ovn.kubernetes.io/external-gw=true` returned
+    "No resources found".
+    """
+
+    def _k8s(self, ready_nodes: list[str], labels: dict | None = None) -> MagicMock:
+        k8s = MagicMock()
+        k8s.custom_api.create_cluster_custom_object = AsyncMock()
+        k8s.custom_api.create_namespaced_custom_object = AsyncMock()
+        k8s.apps_api.create_namespaced_daemon_set = AsyncMock()
+        k8s.custom_api.get_cluster_custom_object = AsyncMock(
+            return_value={"status": {"readyNodes": ready_nodes}},
+        )
+        node = MagicMock()
+        node.metadata.labels = labels or {}
+        k8s.core_api.read_node = AsyncMock(return_value=node)
+        k8s.core_api.patch_node = AsyncMock()
+        return k8s
+
+    def _request(self, k8s: MagicMock) -> MagicMock:
+        request = MagicMock()
+        request.app.state.k8s_client = k8s
+        return request
+
+    @pytest.fixture(autouse=True)
+    def _no_waiting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import app.api.v1.vpc_underlay as mod
+        import app.api.v1.network as network_mod
+
+        async def _ns(_k8s: object) -> str:
+            return KUBEOVN_NS
+
+        monkeypatch.setattr(network_mod, "_find_kubeovn_namespace", _ns)
+        monkeypatch.setattr(mod, "_READY_NODE_POLL_SECONDS", 0)
+        monkeypatch.setattr(mod, "_READY_NODE_POLL_ATTEMPTS", 2)
+
+    async def test_the_watchers_selector_is_the_label_the_endpoint_sets(self) -> None:
+        """The coupling itself, asserted rather than assumed."""
+        selector = build_link_watcher(_req(), KUBEOVN_NS)[
+            "spec"]["template"]["spec"]["nodeSelector"]
+        assert selector == {EXTERNAL_GW_LABEL: "true"}
+
+    async def test_ready_nodes_get_the_label(self) -> None:
+        k8s = self._k8s(["worker-1", "worker-2"])
+
+        result = await ensure_vpc_underlay(
+            request=self._request(k8s), data=_req(), user=MagicMock(),
+        )
+
+        patched = {c.kwargs["name"] for c in k8s.core_api.patch_node.await_args_list}
+        assert patched == {"worker-1", "worker-2"}
+        body = k8s.core_api.patch_node.await_args_list[0].kwargs["body"]
+        assert body["metadata"]["labels"][EXTERNAL_GW_LABEL] == "true"
+        assert result.ready is True
+
+    async def test_no_ready_nodes_is_a_failure_not_a_quiet_success(self) -> None:
+        # The state that shipped: fabric built, nothing labelled, ready=True.
+        k8s = self._k8s([])
+
+        result = await ensure_vpc_underlay(
+            request=self._request(k8s), data=_req(), user=MagicMock(),
+        )
+
+        assert result.ready is False
+        label_obj = next(o for o in result.objects if o.kind == "NodeLabel")
+        assert label_obj.state == "failed"
+        assert "no ready nodes" in label_obj.detail
+
+    async def test_get_reports_an_unlabelled_cluster(self) -> None:
+        k8s = MagicMock()
+        k8s.custom_api.get_cluster_custom_object = AsyncMock(return_value={})
+        k8s.apps_api.read_namespaced_daemon_set = AsyncMock()
+        k8s.core_api.list_node = AsyncMock(return_value=MagicMock(items=[]))
+
+        result = await get_vpc_underlay(request=self._request(k8s), user=MagicMock())
+
+        label_obj = next(o for o in result.objects if o.kind == "NodeLabel")
+        assert label_obj.state == "missing"
+        assert result.ready is False, (
+            "a fabric with no gateway nodes cannot host a gateway"
+        )
