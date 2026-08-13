@@ -11,6 +11,8 @@ load-bearing in ways that fail silently if they drift.
 from unittest.mock import AsyncMock, MagicMock
 
 import json
+import re
+
 import pytest
 from kubernetes_asyncio.client import ApiException
 from pydantic import ValidationError
@@ -19,6 +21,7 @@ from app.api.v1.vpc_underlay import (
     CILIUM_EXEMPT_NAME,
     LINK_WATCHER_NAME,
     WORKAROUND_LABEL,
+    WORKAROUND_REASON,
     WORKAROUND_REMOVE_WHEN,
     VpcUnderlayRequest,
     build_cilium_exempt,
@@ -128,12 +131,13 @@ class TestWorkaroundsAreLabelled:
     def test_link_watcher_says_what_retires_it(self) -> None:
         meta = build_link_watcher(_req(), KUBEOVN_NS)["metadata"]
         assert WORKAROUND_LABEL in meta["labels"]
-        assert "kube-ovn" in meta["labels"][WORKAROUND_LABEL]
+        assert "kube-ovn" in meta["annotations"][WORKAROUND_REASON]
         assert meta["annotations"][WORKAROUND_REMOVE_WHEN]
 
     def test_cilium_exempt_says_what_retires_it(self) -> None:
         meta = build_cilium_exempt(_req())["metadata"]
         assert WORKAROUND_LABEL in meta["labels"]
+        assert meta["annotations"][WORKAROUND_REASON]
         assert meta["annotations"][WORKAROUND_REMOVE_WHEN]
 
     def test_link_watcher_targets_the_configured_interface(self) -> None:
@@ -260,3 +264,74 @@ class TestEnsureEndpoint:
 
         exempt = next(o for o in result.objects if o.name == CILIUM_EXEMPT_NAME)
         assert exempt.state == "skipped"
+
+
+class TestEveryLabelIsAcceptableToTheApiServer:
+    """Labels are validated by the API server, and these were not.
+
+    The workaround marker carried its own explanation as a label *value* — a
+    sentence with spaces. Every object here was built from a pure function and
+    unit-tested, and the four fabric objects really were created, so the only
+    signal was two DaemonSets coming back 422 and an underlay that reported
+    itself built with no link watcher behind it.
+
+    Checked across every builder rather than at the one call site that broke,
+    because the next sentence-in-a-label will not be in `_workaround_meta`.
+    """
+
+    # From the API server's own message, verbatim.
+    VALUE_RE = re.compile(r"^(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?$")
+    NAME_RE = re.compile(
+        r"^([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?/)?"
+        r"([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)$"
+    )
+
+    def _all_label_maps(self, body: dict) -> list[tuple[str, dict]]:
+        """Object labels plus the pod template's, which are validated too."""
+        maps = [("metadata.labels", body["metadata"].get("labels", {}))]
+        template = (
+            body.get("spec", {})
+            .get("template", {})
+            .get("metadata", {})
+            .get("labels")
+        )
+        if template is not None:
+            maps.append(("spec.template.metadata.labels", template))
+        selector = body.get("spec", {}).get("selector", {}).get("matchLabels")
+        if selector is not None:
+            maps.append(("spec.selector.matchLabels", selector))
+        return maps
+
+    @pytest.mark.parametrize("build", [
+        lambda: build_provider_network(_req()),
+        lambda: build_vlan(_req()),
+        lambda: build_external_nad(_req(), KUBEOVN_NS),
+        lambda: build_external_subnet(_req(), KUBEOVN_NS),
+        lambda: build_link_watcher(_req(), KUBEOVN_NS),
+        lambda: build_cilium_exempt(_req()),
+    ])
+    def test_labels_would_be_accepted(self, build) -> None:
+        body = build()
+        for where, labels in self._all_label_maps(body):
+            for key, value in labels.items():
+                assert self.NAME_RE.match(key), (
+                    f"{body['kind']} {where}: key {key!r} is not a valid label key"
+                )
+                assert len(value) <= 63, (
+                    f"{body['kind']} {where}[{key}]: {len(value)} chars, "
+                    f"the limit is 63 — {value!r}"
+                )
+                assert self.VALUE_RE.match(value), (
+                    f"{body['kind']} {where}[{key}]: {value!r} is not a valid "
+                    "label value; prose belongs in an annotation"
+                )
+
+    def test_the_reason_is_not_lost_in_the_move(self) -> None:
+        """Moving it to an annotation must not mean dropping it."""
+        for meta in (
+            build_link_watcher(_req(), KUBEOVN_NS)["metadata"],
+            build_cilium_exempt(_req())["metadata"],
+        ):
+            reason = meta["annotations"][WORKAROUND_REASON]
+            assert " " in reason, "the reason should still be a sentence"
+            assert len(reason) > 20

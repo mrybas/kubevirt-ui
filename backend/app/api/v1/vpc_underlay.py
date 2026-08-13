@@ -35,6 +35,7 @@ INFRA_SUBNET_LABEL = {"kubevirt-ui.io/purpose": "infrastructure"}
 MANAGED_LABEL = {"kubevirt-ui.io/managed": "true"}
 
 WORKAROUND_LABEL = "kubevirt-ui.io/workaround"
+WORKAROUND_REASON = "kubevirt-ui.io/workaround-reason"
 WORKAROUND_REMOVE_WHEN = "kubevirt-ui.io/workaround-remove-when"
 
 LINK_WATCHER_NAME = "provider-link-up"
@@ -216,11 +217,23 @@ def build_external_subnet(data: VpcUnderlayRequest, kubeovn_ns: str) -> dict[str
 
 
 def _workaround_meta(name: str, namespace: str, reason: str, remove_when: str) -> dict:
+    """Mark a workaround so it can be found, and say why it exists.
+
+    The reason is prose and belongs in an annotation. It was a label value
+    once, and the API server refuses those outright — spaces are not allowed,
+    and 63 characters is the ceiling — so both DaemonSets came back 422 while
+    the four fabric objects were created: an underlay that looked built and had
+    no link watcher behind it. The label is the marker you select on; the
+    sentence is the thing you read.
+    """
     return {
         "name": name,
         "namespace": namespace,
-        "labels": {**MANAGED_LABEL, "app": name, WORKAROUND_LABEL: reason},
-        "annotations": {WORKAROUND_REMOVE_WHEN: remove_when},
+        "labels": {**MANAGED_LABEL, "app": name, WORKAROUND_LABEL: "true"},
+        "annotations": {
+            WORKAROUND_REASON: reason,
+            WORKAROUND_REMOVE_WHEN: remove_when,
+        },
     }
 
 
