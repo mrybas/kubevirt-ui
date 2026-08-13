@@ -161,7 +161,10 @@ export function Underlay() {
       subnet_name: form.subnet_name.trim(),
       link_watcher: form.link_watcher,
       cilium_source_ip_exempt: form.cilium_source_ip_exempt,
-      cilium_namespace: form.cilium_namespace.trim() || 'kube-system',
+      // Empty means "find Cilium yourself" — hard-coding kube-system here
+      // put the DaemonSet in a namespace with no Cilium in it, on a
+      // cluster whose agent runs in o0-cilium.
+      cilium_namespace: form.cilium_namespace.trim(),
     });
   };
 
