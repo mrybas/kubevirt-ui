@@ -930,6 +930,7 @@ async def update_golden_image(
             plural="datavolumes",
             name=name,
             body=patch_body,
+            _content_type="application/merge-patch+json",
         )
         
         result_meta = result.get("metadata", {})

@@ -45,7 +45,11 @@ def _k8s(alloc: dict[str, str] | None = None) -> MagicMock:
             "spec": {"cidrBlock": TENANT_CIDR, "vpc": TENANT_VPC},
         },
     }
-    veg = {"metadata": {"name": GW}, "spec": {"policies": [{"snat": True, "subnets": ["egw-shared-egress-subnet"]}]}}
+    veg = {
+        "metadata": {"name": GW},
+        "spec": {"policies": [{"snat": True, "subnets": ["egw-shared-egress-subnet"]}]},
+        "status": {"internalIPs": ["10.199.0.3"]},
+    }
 
     k8s = MagicMock()
     k8s.patches = []
@@ -217,4 +221,41 @@ class TestGatewayPolicies:
         assert any(
             p.get("subnets") == ["egw-shared-egress-subnet"]
             for p in k8s.veg["spec"]["policies"]
+        )
+
+
+class TestGatewayDefaultRoute:
+    """OVN routes (stage 15) before it applies policies (stage 17), so a packet
+    with no matching route on the gateway VPC dies before the gateway's own
+    reroute policy at 29100 is reached."""
+
+    @pytest.mark.asyncio
+    async def test_gateway_vpc_gets_a_default_route_to_the_gateway_pod(self) -> None:
+        k8s = _k8s()
+        await _attach(k8s)
+
+        routes = k8s.vpcs[GW_VPC]["spec"]["staticRoutes"]
+        assert {"cidr": "0.0.0.0/0", "nextHopIP": "10.199.0.3", "policy": "policyDst"} in routes
+
+    @pytest.mark.asyncio
+    async def test_prefix_is_stripped_from_the_reported_internal_ip(self) -> None:
+        k8s = _k8s()
+        k8s.veg["status"]["internalIPs"] = ["10.199.0.3/24"]
+        await _attach(k8s)
+
+        routes = k8s.vpcs[GW_VPC]["spec"]["staticRoutes"]
+        assert any(r["cidr"] == "0.0.0.0/0" and r["nextHopIP"] == "10.199.0.3" for r in routes)
+
+    @pytest.mark.asyncio
+    async def test_attach_still_completes_when_the_gateway_has_no_ip_yet(self) -> None:
+        # A VpcEgressGateway that has not reconciled yet must not fail the
+        # attach — the peering and tenant routes are still worth writing.
+        k8s = _k8s()
+        k8s.veg["status"] = {}
+        result = await _attach(k8s)
+
+        assert result.vpc_name == TENANT_VPC
+        assert not any(
+            r["cidr"] == "0.0.0.0/0"
+            for r in k8s.vpcs[GW_VPC]["spec"].get("staticRoutes", [])
         )

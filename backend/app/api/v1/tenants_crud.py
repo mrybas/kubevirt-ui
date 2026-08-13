@@ -1502,6 +1502,7 @@ async def enable_addon(
                         group=FLUX_HELM_GROUP, version=FLUX_HELM_VERSION,
                         namespace=ns, plural="helmreleases", name=ns_hr_name,
                         body={"spec": {"values": {"namespaces": existing_ns}}},
+                        _content_type="application/merge-patch+json",
                     )
             except ApiException:
                 pass  # namespaces HR not found — skip
@@ -1621,6 +1622,7 @@ async def update_addon_params(
             plural="helmreleases",
             name=hr_name,
             body=patch,
+            _content_type="application/merge-patch+json",
         )
     except ApiException as e:
         raise k8s_error_to_http(e, "tenant operation")

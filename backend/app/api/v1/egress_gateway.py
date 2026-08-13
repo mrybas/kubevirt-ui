@@ -366,7 +366,6 @@ async def create_egress_gateway(
 
     gw_vpc_name = f"egw-{data.name}"
     gw_subnet_name = f"egw-{data.name}-subnet"
-    transit_subnet_name = f"egw-{data.name}-transit"
 
     # Parse CIDRs
     gw_network = ipaddress.IPv4Network(data.gw_vpc_cidr, strict=False)
@@ -440,30 +439,16 @@ async def create_egress_gateway(
         await _cleanup_gateway_vpc(k8s, gw_vpc_name)
         raise k8s_error_to_http(e, "creating gateway subnet")
 
-    # 3. Create transit subnet (for VPC peering)
-    transit_subnet_manifest: dict[str, Any] = {
-        "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",
-        "kind": "Subnet",
-        "metadata": {"name": transit_subnet_name, "labels": labels},
-        "spec": {
-            "protocol": "IPv4",
-            "cidrBlock": data.transit_cidr,
-            "gateway": transit_gateway,
-            "vpc": gw_vpc_name,
-            "enableDHCP": False,
-            "natOutgoing": False,
-        },
-    }
-
-    try:
-        await k8s.custom_api.create_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
-            body=transit_subnet_manifest,
-        )
-    except ApiException as e:
-        logger.error(f"Failed to create transit subnet: {e}")
-        await _cleanup_gateway_resources(k8s, data.name)
-        raise k8s_error_to_http(e, "creating transit subnet")
+    # 3. No Subnet is created for the transit CIDR — deliberately.
+    #
+    # A VPC peering is a router-to-router link: each side gets an address out
+    # of the transit CIDR on its peering port, and no logical switch is
+    # involved. Creating a Subnet for that same CIDR attaches a second port to
+    # the gateway router carrying the *same* address as the peering port
+    # (both take .1), and a router with one address on two ports silently
+    # stops forwarding — a tenant could not even ping the far end of its own
+    # link. The CIDR stays reserved through the gateway VPC's annotation and
+    # the overlap check in `_validate_cidr_no_overlap`.
 
     # 4. Create external macvlan NAD + Subnet (if not using existing)
     if create_external:
@@ -579,6 +564,7 @@ async def create_egress_gateway(
                 group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
                 name=external_subnet_name,
                 body={"spec": {"excludeIps": data.exclude_ips}},
+                _content_type="application/merge-patch+json",
             )
         except ApiException as e:
             logger.warning(f"Failed to patch macvlan subnet excludeIps: {e}")
@@ -743,6 +729,9 @@ async def attach_tenant_to_gateway(
     # 5. Update VpcEgressGateway policies
     await _update_veg_policies(k8s, gateway_name, add_cidr=tenant_cidr)
 
+    # 5b. Give the gateway VPC a default route to the gateway pod.
+    await _ensure_gateway_default_route(k8s, gateway_name, gw_vpc_name)
+
     # 6. Update tenant subnet ACLs to allow transit + gateway CIDRs
     await _add_acl_allow_cidrs(
         k8s, tenant_subnet_name, tenant_cidr,
@@ -872,6 +861,36 @@ async def _find_default_gateway(k8s) -> str | None:
     return items[0].get("metadata", {}).get("labels", {}).get(GATEWAY_LABEL, "")
 
 
+async def _ensure_gateway_default_route(
+    k8s, gateway_name: str, gw_vpc_name: str,
+) -> None:
+    """Point the gateway VPC's default route at the egress gateway pod.
+
+    OVN runs `lr_in_ip_routing` (stage 15) *before* `lr_in_policy` (stage 17),
+    so a packet with no matching route is dropped before the gateway's own
+    reroute policy at priority 29100 is ever consulted. Without this route the
+    hub is a black hole that looks perfectly configured: the peering is up,
+    the policy lists the tenant CIDR, and every packet still dies one hop past
+    the tenant's own router.
+
+    The pod address only exists once the VpcEgressGateway has reconciled,
+    which is why this runs on attach rather than at creation time.
+    """
+    veg = await _get_vpc_egress_gateway(k8s, gateway_name)
+    internal_ips = (veg or {}).get("status", {}).get("internalIPs") or []
+
+    if not internal_ips:
+        logger.warning(
+            f"Egress gateway '{gateway_name}' has no internal IP yet — the gateway "
+            f"VPC keeps no default route, and attached tenants have no egress "
+            f"until it is attached again.",
+        )
+        return
+
+    next_hop = internal_ips[0].split("/")[0]
+    await _add_static_route(k8s, gw_vpc_name, "0.0.0.0/0", next_hop)
+
+
 async def _add_static_route(k8s, vpc_name: str, cidr: str, next_hop_ip: str) -> None:
     """Add a static route to a VPC (idempotent)."""
     try:
@@ -896,6 +915,7 @@ async def _add_static_route(k8s, vpc_name: str, cidr: str, next_hop_ip: str) -> 
     await k8s.custom_api.patch_cluster_custom_object(
         group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
         name=vpc_name, body={"spec": {"staticRoutes": routes}},
+        _content_type="application/merge-patch+json",
     )
 
 
@@ -918,6 +938,7 @@ async def _remove_static_route(k8s, vpc_name: str, cidr: str) -> None:
         await k8s.custom_api.patch_cluster_custom_object(
             group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
             name=vpc_name, body={"spec": {"staticRoutes": new_routes}},
+            _content_type="application/merge-patch+json",
         )
 
 
@@ -975,6 +996,7 @@ async def _update_veg_policies(
             group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
             namespace="kube-system", plural="vpc-egress-gateways",
             name=gateway_name, body=patch,
+            _content_type="application/merge-patch+json",
         )
     except ApiException as e:
         logger.error(f"Failed to update VpcEgressGateway policies: {e}")
@@ -1012,6 +1034,7 @@ async def _add_acl_allow_cidrs(
     await k8s.custom_api.patch_cluster_custom_object(
         group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
         name=subnet_name, body={"spec": {"acls": acls}},
+        _content_type="application/merge-patch+json",
     )
 
 

@@ -47,6 +47,7 @@ async def _patch_peerings(k8s, vpc_name: str, peerings: list[dict]) -> None:
     await k8s.custom_api.patch_cluster_custom_object(
         group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="vpcs",
         name=vpc_name, body={"spec": {"vpcPeerings": peerings}},
+        _content_type="application/merge-patch+json",
     )
 
 

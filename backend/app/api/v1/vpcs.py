@@ -569,6 +569,7 @@ async def _ensure_vpc_dns_policy(k8s, vpc_name: str) -> None:
                 await k8s.custom_api.patch_cluster_custom_object(
                     group=KYVERNO_API_GROUP, version=KYVERNO_API_VERSION,
                     plural="clusterpolicies", name=policy_name, body=body,
+                    _content_type="application/merge-patch+json",
                 )
                 logger.info(f"Patched Kyverno ClusterPolicy {policy_name}")
             except ApiException as patch_exc:
@@ -1390,6 +1391,7 @@ async def create_vpc_peering(
             await k8s.custom_api.patch_cluster_custom_object(
                 group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
                 name=vpc_name, body={"spec": patch},
+                _content_type="application/merge-patch+json",
             )
             applied.append(vpc_name)
         except ApiException as e:
@@ -1462,6 +1464,7 @@ async def _remove_peering_side(k8s, vpc_name: str, remote_vpc: str) -> None:
     await k8s.custom_api.patch_cluster_custom_object(
         group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
         name=vpc_name, body={"spec": patch},
+        _content_type="application/merge-patch+json",
     )
 
 

@@ -206,6 +206,7 @@ async def update_security_group(
             await k8s.custom_api.patch_cluster_custom_object(
                 group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="security-groups",
                 name=name, body={"spec": patch_spec},
+                _content_type="application/merge-patch+json",
             )
         except ApiException as e:
             raise k8s_error_to_http(e, "security group operation")
@@ -350,6 +351,7 @@ async def assign_security_group_to_vm(
         await k8s.custom_api.patch_namespaced_custom_object(
             group=KUBEVIRT_GROUP, version=KUBEVIRT_VERSION, plural="virtualmachines",
             namespace=namespace, name=vm_name, body=patch_body,
+            _content_type="application/merge-patch+json",
         )
     except ApiException as e:
         raise k8s_error_to_http(e, "security group operation")
@@ -410,6 +412,7 @@ async def remove_security_group_from_vm(
         await k8s.custom_api.patch_namespaced_custom_object(
             group=KUBEVIRT_GROUP, version=KUBEVIRT_VERSION, plural="virtualmachines",
             namespace=namespace, name=vm_name, body=patch_body,
+            _content_type="application/merge-patch+json",
         )
     except ApiException as e:
         raise k8s_error_to_http(e, "security group operation")
