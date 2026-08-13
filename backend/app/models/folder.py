@@ -86,6 +86,11 @@ class FolderCreateRequest(BaseModel):
     description: str = ""
     parent_id: str | None = None  # null = root-level folder
     environments: list[str] = []  # optional initial environments
+    # Per-environment quota, keyed by the short environment name. An
+    # environment created without one is capped by nothing: the folder quota
+    # is a ceiling over *declared* quotas, so a bare environment consumes
+    # cluster resources the ceiling never counts.
+    environment_quotas: dict[str, FolderQuota] = {}
     quota: FolderQuota | None = None
 
 

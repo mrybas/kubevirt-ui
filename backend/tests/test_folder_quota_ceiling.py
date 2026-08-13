@@ -450,3 +450,78 @@ class TestRefusalReadsAsQuantities:
 
         assert "30Gi allocated" in e.value.detail
         assert "e+" not in e.value.detail
+
+
+@pytest.mark.asyncio
+class TestInitialEnvironmentQuotas:
+    """A folder created with environments has to be able to cap them.
+
+    The default path enforced nothing: `POST /folders` took a folder quota and
+    a list of environment names, and every namespace it created came up with
+    no ResourceQuota. The folder number caps the sum of *declared* quotas, so
+    with nothing declared the ceiling constrained nothing at all.
+    """
+
+    def _body(self, **kw):
+        from app.models.folder import FolderCreateRequest
+
+        return FolderCreateRequest(
+            name="acme", display_name="Acme",
+            environments=["dev", "prod"], **kw,
+        )
+
+    def test_the_request_carries_a_quota_per_environment(self) -> None:
+        from app.models.folder import FolderQuota
+
+        body = self._body(environment_quotas={"dev": FolderQuota(cpu="4", memory="8Gi")})
+        assert body.environment_quotas["dev"].cpu == "4"
+        assert body.environment_quotas["dev"].memory == "8Gi"
+
+    def test_the_set_is_refused_before_anything_is_written(self) -> None:
+        from app.api.v1.folders import _assert_initial_envs_fit
+        from app.models.folder import FolderQuota
+
+        body = self._body(
+            quota=FolderQuota(cpu="8"),
+            environment_quotas={
+                "dev": FolderQuota(cpu="6"), "prod": FolderQuota(cpu="6"),
+            },
+        )
+        with pytest.raises(HTTPException) as e:
+            _assert_initial_envs_fit(body)
+        assert e.value.status_code == 409
+        assert "12" in e.value.detail and "8" in e.value.detail
+
+    def test_a_set_that_fits_is_allowed(self) -> None:
+        from app.api.v1.folders import _assert_initial_envs_fit
+        from app.models.folder import FolderQuota
+
+        _assert_initial_envs_fit(self._body(
+            quota=FolderQuota(cpu="8", memory="16Gi"),
+            environment_quotas={
+                "dev": FolderQuota(cpu="3", memory="8Gi"),
+                "prod": FolderQuota(cpu="5", memory="8Gi"),
+            },
+        ))
+
+    def test_memory_and_storage_are_summed_too(self) -> None:
+        from app.api.v1.folders import _assert_initial_envs_fit
+        from app.models.folder import FolderQuota
+
+        body = self._body(
+            quota=FolderQuota(storage="100Gi"),
+            environment_quotas={
+                "dev": FolderQuota(storage="60Gi"), "prod": FolderQuota(storage="60Gi"),
+            },
+        )
+        with pytest.raises(HTTPException) as e:
+            _assert_initial_envs_fit(body)
+        assert "120Gi" in e.value.detail
+
+    def test_a_folder_without_a_ceiling_constrains_nothing(self) -> None:
+        from app.api.v1.folders import _assert_initial_envs_fit
+        from app.models.folder import FolderQuota
+
+        _assert_initial_envs_fit(self._body(
+            environment_quotas={"dev": FolderQuota(cpu="999")},
+        ))

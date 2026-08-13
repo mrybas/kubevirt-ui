@@ -21,6 +21,9 @@ import {
   useDeleteFolder,
 } from '../hooks/useFolders';
 import type { Folder as FolderType, FolderQuota } from '../types/folder';
+import { UnitToggle } from '../components/common/UnitToggle';
+import { BYTE_UNITS, parseQuantity } from '../utils/quantity';
+import type { ByteUnit } from '../utils/quantity';
 import { DataTable, type Column } from '@/components/common/DataTable';
 import type { MenuItem } from '@/components/common/KebabMenu';
 import { ActionBar } from '@/components/common/ActionBar';
@@ -193,6 +196,15 @@ export default function Folders() {
 // CreateFolderModal
 // ---------------------------------------------------------------------------
 
+
+interface EnvQuota {
+  cpu: string;
+  memory: string;
+  memUnit: ByteUnit;
+  storage: string;
+  storUnit: ByteUnit;
+}
+
 function CreateFolderModal({
   parentOptions,
   initialParentId,
@@ -208,6 +220,18 @@ function CreateFolderModal({
   const [parentId, setParentId] = useState(initialParentId ?? '');
   const [environments, setEnvironments] = useState<string[]>(['dev']);
   const [newEnv, setNewEnv] = useState('');
+  /**
+   * Per-environment quota, keyed by environment name.
+   *
+   * An environment created here used to get no ResourceQuota at all, so the
+   * whole default path — create a folder with a quota and two environments —
+   * enforced nothing: the folder number caps the sum of *declared* quotas,
+   * and nothing was declared. Verified on the cluster: folder `acme` with
+   * 16 CPU / 32Gi / 200Gi, `acme-dev` and `acme-prod` with no quota object.
+   */
+  const [envQuota, setEnvQuota] = useState<Record<string, EnvQuota>>({
+    dev: { cpu: '', memory: '', memUnit: 'Gi', storage: '', storUnit: 'Gi' },
+  });
   const [enableQuota, setEnableQuota] = useState(false);
   const [quotaCpu, setQuotaCpu] = useState('');
   const [quotaMemory, setQuotaMemory] = useState('');
@@ -226,9 +250,35 @@ function CreateFolderModal({
     const trimmed = newEnv.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-');
     if (trimmed && !environments.includes(trimmed)) {
       setEnvironments([...environments, trimmed]);
+      setEnvQuota({
+        ...envQuota,
+        [trimmed]: { cpu: '', memory: '', memUnit: 'Gi', storage: '', storUnit: 'Gi' },
+      });
       setNewEnv('');
     }
   };
+
+  const patchEnvQuota = (env: string, patch: Partial<EnvQuota>) =>
+    setEnvQuota(prev => ({ ...prev, [env]: { ...prev[env], ...patch } }));
+
+  /** What the initial environments add up to, against the folder ceiling. */
+  const envTotals = environments.reduce((acc, env) => {
+    const q = envQuota[env];
+    if (!q) return acc;
+    acc.cpu += Number(q.cpu) || 0;
+    acc.memory += (Number(q.memory) || 0) * BYTE_UNITS[q.memUnit];
+    acc.storage += (Number(q.storage) || 0) * BYTE_UNITS[q.storUnit];
+    return acc;
+  }, { cpu: 0, memory: 0, storage: 0 });
+
+  const ceiling = {
+    cpu: parseQuantity(quotaCpu),
+    memory: parseQuantity(quotaMemory),
+    storage: parseQuantity(quotaStorage),
+  };
+  const over = (['cpu', 'memory', 'storage'] as const).filter(
+    d => enableQuota && ceiling[d] !== null && envTotals[d] > (ceiling[d] as number) + 1e-9,
+  );
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -240,12 +290,25 @@ function CreateFolderModal({
         storage: quotaStorage || undefined,
       };
     }
+    const environment_quotas: Record<string, FolderQuota> = {};
+    for (const env of environments.filter(Boolean)) {
+      const q = envQuota[env];
+      if (!q) continue;
+      const entry: FolderQuota = {
+        cpu: q.cpu || undefined,
+        memory: q.memory ? `${q.memory}${q.memUnit}` : undefined,
+        storage: q.storage ? `${q.storage}${q.storUnit}` : undefined,
+      };
+      if (entry.cpu || entry.memory || entry.storage) environment_quotas[env] = entry;
+    }
+
     await createFolder.mutateAsync({
       name,
       display_name: displayName,
       description: description || undefined,
       parent_id: parentId || undefined,
       environments: environments.filter(Boolean),
+      ...(Object.keys(environment_quotas).length ? { environment_quotas } : {}),
       quota,
     });
     onClose();
@@ -336,22 +399,70 @@ function CreateFolderModal({
             <label className="block text-sm font-medium text-surface-300 mb-1">
               Initial Environments
             </label>
-            <div className="space-y-2 mb-2">
+            <p className="text-xs text-surface-500 mb-2">
+              Each environment is a namespace; its quota becomes the
+              ResourceQuota on it. Left empty, the environment is capped by
+              nothing — the folder ceiling only counts quotas that were
+              actually declared.
+            </p>
+            <div className="space-y-3 mb-2">
               {environments.map((env, idx) => (
-                <div key={idx} className="flex items-center gap-2">
-                  <div className="flex-1 px-3 py-1.5 bg-surface-900 border border-surface-700 rounded-lg text-sm text-surface-200 flex items-center justify-between">
-                    <span>{env}</span>
-                    <span className="text-xs text-surface-500 font-mono">
-                      {name || 'folder'}-{env}
-                    </span>
+                <div key={idx} className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 px-3 py-1.5 bg-surface-900 border border-surface-700 rounded-lg text-sm text-surface-200 flex items-center justify-between">
+                      <span>{env}</span>
+                      <span className="text-xs text-surface-500 font-mono">
+                        {name || 'folder'}-{env}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setEnvironments(environments.filter((_, i) => i !== idx))}
+                      className="p-1.5 text-surface-500 hover:text-red-400 transition-colors"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => setEnvironments(environments.filter((_, i) => i !== idx))}
-                    className="p-1.5 text-surface-500 hover:text-red-400 transition-colors"
-                  >
-                    <X className="w-4 h-4" />
-                  </button>
+                  <div className="grid grid-cols-3 gap-2 pl-1 pr-9">
+                    <input
+                      type="text"
+                      value={envQuota[env]?.cpu ?? ''}
+                      onChange={(e) => patchEnvQuota(env, { cpu: e.target.value })}
+                      placeholder="CPU"
+                      aria-label={`CPU quota for ${env}`}
+                      className="input w-full text-xs py-1"
+                    />
+                    <div className="flex gap-1">
+                      <input
+                        type="number" min={0}
+                        value={envQuota[env]?.memory ?? ''}
+                        onChange={(e) => patchEnvQuota(env, { memory: e.target.value })}
+                        placeholder="RAM"
+                        aria-label={`Memory quota for ${env}`}
+                        className="input w-full min-w-0 text-xs py-1"
+                      />
+                      <UnitToggle
+                        value={envQuota[env]?.memUnit ?? 'Gi'}
+                        onChange={(u) => patchEnvQuota(env, { memUnit: u })}
+                        label={`Memory unit for ${env}`}
+                      />
+                    </div>
+                    <div className="flex gap-1">
+                      <input
+                        type="number" min={0}
+                        value={envQuota[env]?.storage ?? ''}
+                        onChange={(e) => patchEnvQuota(env, { storage: e.target.value })}
+                        placeholder="Disk"
+                        aria-label={`Storage quota for ${env}`}
+                        className="input w-full min-w-0 text-xs py-1"
+                      />
+                      <UnitToggle
+                        value={envQuota[env]?.storUnit ?? 'Gi'}
+                        onChange={(u) => patchEnvQuota(env, { storUnit: u })}
+                        label={`Storage unit for ${env}`}
+                      />
+                    </div>
+                  </div>
                 </div>
               ))}
             </div>
@@ -385,7 +496,9 @@ function CreateFolderModal({
                 className="rounded border-surface-600 text-primary-600 focus:ring-primary-500"
               />
               <span className="text-sm font-medium text-surface-300">Set quota</span>
-              <span className="text-xs text-surface-500">(optional soft limit)</span>
+              <span className="text-xs text-surface-500">
+                (ceiling for the environments below)
+              </span>
             </label>
 
             {enableQuota && (
@@ -410,6 +523,13 @@ function CreateFolderModal({
             )}
           </div>
 
+          {over.length > 0 && (
+            <p className="text-xs text-amber-400">
+              The initial environments ask for more {over.join(', ')} than the
+              folder ceiling allows.
+            </p>
+          )}
+
           {/* Submit */}
           <div className="flex justify-end gap-3 pt-3">
             <button type="button" onClick={onClose} className="btn-secondary">
@@ -417,7 +537,7 @@ function CreateFolderModal({
             </button>
             <button
               type="submit"
-              disabled={createFolder.isPending || !name || !displayName}
+              disabled={createFolder.isPending || !name || !displayName || over.length > 0}
               className="btn-primary"
             >
               {createFolder.isPending ? 'Creating...' : 'Create Folder'}

@@ -43,6 +43,7 @@ import { useTeams } from '../hooks/useProjects';
 import { FolderBreadcrumb } from '../components/folders/FolderBreadcrumb';
 import { FolderAccessTab } from '../components/folders/FolderAccessTab';
 import { CustomSelect } from '../components/common/CustomSelect';
+import { UnitToggle } from '../components/common/UnitToggle';
 import { ConfirmDeleteModal } from '../components/common/ConfirmDeleteModal';
 import type { FolderEnvironment, FolderRole } from '../types/folder';
 import type { ByteUnit } from '../utils/quantity';
@@ -1013,40 +1014,6 @@ export function AddEnvironmentModal({
           </button>
         </div>
       </div>
-    </div>
-  );
-}
-
-/** Mi/Gi, as two buttons — a two-option select is a worse control than a pair. */
-function UnitToggle({
-  value, onChange, label,
-}: {
-  value: ByteUnit;
-  onChange: (u: ByteUnit) => void;
-  label: string;
-}) {
-  return (
-    <div
-      className="flex shrink-0 rounded-lg border border-surface-600 overflow-hidden"
-      role="group"
-      aria-label={label}
-    >
-      {(['Mi', 'Gi'] as ByteUnit[]).map(u => (
-        <button
-          key={u}
-          type="button"
-          onClick={() => onChange(u)}
-          aria-pressed={value === u}
-          className={clsx(
-            'px-2 text-xs',
-            value === u
-              ? 'bg-primary-600 text-white'
-              : 'bg-surface-900 text-surface-400 hover:text-surface-200',
-          )}
-        >
-          {u}
-        </button>
-      ))}
     </div>
   );
 }

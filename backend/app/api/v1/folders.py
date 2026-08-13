@@ -841,6 +841,35 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
     return FolderTreeResponse(items=root_items, total=len(folders))
 
 
+def _assert_initial_envs_fit(folder: Any) -> None:
+    """Refuse a folder whose own initial environments overrun its ceiling."""
+    ceiling = folder.quota
+    if ceiling is None or not folder.environment_quotas:
+        return
+
+    totals = {"cpu": 0.0, "memory": 0.0, "storage": 0.0}
+    for env_quota in folder.environment_quotas.values():
+        for field in totals:
+            value = parse_quantity(getattr(env_quota, field, None))
+            if value:
+                totals[field] += value
+
+    for field, label in (("cpu", "CPU"), ("memory", "memory"), ("storage", "storage")):
+        limit = parse_quantity(getattr(ceiling, field, None))
+        if limit is None:
+            continue
+        if totals[field] > limit + 1e-9:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"the initial environments ask for "
+                    f"{_format_quantity(field, totals[field])} of {label}, "
+                    f"more than the folder ceiling "
+                    f"{_format_quantity(field, limit)}."
+                ),
+            )
+
+
 @router.post("", response_model=FolderResponse, status_code=201)
 async def create_folder(request: Request, folder: FolderCreateRequest, user: User = Depends(require_admin)):
     """Create a folder (ConfigMap entry) with optional initial environments."""
@@ -881,6 +910,12 @@ async def create_folder(request: Request, folder: FolderCreateRequest, user: Use
     }
     if folder.quota:
         meta["quota"] = folder.quota.model_dump(exclude_none=True)
+
+    # The initial environments are checked as a set, before the folder exists.
+    # Creating them one by one would leave a half-built folder behind when the
+    # third environment turned out not to fit.
+    _assert_initial_envs_fit(folder)
+
     await _save_folder_meta(k8s_client, folder.name, meta)
     logger.info(f"Created folder: {folder.name} (parent={folder.parent_id})")
 
@@ -891,7 +926,13 @@ async def create_folder(request: Request, folder: FolderCreateRequest, user: Use
     # Create initial environments
     envs = []
     for env_name in folder.environments:
-        env_resp = await _create_environment_ns(k8s_client, folders, folder.name, env_name)
+        env_quota = folder.environment_quotas.get(env_name)
+        env_resp = await _create_environment_ns(
+            k8s_client, folders, folder.name, env_name,
+            quota_cpu=env_quota.cpu if env_quota else None,
+            quota_memory=env_quota.memory if env_quota else None,
+            quota_storage=env_quota.storage if env_quota else None,
+        )
         envs.append(env_resp)
 
     path = _get_ancestor_chain(folders, folder.name)

@@ -68,6 +68,8 @@ export interface CreateFolderRequest {
   description?: string;
   parent_id?: string | null;
   environments?: string[];
+  /** Per-environment quota, keyed by the short environment name. */
+  environment_quotas?: Record<string, FolderQuota>;
   quota?: FolderQuota;
 }
 
