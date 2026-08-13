@@ -739,6 +739,80 @@ async def _ensure_vpc_dns(
     await _ensure_vpc_dns_policy(k8s, vpc_name)
 
 
+
+async def _vpc_owning_cidr(k8s, cidr: str) -> str | None:
+    """The VPC whose subnet covers `cidr`, or None when nothing here owns it.
+
+    "Nothing here" is the normal case for a corporate prefix reached over BGP:
+    the allow-ACL is all we can add, and the upstream router carries the path.
+    """
+    try:
+        wanted = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        logger.warning(f"Shared network {cidr!r} is not a CIDR; skipping peering")
+        return None
+
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
+        )
+    except ApiException as e:
+        logger.warning(f"Could not list subnets to resolve {cidr}: {e}")
+        return None
+
+    for subnet in result.get("items", []):
+        spec = subnet.get("spec", {}) or {}
+        vpc = spec.get("vpc")
+        block = spec.get("cidrBlock")
+        if not vpc or not block or vpc == SYSTEM_VPC_NAME:
+            continue
+        try:
+            other = ipaddress.ip_network(block, strict=False)
+        except ValueError:
+            continue
+        if wanted.subnet_of(other) or other.subnet_of(wanted):
+            return vpc
+    return None
+
+
+async def _peer_shared_cidrs(k8s, vpc_name: str, shared_cidrs: list[str]) -> None:
+    """Peer with whichever VPCs own the shared prefixes.
+
+    The allow-ACL only lifts the isolation drop; it does not create a route.
+    Measured: a VPC created with `shared_cidrs=[10.198.200.0/24]` had the
+    allow rules at priority 3100 and
+
+        spec.staticRoutes: [{"cidr": "0.0.0.0/0", "nextHopIP": ...}]
+
+    — nothing pointing at the shared range — so the ping went out the default
+    route and died. Adding the peering by hand fixed it instantly, at two
+    hops (ttl=62) instead of a hairpin through the upstream.
+
+    Best-effort per prefix: a shared network living outside this cluster has
+    no VPC to peer with and is left to the ACL plus whatever the upstream
+    router knows. A failure here does not fail the VPC create — the VPC is
+    already up and the peering can be added from its page.
+    """
+    for cidr in shared_cidrs:
+        peer = await _vpc_owning_cidr(k8s, cidr)
+        if not peer:
+            logger.info(
+                f"Shared network {cidr} is not owned by a VPC here; leaving it "
+                "to the allow-ACL and upstream routing"
+            )
+            continue
+        if peer == vpc_name:
+            continue
+        try:
+            await _create_peering_pair(k8s, vpc_name, peer)
+            logger.info(f"Peered {vpc_name!r} with {peer!r} for shared network {cidr}")
+        except Exception as e:
+            logger.warning(
+                f"Could not peer {vpc_name!r} with {peer!r} for {cidr}: {e}. "
+                "The allow-ACL is in place; add the peering from the VPC page."
+            )
+
+
 async def _get_vpc_peerings(k8s, vpc_name: str) -> list[VpcPeeringInfo]:
     """Peerings involving a VPC, read from `Vpc.spec.vpcPeerings`.
 
@@ -1065,6 +1139,9 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     # later (workloads will lack VPC-internal DNS resolution until then).
     await _ensure_vpc_dns(k8s, data.name, default_subnet_name)
 
+    # Shared networks: build the path, not just the permission.
+    await _peer_shared_cidrs(k8s, data.name, data.shared_cidrs or [])
+
     # Set up OVN NAT if enabled
     if data.enable_nat_gateway:
         from app.api.v1.ovn_gateway import (
@@ -1365,12 +1442,23 @@ async def create_vpc_peering(
     anyway and the peering looks broken for no visible reason.
     """
     k8s = request.app.state.k8s_client
+    return await _create_peering_pair(k8s, name, data.remote_vpc, data.link_cidr)
 
-    if name == data.remote_vpc:
+
+async def _create_peering_pair(
+    k8s, name: str, remote_vpc: str, link_cidr_override: str | None = None,
+) -> VpcPeeringInfo:
+    """Both sides of a peering, allocation included.
+
+    Extracted from the endpoint so the VPC-create path can use it for shared
+    networks: the allow-ACL lifts the isolation drop but writes no route, so a
+    "shared" VPC stayed unreachable until someone added the peering by hand.
+    """
+    if name == remote_vpc:
         raise HTTPException(status_code=400, detail="A VPC cannot peer with itself")
 
     specs: dict[str, dict[str, Any]] = {}
-    for vpc_name in [name, data.remote_vpc]:
+    for vpc_name in [name, remote_vpc]:
         try:
             item = await k8s.custom_api.get_cluster_custom_object(
                 group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
@@ -1383,7 +1471,7 @@ async def create_vpc_peering(
             raise k8s_error_to_http(e, "VPC operation")
 
     local_cidrs = await _vpc_subnet_cidrs(k8s, name)
-    remote_cidrs = await _vpc_subnet_cidrs(k8s, data.remote_vpc)
+    remote_cidrs = await _vpc_subnet_cidrs(k8s, remote_vpc)
     if not local_cidrs or not remote_cidrs:
         raise HTTPException(
             status_code=400,
@@ -1393,13 +1481,13 @@ async def create_vpc_peering(
             ),
         )
 
-    if data.link_cidr:
-        network = ipaddress.ip_network(data.link_cidr, strict=False)
+    if link_cidr_override:
+        network = ipaddress.ip_network(link_cidr_override, strict=False)
         hosts = list(network.hosts())
         if len(hosts) < 2:
             raise HTTPException(
                 status_code=400,
-                detail=f"Link CIDR {data.link_cidr} has no room for two addresses",
+                detail=f"Link CIDR {link_cidr_override} has no room for two addresses",
             )
         local_ip, remote_ip, link_cidr = str(hosts[0]), str(hosts[1]), str(network)
     else:
@@ -1407,11 +1495,11 @@ async def create_vpc_peering(
 
     patches = {
         name: _peering_side_patch(
-            specs[name], data.remote_vpc, local_ip, link_cidr,
+            specs[name], remote_vpc, local_ip, link_cidr,
             remote_cidrs, remote_ip,
         ),
-        data.remote_vpc: _peering_side_patch(
-            specs[data.remote_vpc], name, remote_ip, link_cidr,
+        remote_vpc: _peering_side_patch(
+            specs[remote_vpc], name, remote_ip, link_cidr,
             local_cidrs, local_ip,
         ),
     }
@@ -1421,7 +1509,7 @@ async def create_vpc_peering(
         try:
             await _apply_peering_side(
                 k8s, vpc_name,
-                data.remote_vpc if vpc_name == name else name,
+                remote_vpc if vpc_name == name else name,
                 local_ip if vpc_name == name else remote_ip,
                 link_cidr,
                 remote_cidrs if vpc_name == name else local_cidrs,
@@ -1433,7 +1521,7 @@ async def create_vpc_peering(
             # VPC has no route back. Undo what landed before giving up.
             for done in applied:
                 try:
-                    await _remove_peering_side(k8s, done, _other(done, name, data.remote_vpc))
+                    await _remove_peering_side(k8s, done, _other(done, name, remote_vpc))
                 except Exception as undo_err:
                     logger.warning(
                         f"Could not roll back half-applied peering on {done!r}: {undo_err}"
@@ -1441,13 +1529,13 @@ async def create_vpc_peering(
             raise k8s_error_to_http(e, f"peering VPC '{vpc_name}'")
 
     logger.info(
-        f"Peered VPC {name!r} with {data.remote_vpc!r} over {link_cidr} "
+        f"Peered VPC {name!r} with {remote_vpc!r} over {link_cidr} "
         f"({local_ip} <-> {remote_ip})"
     )
     return VpcPeeringInfo(
-        name=f"{name}-to-{data.remote_vpc}",
+        name=f"{name}-to-{remote_vpc}",
         local_vpc=name,
-        remote_vpc=data.remote_vpc,
+        remote_vpc=remote_vpc,
         link_cidr=link_cidr,
         local_connect_ip=local_ip,
         remote_connect_ip=remote_ip,
