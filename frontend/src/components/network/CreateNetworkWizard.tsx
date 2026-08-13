@@ -87,7 +87,12 @@ const initialState: WizardState = {
   purpose: 'vm',
   namespace: '',
   vpcName: '',
-  vpcSubnetCidr: '10.100.0.0/24',
+  // Empty means "let the allocator pick", which is what the field says and
+  // what almost every VPC wants. Seeding it with the first quick-select made
+  // that unreachable: the wizard sent 10.100.0.0/24 for a field nobody
+  // touched, so the first VPC took a hard-coded prefix and the second was
+  // refused for overlapping with it.
+  vpcSubnetCidr: '',
   vpcEnableNat: true,
   vpcEnablePeering: false,
   // Closed by default — every tenant prefix reaches the same upstream router,
