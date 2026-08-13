@@ -211,6 +211,47 @@ def _parse_tenant_response(
     )
 
 
+async def _healthy_worker_count(k8s, namespace: str, fallback: int) -> int:
+    """Workers whose node is actually healthy, not whose Machine says Ready.
+
+    A Machine keeps `Ready=True` while the node behind it is gone. Measured:
+    a worker VM deleted out of band was recreated by CAPK from its original
+    (expired) bootstrap secret, so the new VM never rejoined — and for ten
+    minutes CAPI reported
+
+        Ready=True  BootstrapReady=True  InfrastructureReady=True
+        NodeHealthy=Unknown  (Node condition Ready is Unknown)
+
+    while the tenant's own `kubectl get nodes` showed the node NotReady with
+    a stale address. `readyReplicas` counts the first three and not the
+    fourth, so the UI said 2/2 for a cluster with one dead worker.
+
+    `NodeHealthy` is the condition that tracks the node, so it is the one to
+    count. Falls back to `readyReplicas` if Machines cannot be listed — a
+    degraded number is better than a zero that reads as an outage.
+    """
+    try:
+        machines = await k8s.custom_api.list_namespaced_custom_object(
+            group=CAPI_GROUP, version=CAPI_VERSION,
+            namespace=namespace, plural="machines",
+        )
+    except ApiException as e:
+        logger.debug(f"Could not list Machines in {namespace}: {e}")
+        return fallback
+
+    items = machines.get("items") or []
+    if not items:
+        return fallback
+
+    healthy = 0
+    for m in items:
+        for cond in (m.get("status", {}).get("conditions") or []):
+            if cond.get("type") == "NodeHealthy" and cond.get("status") == "True":
+                healthy += 1
+                break
+    return healthy
+
+
 async def _enrich_with_workers(
     k8s, tenant: TenantResponse,
 ) -> TenantResponse:
@@ -226,7 +267,9 @@ async def _enrich_with_workers(
             md_status = md.get("status", {})
             md_spec = md.get("spec", {})
             tenant.worker_count = md_spec.get("replicas", 0)
-            tenant.workers_ready = md_status.get("readyReplicas", 0)
+            tenant.workers_ready = await _healthy_worker_count(
+                k8s, tenant.namespace, md_status.get("readyReplicas", 0),
+            )
 
             # Extract VM spec from infrastructure template
             infra_ref = md_spec.get("template", {}).get("spec", {}).get("infrastructureRef", {})

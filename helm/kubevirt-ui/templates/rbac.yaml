@@ -398,6 +398,10 @@ rules:
     resources:
       - clusters
       - machinedeployments
+      # Machines are read to report worker health honestly: a Machine stays
+      # Ready while its node is NotReady, so the count has to come from the
+      # NodeHealthy condition (tenants_crud._enrich_with_workers).
+      - machines
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   - apiGroups: ["bootstrap.cluster.x-k8s.io"]
