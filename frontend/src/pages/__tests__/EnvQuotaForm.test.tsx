@@ -182,3 +182,48 @@ describe('taking room from a sibling', () => {
     expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
   });
 });
+
+describe('the donor panel stays put', () => {
+  /**
+   * Found in the browser: dragging the slider until the shortfall was covered
+   * unmounted the whole panel — the amount being taken from `prod` vanished
+   * from the page while still travelling with the request, and there was no
+   * way to give any of it back short of closing the dialog.
+   */
+  it('does not disappear the moment a slider covers the shortfall', () => {
+    open();
+    fireEvent.change(name(), { target: { value: 'qa' } });
+    fireEvent.change(mem(), { target: { value: '8' } });
+    fireEvent.change(screen.getByLabelText('Take memory from dev'), {
+      target: { value: String(8 * 2 ** 30) },
+    });
+
+    expect(screen.getByLabelText('Take memory from dev')).toBeInTheDocument();
+    expect(screen.getByText(/covered/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeEnabled();
+  });
+
+  it('says how much is still missing while it is', () => {
+    open();
+    fireEvent.change(name(), { target: { value: 'qa' } });
+    fireEvent.change(mem(), { target: { value: '8' } });
+    fireEvent.change(screen.getByLabelText('Take memory from dev'), {
+      target: { value: String(3 * 2 ** 30) },
+    });
+
+    expect(screen.getByText(/5Gi still missing/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
+  });
+
+  it('lets the slider go back down again', () => {
+    open();
+    fireEvent.change(name(), { target: { value: 'qa' } });
+    fireEvent.change(mem(), { target: { value: '8' } });
+    const slider = screen.getByLabelText('Take memory from dev');
+    fireEvent.change(slider, { target: { value: String(8 * 2 ** 30) } });
+    fireEvent.change(slider, { target: { value: String(2 * 2 ** 30) } });
+
+    expect(screen.getByText(/−2Gi → leaves 14Gi/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
+  });
+});

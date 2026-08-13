@@ -771,8 +771,24 @@ export function AddEnvironmentModal({
   const shortfalls: Record<Dim, number> = {
     cpu: shortfallOf('cpu'), memory: shortfallOf('memory'), storage: shortfallOf('storage'),
   };
-  const short = (['cpu', 'memory', 'storage'] as Dim[]).filter(d => shortfalls[d] > 0);
-  const canSubmit = name.trim() !== '' && short.length === 0 && !addEnv.isPending;
+
+  /**
+   * Whether a dimension needs the donor panel at all — asked for more than is
+   * free, regardless of what the sliders have already covered.
+   *
+   * Keyed on the shortfall it would unmount itself the moment a slider covered
+   * it: the panel disappeared, the slider with it, and the create went out
+   * carrying a reallocation nobody could see or take back.
+   */
+  const needsDonors = (dim: Dim): boolean => {
+    const free = headroom?.free[dim] ?? null;
+    return free !== null && wanted[dim] > free;
+  };
+
+  const dims = (['cpu', 'memory', 'storage'] as Dim[]);
+  const short = dims.filter(needsDonors);
+  const canSubmit =
+    name.trim() !== '' && dims.every(d => shortfalls[d] === 0) && !addEnv.isPending;
 
   const setTake = (dim: Dim, key: string, amount: number) =>
     setTakeFrom(prev => ({ ...prev, [dim]: { ...prev[dim], [key]: amount } }));
@@ -819,9 +835,10 @@ export function AddEnvironmentModal({
 
   const renderShort = (dim: Dim) => {
     const eligible = donors.filter(d => d.held[dim] > 0);
-    const amount = dim === 'cpu'
-      ? `${trimNumber(shortfalls[dim])} CPU`
-      : `${formatBytes(shortfalls[dim], unitOf(dim))} of ${DIM_LABEL[dim]}`;
+    const free = headroom?.free[dim] ?? 0;
+    const gap = wanted[dim] - free;
+    const show = (v: number) => (dim === 'cpu' ? trimNumber(v) : formatBytes(v, unitOf(dim)));
+    const amount = dim === 'cpu' ? `${show(gap)} CPU` : `${show(gap)} of ${DIM_LABEL[dim]}`;
 
     if (eligible.length === 0) {
       return (
@@ -834,12 +851,18 @@ export function AddEnvironmentModal({
 
     return (
       <div key={dim} className="p-3 bg-amber-900/10 border border-amber-800/30 rounded-lg space-y-3">
-        <p className="text-xs text-amber-300/90">{amount} short. Take it from:</p>
+        <p className="text-xs text-amber-300/90">
+          {amount} short. Take it from:
+          {shortfalls[dim] === 0 ? (
+            <span className="text-emerald-400"> covered</span>
+          ) : (
+            <span className="text-amber-200"> {show(shortfalls[dim])} still missing</span>
+          )}
+        </p>
         {eligible.map(d => {
           const unit = unitOf(dim);
           const taken = takeFrom[dim][d.key] ?? 0;
           const step = dim === 'cpu' ? 1 : sliderStep(d.held[dim], unit);
-          const show = (v: number) => (dim === 'cpu' ? trimNumber(v) : formatBytes(v, unit));
           return (
             <div key={d.key} className="flex items-center gap-3">
               <span className="text-xs text-surface-300 w-28 truncate" title={d.label}>
@@ -922,7 +945,7 @@ export function AddEnvironmentModal({
                 <input
                   type="number" min={0} value={memory}
                   onChange={(e) => setMemory(e.target.value)}
-                  placeholder="16" className="input w-full"
+                  placeholder="16" className="input w-full min-w-0"
                   aria-label="Environment memory quota"
                 />
                 <UnitToggle value={memUnit} onChange={setMemUnit} label="Memory unit" />
@@ -934,7 +957,7 @@ export function AddEnvironmentModal({
                 <input
                   type="number" min={0} value={storage}
                   onChange={(e) => setStorage(e.target.value)}
-                  placeholder="100" className="input w-full"
+                  placeholder="100" className="input w-full min-w-0"
                   aria-label="Environment storage quota"
                 />
                 <UnitToggle value={storUnit} onChange={setStorUnit} label="Storage unit" />
@@ -972,7 +995,11 @@ function UnitToggle({
   label: string;
 }) {
   return (
-    <div className="flex rounded-lg border border-surface-600 overflow-hidden" role="group" aria-label={label}>
+    <div
+      className="flex shrink-0 rounded-lg border border-surface-600 overflow-hidden"
+      role="group"
+      aria-label={label}
+    >
       {(['Mi', 'Gi'] as ByteUnit[]).map(u => (
         <button
           key={u}
