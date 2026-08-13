@@ -1038,6 +1038,143 @@ async def move_folder(request: Request, name: str, move: FolderMoveRequest, user
 
 
 # ---------------------------------------------------------------------------
+# Quota headroom
+# ---------------------------------------------------------------------------
+
+# Kubernetes quantities, parsed without pulling in a dependency: the folder
+# quota and the env quotas have to be compared, and "16Gi" vs "8192Mi" must
+# not become a string comparison.
+_QUANTITY_SUFFIXES = {
+    "": 1, "m": 0.001,
+    "K": 10**3, "M": 10**6, "G": 10**9, "T": 10**12,
+    "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40,
+}
+
+
+def parse_quantity(value: str | None) -> float | None:
+    """A Kubernetes quantity as a number, or None when unset/unparseable."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for suffix in sorted(_QUANTITY_SUFFIXES, key=len, reverse=True):
+        if suffix and text.endswith(suffix):
+            try:
+                return float(text[: -len(suffix)]) * _QUANTITY_SUFFIXES[suffix]
+            except ValueError:
+                return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+async def _allocated_env_quota(k8s_client: Any, folder_name: str) -> dict[str, float]:
+    """Sum of the quotas already handed to this folder's environments.
+
+    Read from the ResourceQuota objects rather than from any bookkeeping of
+    our own: they are what the API server enforces, and an admin editing one
+    with kubectl must count.
+    """
+    totals = {"cpu": 0.0, "memory": 0.0, "storage": 0.0}
+    try:
+        namespaces = await k8s_client.list_namespaces(
+            label_selector=f"{ENV_FOLDER_LABEL}={folder_name}",
+        )
+    except Exception as e:
+        logger.warning(f"Could not list namespaces of folder {folder_name}: {e}")
+        return totals
+
+    for ns in namespaces:
+        ns_name = ns["name"] if isinstance(ns, dict) else ns
+        try:
+            quotas = await k8s_client.core_api.list_namespaced_resource_quota(
+                namespace=ns_name,
+            )
+        except ApiException:
+            continue
+        for quota in quotas.items:
+            hard = (quota.spec.hard if quota.spec else None) or {}
+            for key, field in (
+                ("requests.cpu", "cpu"),
+                ("requests.memory", "memory"),
+                ("requests.storage", "storage"),
+            ):
+                value = parse_quantity(hard.get(key))
+                if value:
+                    totals[field] += value
+    return totals
+
+
+async def assert_within_folder_quota(
+    k8s_client: Any, folders: dict[str, dict], folder_name: str,
+    quota_cpu: str | None, quota_memory: str | None, quota_storage: str | None,
+    exclude_namespace: str | None = None,
+) -> None:
+    """Refuse an environment quota that would overrun the folder's.
+
+    The folder quota is a ceiling and nothing enforced it: it was a number on
+    a page while the environments below it could be given anything. Checked
+    here rather than in the wizard so `kubectl`-driven and API-driven callers
+    obey it too — the whole reason the quota moves onto real ResourceQuota
+    objects.
+
+    A folder without a quota constrains nothing, which is the state every
+    folder is in until someone sets one.
+    """
+    meta = folders.get(folder_name) or {}
+    ceiling = meta.get("quota") or {}
+    if not ceiling:
+        return
+
+    allocated = await _allocated_env_quota(k8s_client, folder_name)
+    if exclude_namespace:
+        # Re-allocating an existing environment: its current quota is not
+        # competing with itself.
+        try:
+            existing = await k8s_client.core_api.list_namespaced_resource_quota(
+                namespace=exclude_namespace,
+            )
+            for quota in existing.items:
+                hard = (quota.spec.hard if quota.spec else None) or {}
+                for key, field in (
+                    ("requests.cpu", "cpu"),
+                    ("requests.memory", "memory"),
+                    ("requests.storage", "storage"),
+                ):
+                    value = parse_quantity(hard.get(key))
+                    if value:
+                        allocated[field] -= value
+        except ApiException:
+            pass
+
+    requested = {
+        "cpu": parse_quantity(quota_cpu),
+        "memory": parse_quantity(quota_memory),
+        "storage": parse_quantity(quota_storage),
+    }
+
+    for field, label in (("cpu", "CPU"), ("memory", "memory"), ("storage", "storage")):
+        want = requested[field]
+        limit = parse_quantity(ceiling.get(field))
+        if want is None or limit is None:
+            continue
+        free = limit - allocated[field]
+        if want > free + 1e-9:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"{label} quota {ceiling.get(field)} for folder "
+                    f"'{folder_name}' is already {allocated[field]:g} allocated; "
+                    f"{free:g} is free and this environment asks for "
+                    f"{want:g}. Lower it, or take the difference from another "
+                    f"environment first."
+                ),
+            )
+
+
+# ---------------------------------------------------------------------------
 # Environment CRUD
 # ---------------------------------------------------------------------------
 
@@ -1052,6 +1189,12 @@ async def _create_environment_ns(
 ) -> FolderEnvironmentResponse:
     """Create a namespace for an environment under a folder."""
     ns_name = _ns_name(folder_name, environment)
+
+    # The folder quota is a ceiling; refuse before creating anything, so a
+    # rejected request does not leave a namespace behind.
+    await assert_within_folder_quota(
+        k8s_client, folders, folder_name, quota_cpu, quota_memory, quota_storage,
+    )
 
     namespace = {
         "apiVersion": "v1",
@@ -1103,6 +1246,33 @@ async def _create_environment_ns(
             )
         except ApiException as e:
             logger.warning(f"Failed to create quota for {ns_name}: {e}")
+
+        # A quota that names limits.cpu/limits.memory makes the API server
+        # reject every pod that does not declare them. VMs are fine —
+        # virt-launcher sets both — but a plain pod would be refused outright
+        # with "must specify limits.cpu". The LimitRange supplies defaults so
+        # the quota constrains the namespace instead of blocking it.
+        try:
+            await k8s_client.core_api.create_namespaced_limit_range(
+                namespace=ns_name,
+                body={
+                    "apiVersion": "v1",
+                    "kind": "LimitRange",
+                    "metadata": {
+                        "name": f"{ns_name}-defaults",
+                        "namespace": ns_name,
+                        "labels": {ENV_MANAGED_LABEL: "true"},
+                    },
+                    "spec": {"limits": [{
+                        "type": "Container",
+                        "default": {"cpu": "500m", "memory": "512Mi"},
+                        "defaultRequest": {"cpu": "100m", "memory": "128Mi"},
+                    }]},
+                },
+            )
+        except ApiException as e:
+            if e.status != 409:
+                logger.warning(f"Failed to create LimitRange for {ns_name}: {e}")
 
     # Propagate folder-level access (including ancestors) to new environment
     await _propagate_folder_access(k8s_client, folders, folder_name, ns_name)
