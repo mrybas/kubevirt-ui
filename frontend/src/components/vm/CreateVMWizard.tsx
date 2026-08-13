@@ -6,6 +6,8 @@ import { useState, useEffect, useRef } from 'react';
 import { X, Server, HardDrive, Cpu, MemoryStick, Check, Loader2, FolderOpen, Network, Globe, Plus, Trash2, Gauge, ChevronRight, Folder } from 'lucide-react';
 import { useTemplates, useGoldenImages, useCreateVMFromTemplate } from '@/hooks/useTemplates';
 import { useSubnets } from '@/hooks/useNetwork';
+import { useVpcs } from '@/hooks/useVpcs';
+import { isVpcInScope } from '@/utils/vpcScope';
 import { useStorageClasses } from '@/hooks/useStorage';
 import type { VMTemplate, VMFromTemplateRequest } from '@/types/template';
 import { CustomSelect } from '@/components/common/CustomSelect';
@@ -154,6 +156,8 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   
   const { data: templatesData, isLoading: templatesLoading } = useTemplates();
   const { data: subnets } = useSubnets();
+  const { data: vpcsData } = useVpcs();
+  const vpcs = vpcsData?.items ?? [];
   const { data: storageClassesData } = useStorageClasses();
   const storageClasses = storageClassesData?.items ?? [];
   const { data: goldenImagesData } = useGoldenImages();
@@ -543,6 +547,23 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
     // Exclude the kube-ovn built-in system VPC and its system subnets — attaching VMs
     // to ovn-cluster/join or ovn-cluster/ovn-default breaks cluster networking.
     // VPC subnets may have no namespace (cluster-wide) — those always pass the namespace filter.
+    // A VPC scoped to a folder (or to one environment of it) must not be
+    // offered to a VM being created somewhere else. The tenant wizard already
+    // filters this way; this one listed every VPC on the cluster, so creating
+    // a VM in `acme-dev` offered `beta-net` (another folder) and
+    // `acme-prod-net` (another environment) as if they were its own.
+    const vpcScope = new Map<string, { folder?: string | null; environment?: string | null }>(
+      (vpcs || []).map((v: any) => [v.name, { folder: v.folder, environment: v.environment }]),
+    );
+    const selectedEnvironment = selectedFolder?.environments.find(
+      (e: any) => e.name === selectedProject,
+    )?.environment;
+
+    const inScope = (subnetVpc: string | null | undefined): boolean =>
+      // VLAN-backed subnets are not folder-scoped.
+      !subnetVpc ||
+      isVpcInScope(vpcScope.get(subnetVpc), selectedFolderName, selectedEnvironment);
+
     const externalSubnets = (subnets || [])
       .filter((s: any) =>
         (s.vpc || s.vlan) &&
@@ -550,6 +571,7 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
         s.vpc !== 'ovn-cluster' &&
         s.name !== 'join' &&
         s.name !== 'ovn-default' &&
+        inScope(s.vpc) &&
         (!s.namespace || s.namespace === selectedProject)
       )
       // Sort: VPC-backed first (base infrastructure), then VLAN-backed external

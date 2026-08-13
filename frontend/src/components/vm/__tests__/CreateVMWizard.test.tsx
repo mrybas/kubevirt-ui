@@ -21,6 +21,10 @@ vi.mock('@/hooks/useTemplates', () => ({
   }),
 }));
 
+// The network step now filters VPCs by their folder/environment labels,
+// so the wizard reads the VPC list as well as the subnet list.
+vi.mock('@/hooks/useVpcs', () => ({ useVpcs: () => ({ data: { items: [] } }) }));
+
 vi.mock('@/hooks/useNetwork', () => ({
   useSubnets: () => ({ data: [] }),
 }));
