@@ -68,7 +68,7 @@ def get_known_teams() -> list[dict[str, Any]]:
     return _FALLBACK_TEAMS
 
 
-def is_admin(groups: list[str]) -> bool:
+def is_admin(groups: list[str], user: "User | None" = None) -> bool:
     """Check if user is platform admin.
 
     Three admin signals are honored:
@@ -89,7 +89,22 @@ def is_admin(groups: list[str]) -> bool:
         return True
 
     from app.config import get_settings
-    admin_groups = set(get_settings().admin_groups_list)
+    settings = get_settings()
+
+    # Named admins. Needed because not every IdP emits groups — Dex's local
+    # password database emits none, and with a group-only rule such a
+    # deployment cannot produce an admin at all.
+    if user is not None:
+        named = set(settings.admin_users_list)
+        # getattr, not attribute access: callers pass anything user-shaped,
+        # and a stub without an email must not raise its way past the check.
+        if named & {
+            (getattr(user, "email", "") or "").lower(),
+            (getattr(user, "username", "") or "").lower(),
+        } - {""}:
+            return True
+
+    admin_groups = set(settings.admin_groups_list)
     if "system:masters" in groups:
         return True
     return any(g in admin_groups for g in groups)
@@ -133,7 +148,7 @@ def _has_group(user_groups: list[str], names: list[str] | None) -> bool:
 
 def is_folder_admin(user: "User", folder_meta: dict) -> bool:
     """User is global admin OR in folder-level admins list."""
-    if is_admin(user.groups):
+    if is_admin(user.groups, user):
         return True
     return _has_group(user.groups, _access_block(folder_meta).get("admins"))
 
@@ -263,7 +278,7 @@ async def get_user_namespaces(k8s_client: Any, user: Any) -> list[str]:
     )
     all_ns_names = [ns["name"] for ns in all_ns]
 
-    if is_admin(user.groups):
+    if is_admin(user.groups, user):
         return all_ns_names
 
     import asyncio

@@ -838,7 +838,7 @@ async def list_vpcs(
         # Match exact env OR folder-wide VPC (no env label).
         vpcs = [v for v in vpcs if v.environment == environment or not v.environment]
 
-    if not is_admin(user.groups):
+    if not is_admin(user.groups, user):
         # B4 (T9): a folder-scoped VPC that was just created has an empty
         # `spec.namespaces` (no tenants attached yet), so the namespace-
         # overlap filter alone would hide the VPC from the folder admin who

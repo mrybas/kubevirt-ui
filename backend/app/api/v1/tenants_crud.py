@@ -678,7 +678,7 @@ async def list_tenants(
         # those the user can at least view. We do this BEFORE enrichment so
         # we never pay the MachineDeployment list cost for tenants the user
         # can't see anyway.
-        if not is_admin(user.groups):
+        if not is_admin(user.groups, user):
             try:
                 # load_folders raises 404 if the folders CM doesn't exist; in
                 # that case no non-admin can see any tenant.

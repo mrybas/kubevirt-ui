@@ -644,7 +644,7 @@ async def require_tenant_access(
         load_folder,
     )
 
-    if is_admin(user.groups):
+    if is_admin(user.groups, user):
         return {}
 
     ns = _tenant_ns(tenant)

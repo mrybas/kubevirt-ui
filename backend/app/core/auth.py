@@ -207,7 +207,7 @@ async def require_admin(
     Admin groups are configured via ADMIN_GROUPS env var (see app.config).
     """
     from app.core.groups import is_admin
-    if not is_admin(user.groups):
+    if not is_admin(user.groups, user):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin role required",
@@ -455,7 +455,7 @@ async def check_folder_access(
         return True
 
     from app.core.groups import is_admin
-    if is_admin(user.groups):
+    if is_admin(user.groups, user):
         return True
 
     try:

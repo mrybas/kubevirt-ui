@@ -39,9 +39,21 @@ class Settings(BaseSettings):
     # default, "kubevirt-ui-admins" for our bundled LLDAP).
     admin_groups: str = "kubevirt-ui-admins"
 
+    # Admins named individually, by email or username (ADMIN_USERS env var,
+    # comma-separated). Groups are the right mechanism when the IdP emits
+    # them — but not every one does. Dex's local password database emits no
+    # groups at all, so with a group-only rule a deployment using it has no
+    # way to make anyone an admin, and the whole admin half of the UI is
+    # unreachable for everybody.
+    admin_users: str = ""
+
     @property
     def admin_groups_list(self) -> list[str]:
         return [g.strip() for g in self.admin_groups.split(",") if g.strip()]
+
+    @property
+    def admin_users_list(self) -> list[str]:
+        return [u.strip().lower() for u in self.admin_users.split(",") if u.strip()]
 
     # The aggregate every tenant VPC is carved out of (TENANT_SUPERNET env
     # var), e.g. "10.198.192.0/18". Tenant isolation is expressed as "drop
