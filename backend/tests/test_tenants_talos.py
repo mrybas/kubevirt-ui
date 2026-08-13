@@ -511,3 +511,52 @@ class TestGoldenImagePlatform:
         from app.api.v1.tenants_talos import TALOS_GOLDEN_IMAGE_URL
 
         assert TALOS_GOLDEN_IMAGE_URL.endswith(".raw.xz")
+
+
+class TestWorkerConfigCarriesTheCA:
+    """Talos validates the machine config before it dials anything, and
+    refuses one with no CA at all:
+
+        failed to validate config acquired via platform openstack:
+        issuing CA or some accepted CAs are required
+          (.machine.ca, machine.acceptedCAs)
+
+    The field existed and nothing ever filled it, so every Talos worker read
+    its config, rejected it, and sat in maintenance mode — indistinguishable
+    from a worker that never got one.
+    """
+
+    def _config(self, ca: str = "Zm9vCg=="):
+        from app.api.v1.tenants_talos import build_talos_worker_config
+
+        return build_talos_worker_config(
+            "t1", "tenant-t1", api_port=6443, control_plane_vip="10.0.0.1",
+            machine_token="aaaaaa.bbbbbbbbbbbbbbbb", cluster_id="id",
+            cluster_secret="secret", pod_cidr="10.244.0.0/16",
+            service_cidr="10.112.0.0/12", ca_cert_b64=ca,
+        )
+
+    def test_the_ca_is_written_where_talos_looks(self) -> None:
+        machine = self._config()["machine"]
+
+        assert machine["ca"]["crt"] == "Zm9vCg=="
+        assert machine["acceptedCAs"] == [{"crt": "Zm9vCg=="}]
+
+    def test_no_ca_key_is_handed_to_a_worker(self) -> None:
+        # A worker never issues certificates — it asks the signer for one.
+        assert "key" not in self._config()["machine"]["ca"]
+
+    def test_an_absent_ca_leaves_the_fields_out(self) -> None:
+        machine = self._config(ca="")["machine"]
+
+        assert "ca" not in machine
+        assert "acceptedCAs" not in machine
+
+    def test_the_capi_path_reads_and_passes_it(self) -> None:
+        import inspect
+
+        from app.api.v1 import tenants_capi
+
+        source = inspect.getsource(tenants_capi)
+        assert "read_talos_ca_cert(k8s, req.name, ns)" in source
+        assert "ca_cert_b64=talos_ca" in source

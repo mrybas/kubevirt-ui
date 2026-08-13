@@ -476,8 +476,37 @@ def build_talos_worker_config(
         },
     }
     if ca_cert_b64:
+        # Talos refuses a config with neither, and says so before it ever
+        # dials trustd:
+        #
+        #   failed to validate config acquired via platform openstack:
+        #   issuing CA or some accepted CAs are required
+        #     (.machine.ca, machine.acceptedCAs)
+        #
+        # A worker never issues certificates — it asks the signer for one —
+        # so the CA goes in without its key. `acceptedCAs` is what modern
+        # Talos reads; `ca` is kept for older releases.
         config["machine"]["ca"] = {"crt": ca_cert_b64}
+        config["machine"]["acceptedCAs"] = [{"crt": ca_cert_b64}]
     return config
+
+
+async def read_talos_ca_cert(k8s, tenant: str, namespace: str) -> str:
+    """The tenant's Talos CA certificate, base64 as Talos wants it.
+
+    cert-manager already stores it base64-encoded in the Secret, so the value
+    is passed through untouched. Missing is not fatal here — the caller omits
+    the field and Talos reports the omission itself.
+    """
+    try:
+        secret = await k8s.core_api.read_namespaced_secret(
+            name=f"{tenant}-talos-ca", namespace=namespace,
+        )
+    except ApiException as e:
+        logger.warning(f"Talos CA secret for tenant {tenant!r} unreadable: {e}")
+        return ""
+
+    return (secret.data or {}).get("tls.crt", "")
 
 
 # ---------------------------------------------------------------------------
