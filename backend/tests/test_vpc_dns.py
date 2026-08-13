@@ -146,3 +146,36 @@ class TestServiceRoute:
 
         assert await _ensure_vpc_dns_service_route(k8s, "t1-vpc") is False
         k8s.apps_api.patch_namespaced_deployment.assert_not_awaited()
+
+
+class TestVpcDnsConfigRoutesTheForwardTarget:
+    """kube-ovn turns `k8s-service-host` into the one /32 route it puts on the
+    VpcDns pod's secondary NIC. Left at its default — the kubernetes API
+    address — the pod can reach the API and nothing else, so every forward to
+    the kube-dns ClusterIP times out and each query answers SERVFAIL while
+    VpcDns still reports ACTIVE=true. Measured on the lab before the fix."""
+
+    def _config_data(self, source: str) -> dict:
+        import re
+        block = re.search(r'name="vpc-dns-config".*?\n\s*\)', source, re.S)
+        assert block, "vpc-dns-config ConfigMap literal not found"
+        return block.group(0)
+
+    def test_forward_target_is_named_as_the_service_host(self) -> None:
+        import inspect
+        source = inspect.getsource(vpcs._ensure_vpc_dns_prereqs)
+        block = self._config_data(source)
+
+        assert '"k8s-service-host": _vpcdns_forward_dns()' in block
+        assert '"k8s-service-port": "53"' in block
+
+    def test_an_existing_configmap_is_brought_forward(self) -> None:
+        # Create-if-missing alone would leave every cluster built before this
+        # fix with a route to the API server and no DNS in any VPC.
+        import inspect
+        source = inspect.getsource(vpcs._ensure_vpc_dns_prereqs)
+        after_conflict = source.split('Created VpcDns prereq ConfigMap', 1)[1]
+        patch_call = after_conflict.split('vpc-dns-corefile', 1)[0]
+
+        assert 'patch_namespaced_config_map' in patch_call
+        assert 'k8s-service-host' in patch_call
