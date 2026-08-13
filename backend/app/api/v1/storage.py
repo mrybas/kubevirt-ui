@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from app.core.auth import User, require_auth
 from app.core.constants import parse_k8s_capacity as _parse_capacity
+from app.core.groups import get_user_namespaces
 from app.models.storage import (
     DataVolumeCreateRequest,
     DataVolumeListResponse,
@@ -30,6 +31,27 @@ CDI_API_GROUP = "cdi.kubevirt.io"
 CDI_API_VERSION = "v1beta1"
 
 
+
+async def require_namespace_access(request: Request, user: User, namespace: str) -> None:
+    """Refuse a namespace the caller has no binding in.
+
+    Every route here takes the namespace from the caller and reads it with the
+    UI's own ServiceAccount, which can read all of them. Without this check
+    `GET /storage/datavolumes?namespace=<someone-else>` returned that team's
+    images and disks in full to a user with no groups and no membership —
+    while `GET /vms?namespace=<same>` correctly returned nothing, because the
+    VM path does scope. The data was one query parameter away.
+    """
+    allowed = await get_user_namespaces(request.app.state.k8s_client, user)
+    if namespace not in allowed:
+        # 404, not 403: whether that namespace exists is itself not this
+        # caller's business, and the VM path already answers this way.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Namespace '{namespace}' not found",
+        )
+
+
 class ImageUsageResponse(BaseModel):
     """Image usage response model."""
     name: str
@@ -45,8 +67,11 @@ class ImageUsageResponse(BaseModel):
 
 
 @router.get("/datavolumes", response_model=DataVolumeListResponse)
-async def list_datavolumes(request: Request, namespace: str) -> DataVolumeListResponse:
+async def list_datavolumes(
+    request: Request, namespace: str, user: User = Depends(require_auth),
+) -> DataVolumeListResponse:
     """List all DataVolumes in a namespace."""
+    await require_namespace_access(request, user, namespace)
     k8s_client = request.app.state.k8s_client
 
     try:
@@ -73,9 +98,11 @@ async def list_datavolumes(request: Request, namespace: str) -> DataVolumeListRe
 
 @router.get("/datavolumes/{name}", response_model=DataVolumeResponse)
 async def get_datavolume(
-    request: Request, namespace: str, name: str
+    request: Request, namespace: str, name: str,
+    user: User = Depends(require_auth),
 ) -> DataVolumeResponse:
     """Get a specific DataVolume."""
+    await require_namespace_access(request, user, namespace)
     k8s_client = request.app.state.k8s_client
 
     try:
@@ -104,9 +131,11 @@ async def get_datavolume(
     "/datavolumes", response_model=DataVolumeResponse, status_code=status.HTTP_201_CREATED
 )
 async def create_datavolume(
-    request: Request, namespace: str, dv_request: DataVolumeCreateRequest
+    request: Request, namespace: str, dv_request: DataVolumeCreateRequest,
+    user: User = Depends(require_auth),
 ) -> DataVolumeResponse:
     """Create a new DataVolume."""
+    await require_namespace_access(request, user, namespace)
     k8s_client = request.app.state.k8s_client
 
     # Build DataVolume manifest
@@ -141,7 +170,11 @@ async def create_datavolume(
 
 
 @router.delete("/datavolumes/{name}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_datavolume(request: Request, namespace: str, name: str) -> None:
+async def delete_datavolume(
+    request: Request, namespace: str, name: str,
+    user: User = Depends(require_auth),
+) -> None:
+    await require_namespace_access(request, user, namespace)
     """Delete a DataVolume."""
     k8s_client = request.app.state.k8s_client
 
@@ -167,8 +200,11 @@ async def delete_datavolume(request: Request, namespace: str, name: str) -> None
 
 
 @router.get("/pvcs", response_model=PVCListResponse)
-async def list_pvcs(request: Request, namespace: str) -> PVCListResponse:
+async def list_pvcs(
+    request: Request, namespace: str, user: User = Depends(require_auth),
+) -> PVCListResponse:
     """List all PVCs in a namespace."""
+    await require_namespace_access(request, user, namespace)
     k8s_client = request.app.state.k8s_client
 
     try:
