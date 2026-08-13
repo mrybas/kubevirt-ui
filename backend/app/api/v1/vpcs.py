@@ -17,6 +17,7 @@ from kubernetes_asyncio.client import ApiException
 
 from app.api.v1.subnet_acls import (
     ISOLATION_PRIORITY_DROP,
+    ISOLATION_PRIORITY_OWN,
     SubnetAcl,
     _acls_to_spec,
     build_isolation_acls,
@@ -950,6 +951,86 @@ async def list_vpcs(
     return VpcListResponse(items=vpcs, total=len(vpcs))
 
 
+async def _tenant_vpc_cidrs(k8s_client: Any, exclude: str | None = None) -> list[str]:
+    """Default-subnet CIDRs of every managed tenant VPC except `exclude`."""
+    out: list[str] = []
+    try:
+        subnets = await k8s_client.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
+        )
+    except Exception as e:
+        logger.warning(f"Could not list subnets for isolation scoping: {e}")
+        return out
+
+    for item in subnets.get("items", []):
+        spec = item.get("spec", {}) or {}
+        vpc = spec.get("vpc")
+        cidr = spec.get("cidrBlock")
+        if not vpc or not cidr or vpc == SYSTEM_VPC_NAME or vpc == exclude:
+            continue
+        if spec.get("vlan"):        # underlay/provider subnet, not a tenant VPC
+            continue
+        out.append(cidr)
+    return out
+
+
+async def reconcile_isolation_acls(k8s_client: Any) -> int:
+    """Re-scope every isolated VPC's drop rules to the current set of peers.
+
+    A VPC created later is a prefix the older ones have never heard of, and
+    their ACLs are written as literal matches — so without this pass the new
+    tenant is reachable from every tenant that predates it.
+    """
+    updated = 0
+    try:
+        subnets = await k8s_client.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
+        )
+    except Exception as e:
+        logger.warning(f"Isolation reconcile: could not list subnets: {e}")
+        return 0
+
+    tenant_subnets = [
+        i for i in subnets.get("items", [])
+        if (i.get("spec", {}) or {}).get("vpc") not in (None, "", SYSTEM_VPC_NAME)
+        and not (i.get("spec", {}) or {}).get("vlan")
+    ]
+    supernet = get_settings().tenant_supernet
+
+    for item in tenant_subnets:
+        spec = item.get("spec", {}) or {}
+        name = item["metadata"]["name"]
+        existing = spec.get("acls") or []
+        if not any(a.get("action") == "drop" for a in existing):
+            continue                      # this VPC was created un-isolated
+        shared = [
+            a["match"].split("== ")[-1] for a in existing
+            if a.get("action") == "allow-related"
+            and a.get("priority", 0) < ISOLATION_PRIORITY_OWN
+            and "== " in a.get("match", "")
+        ]
+        peers = [
+            (s.get("spec") or {}).get("cidrBlock") for s in tenant_subnets
+            if s["metadata"]["name"] != name
+        ]
+        acls = build_isolation_acls(
+            subnet_cidr=spec.get("cidrBlock", ""),
+            tenant_supernet=supernet,
+            shared_cidrs=sorted(set(shared)),
+            peer_cidrs=[p for p in peers if p],
+        )
+        if not acls:
+            continue
+        await k8s_client.custom_api.patch_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
+            name=name,
+            body={"spec": {"acls": [a.model_dump() for a in acls]}},
+            _content_type="application/merge-patch+json",
+        )
+        updated += 1
+    return updated
+
+
 @router.post("", response_model=VpcResponse, status_code=201)
 async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depends(require_admin)) -> VpcResponse:
     """Create a VPC with a default subnet.
@@ -1021,19 +1102,22 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     # configured we create the VPC un-isolated and report that truthfully
     # instead of writing a rule set that would blackhole the internet.
     isolation_acls: list[SubnetAcl] = []
+    peer_cidrs: list[str] = []
     if data.isolated:
         supernet = get_settings().tenant_supernet
-        if supernet:
+        peer_cidrs = await _tenant_vpc_cidrs(k8s_client, exclude=data.name)
+        if peer_cidrs or supernet:
             isolation_acls = build_isolation_acls(
                 subnet_cidr=cidr,
                 tenant_supernet=supernet,
                 shared_cidrs=data.shared_cidrs,
+                peer_cidrs=peer_cidrs,
             )
         else:
             logger.warning(
-                f"VPC {data.name!r}: isolation requested but TENANT_SUPERNET is "
-                "not configured — creating without isolation ACLs. Every other "
-                "tenant can reach this VPC via the upstream router."
+                f"VPC {data.name!r}: isolation requested but there is neither "
+                "another tenant VPC nor a TENANT_SUPERNET to scope the drop to "
+                "— creating without isolation ACLs."
             )
 
     labels: dict[str, str] = {"kubevirt-ui.io/managed": "true"}
@@ -1243,6 +1327,15 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             raise
         except Exception as e:
             logger.warning(f"Failed to set up OVN NAT for VPC {data.name}: {e}")
+
+    # Older VPCs have never heard of this prefix; their drop rules are
+    # literal matches, so re-scope every isolated VPC to the new peer set.
+    if data.isolated:
+        try:
+            n = await reconcile_isolation_acls(k8s_client)
+            logger.info(f"Isolation ACLs re-scoped on {n} VPC subnet(s)")
+        except Exception as e:
+            logger.warning(f"Isolation reconcile after creating {data.name!r} failed: {e}")
 
     return VpcResponse(
         name=data.name,

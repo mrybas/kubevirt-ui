@@ -113,6 +113,7 @@ def build_isolation_acls(
     subnet_cidr: str,
     tenant_supernet: str,
     shared_cidrs: list[str] | None = None,
+    peer_cidrs: list[str] | None = None,
 ) -> list[SubnetAcl]:
     """ACLs that make one VPC unreachable from the other tenants.
 
@@ -133,10 +134,24 @@ def build_isolation_acls(
     return traffic from the internet (8.8.8.8 is not in `allowSubnets`), so
     the tenant silently loses egress.
 
-    Returns an empty list when there is no supernet to scope the drop to —
-    a drop without one would take the internet with it.
+    `peer_cidrs` — the prefixes of the other tenant VPCs — is what the drop is
+    actually scoped to. `tenant_supernet` remains as a fallback aggregate.
+
+    Scoping the drop to the supernet alone was a rule about a range no tenant
+    was ever in: the allocator hands out `10.{200+N}.0.0/24` while the
+    deployment's `TENANT_SUPERNET` was `10.198.192.0/18`. Measured on the
+    cluster — `acme-net` 10.100.0.0/24, `beta-net` 10.205.0.0/24, both
+    "Isolated", and the only ACL between them dropping 10.198.192.0/18, which
+    contains neither. Nothing blocked them; they merely had no route yet, and
+    the first BGP announcement would have made "Isolated" a caption.
+
+    Returns an empty list when there is nothing to scope the drop to — a drop
+    without one would take the internet with it.
     """
-    if not subnet_cidr or not tenant_supernet:
+    drop_targets = [c for c in (peer_cidrs or []) if c and c != subnet_cidr]
+    if not drop_targets and tenant_supernet:
+        drop_targets = [tenant_supernet]
+    if not subnet_cidr or not drop_targets:
         return []
 
     acls = [
@@ -166,14 +181,15 @@ def build_isolation_acls(
         ))
         priority += 1
 
-    acls.append(SubnetAcl(
-        action="drop", direction="from-lport",
-        match=f"ip4.dst == {tenant_supernet}", priority=ISOLATION_PRIORITY_DROP,
-    ))
-    acls.append(SubnetAcl(
-        action="drop", direction="to-lport",
-        match=f"ip4.src == {tenant_supernet}", priority=ISOLATION_PRIORITY_DROP,
-    ))
+    for target in drop_targets:
+        acls.append(SubnetAcl(
+            action="drop", direction="from-lport",
+            match=f"ip4.dst == {target}", priority=ISOLATION_PRIORITY_DROP,
+        ))
+        acls.append(SubnetAcl(
+            action="drop", direction="to-lport",
+            match=f"ip4.src == {target}", priority=ISOLATION_PRIORITY_DROP,
+        ))
     return acls
 
 

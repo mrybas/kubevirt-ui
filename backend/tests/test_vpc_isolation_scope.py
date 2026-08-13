@@ -1,0 +1,120 @@
+"""«Isolated» has to block the other tenants, not a range none of them are in.
+
+On the cluster: `acme-net` 10.100.0.0/24 and `beta-net` 10.205.0.0/24, both
+created with Isolated on, and the only drop rule between them was
+
+    ip4.dst == 10.198.192.0/18   (TENANT_SUPERNET)
+
+which contains neither — the allocator hands out `10.{200+N}.0.0/24`. Nothing
+was blocking them; they merely had no route to each other yet, and the first
+BGP announcement of those prefixes would have turned "Isolated" into a caption.
+"""
+
+import pytest
+
+from app.api.v1.subnet_acls import (
+    ISOLATION_PRIORITY_DROP,
+    build_isolation_acls,
+)
+
+
+def _drops(acls):
+    return sorted(
+        a.match.split("== ")[-1] for a in acls
+        if a.action == "drop" and a.direction == "from-lport"
+    )
+
+
+class TestDropScope:
+    def test_drops_every_other_tenant_prefix(self) -> None:
+        acls = build_isolation_acls(
+            subnet_cidr="10.100.0.0/24",
+            tenant_supernet="10.198.192.0/18",
+            peer_cidrs=["10.205.0.0/24", "10.206.0.0/24"],
+        )
+        assert _drops(acls) == ["10.205.0.0/24", "10.206.0.0/24"]
+
+    def test_never_drops_its_own_prefix(self) -> None:
+        acls = build_isolation_acls(
+            subnet_cidr="10.100.0.0/24",
+            tenant_supernet="",
+            peer_cidrs=["10.100.0.0/24", "10.205.0.0/24"],
+        )
+        assert _drops(acls) == ["10.205.0.0/24"]
+
+    def test_falls_back_to_the_supernet_for_the_first_vpc(self) -> None:
+        acls = build_isolation_acls(
+            subnet_cidr="10.100.0.0/24",
+            tenant_supernet="10.198.192.0/18",
+            peer_cidrs=[],
+        )
+        assert _drops(acls) == ["10.198.192.0/18"]
+
+    def test_writes_nothing_when_there_is_nothing_to_scope_to(self) -> None:
+        # A drop with no scope would take the internet with it.
+        assert build_isolation_acls("10.100.0.0/24", "", peer_cidrs=[]) == []
+
+    def test_shared_prefixes_still_outrank_the_drop(self) -> None:
+        acls = build_isolation_acls(
+            subnet_cidr="10.100.0.0/24",
+            tenant_supernet="",
+            shared_cidrs=["10.205.0.0/24"],
+            peer_cidrs=["10.205.0.0/24"],
+        )
+        allow = [a for a in acls if a.action == "allow-related" and "10.205" in a.match]
+        drop = [a for a in acls if a.action == "drop"]
+        assert allow and drop
+        assert min(a.priority for a in allow) > ISOLATION_PRIORITY_DROP
+
+
+@pytest.mark.asyncio
+class TestReconcileTeachesTheOldVpcsAboutTheNewOne:
+    async def test_it_rewrites_every_isolated_subnet(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.api.v1.vpcs import reconcile_isolation_acls
+
+        subnets = {"items": [
+            {"metadata": {"name": "a-default"}, "spec": {
+                "vpc": "a", "cidrBlock": "10.200.0.0/24",
+                "acls": [{"action": "drop", "direction": "from-lport",
+                          "match": "ip4.dst == 10.198.192.0/18", "priority": 3000}],
+            }},
+            {"metadata": {"name": "b-default"}, "spec": {
+                "vpc": "b", "cidrBlock": "10.201.0.0/24",
+                "acls": [{"action": "drop", "direction": "from-lport",
+                          "match": "ip4.dst == 10.198.192.0/18", "priority": 3000}],
+            }},
+            {"metadata": {"name": "ovn-default"}, "spec": {
+                "vpc": "ovn-cluster", "cidrBlock": "10.16.0.0/16",
+            }},
+        ]}
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(return_value=subnets)
+        k8s.custom_api.patch_cluster_custom_object = AsyncMock()
+
+        assert await reconcile_isolation_acls(k8s) == 2
+
+        written = {
+            c.kwargs["name"]: c.kwargs["body"]["spec"]["acls"]
+            for c in k8s.custom_api.patch_cluster_custom_object.await_args_list
+        }
+        a_drops = [x["match"] for x in written["a-default"] if x["action"] == "drop"]
+        assert any("10.201.0.0/24" in m for m in a_drops), a_drops
+        assert not any("10.200.0.0/24" in m for m in a_drops), "not its own prefix"
+
+    async def test_it_leaves_un_isolated_vpcs_alone(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.api.v1.vpcs import reconcile_isolation_acls
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": [
+            {"metadata": {"name": "open-default"},
+             "spec": {"vpc": "open", "cidrBlock": "10.202.0.0/24", "acls": []}},
+        ]})
+        k8s.custom_api.patch_cluster_custom_object = AsyncMock()
+
+        assert await reconcile_isolation_acls(k8s) == 0
+        k8s.custom_api.patch_cluster_custom_object.assert_not_awaited()
