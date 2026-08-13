@@ -38,13 +38,20 @@ export function useVpc(name: string | undefined) {
   });
 }
 
+// Creating or deleting a VPC also creates or deletes its default subnet, and
+// the Subnets tab reads a different key. Without this it kept showing the
+// list from before the VPC existed — "Total Subnets 2" with four on the
+// cluster — until someone reloaded the page.
+function invalidateVpcAndSubnets(queryClient: ReturnType<typeof useQueryClient>) {
+  queryClient.invalidateQueries({ queryKey: ['vpcs'] });
+  queryClient.invalidateQueries({ queryKey: ['network'] });
+}
+
 export function useCreateVpc() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (request: CreateVpcRequest) => createVpc(request),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['vpcs'] });
-    },
+    onSuccess: () => invalidateVpcAndSubnets(queryClient),
   });
 }
 
@@ -52,9 +59,7 @@ export function useDeleteVpc() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (name: string) => deleteVpc(name),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['vpcs'] });
-    },
+    onSuccess: () => invalidateVpcAndSubnets(queryClient),
   });
 }
 
