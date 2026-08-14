@@ -3,7 +3,6 @@
 import asyncio
 import json
 import logging
-import secrets
 import uuid
 from typing import Any, Literal
 
@@ -72,26 +71,38 @@ from app.core.constants import KUBEOVN_SYSTEM_VPC as SYSTEM_VPC_NAME  # noqa: E4
 
 
 
-def allocate_mac() -> str:
-    """A MAC that belongs to the VM object, not to one boot of it.
-
-    KubeVirt generates a MAC when the VMI starts and it lives only on the
-    VMI, so a VM restored from a backup comes up with a different one.
-    Ubuntu's cloud-init writes netplan matching the MAC it saw at first boot,
-    so the restored guest has an interface it does not recognise:
-
-        enp1s0  DOWN  b6:68:8e:58:ba:1d
-        netplan: match: macaddress: "6a:aa:5d:81:45:49"
-
-    — no address, no DNS, no network at all, while Velero reports Completed
-    and the VMI reports Running with an IP the guest never used. Verified on
-    the cluster by restoring `web1` from a Velero backup.
-
-    Written into the VM's own spec at creation, which is what a backup
-    captures, so the restored VM keeps the identity its guest was configured
-    for. 0x02 in the first octet: locally administered, unicast.
-    """
-    return "02:" + ":".join(f"{b:02x}" for b in secrets.token_bytes(5))
+# Network config handed to the guest, so it matches its NIC by name.
+#
+# Left to itself, cloud-init on Ubuntu writes netplan pinned to the MAC it saw
+# on first boot:
+#
+#     enp1s0: {match: {macaddress: "6a:aa:5d:81:45:49"}, dhcp4: true}
+#
+# KubeVirt generates that MAC when the VMI starts and keeps it nowhere the VM
+# object can carry, so a VM restored from a backup boots with a different one,
+# and the guest has an interface it does not recognise — no address, no DNS,
+# while Velero reports Completed and the VM page shows an IP the guest never
+# used. Measured on the cluster:
+#
+#     enp1s0  DOWN  b6:68:8e:58:ba:1d
+#     getent hosts example.com  -> rc=2
+#
+# Matching on the name instead makes the guest indifferent to the MAC, which
+# is the property we actually need: pinning the address into the VM spec would
+# hand every clone (and every restore made alongside the original) a duplicate
+# MAC on the same subnet.
+#
+# `optional: true` keeps a NIC without carrier from holding the boot for two
+# minutes; cloud-init's own data comes from the attached disk, not the network.
+GUEST_NETWORK_DATA = """version: 2
+ethernets:
+  primary:
+    match:
+      name: "e*"
+    dhcp4: true
+    dhcp6: false
+    optional: true
+"""
 
 
 def build_vpc_dns_spec(namespace: str, vip: str) -> dict[str, Any]:
@@ -1366,18 +1377,18 @@ async def create_vm_from_template(
             ],
         }
         
-        # Add cloud-init volume if configured
+        # The cloud-init disk is attached even with no user data: it carries
+        # the network config that keeps the guest from pinning itself to a MAC
+        # (see GUEST_NETWORK_DATA). Without a datasource at all, cloud-init
+        # falls back to its own guess and writes a MAC match again.
+        ci: dict[str, str] = {"networkData": GUEST_NETWORK_DATA}
         if cloud_init_data:
-            vm_spec["domain"]["devices"]["disks"].append({
-                "name": "cloudinit",
-                "disk": {"bus": "virtio"},
-            })
-            vm_spec["volumes"].append({
-                "name": "cloudinit",
-                "cloudInitNoCloud": {
-                    "userData": cloud_init_data,
-                },
-            })
+            ci["userData"] = cloud_init_data
+        vm_spec["domain"]["devices"]["disks"].append({
+            "name": "cloudinit",
+            "disk": {"bus": "virtio"},
+        })
+        vm_spec["volumes"].append({"name": "cloudinit", "cloudInitNoCloud": ci})
         
         # Handle network configuration
         # Priority: request.networks (multi-NIC) > request.network (single, backward compat) > template multus > default pod network
@@ -1395,7 +1406,6 @@ async def create_vm_from_template(
             static_ips: list[str] = []
             has_bridge = False  # tracks whether any NIC uses bridge binding
             vpc_dns_needed = False  # any NIC on a VPC overlay (not the cluster VPC)
-            primary_mac: str | None = None  # MAC of NIC 0, for the OVN port
 
             for idx, nic in enumerate(nic_list):
                 subnet_name = nic.subnet
@@ -1427,12 +1437,7 @@ async def create_vm_from_template(
                     if idx == 0:
                         multus_entry["default"] = True
                     net_specs.append({"name": iface_name, "multus": multus_entry})
-                    mac = allocate_mac()
-                    if idx == 0:
-                        primary_mac = mac
-                    iface_specs.append({
-                        "name": iface_name, "bridge": {}, "macAddress": mac,
-                    })
+                    iface_specs.append({"name": iface_name, "bridge": {}})
                     has_bridge = True
                 else:
                     # VPC overlay: default pod network. Bind defaults to
@@ -1457,11 +1462,7 @@ async def create_vm_from_template(
                         if vm_request.network_binding == "masquerade"
                         else "bridge"
                     )
-                    mac = allocate_mac()
-                    primary_mac = mac
-                    iface_specs.append({
-                        "name": iface_name, vpc_binding: {}, "macAddress": mac,
-                    })
+                    iface_specs.append({"name": iface_name, vpc_binding: {}})
                     if vpc_binding == "bridge":
                         has_bridge = True
                     # `ovn-cluster` is the cluster's own VPC: its pods reach
@@ -1488,17 +1489,6 @@ async def create_vm_from_template(
             first_subnet = nic_list[0].subnet
             template_annotations["ovn.kubernetes.io/logical_switch"] = first_subnet
 
-            # The OVN port has to be given the same MAC the guest will use.
-            #
-            # With bridge binding the guest's own frames go on the wire, and
-            # kube-ovn binds the logical switch port to the MAC it allocated —
-            # so a VM whose interface carries a different MAC comes up with an
-            # address and no reachable network. Measured on the cluster after
-            # pinning the MAC without this annotation: guest 02:f3:2d:80:64:96,
-            # OVN port 96:77:a8:8c:7b:3b, and a pod on the same subnet could
-            # not open tcp/22 on the VM at all.
-            if primary_mac:
-                template_annotations["ovn.kubernetes.io/mac_address"] = primary_mac
 
             # Static IPs via Kube-OVN annotation (comma-separated for multi-NIC)
             if static_ips:
@@ -1529,10 +1519,8 @@ async def create_vm_from_template(
                 vm_spec["networks"] = [
                     {"name": "default", "multus": {"networkName": network_config["multus_network"]}}
                 ]
-                fallback_mac = allocate_mac()
-                template_annotations["ovn.kubernetes.io/mac_address"] = fallback_mac
                 vm_spec["domain"]["devices"]["interfaces"] = [
-                    {"name": "default", "bridge": {}, "macAddress": fallback_mac}
+                    {"name": "default", "bridge": {}}
                 ]
         
         # Build template metadata. We deliberately do NOT set
