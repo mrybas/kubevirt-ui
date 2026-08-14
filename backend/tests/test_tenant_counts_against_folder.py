@@ -91,6 +91,7 @@ class TestItIsCheckedAndWritten:
             side_effect=ApiException(status=409),
         )
         k8s.core_api.replace_namespaced_resource_quota = AsyncMock()
+        k8s.core_api.create_namespaced_limit_range = AsyncMock()
         await _write_tenant_quota(k8s, "tenant-tci", {
             "cpu": "2", "memory": "1", "storage": "1",
         })
@@ -155,6 +156,7 @@ class TestScalingResizesTheQuota:
             side_effect=ApiException(status=409),
         )
         k8s.core_api.replace_namespaced_resource_quota = AsyncMock()
+        k8s.core_api.create_namespaced_limit_range = AsyncMock()
 
         await _write_tenant_quota(k8s, "tenant-tci", {
             "cpu": "4", "memory": "8", "storage": "40",
@@ -183,6 +185,7 @@ async def test_the_tenant_quota_never_caps_limits() -> None:
 
     k8s = MagicMock()
     k8s.core_api.create_namespaced_resource_quota = AsyncMock()
+    k8s.core_api.create_namespaced_limit_range = AsyncMock()
     await _write_tenant_quota(k8s, "tenant-tstor", {
         "cpu": "2", "memory": "1073741824", "storage": "21474836480",
     })
@@ -191,3 +194,39 @@ async def test_the_tenant_quota_never_caps_limits() -> None:
     hard = body.spec.hard
     assert "requests.cpu" in hard
     assert not [k for k in hard if k.startswith("limits.")], hard
+
+
+@pytest.mark.asyncio
+async def test_a_limit_range_covers_pods_that_declare_nothing() -> None:
+    """Kamaji's containers declare neither requests nor limits.
+
+    With a quota on the namespace and nothing to default them, the control
+    plane cannot be created at all:
+
+        must specify requests.cpu for: chmod, kine, kube-apiserver,
+        kube-controller-manager, kube-scheduler
+
+    Only `defaultRequest`: a defaulted *limit* would throttle the tenant's
+    apiserver at whatever number we happened to pick.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.api.v1.tenants_crud import _write_tenant_quota
+
+    k8s = MagicMock()
+    k8s.core_api.create_namespaced_resource_quota = AsyncMock()
+    k8s.core_api.create_namespaced_limit_range = AsyncMock()
+
+    await _write_tenant_quota(k8s, "tenant-tstor", {
+        "cpu": "2", "memory": "1", "storage": "1",
+    })
+
+    lr = k8s.core_api.create_namespaced_limit_range.await_args.kwargs["body"]
+    item = lr.spec.limits[0]
+    assert item.default_request == {"cpu": "50m", "memory": "128Mi"}
+    assert getattr(item, "default", None) is None
+    # …and it is in place before the quota starts refusing pods.
+    assert (
+        k8s.core_api.create_namespaced_limit_range.await_args_list
+        and k8s.core_api.create_namespaced_resource_quota.await_count == 1
+    )

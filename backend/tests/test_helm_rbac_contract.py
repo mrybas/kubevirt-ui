@@ -95,6 +95,9 @@ REQUIRED: list[tuple[str, str, str, str]] = [
      "tenants_crud.delete_tenant (namespace teardown)"),
     ("", "resourcequotas", "list", "folders._allocated_env_quota"),
     ("", "limitranges", "create", "folders._create_environment_ns"),
+    # Kamaji's control-plane pods declare no requests at all; without a
+    # LimitRange to default them the tenant quota refuses the control plane.
+    ("", "limitranges", "create", "tenants_crud._ensure_tenant_limit_range"),
     ("apps", "daemonsets", "get", "vpc_underlay._kubeovn_cni_image"),
     ("apps", "daemonsets", "list", "vpc_underlay.get (workaround DaemonSets)"),
     # --- Talos tenants: PKI via cert-manager for the CSR signer ---

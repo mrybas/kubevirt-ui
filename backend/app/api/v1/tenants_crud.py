@@ -841,6 +841,26 @@ def _tenant_quota(req: Any) -> dict[str, str]:
     }
 
 
+async def _ensure_tenant_limit_range(k8s, ns: str) -> None:
+    """Default requests for pods that declare none (the Kamaji control plane)."""
+    body = client.V1LimitRange(
+        metadata=client.V1ObjectMeta(
+            name=f"{ns}-limits", labels={"kubevirt-ui.io/managed": "true"},
+        ),
+        spec=client.V1LimitRangeSpec(limits=[
+            client.V1LimitRangeItem(
+                type="Container",
+                default_request={"cpu": "50m", "memory": "128Mi"},
+            ),
+        ]),
+    )
+    try:
+        await k8s.core_api.create_namespaced_limit_range(namespace=ns, body=body)
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+
 async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
     """Put the tenant's own quota on its namespace.
 
@@ -872,6 +892,18 @@ async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
             "requests.storage": quota["storage"],
         }),
     )
+    # Kamaji's control-plane containers declare neither requests nor limits,
+    # and a quota on requests makes requests mandatory:
+    #
+    #   pods "tstor-…" is forbidden: failed quota: tenant-tstor-quota: must
+    #   specify requests.cpu for: chmod, kine, kube-apiserver,
+    #   kube-controller-manager, kube-scheduler
+    #
+    # A LimitRange supplying defaults is what lets both coexist. Only
+    # `defaultRequest` — a defaulted *limit* would throttle the apiserver at
+    # whatever number we picked.
+    await _ensure_tenant_limit_range(k8s, ns)
+
     try:
         await k8s.core_api.create_namespaced_resource_quota(namespace=ns, body=body)
     except ApiException as e:
