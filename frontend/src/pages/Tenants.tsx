@@ -34,6 +34,7 @@ import { useAuthStore } from '../store/auth';
 import { useAppStore } from '../store';
 import type { Tenant, TenantCreateRequest, TenantAddon, AddonComponent } from '../types/tenant';
 import { WizardStepIndicator } from '../components/common/WizardStepIndicator';
+import { tenantNamespace, withDerivedAddonParams } from '@/utils/addonParams';
 import { DataTable, type Column } from '@/components/common/DataTable';
 import type { MenuItem } from '@/components/common/KebabMenu';
 import { ActionBar } from '@/components/common/ActionBar';
@@ -323,6 +324,8 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
         const params = { ...(form.addonParams[id] || {}) };
         // Inject auto-discovered values for params that weren't manually set
         const component = catalog?.components?.find((c: AddonComponent) => c.id === id);
+        // Derivation is not discovery — see utils/addonParams.
+        Object.assign(params, withDerivedAddonParams(id, params, form.name));
         if (component && discovery) {
           for (const p of component.parameters) {
             if (p.auto_discover && !params[p.id]) {
@@ -340,8 +343,6 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                 // backend fills these itself for the auto-added one.
                 const sc = form.storage_class || suggestedStorageClass;
                 if (sc) params[p.id] = sc;
-              } else if (p.id === 'INFRA_CLUSTER_NAMESPACE') {
-                params[p.id] = `tenant-${form.name}`;
               }
             }
           }
@@ -1230,6 +1231,11 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                                 ) : (
                                   <input
                                     type="text"
+                                    placeholder={
+                                      p.id === 'INFRA_CLUSTER_NAMESPACE'
+                                        ? tenantNamespace(form.name || '<name>')
+                                        : p.default || ''
+                                    }
                                     value={form.addonParams[c.id]?.[p.id] || p.default}
                                     onChange={e => setForm({
                                       ...form,
