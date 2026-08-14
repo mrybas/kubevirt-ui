@@ -66,10 +66,16 @@ def _build_helm_values(
     # Secret with kubeconfig) are created by `tenants_storage`, this just
     # wires the tenant-CP chart values to point at them.
     if component.id == "kubevirt-csi-driver":
-        infra_ns = user_params.get("INFRA_CLUSTER_NAMESPACE", "")
+        # An empty namespace is not a default, it is a broken driver: every
+        # CreateVolume then reaches the host API with a resource name and no
+        # namespace and comes back as
+        #   rpc error: ... an empty namespace may not be set when a resource
+        #   name is provided
+        # The tenant's own namespace is the only correct value here, and it
+        # is derivable, so never leave the field blank.
+        infra_ns = user_params.get("INFRA_CLUSTER_NAMESPACE", "") or _tenant_ns(tenant_name)
         infra_sc = user_params.get("INFRA_STORAGE_CLASS_NAME", "")
-        if infra_ns:
-            values["infraClusterNamespace"] = infra_ns
+        values["infraClusterNamespace"] = infra_ns
         if infra_sc:
             sc_list = values.setdefault("storageClasses", [{}])
             if sc_list:

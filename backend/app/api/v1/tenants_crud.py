@@ -1117,7 +1117,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         # T4 — when tenant storage is enabled, auto-include the
         # kubevirt-csi-driver addon (idempotent: user might also tick the
         # box in the wizard; that's fine, we don't double-add).
-        if req.enable_storage and KUBEVIRT_CSI_ADDON_ID not in addon_ids:
+        if req.enable_storage:
             csi_component = catalog.get_component(KUBEVIRT_CSI_ADDON_ID)
             if csi_component:
                 ns_for_quota = _tenant_ns(req.name)
@@ -1135,13 +1135,34 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                                  "cluster default"
                         )
                     )
-                all_addons.append(TenantAddon(
-                    addon_id=KUBEVIRT_CSI_ADDON_ID,
-                    parameters={
-                        "INFRA_CLUSTER_NAMESPACE": ns_for_quota,
-                        "INFRA_STORAGE_CLASS_NAME": infra_sc,
-                    },
-                ))
+                wired = {
+                    "INFRA_CLUSTER_NAMESPACE": ns_for_quota,
+                    "INFRA_STORAGE_CLASS_NAME": infra_sc,
+                }
+                # The wizard also shows this addon as a tickable box, with
+                # both fields blank. Ticking it used to skip this whole
+                # block, so the driver was installed with
+                # `infraClusterNamespace: ""` and every PVC in the tenant
+                # failed with
+                #   an empty namespace may not be set when a resource name
+                #   is provided
+                # — the checkbox the UI offered turned the feature off.
+                # Fill in what the operator left blank instead of stepping
+                # aside; anything they did type still wins.
+                existing = next(
+                    (a for a in all_addons if a.addon_id == KUBEVIRT_CSI_ADDON_ID),
+                    None,
+                )
+                if existing is None:
+                    all_addons.append(TenantAddon(
+                        addon_id=KUBEVIRT_CSI_ADDON_ID, parameters=wired,
+                    ))
+                else:
+                    params = dict(existing.parameters or {})
+                    for key, value in wired.items():
+                        if not params.get(key):
+                            params[key] = value
+                    existing.parameters = params
             else:
                 # Catalog ConfigMap doesn't have the entry — likely the
                 # k8s-bootstrap repo hasn't been re-flux'd yet. Log and
