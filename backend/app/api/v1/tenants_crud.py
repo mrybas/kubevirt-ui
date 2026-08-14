@@ -852,12 +852,24 @@ async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
         metadata=client.V1ObjectMeta(
             name=f"{ns}-quota", labels={"kubevirt-ui.io/managed": "true"},
         ),
+        # Requests only — never `limits.*`.
+        #
+        # A ResourceQuota that caps a limit makes the API server *require*
+        # that limit on every pod in the namespace, and the Kamaji control
+        # plane declares none. Every tenant created in a folder since the
+        # quota was introduced simply had no control plane:
+        #
+        #   pods "tstor-7f5f7655fb-nvctq" is forbidden: failed quota:
+        #   tenant-tstor-quota: must specify limits.cpu for: chmod, kine,
+        #   konnectivity-server, kube-apiserver, kube-controller-manager,
+        #   kube-scheduler
+        #
+        # — the TenantControlPlane sat NotReady with zero pods, and the
+        # tenant page reported Provisioning forever.
         spec=client.V1ResourceQuotaSpec(hard={
             "requests.cpu": quota["cpu"],
             "requests.memory": quota["memory"],
             "requests.storage": quota["storage"],
-            "limits.cpu": quota["cpu"],
-            "limits.memory": quota["memory"],
         }),
     )
     try:

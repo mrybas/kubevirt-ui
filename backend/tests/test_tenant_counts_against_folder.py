@@ -160,3 +160,34 @@ class TestScalingResizesTheQuota:
             "cpu": "4", "memory": "8", "storage": "40",
         })
         k8s.core_api.replace_namespaced_resource_quota.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_the_tenant_quota_never_caps_limits() -> None:
+    """Capping a limit makes it mandatory for every pod in the namespace.
+
+    The Kamaji control plane declares no limits, so a tenant quota with
+    `limits.cpu` made the control plane impossible to create:
+
+        pods "tstor-7f5f7655fb-nvctq" is forbidden: failed quota:
+        tenant-tstor-quota: must specify limits.cpu for: chmod, kine,
+        konnectivity-server, kube-apiserver, kube-controller-manager,
+        kube-scheduler
+
+    The TenantControlPlane stayed NotReady with zero pods while the tenant
+    page reported Provisioning.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.api.v1.tenants_crud import _write_tenant_quota
+
+    k8s = MagicMock()
+    k8s.core_api.create_namespaced_resource_quota = AsyncMock()
+    await _write_tenant_quota(k8s, "tenant-tstor", {
+        "cpu": "2", "memory": "1073741824", "storage": "21474836480",
+    })
+
+    body = k8s.core_api.create_namespaced_resource_quota.await_args.kwargs["body"]
+    hard = body.spec.hard
+    assert "requests.cpu" in hard
+    assert not [k for k in hard if k.startswith("limits.")], hard
