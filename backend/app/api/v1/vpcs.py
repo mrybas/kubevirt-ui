@@ -1516,7 +1516,8 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
     # Peerings live in `Vpc.spec.vpcPeerings` on *both* routers — there is no
     # `vpc-peerings` object to delete, and deleting this VPC leaves the other
     # side pointing at a router that no longer exists.
-    for peering in await _get_vpc_peerings(k8s, name):
+    peerings = await _get_vpc_peerings(k8s, name)
+    for peering in peerings:
         remote = peering.remote_vpc
         if not remote:
             continue

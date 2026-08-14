@@ -146,3 +146,46 @@ async def test_the_endpoint_refuses_while_the_subnet_is_still_terminating(monkey
     assert "con3-default" in e.value.detail
     deleted = [c.kwargs.get("plural") for c in k8s.custom_api.delete_cluster_custom_object.await_args_list]
     assert "vpcs" not in deleted, "the router must still be there for the finalizer"
+
+
+@pytest.mark.asyncio
+async def test_a_successful_delete_actually_returns(monkeypatch):
+    """Every delete answered 500 — after doing all of the work.
+
+        File "/app/app/api/v1/vpcs.py", line 1586, in delete_vpc
+        NameError: name 'peerings' is not defined
+
+    The summary at the end of the handler counted a variable that the
+    peering-removal rewrite had turned into a loop-local. The VPC really was
+    gone, so the UI showed a failure for an operation that had succeeded and
+    could not be retried — `DELETE /vpcs/con4` then answered 404. Only the
+    refusal path was covered by tests, which is exactly why it survived.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.api.v1 import vpcs as mod
+
+    k8s, _ = _delete_env(set())
+    request = MagicMock()
+    request.app.state.k8s_client = k8s
+
+    subnet = MagicMock()
+    subnet.name = "reco1-default"
+    peering = MagicMock()
+    peering.remote_vpc = "ovn-cluster"
+
+    monkeypatch.setattr(mod, "_get_vpc_subnets", AsyncMock(return_value=([subnet], True)))
+    monkeypatch.setattr(mod, "_get_vpc_peerings", AsyncMock(return_value=[peering]))
+    monkeypatch.setattr(mod, "_remove_peering_side", AsyncMock())
+    monkeypatch.setattr(mod, "_delete_vpc_dns_policy", AsyncMock())
+    monkeypatch.setattr(mod, "reconcile_isolation_acls", AsyncMock(return_value=2))
+    monkeypatch.setattr("app.api.v1.ovn_gateway._get_gateway_tracking",
+                        AsyncMock(return_value=({}, None)))
+
+    result = await mod.delete_vpc(request, "reco1", user=MagicMock())
+
+    assert result["status"] == "deleted"
+    assert result["subnets_deleted"] == 1
+    assert result["peerings_deleted"] == 1
+    deleted = [c.kwargs.get("plural") for c in k8s.custom_api.delete_cluster_custom_object.await_args_list]
+    assert "vpcs" in deleted
