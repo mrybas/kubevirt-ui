@@ -1405,15 +1405,81 @@ async def get_vpc(request: Request, name: str, user: User = Depends(require_auth
     return vpc
 
 
+async def _still_present(k8s_client: Any, plural: str, names: list[str]) -> list[str]:
+    """Which of these cluster-scoped objects still exist."""
+    left = []
+    for n in names:
+        try:
+            await k8s_client.custom_api.get_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural=plural, name=n,
+            )
+            left.append(n)
+        except ApiException as e:
+            if e.status != 404:
+                left.append(n)
+    return left
+
+
+# How long the delete request is willing to hold while kube-ovn finishes. A
+# subnet normally goes in well under ten seconds; past this the caller is told
+# to retry rather than kept waiting.
+DELETE_DRAIN_TIMEOUT = 45.0
+
+
+async def _await_dependents_gone(
+    k8s_client: Any, subnets: list[str], nat: dict[str, list[str]],
+    timeout: float | None = None,
+) -> dict[str, list[str]]:
+    """Block until the VPC's subnets and NAT objects are really gone.
+
+    Every one of them is finalized by kube-ovn against the VPC's logical
+    router, so removing the Vpc CR while they are still finalizing strands
+    them permanently: the controller then loops on `not found logical router`
+    and the finalizer never comes off. Measured on the lab cluster two hours
+    after deleting `gamma-net` — `snat-gamma-net` and `eip-gamma-net` still
+    terminating, and 10.198.190.206 still missing from an external pool with
+    14 addresses left in it. `con3-default` hung the same way.
+
+    Returns whatever is still there when the deadline passes, so the caller
+    can refuse rather than create the stranded objects itself.
+    """
+    deadline = asyncio.get_running_loop().time() + (
+        DELETE_DRAIN_TIMEOUT if timeout is None else timeout
+    )
+    while True:
+        left = {"subnets": await _still_present(k8s_client, "subnets", subnets)}
+        for plural, names in nat.items():
+            remaining = await _still_present(k8s_client, plural, names)
+            if remaining:
+                left[plural] = remaining
+        if not any(left.values()):
+            return {}
+        if asyncio.get_running_loop().time() >= deadline:
+            return {k: v for k, v in left.items() if v}
+        await asyncio.sleep(2)
+
+
 @router.delete("/{name}")
 async def delete_vpc(request: Request, name: str, user: User = Depends(require_admin)) -> dict:
     """Delete a VPC and cascade-delete its subnets and peerings."""
     k8s = request.app.state.k8s_client
 
     # Clean up OVN NAT gateway if exists (keyed by vpc_name)
-    from app.api.v1.ovn_gateway import _cleanup_ovn_gateway, _get_gateway_tracking
+    from app.api.v1.ovn_gateway import OVN_GW_LABEL, _cleanup_ovn_gateway, _get_gateway_tracking
+    nat_names: dict[str, list[str]] = {}
     tracking, _ = await _get_gateway_tracking(k8s, name)
     if tracking:
+        for plural in ("ovn-snat-rules", "ovn-fips", "ovn-dnat-rules", "ovn-eips"):
+            try:
+                found = await k8s.custom_api.list_cluster_custom_object(
+                    group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural=plural,
+                    label_selector=f"{OVN_GW_LABEL}={name}",
+                )
+                names = [i["metadata"]["name"] for i in found.get("items", [])]
+                if names:
+                    nat_names[plural] = names
+            except ApiException as e:
+                logger.warning(f"Could not list {plural} for VPC {name}: {e}")
         try:
             await _cleanup_ovn_gateway(k8s, name)
         except Exception as e:
@@ -1465,6 +1531,22 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
         except ApiException as e:
             if e.status != 404:
                 logger.warning(f"Failed to delete subnet {s.name}: {e}")
+
+    # The router has to outlive everything finalized against it.
+    stranded = await _await_dependents_gone(
+        k8s, [s.name for s in subnets], nat_names,
+    )
+    if stranded:
+        detail = "; ".join(f"{k}: {', '.join(v)}" for k, v in stranded.items())
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"VPC '{name}' still has resources being deleted ({detail}). "
+                "Removing the VPC now would strand them permanently — kube-ovn "
+                "finalizes them against this VPC's router. They are already "
+                "marked for deletion; retry in a moment."
+            ),
+        )
 
     # Delete VPC
     try:

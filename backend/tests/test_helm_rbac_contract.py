@@ -103,6 +103,15 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     # --- Talos tenants: PKI via cert-manager for the CSR signer ---
     ("cert-manager.io", "issuers", "create", "tenants_talos.build_talos_pki"),
     ("cert-manager.io", "certificates", "create", "tenants_talos.build_talos_pki"),
+    # Deleting a VPC has to watch its dependents actually disappear before it
+    # removes the router they are finalized against.
+    ("kubeovn.io", "subnets", "get", "vpcs._await_dependents_gone"),
+    ("kubeovn.io", "ovn-eips", "get", "vpcs._await_dependents_gone"),
+    ("kubeovn.io", "ovn-eips", "list", "vpcs.delete_vpc (NAT inventory)"),
+    ("kubeovn.io", "ovn-snat-rules", "get", "vpcs._await_dependents_gone"),
+    ("kubeovn.io", "ovn-snat-rules", "list", "vpcs.delete_vpc (NAT inventory)"),
+    ("kubeovn.io", "ovn-fips", "list", "vpcs.delete_vpc (NAT inventory)"),
+    ("kubeovn.io", "ovn-dnat-rules", "list", "vpcs.delete_vpc (NAT inventory)"),
 ]
 
 
