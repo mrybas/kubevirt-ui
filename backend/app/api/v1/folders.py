@@ -1060,7 +1060,7 @@ async def update_folder(request: Request, name: str, update: FolderUpdateRequest
     await _save_folder_meta(k8s_client, name, save_meta)
     logger.info(f"Updated folder: {name}")
 
-    return await get_folder(request, name)
+    return await get_folder(request, name, user=user)
 
 
 @router.delete("/{name}", status_code=204)
@@ -1137,7 +1137,7 @@ async def move_folder(request: Request, name: str, move: FolderMoveRequest, user
 
     # TODO: re-propagate RBAC for moved subtree
 
-    return await get_folder(request, name)
+    return await get_folder(request, name, user=user)
 
 
 # ---------------------------------------------------------------------------

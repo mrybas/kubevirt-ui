@@ -1494,7 +1494,13 @@ async def scale_tenant(
     # then be refused pod by pod.
     await _write_tenant_quota(k8s, ns, planned_quota)
 
-    return await get_tenant(request, name)
+    # `user` must be handed over explicitly: calling an endpoint function
+    # directly bypasses FastAPI's dependency resolution, so its
+    # `user: User = Depends(require_auth)` default arrives as the Depends
+    # object itself and the first authorisation check dies with
+    # `'Depends' object has no attribute 'groups'` — a 500 on every scale,
+    # after the scale had already been applied.
+    return await get_tenant(request, name, user=user)
 
 
 @router.get("/{name}/storage/status", response_model=TenantStorageStatus)
