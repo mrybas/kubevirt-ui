@@ -355,6 +355,58 @@ async def get_hotplug_capabilities(
         }
 
 
+async def _datavolume_blockers(
+    k8s_client: Any, namespace: str, vm: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Why the VM's disks are not ready, if they are not.
+
+    A clone refused for storage quota shows `DataVolumeError` on the VM and
+    `Ready=False VMINotExists: VMI does not exist` in its conditions — true,
+    and useless. What actually happened lives on the DataVolume:
+
+        Running=False Error: persistentvolumeclaims "tmp-pvc-591d600d…" is
+        forbidden: exceeded quota: acme-dev-quota, requested:
+        requests.storage=10737418240, used: requests.storage=85899345920
+
+    (a CSI clone needs a temporary PVC on top of the disk it is creating, so
+    a quota that fits the disk exactly still refuses the clone.)
+    """
+    template = ((vm.get("spec") or {}).get("template") or {}).get("spec") or {}
+    names = [
+        (v.get("dataVolume") or {}).get("name")
+        for v in (template.get("volumes") or [])
+        if v.get("dataVolume")
+    ]
+    names += [
+        (dvt.get("metadata") or {}).get("name")
+        for dvt in ((vm.get("spec") or {}).get("dataVolumeTemplates") or [])
+    ]
+
+    out: list[dict[str, str]] = []
+    for dv_name in {n for n in names if n}:
+        try:
+            dv = await k8s_client.custom_api.get_namespaced_custom_object(
+                group="cdi.kubevirt.io", version="v1beta1", namespace=namespace,
+                plural="datavolumes", name=dv_name,
+            )
+        except Exception:
+            continue
+        status = dv.get("status") or {}
+        if status.get("phase") == "Succeeded":
+            continue
+        for cond in status.get("conditions") or []:
+            if cond.get("status") == "True" or not cond.get("message"):
+                continue
+            out.append({
+                "type": f"DataVolume {dv_name}",
+                "status": "False",
+                "reason": cond.get("reason") or status.get("phase") or "",
+                "message": cond.get("message", ""),
+            })
+            break
+    return out
+
+
 @router.get("/{name}", response_model=VMResponse)
 async def get_vm(
     request: Request,
@@ -393,7 +445,11 @@ async def get_vm(
         except Exception:
             pass
 
-        return vm_from_k8s(vm, vmi, pod_ip=pod_ip)
+        resp = vm_from_k8s(vm, vmi, pod_ip=pod_ip)
+        resp.conditions = list(resp.conditions or []) + await _datavolume_blockers(
+            k8s_client, namespace, vm,
+        )
+        return resp
 
     except ApiException as e:
         if e.status == 404:

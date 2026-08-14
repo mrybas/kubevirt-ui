@@ -23,9 +23,13 @@ export function OverviewTab({ vm }: { vm: VM }) {
   // The first condition that explains why the VM is not up. `Synchronized`
   // carries the API server's own refusal (quota, webhooks); `Ready` carries
   // the scheduling story. A running VM has neither.
+  // A disk that cannot be created outranks both: `Ready=False VMINotExists`
+  // is true of every VM whose DataVolume failed, and says nothing.
   const blocker = (vm.status === 'Running' || vm.ready)
     ? null
     : (vm.conditions ?? []).find(
+        (c: any) => String(c.type).startsWith('DataVolume') && c.status === 'False',
+      ) ?? (vm.conditions ?? []).find(
         (c: any) => c.type === 'Synchronized' && c.status === 'False',
       ) ?? (vm.conditions ?? []).find(
         (c: any) => c.type === 'Ready' && c.status === 'False' && c.reason,

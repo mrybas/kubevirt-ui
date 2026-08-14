@@ -67,3 +67,23 @@ describe('a blocked VM explains itself', () => {
     expect(screen.queryByText(/Not running/)).not.toBeInTheDocument();
   });
 });
+
+describe('a disk that cannot be created outranks the VMI story', () => {
+  const QUOTA_CLONE =
+    'persistentvolumeclaims "tmp-pvc-591d600d" is forbidden: exceeded quota: ' +
+    'acme-dev-quota, requested: requests.storage=10737418240';
+
+  it('shows the DataVolume failure, not "VMI does not exist"', () => {
+    const vm = {
+      ...base, status: 'DataVolumeError', phase: '-', ready: false,
+      conditions: [
+        { type: 'Ready', status: 'False', reason: 'VMINotExists', message: 'VMI does not exist' },
+        { type: 'DataVolume nomac-clone-disk0', status: 'False', reason: 'Error', message: QUOTA_CLONE },
+      ],
+    };
+    render(<OverviewTab vm={vm as any} />);
+    expect(screen.getByText(/Not running: Error/)).toBeInTheDocument();
+    expect(screen.getAllByText(/exceeded quota/).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Not running: VMINotExists/)).not.toBeInTheDocument();
+  });
+});

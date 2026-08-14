@@ -72,3 +72,30 @@ class TestItIsAlwaysDelivered:
         assert '"networkData": GUEST_NETWORK_DATA' in block
         assert 'if cloud_init_data:' in block
         assert block.index('ci: dict[str, str]') < block.index('if cloud_init_data:')
+
+
+class TestTheDiskFailureReachesTheUI:
+    """A clone refused for storage quota said only "VMI does not exist".
+
+    The real reason lives on the DataVolume — and a CSI clone needs a
+    temporary PVC on top of the disk it creates, so a quota that fits the disk
+    exactly still refuses the clone:
+
+        persistentvolumeclaims "tmp-pvc-591d600d…" is forbidden: exceeded
+        quota: acme-dev-quota, requested: requests.storage=10737418240,
+        used: requests.storage=85899345920
+    """
+
+    def test_the_detail_handler_appends_datavolume_conditions(self) -> None:
+        assert "_datavolume_blockers" in SRC
+        assert "resp.conditions = list(resp.conditions or [])" in SRC
+
+    def test_it_looks_at_both_volumes_and_templates(self) -> None:
+        block = SRC[SRC.index("async def _datavolume_blockers"):SRC.index("@router.get(\"/{name}\"")]
+        assert 'v.get("dataVolume")' in block
+        assert '"dataVolumeTemplates"' in block
+
+    def test_a_ready_disk_contributes_nothing(self) -> None:
+        block = SRC[SRC.index("async def _datavolume_blockers"):SRC.index("@router.get(\"/{name}\"")]
+        assert 'if status.get("phase") == "Succeeded":' in block
+        assert "continue" in block
