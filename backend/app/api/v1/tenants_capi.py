@@ -483,6 +483,19 @@ def _build_machine_deployment_cr(req: TenantCreateRequest) -> dict[str, Any]:
             "template": {
                 "spec": {
                     "clusterName": req.name,
+                    # Remediating a dead worker means deleting its Machine,
+                    # and CAPI drains the node first. A node that is gone
+                    # cannot be drained: on the cluster it stopped at
+                    #
+                    #   DrainingSucceeded=False Draining: cannot evict pod as
+                    #   it would violate the pod's disruption budget. The
+                    #   disruption budget calico-typha needs 0 healthy pods
+                    #   and has 0 currently
+                    #
+                    # and with no timeout CAPI retried that forever — the
+                    # replacement worker never arrived and the tenant kept a
+                    # NotReady node indefinitely.
+                    "nodeDrainTimeout": "5m",
                     "version": req.kubernetes_version,
                     # Talos nodes are not bootstrapped by kubeadm — they get a
                     # machine config and ask a trustd signer for a certificate,

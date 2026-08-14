@@ -56,3 +56,31 @@ class TestMachineHealthCheck:
 
         src = Path("app/api/v1/tenants_capi.py").read_text()
         assert '"machinehealthchecks", _build_machine_health_check_cr(req)' in src
+
+
+class TestRemediationCanFinish:
+    """Deleting a dead worker's Machine drains its node first.
+
+    A node that is gone cannot be drained, and CAPI retries forever unless a
+    timeout says otherwise. On the cluster the remediation cordoned the node
+    and then stopped:
+
+        DrainingSucceeded=False Draining: cannot evict pod as it would violate
+        the pod's disruption budget. The disruption budget calico-typha needs
+        0 healthy pods and has 0 currently
+
+    — Machine deleting since 07:35, replacement never created.
+    """
+
+    def test_the_worker_template_gives_the_drain_a_deadline(self) -> None:
+        from unittest.mock import MagicMock
+
+        from app.api.v1.tenants_capi import _build_machine_deployment_cr
+
+        req = MagicMock()
+        req.name = "tci"
+        req.kubernetes_version = "v1.32.1"
+        req.worker_count = 1
+        req.worker_os = "cloud-init"
+        cr = _build_machine_deployment_cr(req)
+        assert cr["spec"]["template"]["spec"]["nodeDrainTimeout"] == "5m"
