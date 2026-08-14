@@ -1328,14 +1328,20 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
         except Exception as e:
             logger.warning(f"Failed to set up OVN NAT for VPC {data.name}: {e}")
 
-    # Older VPCs have never heard of this prefix; their drop rules are
-    # literal matches, so re-scope every isolated VPC to the new peer set.
-    if data.isolated:
-        try:
-            n = await reconcile_isolation_acls(k8s)
-            logger.info(f"Isolation ACLs re-scoped on {n} VPC subnet(s)")
-        except Exception as e:
-            logger.warning(f"Isolation reconcile after creating {data.name!r} failed: {e}")
+    # Older VPCs have never heard of this prefix; their drop rules are literal
+    # matches, so re-scope every isolated VPC to the new peer set.
+    #
+    # Unconditionally — not only when the new VPC is itself isolated. Gating
+    # on that punched a hole in every isolated VPC each time an un-isolated
+    # one appeared: four VPCs created concurrently took 10.211–10.214 and
+    # `acme-net`, isolated, went on dropping only 10.205/206/208/209.
+    # Isolation is about who may reach *this* VPC; the other side's setting
+    # has no say in it.
+    try:
+        n = await reconcile_isolation_acls(k8s)
+        logger.info(f"Isolation ACLs re-scoped on {n} VPC subnet(s)")
+    except Exception as e:
+        logger.warning(f"Isolation reconcile after creating {data.name!r} failed: {e}")
 
     return VpcResponse(
         name=data.name,
@@ -1440,6 +1446,14 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
         if e.status == 404:
             raise HTTPException(status_code=404, detail=f"VPC '{name}' not found")
         raise k8s_error_to_http(e, "VPC operation")
+
+    # The other VPCs' drop rules name this prefix literally; leave them and a
+    # future VPC handed the same CIDR inherits a block nobody wrote for it.
+    try:
+        n = await reconcile_isolation_acls(k8s)
+        logger.info(f"Isolation ACLs re-scoped on {n} VPC subnet(s) after deleting {name!r}")
+    except Exception as e:
+        logger.warning(f"Isolation reconcile after deleting {name!r} failed: {e}")
 
     return {
         "status": "deleted",

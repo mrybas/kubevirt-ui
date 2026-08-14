@@ -135,3 +135,30 @@ def test_the_create_path_passes_the_client_it_actually_has():
     # The only legitimate mention is where the client is bound.
     assert body.count("k8s_client") == 1
     assert "k8s = request.app.state.k8s_client" in body
+
+
+def test_every_create_re_scopes_not_only_isolated_ones():
+    """An un-isolated VPC is still a tenant the isolated ones must not reach.
+
+    Gating the reconcile on the *new* VPC's own setting punched a hole in
+    every isolated VPC each time an un-isolated one appeared: four VPCs
+    created concurrently took 10.211–10.214, and `acme-net`, isolated, went
+    on dropping only 10.205/206/208/209.
+    """
+    from pathlib import Path
+
+    src = Path("app/api/v1/vpcs.py").read_text()
+    start = src.index("async def create_vpc(")
+    body = src[start:src.index("\n@router.", start)]
+    assert "reconcile_isolation_acls(k8s)" in body
+    assert "if data.isolated:\n        try:\n            n = await reconcile" not in body
+
+
+def test_delete_re_scopes_too():
+    """A stale drop rule blocks whoever is handed that CIDR next."""
+    from pathlib import Path
+
+    src = Path("app/api/v1/vpcs.py").read_text()
+    start = src.index("async def delete_vpc(")
+    body = src[start:src.index("\n@router.", start)]
+    assert "reconcile_isolation_acls(k8s)" in body
