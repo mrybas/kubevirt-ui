@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useEgressGateways, useCreateEgressGateway, useDeleteEgressGateway, useAttachVpc, useDetachVpc } from '../hooks/useEgressGateways';
+import { useBgpConfs } from '../hooks/useBgp';
 import { useVpcs } from '../hooks/useVpcs';
 import type { EgressGateway, CreateEgressGatewayRequest, AttachVpcRequest } from '../types/egress';
 import { Modal } from '@/components/common/Modal';
@@ -199,7 +200,7 @@ const DEFAULT_FORM: CreateEgressGatewayRequest = {
 
 type ExternalMode = 'existing' | 'create';
 
-function CreateEgressGatewayModal({
+export function CreateEgressGatewayModal({
   subnets,
   onClose,
 }: {
@@ -207,6 +208,7 @@ function CreateEgressGatewayModal({
   onClose: () => void;
 }) {
   const [form, setForm] = useState<CreateEgressGatewayRequest>(DEFAULT_FORM);
+  const { data: bgpConfs } = useBgpConfs();
   const [externalMode, setExternalMode] = useState<ExternalMode>(subnets.length > 0 ? 'existing' : 'create');
   const [excludeIpInput, setExcludeIpInput] = useState('');
   const createGateway = useCreateEgressGateway();
@@ -490,6 +492,38 @@ function CreateEgressGatewayModal({
                 </button>
               ))}
             </div>
+          </div>
+
+          {/* BGP peering — without it the VPC's prefix is never announced.
+              The backend and the CRD have carried `bgpConf` all along
+              (VpcEgressGateway.spec.bgpConf, a BgpConf name), and the request
+              type has `bgp_conf`; only this control was missing, so a
+              BGP-peered gateway could not be created from the screen at all.
+              Verified on the lab router afterwards: the session reaches
+              Established and `10.100.0.0/24 via <gateway external IP>` lands
+              in its kernel table. */}
+          <div>
+            <label className="block text-sm text-surface-300 mb-1">
+              BGP peering{' '}
+              <span className="text-surface-500">(optional)</span>
+            </label>
+            <select
+              value={form.bgp_conf ?? ''}
+              onChange={(e) => set('bgp_conf', e.target.value || undefined)}
+              className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-200 focus:outline-none focus:border-primary-500"
+            >
+              <option value="">No BGP — reachable through NAT only</option>
+              {(bgpConfs?.items ?? []).map((c) => (
+                <option key={c.name} value={c.name}>
+                  {c.name} — AS {c.local_asn} → {c.peer_asn} @ {c.neighbours.join(', ')}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-surface-500 mt-1">
+              {(bgpConfs?.items?.length ?? 0) === 0
+                ? 'No BgpConf exists yet — create one under Network → BGP Peering first.'
+                : "The gateway's FRR peers with this neighbour and announces the CIDRs of every attached VPC."}
+            </p>
           </div>
 
           {/* BFD Enabled */}
