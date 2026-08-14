@@ -5,6 +5,7 @@ import {
   Network,
   CheckCircle,
   XCircle,
+  AlertTriangle,
 } from 'lucide-react';
 import type { VM } from '../../../types/vm';
 import { CopyableValue } from '@/components/common/CopyableValue';
@@ -19,6 +20,17 @@ function DetailRow({ label, value }: { label: string; value: string }) {
 }
 
 export function OverviewTab({ vm }: { vm: VM }) {
+  // The first condition that explains why the VM is not up. `Synchronized`
+  // carries the API server's own refusal (quota, webhooks); `Ready` carries
+  // the scheduling story. A running VM has neither.
+  const blocker = (vm.status === 'Running' || vm.ready)
+    ? null
+    : (vm.conditions ?? []).find(
+        (c: any) => c.type === 'Synchronized' && c.status === 'False',
+      ) ?? (vm.conditions ?? []).find(
+        (c: any) => c.type === 'Ready' && c.status === 'False' && c.reason,
+      ) ?? null;
+
   return (
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div className="lg:col-span-2 space-y-6">
@@ -179,6 +191,34 @@ export function OverviewTab({ vm }: { vm: VM }) {
                   </div>
                 </details>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* What is stopping this VM from running.
+          *
+          * The reason was already here — inside the collapsed Conditions
+          * panel below — which is not where someone looks at a VM that has
+          * said "Starting…" for twenty minutes. A VM refused by its
+          * environment's quota is indistinguishable from a slow one:
+          *
+          *   Synchronized=False FailedCreate: failed to create virtual
+          *   machine pod: ... is forbidden: exceeded quota: acme-dev-quota
+          */}
+        {blocker && (
+          <div className="card border-amber-500/40 bg-amber-500/5">
+            <div className="card-body flex items-start gap-3">
+              <AlertTriangle className="h-5 w-5 text-amber-400 shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <div className="text-sm font-medium text-amber-300">
+                  Not running: {blocker.reason || blocker.type}
+                </div>
+                {blocker.message && (
+                  <div className="text-xs text-surface-300 mt-1 break-words">
+                    {blocker.message}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}
