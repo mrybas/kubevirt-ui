@@ -225,6 +225,10 @@ rules:
       - ovn-dnat-rules
       - ovn-fips
       - security-groups
+      # The tenant control-plane VIP, published inside the tenant's own VPC
+      # so the join path does not depend on the VPC default route
+      # (tenants_capi._ensure_cp_reachable_in_vpc).
+      - switch-lb-rules
       # FRR config an egress gateway peers BGP with. One shared object serves
       # every gateway; without it a UI-created VPC is reachable by NAT only
       # (bgp.py — BGPCONF_PLURAL).

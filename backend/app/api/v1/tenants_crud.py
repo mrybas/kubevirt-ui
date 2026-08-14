@@ -87,6 +87,9 @@ from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.api.v1.tenants_capi import (
     _create_capi_resources,
     _detach_tenant_ns_from_vpc_subnet,
+    _ensure_cp_reachable_in_vpc,
+    _remove_cp_vpc_publication,
+    tenant_vpc_name,
 )
 from app.api.v1.tenants_addons import (
     _build_helm_values,
@@ -1104,6 +1107,23 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         # 3. Create CAPI resources + Ingress.
         await _create_capi_resources(k8s, req, storage_info)
 
+        # 3b. Publish the control-plane VIP inside the tenant's VPC.
+        #
+        # Without it the workers reach their apiserver by leaving the VPC on
+        # its default route (measured with ovn-trace), which makes the join
+        # path hostage to whatever else edits that route. Kamaji creates the
+        # Service moments after the KamajiControlPlane, so this usually has
+        # nothing to read yet — `get_tenant` retries it, and that is the path
+        # that normally wins.
+        if req.vpc_name:
+            try:
+                await _ensure_cp_reachable_in_vpc(k8s, req.name, req.vpc_name)
+            except Exception as e:
+                logger.warning(
+                    f"Tenant {req.name!r}: could not publish the control plane "
+                    f"in VPC {req.vpc_name!r} yet ({e}); will retry on read",
+                )
+
         # 4. Create addon resources (Flux HelmRelease CRs)
         catalog = await _get_addon_catalog(k8s)
 
@@ -1241,6 +1261,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             # Subnet, so without this the subnet would carry a stale entry
             # for an aborted tenant.
             await _detach_tenant_ns_from_vpc_subnet(k8s, req.name)
+            await _remove_cp_vpc_publication(k8s, req.name)
         except Exception:
             pass
         try:
@@ -1291,6 +1312,16 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
         if e.status == 404:
             raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
         raise k8s_error_to_http(e, "tenant operation")
+
+    # Self-heal: the Service does not exist when the tenant is created, so
+    # this is where the control-plane VIP usually gets published. Cheap and
+    # idempotent — one read of a cluster-scoped object, then nothing.
+    vpc_name = await tenant_vpc_name(k8s, name)
+    if vpc_name:
+        try:
+            await _ensure_cp_reachable_in_vpc(k8s, name, vpc_name)
+        except Exception as e:
+            logger.debug(f"Tenant {name!r}: CP VPC publication retry failed: {e}")
 
     addon_statuses = await _get_addon_statuses(k8s, name)
     tenant = _parse_tenant_response(cluster, addon_statuses)
@@ -1355,6 +1386,7 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
     #    and left the tenant fully alive behind a 5xx.
     for label, cleanup in (
         ("detach tenant ns from the VPC subnet", _detach_tenant_ns_from_vpc_subnet),
+        ("drop the control-plane SwitchLBRule", _remove_cp_vpc_publication),
         ("delete the CSI ClusterRoleBinding", delete_csi_cluster_role_binding),
         ("release the CP demux ports", release_cp_ports),
     ):
