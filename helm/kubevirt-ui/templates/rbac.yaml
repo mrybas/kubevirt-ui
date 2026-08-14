@@ -402,6 +402,9 @@ rules:
       # Ready while its node is NotReady, so the count has to come from the
       # NodeHealthy condition (tenants_crud._enrich_with_workers).
       - machines
+      # A worker whose node dies is only replaced if something remediates it;
+      # CAPI stays content while the infrastructure VM exists.
+      - machinehealthchecks
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   - apiGroups: ["bootstrap.cluster.x-k8s.io"]

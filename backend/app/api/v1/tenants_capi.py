@@ -423,6 +423,49 @@ def _build_kubevirt_cluster_cr(
     }
 
 
+def _build_machine_health_check_cr(req: Any) -> dict[str, Any]:
+    """Replace a worker whose node stops being Ready.
+
+    Without this nothing notices. Killing a worker's VMI on the cluster
+    brought the VM straight back — same name, fresh container disk, no
+    kubelet configuration on it — and the tenant kept a node that never
+    returned:
+
+        tci-workers-dhnn8-96ww7   NotReady   (8+ minutes, no remediation)
+        Machine: Ready=True InfrastructureReady=True NodeHealthy=Unknown
+
+    CAPI is content because the infrastructure VM exists; only the *node*
+    is gone. A MachineHealthCheck is the piece that turns that into a
+    replacement.
+
+    `maxUnhealthy: 100%` on purpose: a one-worker tenant is the common case
+    here, and the usual 40% guard would refuse to remediate the only worker —
+    exactly when the tenant is fully down and most needs it.
+    """
+    ns = _tenant_ns(req.name)
+    return {
+        "apiVersion": f"{CAPI_GROUP}/{CAPI_VERSION}",
+        "kind": "MachineHealthCheck",
+        "metadata": {
+            "name": f"{req.name}-workers",
+            "namespace": ns,
+            "labels": {"kubevirt-ui.io/tenant": req.name},
+        },
+        "spec": {
+            "clusterName": req.name,
+            "maxUnhealthy": "100%",
+            "nodeStartupTimeout": "20m",
+            "selector": {"matchLabels": {
+                "cluster.x-k8s.io/deployment-name": f"{req.name}-workers",
+            }},
+            "unhealthyConditions": [
+                {"type": "Ready", "status": "False", "timeout": "5m"},
+                {"type": "Ready", "status": "Unknown", "timeout": "5m"},
+            ],
+        },
+    }
+
+
 def _build_machine_deployment_cr(req: TenantCreateRequest) -> dict[str, Any]:
     return {
         "apiVersion": f"{CAPI_GROUP}/{CAPI_VERSION}",
@@ -1336,6 +1379,7 @@ async def _create_capi_resources(
         vm_resources = [
             (CAPI_GROUP, CAPI_VERSION, "machinedeployments", _build_machine_deployment_cr(req)),
             (KUBEVIRT_INFRA_GROUP, KUBEVIRT_INFRA_VERSION, "kubevirtmachinetemplates", _build_kubevirt_machine_template_cr(req)),
+            (CAPI_GROUP, CAPI_VERSION, "machinehealthchecks", _build_machine_health_check_cr(req)),
         ]
         if req.worker_os == "talos":
             talos_secrets = await read_talos_secrets(k8s, req.name, ns)
