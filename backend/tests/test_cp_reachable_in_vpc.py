@@ -13,10 +13,23 @@ way out. So the node's lifeline was a property of that one route: attaching an
 egress gateway added a second `0.0.0.0/0` and the tenant then sat with zero
 registered nodes for eight minutes.
 
-Publishing the same VIP on the VPC's own load balancer (a SwitchLBRule, the
-mechanism VpcDns already uses for 10.96.0.200) moves the DNAT inside the VPC.
-Verified by hand before writing this: the trace then ends at the control-plane
-pod itself, reached over the ovn-cluster peering.
+Publishing the same VIP on the VPC's own load balancer moves the DNAT inside
+the VPC — verified by hand with `ovn-nbctl lb-add`: the trace then ends at the
+control-plane pod itself, over the ovn-cluster peering.
+
+The supported route, a SwitchLBRule, is **not** enough on its own. kube-ovn
+accepts the rule, creates its `slr-<name>` Service and resolves the endpoints,
+then refuses to program the load balancer:
+
+    service.go:568 Service tenant-tstor4/slr-tstor4-cp
+                   external IP belongs to subnet: false
+
+— the VIP must belong to a subnet kube-ovn manages, and a host-cluster
+ClusterIP does not. So these helpers exist and are correct, but nothing calls
+them until the control-plane endpoint moves to an address inside the VPC
+subnet (which also means adding it to the apiserver SANs). What is wired up is
+the *removal*, so any rule left behind by 2026.10.23 gets cleaned up with its
+tenant.
 """
 
 from unittest.mock import AsyncMock, MagicMock
@@ -155,6 +168,16 @@ async def test_a_tenant_on_the_cluster_overlay_reports_no_vpc():
     }]})
 
     assert await tenant_vpc_name(k8s, "tci") == ""
+
+
+def test_nothing_creates_it_until_the_vip_can_live_in_the_vpc() -> None:
+    """Guards against re-wiring this before the endpoint moves: kube-ovn would
+    accept the rule and quietly not program it, which reads as working."""
+    from pathlib import Path
+
+    src = Path("app/api/v1/tenants_crud.py").read_text()
+
+    assert "_ensure_cp_reachable_in_vpc" not in src
 
 
 def test_delete_tenant_cleans_it_up() -> None:

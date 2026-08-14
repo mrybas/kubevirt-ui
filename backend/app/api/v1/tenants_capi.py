@@ -1161,8 +1161,27 @@ async def _ensure_cp_reachable_in_vpc(k8s, tenant_name: str, vpc_name: str) -> b
     The endpoint string does not change, so nothing has to be re-issued: only
     where the DNAT happens does.
 
+    NOT WIRED UP — kube-ovn refuses this VIP. Measured on the cluster: the
+    rule is accepted, kube-ovn creates its `slr-<name>` Service and resolves
+    the endpoints correctly, and then the controller stops at
+
+        service.go:568 Service tenant-tstor4/slr-tstor4-cp
+                       external IP belongs to subnet: false
+
+    A SwitchLBRule's VIP has to belong to a subnet kube-ovn manages; the
+    tenant's control-plane address is a ClusterIP of the *host* cluster
+    (10.96.0.0/12), which it does not. Programming it by hand
+    (`ovn-nbctl lb-add`) does work and proves the datapath — the trace then
+    ends at the control-plane pod over the peering — but that bypasses the
+    controller and it would fight us back.
+
+    Making this real needs the control-plane endpoint itself to move to an
+    address inside the VPC subnet (a `Vip` CR), which also means adding that
+    address to the apiserver certificate SANs. That is a design change, not a
+    wiring change, so this stays uncalled until it is decided.
+
     Returns True when the rule is in place. Returns False (without raising)
-    when the Kamaji Service does not exist yet — the caller retries later.
+    when the Kamaji Service does not exist yet.
     """
     ns = _tenant_ns(tenant_name)
     try:
