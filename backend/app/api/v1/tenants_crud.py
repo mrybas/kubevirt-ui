@@ -1355,16 +1355,15 @@ async def _rotate_worker_template(
     return new_name
 
 
-async def _resize_tenant_quota(k8s, name: str, ns: str, scale: Any) -> None:
-    """Re-size the tenant namespace quota to the shape it now asks for.
+async def _plan_tenant_quota(k8s, name: str, ns: str, scale: Any) -> dict[str, str]:
+    """What the tenant will need, refused here if the folder cannot cover it.
 
-    Written once at creation and never again, the quota turned every scale-up
-    into a silent half-failure: the MachineDeployment scaled, and each new
-    worker's pod was then refused for exceeding a quota sized for the tenant
-    as it used to be.
+    Called *before* anything is patched. Checking afterwards left the
+    MachineDeployment already scaled when the ceiling said no — the same
+    half-applied state this whole path exists to avoid.
 
-    The folder ceiling is asked first, with the tenant's own current
-    reservation excluded so it is not counted twice.
+    The tenant's own current reservation is excluded from the folder's sum so
+    it is not counted twice.
     """
     shape = await _current_worker_shape(k8s, ns, f"{name}-workers")
     quota = _tenant_quota(SimpleNamespace(
@@ -1390,8 +1389,7 @@ async def _resize_tenant_quota(k8s, name: str, ns: str, scale: Any) -> None:
             exclude_namespace=ns,
             asking=f"tenant '{name}'",
         )
-
-    await _write_tenant_quota(k8s, ns, quota)
+    return quota
 
 
 async def _current_worker_shape(k8s, ns: str, md_name: str) -> dict[str, Any]:
@@ -1456,6 +1454,10 @@ async def scale_tenant(
     ns = _tenant_ns(name)
     md_name = f"{name}-workers"
 
+    # Ask the folder ceiling before touching anything: a refusal must leave
+    # the tenant exactly as it was.
+    planned_quota = await _plan_tenant_quota(k8s, name, ns, scale)
+
     try:
         # Resize first (rotate template), so the replica patch below lands on
         # the MachineDeployment that already points at the new template.
@@ -1487,11 +1489,10 @@ async def scale_tenant(
             raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
         raise k8s_error_to_http(e, "tenant operation")
 
-    # The namespace quota was sized for the shape the tenant had when it was
-    # created; leaving it there makes the scale-up land and then be refused
-    # pod by pod. Re-sized to what the tenant asks for now, after the folder
-    # ceiling has been asked whether that fits.
-    await _resize_tenant_quota(k8s, name, ns, scale)
+    # Now that the shape is applied, the namespace quota follows it. Left at
+    # the size it had when the tenant was created, the scale-up would land and
+    # then be refused pod by pod.
+    await _write_tenant_quota(k8s, ns, planned_quota)
 
     return await get_tenant(request, name)
 

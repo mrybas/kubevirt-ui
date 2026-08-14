@@ -104,15 +104,27 @@ class TestScalingResizesTheQuota:
 
         src = Path("app/api/v1/tenants_crud.py").read_text()
         scale = src[src.index("async def scale_tenant"):src.index("@router.get(\"/{name}/storage/status\"")]
-        assert "_resize_tenant_quota(k8s, name, ns, scale)" in scale
+        assert "_write_tenant_quota(k8s, ns, planned_quota)" in scale
 
     async def test_it_asks_the_ceiling_excluding_the_tenant_itself(self) -> None:
         from pathlib import Path
 
         src = Path("app/api/v1/tenants_crud.py").read_text()
-        block = src[src.index("async def _resize_tenant_quota"):src.index("async def _current_worker_shape")]
+        block = src[src.index("async def _plan_tenant_quota"):src.index("async def _current_worker_shape")]
         assert "assert_within_folder_quota" in block
         assert "exclude_namespace=ns" in block
+
+    async def test_the_ceiling_is_asked_before_anything_is_patched(self) -> None:
+        # A refusal must leave the tenant exactly as it was; checking after
+        # the patch left the MachineDeployment already scaled.
+        from pathlib import Path
+
+        src = Path("app/api/v1/tenants_crud.py").read_text()
+        start = src.index("async def scale_tenant")
+        scale = src[start:src.index("@router.", start + 10)]
+        assert scale.index("_plan_tenant_quota(k8s, name, ns, scale)") < scale.index(
+            "patch_namespaced_custom_object",
+        )
 
     async def test_the_shape_comes_from_the_objects_not_from_guesswork(self) -> None:
         from pathlib import Path
