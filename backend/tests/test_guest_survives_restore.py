@@ -88,7 +88,9 @@ class TestTheDiskFailureReachesTheUI:
 
     def test_the_detail_handler_appends_datavolume_conditions(self) -> None:
         assert "_datavolume_blockers" in SRC
-        assert "resp.conditions = list(resp.conditions or [])" in SRC
+        # the handler extends whatever conditions the serializer produced
+        assert "resp.conditions" in SRC
+        assert "await _datavolume_blockers(k8s_client, namespace, vm)" in SRC
 
     def test_it_looks_at_both_volumes_and_templates(self) -> None:
         block = SRC[SRC.index("async def _datavolume_blockers"):SRC.index("@router.get(\"/{name}\"")]
