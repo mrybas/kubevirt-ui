@@ -70,7 +70,9 @@ class TestItIsCheckedAndWritten:
         assert "await _write_tenant_quota(k8s, ns, tenant_quota)" in src
 
     @pytest.mark.asyncio
-    async def test_writing_it_twice_is_not_an_error(self) -> None:
+    async def test_writing_it_twice_replaces_rather_than_failing(self) -> None:
+        # Scaling calls this again with new numbers; the second write has to
+        # land, not be swallowed.
         from unittest.mock import AsyncMock
 
         from kubernetes_asyncio.client.rest import ApiException
@@ -81,6 +83,61 @@ class TestItIsCheckedAndWritten:
         k8s.core_api.create_namespaced_resource_quota = AsyncMock(
             side_effect=ApiException(status=409),
         )
+        k8s.core_api.replace_namespaced_resource_quota = AsyncMock()
         await _write_tenant_quota(k8s, "tenant-tci", {
             "cpu": "2", "memory": "1", "storage": "1",
         })
+        k8s.core_api.replace_namespaced_resource_quota.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+class TestScalingResizesTheQuota:
+    """The quota written at creation made every scale-up a half-failure.
+
+    The MachineDeployment scaled, and each new worker's pod was then refused
+    for exceeding a quota sized for the tenant as it used to be — visible only
+    in events, with the tenant reporting the new worker count it never got.
+    """
+
+    async def test_the_scale_path_resizes_it(self) -> None:
+        from pathlib import Path
+
+        src = Path("app/api/v1/tenants_crud.py").read_text()
+        scale = src[src.index("async def scale_tenant"):src.index("@router.get(\"/{name}/storage/status\"")]
+        assert "_resize_tenant_quota(k8s, name, ns, scale)" in scale
+
+    async def test_it_asks_the_ceiling_excluding_the_tenant_itself(self) -> None:
+        from pathlib import Path
+
+        src = Path("app/api/v1/tenants_crud.py").read_text()
+        block = src[src.index("async def _resize_tenant_quota"):src.index("async def _current_worker_shape")]
+        assert "assert_within_folder_quota" in block
+        assert "exclude_namespace=ns" in block
+
+    async def test_the_shape_comes_from_the_objects_not_from_guesswork(self) -> None:
+        from pathlib import Path
+
+        src = Path("app/api/v1/tenants_crud.py").read_text()
+        block = src[src.index("async def _current_worker_shape"):]
+        block = block[:block.index("\n\n\n")]
+        assert "kubevirtmachinetemplates" in block
+        assert "kamajicontrolplanes" in block
+        assert "dataVolumeTemplates" in block
+
+    async def test_writing_the_quota_replaces_an_existing_one(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from kubernetes_asyncio.client.rest import ApiException
+
+        from app.api.v1.tenants_crud import _write_tenant_quota
+
+        k8s = MagicMock()
+        k8s.core_api.create_namespaced_resource_quota = AsyncMock(
+            side_effect=ApiException(status=409),
+        )
+        k8s.core_api.replace_namespaced_resource_quota = AsyncMock()
+
+        await _write_tenant_quota(k8s, "tenant-tci", {
+            "cpu": "4", "memory": "8", "storage": "40",
+        })
+        k8s.core_api.replace_namespaced_resource_quota.assert_awaited_once()

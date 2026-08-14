@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 import yaml
@@ -852,6 +853,11 @@ async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
     except ApiException as e:
         if e.status != 409:
             raise
+        # Already there — replace it, which is what makes scaling work: the
+        # quota was written for the shape the tenant had when it was created.
+        await k8s.core_api.replace_namespaced_resource_quota(
+            name=f"{ns}-quota", namespace=ns, body=body,
+        )
 
 
 @router.post("", response_model=TenantResponse, status_code=201)
@@ -1349,6 +1355,96 @@ async def _rotate_worker_template(
     return new_name
 
 
+async def _resize_tenant_quota(k8s, name: str, ns: str, scale: Any) -> None:
+    """Re-size the tenant namespace quota to the shape it now asks for.
+
+    Written once at creation and never again, the quota turned every scale-up
+    into a silent half-failure: the MachineDeployment scaled, and each new
+    worker's pod was then refused for exceeding a quota sized for the tenant
+    as it used to be.
+
+    The folder ceiling is asked first, with the tenant's own current
+    reservation excluded so it is not counted twice.
+    """
+    shape = await _current_worker_shape(k8s, ns, f"{name}-workers")
+    quota = _tenant_quota(SimpleNamespace(
+        worker_count=scale.worker_count,
+        worker_vcpu=scale.worker_vcpu or shape["vcpu"],
+        worker_memory=scale.worker_memory or shape["memory"],
+        worker_disk=shape["disk"],
+        control_plane_replicas=shape["cp_replicas"],
+    ))
+
+    folder = ""
+    try:
+        ns_obj = await k8s.core_api.read_namespace(name=ns)
+        folder = (ns_obj.metadata.labels or {}).get("kubevirt-ui.io/folder", "")
+    except Exception:
+        pass
+
+    if folder:
+        all_folders = _parse_all_folders(await _ensure_folders_configmap(k8s))
+        await assert_within_folder_quota(
+            k8s, all_folders, folder,
+            quota["cpu"], quota["memory"], quota["storage"],
+            exclude_namespace=ns,
+            asking=f"tenant '{name}'",
+        )
+
+    await _write_tenant_quota(k8s, ns, quota)
+
+
+async def _current_worker_shape(k8s, ns: str, md_name: str) -> dict[str, Any]:
+    """The shape the tenant's workers have right now, read from the objects.
+
+    There is no bookkeeping to consult: vCPU/memory/disk live on the
+    KubevirtMachineTemplate the MachineDeployment points at, and the control
+    plane replica count on the KamajiControlPlane.
+    """
+    shape: dict[str, Any] = {
+        "vcpu": 2, "memory": "2Gi", "disk": "20Gi", "cp_replicas": 1,
+    }
+    try:
+        md = await k8s.custom_api.get_namespaced_custom_object(
+            group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
+            plural="machinedeployments", name=md_name,
+        )
+        ref = (((md.get("spec") or {}).get("template") or {}).get("spec") or {}).get(
+            "infrastructureRef", {},
+        )
+        tpl = await k8s.custom_api.get_namespaced_custom_object(
+            group=KUBEVIRT_INFRA_GROUP, version=KUBEVIRT_INFRA_VERSION, namespace=ns,
+            plural="kubevirtmachinetemplates", name=ref.get("name", ""),
+        )
+        vm = (
+            tpl.get("spec", {}).get("template", {}).get("spec", {})
+            .get("virtualMachineTemplate", {}).get("spec", {})
+        )
+        domain = vm.get("template", {}).get("spec", {}).get("domain", {})
+        shape["vcpu"] = domain.get("cpu", {}).get("cores") or shape["vcpu"]
+        shape["memory"] = domain.get("memory", {}).get("guest") or shape["memory"]
+        for dvt in vm.get("dataVolumeTemplates") or []:
+            size = (
+                ((dvt.get("spec") or {}).get("storage") or {})
+                .get("resources", {}).get("requests", {}).get("storage")
+            )
+            if size:
+                shape["disk"] = size
+                break
+    except Exception as e:
+        logger.warning(f"Could not read worker shape in {ns}: {e}")
+
+    try:
+        cp = await k8s.custom_api.get_namespaced_custom_object(
+            group=KAMAJI_CP_GROUP, version=KAMAJI_CP_VERSION, namespace=ns,
+            plural="kamajicontrolplanes", name=ns.removeprefix("tenant-"),
+        )
+        shape["cp_replicas"] = (cp.get("spec") or {}).get("replicas") or 1
+    except Exception:
+        pass
+    return shape
+
+
 @router.post("/{name}/scale", response_model=TenantResponse)
 async def scale_tenant(
     request: Request, name: str, scale: TenantScaleRequest,
@@ -1390,6 +1486,12 @@ async def scale_tenant(
         if e.status == 404:
             raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
         raise k8s_error_to_http(e, "tenant operation")
+
+    # The namespace quota was sized for the shape the tenant had when it was
+    # created; leaving it there makes the scale-up land and then be refused
+    # pod by pod. Re-sized to what the tenant asks for now, after the folder
+    # ceiling has been asked whether that fits.
+    await _resize_tenant_quota(k8s, name, ns, scale)
 
     return await get_tenant(request, name)
 
