@@ -394,16 +394,23 @@ async def _datavolume_blockers(
         status = dv.get("status") or {}
         if status.get("phase") == "Succeeded":
             continue
-        for cond in status.get("conditions") or []:
-            if cond.get("status") == "True" or not cond.get("message"):
-                continue
+        # Several conditions are unhappy at once while a disk is stuck; the
+        # one that says *why* carries reason=Error ("forbidden: exceeded
+        # quota…"), the others only repeat that it is Pending.
+        unhappy = [
+            c for c in (status.get("conditions") or [])
+            if c.get("status") != "True" and c.get("message")
+        ]
+        cond = next((c for c in unhappy if c.get("reason") == "Error"), None) or (
+            unhappy[0] if unhappy else None
+        )
+        if cond:
             out.append({
                 "type": f"DataVolume {dv_name}",
                 "status": "False",
                 "reason": cond.get("reason") or status.get("phase") or "",
                 "message": cond.get("message", ""),
             })
-            break
     return out
 
 

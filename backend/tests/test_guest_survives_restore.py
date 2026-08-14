@@ -99,3 +99,10 @@ class TestTheDiskFailureReachesTheUI:
         block = SRC[SRC.index("async def _datavolume_blockers"):SRC.index("@router.get(\"/{name}\"")]
         assert 'if status.get("phase") == "Succeeded":' in block
         assert "continue" in block
+
+    def test_it_prefers_the_condition_that_says_why(self) -> None:
+        # A stuck disk reports several unhappy conditions at once; only the
+        # one with reason=Error carries "forbidden: exceeded quota…", the
+        # rest just repeat that it is Pending.
+        block = SRC[SRC.index("async def _datavolume_blockers"):SRC.index("@router.get(\"/{name}\"")]
+        assert 'c.get("reason") == "Error"' in block
