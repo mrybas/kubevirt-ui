@@ -162,3 +162,70 @@ def test_delete_re_scopes_too():
     start = src.index("async def delete_vpc(")
     body = src[start:src.index("\n@router.", start)]
     assert "reconcile_isolation_acls(k8s)" in body
+
+
+def _subnet(name, vpc, cidr, drops, dying=False):
+    meta = {"name": name}
+    if dying:
+        meta["deletionTimestamp"] = "2026-08-14T11:00:00Z"
+    return {"metadata": meta, "spec": {"vpc": vpc, "cidrBlock": cidr, "acls": [
+        {"action": "allow-related", "direction": "from-lport",
+         "match": f"ip4.dst == {cidr}", "priority": 3200},
+    ] + [
+        {"action": "drop", "direction": "from-lport",
+         "match": f"ip4.dst == {d}", "priority": 3000} for d in drops
+    ]}}
+
+
+async def _reconcile(items):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.api.v1.vpcs import reconcile_isolation_acls
+
+    k8s = MagicMock()
+    k8s.custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": items})
+    k8s.custom_api.patch_cluster_custom_object = AsyncMock()
+    await reconcile_isolation_acls(k8s)
+    return {
+        c.kwargs["name"]: c.kwargs["body"]["spec"]["acls"]
+        for c in k8s.custom_api.patch_cluster_custom_object.await_args_list
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_subnet_being_deleted_is_not_a_peer():
+    """kube-ovn keeps a deleted subnet listed while its finalizer runs.
+
+    Counting it left every surviving VPC dropping a prefix that no longer
+    exists — seen on the cluster after removing four VPCs, with `acme-net`
+    still dropping 10.208.0.0/24, 10.209.0.0/24 and 10.212.0.0/24. The
+    allocator hands those same CIDRs to the next VPC, which would then be
+    unreachable from acme-net for a reason absent from its own spec.
+    """
+    written = await _reconcile([
+        _subnet("a-default", "a", "10.200.0.0/24", ["10.201.0.0/24", "10.202.0.0/24"]),
+        _subnet("b-default", "b", "10.201.0.0/24", ["10.200.0.0/24", "10.202.0.0/24"]),
+        _subnet("dying-default", "dying", "10.202.0.0/24", ["10.200.0.0/24"], dying=True),
+    ])
+
+    assert "dying-default" not in written, "a dying subnet is not re-scoped"
+    drops = [x["match"] for x in written["a-default"] if x["action"] == "drop"]
+    assert any("10.201.0.0/24" in m for m in drops), drops
+    assert not any("10.202.0.0/24" in m for m in drops), drops
+
+
+@pytest.mark.asyncio
+async def test_last_peer_gone_clears_the_drop(monkeypatch):
+    """The final delete has to leave a clean subnet, not one stale rule."""
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("TENANT_SUPERNET", "")
+    written = await _reconcile([
+        _subnet("a-default", "a", "10.200.0.0/24", ["10.202.0.0/24"]),
+        _subnet("dying-default", "dying", "10.202.0.0/24", [], dying=True),
+    ])
+    get_settings.cache_clear()
+
+    assert [x for x in written["a-default"] if x["action"] == "drop"] == []
+    assert written["a-default"], "the VPC keeps its own allow rules"

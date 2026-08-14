@@ -968,6 +968,8 @@ async def _tenant_vpc_cidrs(k8s_client: Any, exclude: str | None = None) -> list
         cidr = spec.get("cidrBlock")
         if not vpc or not cidr or vpc == SYSTEM_VPC_NAME or vpc == exclude:
             continue
+        if (item.get("metadata") or {}).get("deletionTimestamp"):
+            continue  # on its way out; not a peer to block
         if spec.get("vlan"):        # underlay/provider subnet, not a tenant VPC
             continue
         out.append(cidr)
@@ -994,6 +996,11 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:
         i for i in subnets.get("items", [])
         if (i.get("spec", {}) or {}).get("vpc") not in (None, "", SYSTEM_VPC_NAME)
         and not (i.get("spec", {}) or {}).get("vlan")
+        # A subnet being deleted is still listed — kube-ovn holds it with a
+        # finalizer for a while. Counting it left every other VPC dropping a
+        # prefix that no longer exists, which then blocks whoever is handed
+        # that CIDR next.
+        and not (i.get("metadata", {}) or {}).get("deletionTimestamp")
     ]
     supernet = get_settings().tenant_supernet
 
@@ -1020,6 +1027,20 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:
             peer_cidrs=[p for p in peers if p],
         )
         if not acls:
+            # Nothing left to be isolated from. Leaving the old literal drops
+            # in place is not harmless: the allocator hands those very CIDRs
+            # to the next VPC, so the new tenant would be born unreachable
+            # from this one for a reason nobody could see in its own spec.
+            body = [a for a in existing if a.get("action") != "drop"]
+            if body == existing:
+                continue
+            await k8s_client.custom_api.patch_cluster_custom_object(
+                group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
+                name=name,
+                body={"spec": {"acls": body}},
+                _content_type="application/merge-patch+json",
+            )
+            updated += 1
             continue
         await k8s_client.custom_api.patch_cluster_custom_object(
             group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
