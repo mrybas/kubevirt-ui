@@ -808,9 +808,11 @@ async def detach_tenant_from_gateway(
     if tenant_cidr:
         await _remove_static_route(k8s, gw_vpc_name, tenant_cidr)
 
-    # 3. Remove default route from tenant VPC
+    # 3. Remove the default route this gateway installed — and only that one.
     if gw_transit_ip:
-        await _remove_static_route(k8s, tenant_vpc_name, "0.0.0.0/0")
+        await _remove_static_route(
+            k8s, tenant_vpc_name, "0.0.0.0/0", next_hop=gw_transit_ip,
+        )
 
     # 4. Remove tenant subnet from VpcEgressGateway policies
     if tenant_cidr:
@@ -931,8 +933,18 @@ async def _add_static_route(k8s, vpc_name: str, cidr: str, next_hop_ip: str) -> 
     )
 
 
-async def _remove_static_route(k8s, vpc_name: str, cidr: str) -> None:
-    """Remove a static route from a VPC by CIDR."""
+async def _remove_static_route(
+    k8s, vpc_name: str, cidr: str, next_hop: str | None = None,
+) -> None:
+    """Remove a static route from a VPC.
+
+    `next_hop` narrows it to the route this gateway actually installed.
+    Without it, detaching a VPC deleted **every** route with that CIDR —
+    including the `0.0.0.0/0 -> 10.198.191.254` the VPC was created with, so
+    a detach left the tenant with no way out at all. Measured on the lab
+    cluster: acme-net went from four static routes to three, losing the
+    default it had before the gateway ever existed.
+    """
     try:
         vpc = await k8s.custom_api.get_cluster_custom_object(
             group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
@@ -944,7 +956,11 @@ async def _remove_static_route(k8s, vpc_name: str, cidr: str) -> None:
         raise
 
     routes = vpc.get("spec", {}).get("staticRoutes", [])
-    new_routes = [r for r in routes if r.get("cidr") != cidr]
+    new_routes = [
+        r for r in routes
+        if r.get("cidr") != cidr
+        or (next_hop is not None and r.get("nextHopIP") != next_hop)
+    ]
 
     if len(new_routes) != len(routes):
         await k8s.custom_api.patch_cluster_custom_object(
@@ -1095,7 +1111,10 @@ async def _cleanup_gateway_resources(k8s, gateway_name: str) -> list[str]:
         tenant_vpc = key[len("vpc."):]
         try:
             await _remove_vpc_peering(k8s, tenant_vpc, gw_vpc_name)
-            await _remove_static_route(k8s, tenant_vpc, "0.0.0.0/0")
+            transit = (alloc_data.get(key, "").split(",") or [""])[0]
+            await _remove_static_route(
+                k8s, tenant_vpc, "0.0.0.0/0", next_hop=transit or None,
+            )
         except ApiException as e:
             logger.warning(f"Failed to unpeer {tenant_vpc} from {gw_vpc_name}: {e}")
 
