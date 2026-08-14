@@ -118,10 +118,6 @@ KUBEVIRT_CSI_ADDON_ID = "kubevirt-csi-driver"
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Rough per-replica allowance for a Kamaji control plane: five small
-# containers that declare requests but no limits.
-_CP_CPU = 0.5
-_CP_MEMORY = 1024 ** 3
 
 
 
@@ -809,12 +805,16 @@ async def list_tenants(
 
 
 def _tenant_quota(req: Any) -> dict[str, str]:
-    """What a tenant asks of its folder: its workers, plus its control plane.
+    """What a tenant asks of its folder: its workers, and only its workers.
+
+    The control plane is not billed. It is infrastructure the platform runs
+    on the host cluster on the tenant's behalf — the user asked for N workers
+    of a given size, and that is what their folder budget should show. The
+    Kamaji pods are small (six containers defaulted to 50m/128Mi each by the
+    namespace LimitRange) and fit inside the replacement headroom below.
 
     Sized from the request rather than measured afterwards, so the folder
     ceiling can refuse a tenant that does not fit before any of it exists.
-    The control-plane allowance is per replica and deliberately rough — the
-    Kamaji pods are small and declare no limits of their own.
     """
     # One worker of headroom, because replacing a worker overlaps with it.
     #
@@ -828,11 +828,8 @@ def _tenant_quota(req: Any) -> dict[str, str]:
     # so a tenant whose worker died could never get a new one. The same slack
     # is what lets a rolling worker resize proceed.
     surge = req.worker_count + 1
-    cpu = surge * req.worker_vcpu + req.control_plane_replicas * _CP_CPU
-    memory = (
-        surge * (parse_quantity(req.worker_memory) or 0)
-        + req.control_plane_replicas * _CP_MEMORY
-    )
+    cpu = surge * req.worker_vcpu
+    memory = surge * (parse_quantity(req.worker_memory) or 0)
     storage = surge * (parse_quantity(req.worker_disk) or 0)
     return {
         "cpu": f"{cpu:g}",
