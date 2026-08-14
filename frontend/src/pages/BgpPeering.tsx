@@ -612,8 +612,7 @@ export default function BgpPeering() {
                   <th className="text-left px-4 py-2 font-medium">Peer IP</th>
                   <th className="text-left px-4 py-2 font-medium">ASN</th>
                   <th className="text-left px-4 py-2 font-medium">State</th>
-                  <th className="text-left px-4 py-2 font-medium">Uptime</th>
-                  <th className="text-left px-4 py-2 font-medium">Prefixes</th>
+                  <th className="text-left px-4 py-2 font-medium">Announced</th>
                   <th className="text-left px-4 py-2 font-medium">Node</th>
                 </tr>
               </thead>
@@ -628,8 +627,7 @@ export default function BgpPeering() {
                     <td className="px-4 py-2">
                       <SessionStateBadge state={s.state} />
                     </td>
-                    <td className="px-4 py-2 text-surface-400 font-mono text-xs">{s.uptime || '-'}</td>
-                    <td className="px-4 py-2 text-surface-300">{s.prefixes_received}</td>
+                    <td className="px-4 py-2 text-surface-300">{s.announced}</td>
                     <td className="px-4 py-2 font-mono text-surface-400 text-xs">{s.node || '-'}</td>
                   </tr>
                 ))}

@@ -48,8 +48,13 @@ class BGPSessionResponse(BaseModel):
     peer_address: str
     peer_asn: int
     state: str  # Established, Active, Connect, etc.
-    uptime: str = ""
-    prefixes_received: int = 0
+    # The speaker exposes no BGP metrics — its /metrics endpoint carries only
+    # Go runtime and klog counters — and its GoBGP API port is disabled, so
+    # neither uptime nor a received-prefix count can be measured from here.
+    # `announced` is what this cluster is configured to advertise; it is a
+    # real number, unlike the 0 that used to sit under "Prefixes" while the
+    # neighbour held five routes.
+    announced: int = 0
     node: str = ""  # which speaker pod reports this
 
 

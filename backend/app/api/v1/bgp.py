@@ -605,6 +605,13 @@ async def list_sessions(
         neighbor_addresses = []
         neighbor_as = 0
 
+    # Counted once: every speaker advertises the same set.
+    try:
+        announced = len(await list_announcements(request, user=user))
+    except Exception as e:                       # never fail the session list
+        logger.debug(f"Could not count announcements: {e}")
+        announced = 0
+
     for pod in pods.items:
         if pod.status.phase != "Running":
             continue
@@ -641,8 +648,7 @@ async def list_sessions(
                 peer_address=addr,
                 peer_asn=neighbor_as,
                 state=state,
-                uptime="",
-                prefixes_received=0,
+                announced=announced,
                 node=node_name,
             ))
 

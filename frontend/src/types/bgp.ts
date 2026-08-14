@@ -43,8 +43,7 @@ export interface BGPSessionResponse {
   peer_address: string;
   peer_asn: number;
   state: string; // "Established" | "Active" | "Connect" | ...
-  uptime: string;
-  prefixes_received: number;
+  announced: number;
   node: string;
 }
 
