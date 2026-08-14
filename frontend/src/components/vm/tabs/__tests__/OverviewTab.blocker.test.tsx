@@ -87,3 +87,29 @@ describe('a disk that cannot be created outranks the VMI story', () => {
     expect(screen.queryByText(/Not running: VMINotExists/)).not.toBeInTheDocument();
   });
 });
+
+describe('a migration that is going nowhere', () => {
+  const stuck = {
+    type: 'Migration', status: 'False', reason: 'Pending',
+    message: "Rejected by the environment's ResourceQuota: a live migration runs a second copy of the VM alongside the first.",
+  };
+
+  it('is reported even though the VM is running', () => {
+    const vm = {
+      ...base, status: 'Running', phase: 'Running', ready: true,
+      conditions: [{ type: 'Ready', status: 'True' }, stuck],
+    };
+    render(<OverviewTab vm={vm as any} />);
+    expect(screen.getByText(/Migration pending/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/second copy of the VM/).length).toBeGreaterThan(0);
+  });
+
+  it('a healthy running VM still says nothing', () => {
+    const vm = {
+      ...base, status: 'Running', phase: 'Running', ready: true,
+      conditions: [{ type: 'Ready', status: 'True' }],
+    };
+    render(<OverviewTab vm={vm as any} />);
+    expect(screen.queryByText(/Migration/)).not.toBeInTheDocument();
+  });
+});

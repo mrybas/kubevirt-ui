@@ -414,6 +414,58 @@ async def _datavolume_blockers(
     return out
 
 
+async def _migration_blockers(
+    k8s_client: Any, namespace: str, vm_name: str,
+) -> list[dict[str, str]]:
+    """A live migration that is not going anywhere.
+
+    Migration runs a second launcher pod beside the first, so for its duration
+    the VM counts twice against the environment's quota. With none to spare
+    the migration simply waits:
+
+        migrate-nomac-88jjm-2mw42  Pending
+          migrationRejectedByResourceQuota=True
+
+    Nothing said so anywhere — the VM keeps running on its old node and the
+    request looks like it was accepted.
+    """
+    try:
+        migrations = await k8s_client.custom_api.list_namespaced_custom_object(
+            group="kubevirt.io", version="v1", namespace=namespace,
+            plural="virtualmachineinstancemigrations",
+        )
+    except Exception:
+        return []
+
+    out: list[dict[str, str]] = []
+    for m in migrations.get("items", []):
+        if (m.get("spec") or {}).get("vmiName") != vm_name:
+            continue
+        status = m.get("status") or {}
+        phase = status.get("phase")
+        if phase in ("Succeeded", "Failed", None):
+            continue
+        rejected = next(
+            (c for c in (status.get("conditions") or [])
+             if c.get("type") == "migrationRejectedByResourceQuota"
+             and c.get("status") == "True"),
+            None,
+        )
+        out.append({
+            "type": "Migration",
+            "status": "False",
+            "reason": phase or "Pending",
+            "message": (
+                "Rejected by the environment's ResourceQuota: a live migration "
+                "runs a second copy of the VM alongside the first, so it needs "
+                "that much headroom for the duration."
+                if rejected else
+                f"Migration {m['metadata']['name']} is {phase}."
+            ),
+        })
+    return out
+
+
 @router.get("/{name}", response_model=VMResponse)
 async def get_vm(
     request: Request,
@@ -453,8 +505,10 @@ async def get_vm(
             pass
 
         resp = vm_from_k8s(vm, vmi, pod_ip=pod_ip)
-        resp.conditions = list(resp.conditions or []) + await _datavolume_blockers(
-            k8s_client, namespace, vm,
+        resp.conditions = (
+            list(resp.conditions or [])
+            + await _datavolume_blockers(k8s_client, namespace, vm)
+            + await _migration_blockers(k8s_client, namespace, name)
         )
         return resp
 

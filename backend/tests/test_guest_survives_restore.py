@@ -106,3 +106,33 @@ class TestTheDiskFailureReachesTheUI:
         # rest just repeat that it is Pending.
         block = SRC[SRC.index("async def _datavolume_blockers"):SRC.index("@router.get(\"/{name}\"")]
         assert 'c.get("reason") == "Error"' in block
+
+
+class TestAStuckMigrationIsReported:
+    """A live migration runs a second launcher beside the first, so the VM
+    counts twice against the environment quota for its duration. With none to
+    spare it just waits:
+
+        migrate-nomac-88jjm-2mw42  Pending
+          migrationRejectedByResourceQuota=True
+
+    and nothing said so — the VM kept running on its old node and the request
+    looked accepted.
+    """
+
+    def test_the_detail_handler_looks_for_migrations(self) -> None:
+        assert "_migration_blockers" in SRC
+        assert "virtualmachineinstancemigrations" in SRC
+
+    def test_it_ignores_finished_migrations(self) -> None:
+        block = SRC[SRC.index("async def _migration_blockers"):SRC.index("@router.get(\"/{name}\"")]
+        assert 'if phase in ("Succeeded", "Failed", None):' in block
+
+    def test_it_names_the_quota_as_the_cause_when_that_is_it(self) -> None:
+        block = SRC[SRC.index("async def _migration_blockers"):SRC.index("@router.get(\"/{name}\"")]
+        assert "migrationRejectedByResourceQuota" in block
+        assert "second copy of the VM" in block
+
+    def test_it_only_reports_this_vm(self) -> None:
+        block = SRC[SRC.index("async def _migration_blockers"):SRC.index("@router.get(\"/{name}\"")]
+        assert '.get("vmiName") != vm_name' in block
