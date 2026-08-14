@@ -1788,6 +1788,25 @@ async def get_tenant_kubeconfig(
 # Addon management (post-creation enable/disable/update)
 # ---------------------------------------------------------------------------
 
+
+_STORAGE_ADDONS = {"kubevirt-csi-driver"}
+
+
+async def _tenant_storage_enabled(k8s, name: str) -> bool:
+    """Whether the tenant was created with storage passthrough.
+
+    The marker is the KubevirtCluster's `infraClusterSecretRef`: that is what
+    lets CAPK — and the CSI driver behind it — talk to the host cluster.
+    """
+    try:
+        kvc = await k8s.custom_api.get_namespaced_custom_object(
+            group=KUBEVIRT_INFRA_GROUP, version=KUBEVIRT_INFRA_VERSION,
+            namespace=_tenant_ns(name), plural="kubevirtclusters", name=name,
+        )
+    except Exception:
+        return False
+    return bool((kvc.get("spec") or {}).get("infraClusterSecretRef"))
+
 @router.post("/{name}/addons", status_code=201)
 async def enable_addon(
     request: Request, name: str, addon: TenantAddon,
@@ -1802,6 +1821,25 @@ async def enable_addon(
     component = catalog.get_component(addon.addon_id)
     if not component:
         raise HTTPException(status_code=404, detail=f"Addon '{addon.addon_id}' not in catalog")
+
+    # The CSI driver is useless — and silently stuck — without the host-side
+    # credentials that only `enable_storage` at creation puts in place.
+    #
+    # Enabling it on a tenant created without storage looked like it worked:
+    # the HelmRelease went to `Running 'install' action with timeout of 15m0s`
+    # and stayed there, while `storage/status` said `phase: disabled` and the
+    # wiring card that would have explained it is hidden in exactly that
+    # state. Refused with the reason instead.
+    if addon.addon_id in _STORAGE_ADDONS and not await _tenant_storage_enabled(k8s, name):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Tenant '{name}' was created without storage, so the "
+                f"host-side CSI credentials it needs do not exist. The driver "
+                f"would install and then wait for them indefinitely. Recreate "
+                f"the tenant with storage enabled."
+            ),
+        )
 
     # Merge defaults with user params
     params: dict[str, str] = {}
