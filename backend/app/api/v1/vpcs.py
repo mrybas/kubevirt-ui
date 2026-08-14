@@ -1413,20 +1413,28 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
     # Delete the paired Kyverno ClusterPolicy.
     await _delete_vpc_dns_policy(k8s, name)
 
-    # Delete peerings first
-    peerings = await _get_vpc_peerings(k8s, name)
-    for p in peerings:
+    # Peerings live in `Vpc.spec.vpcPeerings` on *both* routers — there is no
+    # `vpc-peerings` object to delete, and deleting this VPC leaves the other
+    # side pointing at a router that no longer exists.
+    for peering in await _get_vpc_peerings(k8s, name):
+        remote = peering.remote_vpc
+        if not remote:
+            continue
         try:
-            await k8s.custom_api.delete_cluster_custom_object(
-                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpc-peerings",
-                name=p.name,
-            )
-        except ApiException as e:
-            if e.status != 404:
-                logger.warning(f"Failed to delete peering {p.name}: {e}")
+            await _remove_peering_side(k8s, remote, name)
+        except Exception as e:
+            logger.warning(f"Failed to remove peering {remote}→{name}: {e}")
 
-    # Delete subnets
-    subnets = await _get_vpc_subnets(k8s, name)
+    # Delete subnets.
+    #
+    # `_get_vpc_subnets` returns (subnets, isolated); iterating the tuple gave
+    # the list itself as the first item —
+    #
+    #   AttributeError: 'list' object has no attribute 'name'
+    #
+    # so deleting a VPC answered 500 and left its subnet behind, which then
+    # blocks kube-ovn from ever finishing the VPC's own deletion.
+    subnets, _isolated = await _get_vpc_subnets(k8s, name)
     for s in subnets:
         try:
             await k8s.custom_api.delete_cluster_custom_object(
