@@ -1543,49 +1543,25 @@ async def get_vpc(request: Request, name: str, user: User = Depends(require_auth
 
 @router.delete("/vpcs/{name}")
 async def delete_vpc(request: Request, name: str, user: User = Depends(require_admin)) -> dict:
-    """Delete a VPC and cascade-delete its subnets and peerings."""
-    k8s = request.app.state.k8s_client
+    """Delete a VPC and cascade-delete its subnets and peerings.
 
-    # Drop peering entries that OTHER VPCs still hold against this one — the
-    # entries on this VPC go away with the VPC itself, but a dangling remote
-    # side leaves kube-ovn trying to build a link to a switch that is gone.
-    peerings = await _get_vpc_peerings(k8s, name)
-    for p in peerings:
-        if p.local_vpc == name:
-            continue
-        try:
-            await remove_vpc_peering(k8s, p.local_vpc, name)
-        except ApiException as e:
-            logger.warning(f"Failed to remove peering {p.name}: {e}")
+    This route predates `/api/v1/vpcs/{name}` and had grown a second, weaker
+    copy of the teardown: it removed the subnets and then the VPC in the same
+    breath, so whatever kube-ovn was still finalizing against that router was
+    stranded for good — the defect fixed in `vpcs.delete_vpc`, still live
+    here. It also skipped the VpcDns CR, the Kyverno policy, the NAT objects
+    and the isolation re-scope, so a VPC deleted through this URL left DNS and
+    ACL debris behind.
 
-    # Delete subnets
-    subnets = await _get_vpc_subnets(k8s, name)
-    for s in subnets:
-        try:
-            await k8s.custom_api.delete_cluster_custom_object(
-                group=KUBEOVN_API_GROUP,
-                version=KUBEOVN_API_VERSION,
-                plural="subnets",
-                name=s.name,
-            )
-        except ApiException as e:
-            if e.status != 404:
-                logger.warning(f"Failed to delete subnet {s.name}: {e}")
+    One teardown, one place. The URL stays so existing callers keep working.
+    """
+    from app.api.v1.vpcs import delete_vpc as _delete_vpc
 
-    # Delete VPC
-    try:
-        await k8s.custom_api.delete_cluster_custom_object(
-            group=KUBEOVN_API_GROUP,
-            version=KUBEOVN_API_VERSION,
-            plural="vpcs",
-            name=name,
-        )
-    except ApiException as e:
-        if e.status == 404:
-            raise HTTPException(status_code=404, detail=f"VPC '{name}' not found")
-        raise k8s_error_to_http(e, "network operation")
-
-    return {"status": "deleted", "name": name, "subnets_deleted": len(subnets), "peerings_deleted": len(peerings)}
+    # `user=` is not optional: the dependency is only resolved for routed
+    # requests, so calling a sibling handler without it passes the `Depends`
+    # object itself and the call dies on `'Depends' object has no attribute
+    # 'groups'`.
+    return await _delete_vpc(request, name, user=user)
 
 
 # ============================================================================
