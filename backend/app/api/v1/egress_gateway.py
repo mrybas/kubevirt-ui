@@ -10,6 +10,7 @@ Supports flexible topologies:
   - Groups: gateway A for VPC 1,2,3 — gateway B for VPC 4,5
 """
 
+import asyncio
 import ipaddress
 import logging
 from typing import Any
@@ -606,7 +607,18 @@ async def delete_egress_gateway(request: Request, name: str, user: User = Depend
                    f"({', '.join(v.vpc_name for v in attached)}). Detach them first.",
         )
 
-    await _cleanup_gateway_resources(k8s, name)
+    stranded = await _cleanup_gateway_resources(k8s, name)
+    if stranded:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Egress gateway '{name}' is still being deleted "
+                f"({', '.join(stranded)}). Its VPC has been left in place so "
+                "kube-ovn can finish — removing it now would strand the "
+                "gateway and its external address permanently. Retry in a "
+                "moment."
+            ),
+        )
 
     # Delete transit allocator ConfigMap
     try:
@@ -1049,8 +1061,16 @@ async def _cleanup_gateway_vpc(k8s, gw_vpc_name: str) -> None:
         pass
 
 
-async def _cleanup_gateway_resources(k8s, gateway_name: str) -> None:
-    """Delete all resources associated with an egress gateway."""
+# How long a delete waits for kube-ovn before handing the caller a retry.
+GATEWAY_DRAIN_TIMEOUT = 45.0
+
+
+async def _cleanup_gateway_resources(k8s, gateway_name: str) -> list[str]:
+    """Delete all resources associated with an egress gateway.
+
+    Returns whatever was still terminating when the wait ran out; empty when
+    the teardown completed.
+    """
     label_sel = f"{GATEWAY_LABEL}={gateway_name}"
 
     # Delete VpcEgressGateway
@@ -1096,8 +1116,62 @@ async def _cleanup_gateway_resources(k8s, gateway_name: str) -> None:
     except ApiException:
         pass
 
-    # Delete gateway VPC
+    # Delete gateway VPC — but not before the objects finalized against its
+    # logical router are actually gone.
+    #
+    # `shared-egress` sat on the lab cluster for 29 hours in exactly this
+    # state: deletionTimestamp set, phase still Completed, holding
+    # 10.198.190.207 from the external pool, while the controller looped
+    #
+    #   error syncing delete vpc egress gateway "kube-system/shared-egress":
+    #   not found logical router "egw-shared-egress", requeuing
+    #
+    # The VPC had already been removed, so the finalizer could never run.
     gw_vpc_name = f"egw-{gateway_name}"
+    left = await _await_gateway_gone(k8s, gateway_name)
+    if left:
+        logger.warning(
+            f"Egress gateway {gateway_name!r}: {', '.join(left)} still "
+            "terminating; leaving the gateway VPC in place so kube-ovn can "
+            "finish. Retry the delete.",
+        )
+        return left
     await _cleanup_gateway_vpc(k8s, gw_vpc_name)
 
     logger.info(f"Cleaned up all resources for egress gateway '{gateway_name}'")
+    return []
+
+
+async def _await_gateway_gone(
+    k8s, gateway_name: str, timeout: float | None = None,
+) -> list[str]:
+    """Wait for the VpcEgressGateway and its subnets to really disappear."""
+    deadline = asyncio.get_running_loop().time() + (
+        GATEWAY_DRAIN_TIMEOUT if timeout is None else timeout
+    )
+    label_sel = f"{GATEWAY_LABEL}={gateway_name}"
+    while True:
+        left: list[str] = []
+        try:
+            await k8s.custom_api.get_namespaced_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+                namespace="kube-system", plural="vpc-egress-gateways",
+                name=gateway_name,
+            )
+            left.append(f"vpc-egress-gateway/{gateway_name}")
+        except ApiException as e:
+            if e.status != 404:
+                left.append(f"vpc-egress-gateway/{gateway_name}")
+        try:
+            found = await k8s.custom_api.list_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
+                label_selector=label_sel,
+            )
+            left += [f"subnet/{i['metadata']['name']}" for i in found.get("items", [])]
+        except ApiException:
+            pass
+        if not left:
+            return []
+        if asyncio.get_running_loop().time() >= deadline:
+            return left
+        await asyncio.sleep(2)

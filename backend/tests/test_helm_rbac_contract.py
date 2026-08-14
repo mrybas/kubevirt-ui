@@ -112,6 +112,8 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     ("kubeovn.io", "ovn-snat-rules", "list", "vpcs.delete_vpc (NAT inventory)"),
     ("kubeovn.io", "ovn-fips", "list", "vpcs.delete_vpc (NAT inventory)"),
     ("kubeovn.io", "ovn-dnat-rules", "list", "vpcs.delete_vpc (NAT inventory)"),
+    ("kubeovn.io", "vpc-egress-gateways", "get",
+     "egress_gateway._await_gateway_gone"),
 ]
 
 
