@@ -35,24 +35,25 @@ class TestTenantQuota:
         # Replacing a worker overlaps with it: sized to exactly the worker
         # count, the quota refused every replacement and a tenant whose
         # worker died could never get a new one.
-        q = _tenant_quota(_req(worker_count=3, control_plane_replicas=1))
+        q = _tenant_quota(_req(worker_count=3, control_plane_replicas=0))
         assert q["cpu"] == "8"                              # (3+1) x 2 vCPU
         assert int(q["memory"]) == 4 * 2 * 1024 ** 3
         assert int(q["storage"]) == 4 * 20 * 1024 ** 3
 
     def test_a_single_worker_tenant_can_replace_its_only_worker(self) -> None:
-        q = _tenant_quota(_req(worker_count=1, worker_vcpu=2))
+        q = _tenant_quota(_req(worker_count=1, worker_vcpu=2, control_plane_replicas=0))
         assert float(q["cpu"]) == 4
 
-    def test_the_control_plane_is_not_billed_to_the_user(self) -> None:
-        # The user asked for N workers of a size; that is what their folder
-        # budget shows. The control plane is infrastructure the platform runs
-        # on their behalf.
+    def test_the_control_plane_is_counted(self) -> None:
+        # Its pods live in the tenant namespace and spend the same quota the
+        # workers do; leaving it out would not make it free, it would eat the
+        # workers' headroom and surface as a worker that cannot start.
         one = _tenant_quota(_req(control_plane_replicas=1))
         three = _tenant_quota(_req(control_plane_replicas=3))
-        assert one == three
+        assert float(three["cpu"]) > float(one["cpu"])
+        assert int(three["memory"]) > int(one["memory"])
 
-    def test_storage_is_the_workers_disks_only(self) -> None:
+    def test_the_control_plane_needs_no_storage(self) -> None:
         q = _tenant_quota(_req(worker_count=1, control_plane_replicas=3))
         assert int(q["storage"]) == 2 * 20 * 1024 ** 3   # worker + its replacement
 
