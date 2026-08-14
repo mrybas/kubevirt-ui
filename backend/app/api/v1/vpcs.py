@@ -828,6 +828,18 @@ async def _get_vpc_peerings(k8s, vpc_name: str) -> list[VpcPeeringInfo]:
     except ApiException:
         return []
 
+    return _peerings_from_item(item, vpc_name)
+
+
+def _peerings_from_item(item: dict, vpc_name: str) -> list[VpcPeeringInfo]:
+    """The peerings written on one Vpc object.
+
+    Split out of `_get_vpc_peerings` so a listing that already holds the
+    object does not have to fetch it again — and, more to the point, so it
+    stops reporting zero. `GET /vpcs` said `peerings: []` for a VPC whose
+    detail page listed `acme-net-to-ovn-cluster`, so the Networks table read
+    "Peerings 0" for every row while the routers were peered.
+    """
     peerings = []
     for entry in item.get("spec", {}).get("vpcPeerings", []) or []:
         remote = entry.get("remoteVpc", "")
@@ -904,6 +916,7 @@ async def list_vpcs(
     for item in result.get("items", []):
         vpc = _parse_vpc(item)
         vpc.subnets, vpc.isolated = await _get_vpc_subnets(k8s, vpc.name)
+        vpc.peerings = _peerings_from_item(item, vpc.name)
         vpcs.append(vpc)
 
     # T7 — folder/env filter applied AFTER fetch (label selector with OR semantics
