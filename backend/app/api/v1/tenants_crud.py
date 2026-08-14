@@ -816,12 +816,24 @@ def _tenant_quota(req: Any) -> dict[str, str]:
     The control-plane allowance is per replica and deliberately rough — the
     Kamaji pods are small and declare no limits of their own.
     """
-    cpu = req.worker_count * req.worker_vcpu + req.control_plane_replicas * _CP_CPU
+    # One worker of headroom, because replacing a worker overlaps with it.
+    #
+    # Sized to exactly `worker_count`, the quota refused every replacement —
+    # remediation created the new Machine while the old one was still around
+    # and the pod was rejected:
+    #
+    #   exceeded quota: tenant-tci-quota, requested: requests.memory=2.4Gi,
+    #   used: 5.0Gi, limited: 5.3Gi
+    #
+    # so a tenant whose worker died could never get a new one. The same slack
+    # is what lets a rolling worker resize proceed.
+    surge = req.worker_count + 1
+    cpu = surge * req.worker_vcpu + req.control_plane_replicas * _CP_CPU
     memory = (
-        req.worker_count * (parse_quantity(req.worker_memory) or 0)
+        surge * (parse_quantity(req.worker_memory) or 0)
         + req.control_plane_replicas * _CP_MEMORY
     )
-    storage = req.worker_count * (parse_quantity(req.worker_disk) or 0)
+    storage = surge * (parse_quantity(req.worker_disk) or 0)
     return {
         "cpu": f"{cpu:g}",
         "memory": f"{int(memory)}",
