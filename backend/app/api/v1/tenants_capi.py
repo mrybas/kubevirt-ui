@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 
-from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION, KUBEOVN_SYSTEM_VPC
+from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.models.tenant import TenantCreateRequest
 
 from app.api.v1.tenants_common import (
@@ -1421,45 +1421,6 @@ async def _wait_for_tcp_service_ip(
     raise RuntimeError(f"TCP service {namespace}/{name} did not get ClusterIP within {timeout}s")
 
 
-async def _assert_vpc_reaches_services(k8s: Any, vpc_name: str) -> None:
-    """Refuse a VPC tenant whose VPC cannot reach the service network.
-
-    Workers join at the control plane's ClusterIP, which OVN load-balances
-    into a VPC only when that VPC is peered with the cluster's own. From an
-    unpeered VPC the same request simply hangs:
-
-        acme-net (peered)   https://10.108.25.46:20000/version → 200 in 56ms
-        beta-net (unpeered) same request                       → timeout
-
-    Checked before anything is created, because the failure is otherwise
-    invisible: the tenant reports Ready and only the workers never appear.
-    """
-    try:
-        vpc = await k8s.custom_api.get_cluster_custom_object(
-            group="kubeovn.io", version="v1", plural="vpcs", name=vpc_name,
-        )
-    except ApiException as e:
-        if e.status == 404:
-            raise HTTPException(
-                status_code=422, detail=f"VPC '{vpc_name}' not found",
-            )
-        raise
-
-    peers = {
-        p.get("remoteVpc") for p in (vpc.get("spec", {}).get("vpcPeerings") or [])
-    }
-    if KUBEOVN_SYSTEM_VPC not in peers:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"VPC '{vpc_name}' is not peered with '{KUBEOVN_SYSTEM_VPC}', so its "
-                f"workers cannot reach the tenant control plane's ClusterIP and "
-                f"would never join. Enable host cluster access on the VPC (the "
-                f"Peering step of the network wizard), then create the tenant."
-            ),
-        )
-
-
 async def _create_capi_resources(
     k8s, req: TenantCreateRequest,
     storage_info: dict[str, str] | None = None,
@@ -1500,27 +1461,21 @@ async def _create_capi_resources(
     vpc = bool(req.vpc_name)
     vip = api_port = konn_port = None
     if vpc:
-        # Workers on a VPC reach their control plane at the Kamaji Service's
-        # ClusterIP — the same model the default overlay uses — because a
-        # host-network address does not work from inside a VPC at all.
-        #
-        # Measured on the cluster from a pod on `acme-net`:
-        #
-        #   https://10.108.25.46:20000/version  (TCP Service ClusterIP) → 200
-        #   https://10.198.175.201:20000/...    (MetalLB CP VIP)        → connects, 0 bytes
-        #   http://10.198.175.200/              (Traefik LB)            → connects, 0 bytes
-        #
-        # The node's own reply goes out its default gateway
-        # (`ip route get 10.100.0.9` → `via 10.198.175.254 dev eth0`) and
-        # nothing routes the VPC prefix back, so anything served from host
-        # network is a black hole. The service network is reachable because
-        # OVN load-balances it inside the VPC.
-        #
-        # The consequence of getting this wrong was silent: the tenant
-        # reported Ready, and `kubeadm join` sat for five minutes on
-        # "couldn't validate the identity of the API Server … cluster-info"
-        # before giving up, leaving a Provisioned Machine and no node.
-        await _assert_vpc_reaches_services(k8s, req.vpc_name)
+        vip = _cp_demux_vip()
+        if not vip:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "VPC tenant requested but no shared CP demux VIP is "
+                    "configured — set TENANTS_CP_DEMUX_VIP (a MetalLB IP) "
+                    "or create the tenant without a VPC."
+                ),
+            )
+        api_port, konn_port = await allocate_cp_ports(k8s, req.name)
+        logger.info(
+            f"VPC tenant {req.name!r}: CP ports api={api_port} konn={konn_port} "
+            f"on shared VIP {vip}"
+        )
 
     # 1. Create infrastructure + control plane providers first — both in the
     #    tenant ns (CAPI webhook forbids cross-ns controlPlaneRef).
@@ -1543,23 +1498,34 @@ async def _create_capi_resources(
         plural="clusters", body=cluster_cr,
     )
 
-    # 3. Wait for the Kamaji TCP Service ClusterIP, then PATCH
-    #    controlPlaneEndpoint to it. Workers join via the ClusterIP — natively
-    #    routable on the default overlay, and load-balanced into a peered VPC
-    #    by OVN — so cluster-info and the join endpoint agree.
-    cluster_ip = await _wait_for_tcp_service_ip(k8s, req.name, ns)
-    endpoint_patch = {
-        "spec": {"controlPlaneEndpoint": {"host": cluster_ip, "port": 6443}},
-    }
-    await custom.patch_namespaced_custom_object(
-        group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
-        plural="clusters", name=req.name, body=endpoint_patch,
-        _content_type="application/merge-patch+json",
-    )
-    logger.info(
-        f"Patched Cluster {req.name} controlPlaneEndpoint → {cluster_ip}:6443"
-    )
-    cp_address = cluster_ip
+    if vpc:
+        # 3-VPC. advertiseAddress model: cluster-info is already correct
+        #   (<vip>:<api_port> baked by KCP), so NO endpoint patch. Create the
+        #   per-tenant MetalLB shared-IP Service that fronts this tenant's CP
+        #   pods on the shared VIP; workers reach it via native kube-proxy.
+        cp_lb = _build_cp_lb_service(req, vip, api_port, konn_port)
+        await k8s.core_api.create_namespaced_service(namespace=ns, body=cp_lb)
+        logger.info(
+            f"Created {req.name}-cp-lb on {vip}:{api_port}(api)/{konn_port}(konn)"
+        )
+        cp_address = vip
+    else:
+        # 3-default. Wait for the Kamaji TCP Service ClusterIP, then PATCH
+        #   controlPlaneEndpoint to it. Workers join via the ClusterIP
+        #   (natively routable on the default overlay); cluster-info matches.
+        cluster_ip = await _wait_for_tcp_service_ip(k8s, req.name, ns)
+        endpoint_patch = {
+            "spec": {"controlPlaneEndpoint": {"host": cluster_ip, "port": 6443}},
+        }
+        await custom.patch_namespaced_custom_object(
+            group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
+            plural="clusters", name=req.name, body=endpoint_patch,
+            _content_type="application/merge-patch+json",
+        )
+        logger.info(
+            f"Patched Cluster {req.name} controlPlaneEndpoint → {cluster_ip}:6443"
+        )
+        cp_address = cluster_ip
 
     # 5. Create VM worker resources (skip for bare_metal)
     if req.worker_type == "vm":
