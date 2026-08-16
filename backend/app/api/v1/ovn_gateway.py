@@ -599,6 +599,7 @@ async def create_ovn_gateway(
             },
             "spec": {
                 "ovnEip": eip_name,
+                "vpc": vpc_name,
                 "vpcSubnet": data.subnet_name,
             },
         }
@@ -692,7 +693,9 @@ async def create_snat_rule(
     suffix = data.vpc_subnet or data.internal_cidr.replace("/", "-").replace(".", "-")
     rule_name = f"snat-{vpc_name}-{suffix}"
 
-    spec: dict[str, str] = {"ovnEip": data.ovn_eip}
+    # `vpc` is not optional: kube-ovn resolves the logical router from it, and a
+    # rule without it stays unready forever with "failed to get vpc for snat".
+    spec: dict[str, str] = {"ovnEip": data.ovn_eip, "vpc": vpc_name}
     if data.vpc_subnet:
         spec["vpcSubnet"] = data.vpc_subnet
     else:

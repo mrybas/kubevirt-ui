@@ -1323,6 +1323,7 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
                     },
                     "spec": {
                         "ovnEip": eip_name,
+                        "vpc": data.name,
                         "vpcSubnet": default_subnet_name,
                     },
                 }
