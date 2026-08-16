@@ -81,10 +81,15 @@ describe('subnet CIDR', () => {
     expect(createVpc.mock.calls[0][0].subnet_cidr).toBeUndefined();
   });
 
-  it('still sends what the quick-select puts there', async () => {
+  it('still sends a CIDR the operator typed', async () => {
+    // The fixed quick-select chips are gone: they were constants from another
+    // network that overrode the allocator, and the first one collided with an
+    // existing subnet on the lab. Typing still wins over auto-allocation.
     renderWizard();
     await walkToVpcStep();
-    fireEvent.click(screen.getByRole('button', { name: '10.200.0.0/24' }));
+    fireEvent.change(screen.getByPlaceholderText('10.100.0.0/24'), {
+      target: { value: '10.200.0.0/24' },
+    });
     fireEvent.click(screen.getByRole('button', { name: /next/i }));
     fireEvent.click(screen.getByRole('button', { name: /next/i }));
     fireEvent.click(await screen.findByRole('button', { name: /create vpc/i }));

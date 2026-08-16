@@ -1214,26 +1214,18 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                 />
               </div>
 
-              {/* CIDR suggestions */}
-              <div>
-                <p className="text-xs text-surface-400 mb-2">Quick select:</p>
-                <div className="flex flex-wrap gap-2">
-                  {['10.100.0.0/24', '10.200.0.0/24', '172.20.0.0/16', '192.168.100.0/24'].map((cidr) => (
-                    <button
-                      key={cidr}
-                      type="button"
-                      onClick={() => setState((s) => ({ ...s, vpcSubnetCidr: cidr }))}
-                      className={`px-3 py-1.5 rounded-lg border text-xs font-mono transition-colors ${
-                        state.vpcSubnetCidr === cidr
-                          ? 'border-primary-500 bg-primary-500/10 text-primary-400'
-                          : 'border-surface-700 text-surface-400 hover:border-surface-600'
-                      }`}
-                    >
-                      {cidr}
-                    </button>
-                  ))}
-                </div>
-              </div>
+{/* No fixed suggestions here. They were `10.100.0.0/24`,
+                    `10.200.0.0/24`, `172.20.0.0/16`, `192.168.100.0/24` —
+                    constants from someone else's network that fought the
+                    allocator: leaving the field empty hands out the next free
+                    prefix from this deployment's configured supernet, while
+                    picking a chip overrode that with a range that may already
+                    be in use (and the first chip collided with an existing
+                    subnet on the lab). */}
+                <p className="text-xs text-surface-400">
+                  Leave empty to take the next free range from the configured
+                  tenant supernet.
+                </p>
 
               {/* NAT Gateway toggle */}
               <div className="flex items-center justify-between p-4 bg-surface-800/50 rounded-lg border border-surface-700">
