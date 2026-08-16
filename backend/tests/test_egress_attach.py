@@ -57,10 +57,15 @@ def _k8s(alloc: dict[str, str] | None = None) -> MagicMock:
     async def get_obj(**kw):
         plural, name = kw["plural"], kw["name"]
         if plural == "vpcs":
-            return vpcs[name]
-        if plural == "subnets":
-            return subnets[name]
-        raise AssertionError(f"unexpected get of {plural}/{name}")
+            obj = vpcs[name]
+        elif plural == "subnets":
+            obj = subnets[name]
+        else:
+            raise AssertionError(f"unexpected get of {plural}/{name}")
+        # The API server always stamps one, and the compare-and-set writes in
+        # `core.cas` echo it back in the patch body.
+        obj["metadata"].setdefault("resourceVersion", "1")
+        return obj
 
     async def patch_obj(**kw):
         name, body, plural = kw["name"], kw["body"], kw["plural"]

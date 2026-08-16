@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
 from app.core.auth import User, require_auth, require_admin
+from app.core.cas import patch_spec_with_retry
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.core.errors import k8s_error_to_http
 
@@ -302,17 +303,19 @@ async def add_subnet_acl(
         "match": data.match,
         "priority": data.priority,
     }
-    raw_acls.append(new_acl)
+
+    # Append under compare-and-set: `spec.acls` is a list and a merge patch
+    # replaces it wholesale, so two rules added at the same time would leave
+    # only the second one — with both calls reporting success.
+    def mutate(spec: dict) -> dict:
+        return {"acls": [*(spec.get("acls") or []), new_acl]}
 
     try:
-        await k8s.custom_api.patch_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
-            name=name, body={"spec": {"acls": raw_acls}},
-            _content_type="application/merge-patch+json",
-        )
+        await patch_spec_with_retry(k8s, "subnets", name, mutate)
     except ApiException as e:
         raise k8s_error_to_http(e, "subnet ACL operation")
 
+    raw_acls = (await _get_subnet(k8s, name)).get("spec", {}).get("acls", [])
     acls = _parse_acls(raw_acls)
     return SubnetAclListResponse(
         subnet=name, cidr_block=cidr_block,
@@ -337,14 +340,20 @@ async def delete_subnet_acl(
             detail=f"ACL index {index} out of range (subnet has {len(raw_acls)} ACLs)",
         )
 
-    removed = raw_acls.pop(index)
+    removed = raw_acls[index]
+
+    # Delete by identity, not by index: under compare-and-set the list may have
+    # been re-read, and an index computed against the old copy would remove
+    # somebody else's rule.
+    def mutate(spec: dict) -> dict | None:
+        current = list(spec.get("acls") or [])
+        if removed not in current:
+            return None
+        current.remove(removed)
+        return {"acls": current}
 
     try:
-        await k8s.custom_api.patch_cluster_custom_object(
-            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
-            name=name, body={"spec": {"acls": raw_acls}},
-            _content_type="application/merge-patch+json",
-        )
+        await patch_spec_with_retry(k8s, "subnets", name, mutate)
     except ApiException as e:
         raise k8s_error_to_http(e, "subnet ACL operation")
 

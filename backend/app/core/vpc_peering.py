@@ -21,6 +21,7 @@ import logging
 
 from kubernetes_asyncio.client import ApiException
 
+from app.core.cas import patch_spec_with_retry, upsert
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 
 logger = logging.getLogger(__name__)
@@ -43,14 +44,6 @@ async def _get_vpc(k8s, vpc_name: str) -> dict | None:
         raise
 
 
-async def _patch_peerings(k8s, vpc_name: str, peerings: list[dict]) -> None:
-    await k8s.custom_api.patch_cluster_custom_object(
-        group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="vpcs",
-        name=vpc_name, body={"spec": {"vpcPeerings": peerings}},
-        _content_type="application/merge-patch+json",
-    )
-
-
 async def ensure_vpc_peering(
     k8s, vpc_name: str, remote_vpc: str, local_connect_ip: str,
 ) -> bool:
@@ -58,37 +51,40 @@ async def ensure_vpc_peering(
 
     Returns False if the VPC does not exist, True once the entry is in place.
     Call once per side — kube-ovn will not build the link from one half.
+
+    The write goes through compare-and-set: `spec.vpcPeerings` is a list that
+    several flows append to (a tenant's link to `ovn-cluster`, an egress
+    gateway's link to its tenant), and a plain merge patch computed from a
+    stale read would drop whichever entry landed in between. See `core.cas`.
     """
-    vpc = await _get_vpc(k8s, vpc_name)
-    if vpc is None:
-        return False
+    entry = {"remoteVpc": remote_vpc, "localConnectIP": local_connect_ip}
 
-    peerings = vpc.get("spec", {}).get("vpcPeerings") or []
+    def mutate(spec: dict) -> dict | None:
+        peerings = spec.get("vpcPeerings") or []
+        if any(p.get("remoteVpc") == remote_vpc
+               and p.get("localConnectIP") == local_connect_ip for p in peerings):
+            return None  # already in the desired state
+        return {"vpcPeerings": upsert(peerings, entry, "remoteVpc")}
 
-    for p in peerings:
-        if p.get("remoteVpc") == remote_vpc:
-            if p.get("localConnectIP") == local_connect_ip:
-                return True  # already in the desired state
-            p["localConnectIP"] = local_connect_ip
-            break
-    else:
-        peerings.append({"remoteVpc": remote_vpc, "localConnectIP": local_connect_ip})
+    if await patch_spec_with_retry(k8s, "vpcs", vpc_name, mutate):
+        return True
 
-    await _patch_peerings(k8s, vpc_name, peerings)
-    return True
+    # `mutate` returning None (already correct) and a missing VPC both come back
+    # False; tell them apart so callers keep their "does the VPC exist" contract.
+    return await _get_vpc(k8s, vpc_name) is not None
 
 
 async def remove_vpc_peering(k8s, vpc_name: str, remote_vpc: str) -> None:
     """Drop one side of a peering. A missing VPC or entry is not an error."""
-    vpc = await _get_vpc(k8s, vpc_name)
-    if vpc is None:
-        return
 
-    peerings = vpc.get("spec", {}).get("vpcPeerings") or []
-    remaining = [p for p in peerings if p.get("remoteVpc") != remote_vpc]
+    def mutate(spec: dict) -> dict | None:
+        peerings = spec.get("vpcPeerings") or []
+        remaining = [p for p in peerings if p.get("remoteVpc") != remote_vpc]
+        if len(remaining) == len(peerings):
+            return None
+        return {"vpcPeerings": remaining}
 
-    if len(remaining) != len(peerings):
-        await _patch_peerings(k8s, vpc_name, remaining)
+    await patch_spec_with_retry(k8s, "vpcs", vpc_name, mutate)
 
 
 async def list_vpc_peerings(k8s, vpc_name: str) -> list[tuple[str, str]]:
