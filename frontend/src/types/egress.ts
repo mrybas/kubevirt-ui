@@ -9,6 +9,8 @@ export interface AttachedVpcInfo {
   cidr: string;
   transit_ip: string;
   peering_name: string;
+  /** False when the tenant's router no longer declares the peering back. */
+  peering_ok?: boolean;
 }
 
 export interface GatewayPodInfo {
@@ -30,7 +32,12 @@ export interface EgressGateway {
   exclude_ips: string[];
   attached_vpcs: AttachedVpcInfo[];
   assigned_ips: GatewayPodInfo[];
+  /** Straight from VpcEgressGateway.status — does not depend on pod labels. */
+  internal_ips?: string[];
+  external_ips?: string[];
   ready: boolean;
+  /** Set when the gateway is up but a tenant's wiring to it is broken. */
+  degraded_reason?: string | null;
   status: Record<string, unknown> | null; // raw k8s VpcEgressGateway status
 }
 

@@ -213,6 +213,7 @@ def _parse_gateway(
     veg: dict[str, Any] | None,
     attached: list[AttachedVpcInfo],
     assigned_ips: list[GatewayPodInfo] | None = None,
+    degraded_reason: str | None = None,
 ) -> EgressGatewayResponse:
     """Parse gateway VPC + VpcEgressGateway into response model."""
     metadata = vpc.get("metadata", {})
@@ -250,9 +251,76 @@ def _parse_gateway(
         exclude_ips=exclude_ips,
         attached_vpcs=attached,
         assigned_ips=assigned_ips or [],
-        ready=ready,
+        internal_ips=list(veg_status.get("internalIPs") or []),
+        external_ips=list(veg_status.get("externalIPs") or []),
+        # A gateway whose tenant cannot reach it is not Ready, whatever the
+        # VpcEgressGateway status says about the gateway pods.
+        ready=ready and degraded_reason is None,
+        degraded_reason=degraded_reason,
         status=veg_status if veg_status else None,
     )
+
+
+async def _verify_and_heal_peerings(
+    k8s, gw_vpc_name: str, transit_cidr: str, attached: list[AttachedVpcInfo],
+) -> str | None:
+    """Check every attached tenant still declares its half of the peering.
+
+    kube-ovn builds the link only when both routers declare it, and
+    `spec.vpcPeerings` is a plain list on a shared object — another flow, a
+    GitOps reconcile or a `kubectl patch --type merge` with a one-element array
+    all replace it wholesale and take our entry with them. The tenant is then
+    left with a default route to a next hop it has no interface for, which
+    drops all of its egress while every status field stays green.
+
+    So: re-assert the invariant on read, repair what is missing, and return a
+    reason string when something was broken (the caller reports Degraded rather
+    than Ready). Repair is safe — `ensure_vpc_peering` upserts under
+    compare-and-set and leaves unrelated peerings alone.
+    """
+    broken: list[str] = []
+
+    for vpc in attached:
+        item = await _get_vpc(k8s, vpc.vpc_name)
+        if item is None:
+            continue
+        peerings = (item.get("spec", {}) or {}).get("vpcPeerings") or []
+        if any(p.get("remoteVpc") == gw_vpc_name for p in peerings):
+            continue
+
+        vpc.peering_ok = False
+        broken.append(vpc.vpc_name)
+        logger.warning(
+            "Tenant VPC %r lost its peering to gateway VPC %r; restoring it",
+            vpc.vpc_name, gw_vpc_name,
+        )
+        if vpc.transit_ip and transit_cidr:
+            prefix = _transit_prefix_len(transit_cidr)
+            try:
+                await _ensure_vpc_peering(
+                    k8s, vpc.vpc_name, gw_vpc_name, f"{vpc.transit_ip}/{prefix}",
+                )
+            except ApiException as e:
+                logger.error("Could not restore peering for %r: %s", vpc.vpc_name, e)
+
+    if not broken:
+        return None
+    return (
+        "tenant side peering missing for "
+        + ", ".join(broken)
+        + " (restored; re-check in a moment)"
+    )
+
+
+async def _get_vpc(k8s, name: str) -> dict[str, Any] | None:
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
 
 
 async def _list_attached_vpcs(k8s, gateway_name: str) -> list[AttachedVpcInfo]:
@@ -298,7 +366,12 @@ async def list_egress_gateways(request: Request, user: User = Depends(require_au
         veg = await _get_vpc_egress_gateway(k8s, gw_name)
         attached = await _list_attached_vpcs(k8s, gw_name)
         pod_ips = await _get_gateway_pod_ips(k8s, gw_name)
-        items.append(_parse_gateway(vpc, veg, attached, pod_ips))
+        annotations = vpc.get("metadata", {}).get("annotations", {})
+        degraded = await _verify_and_heal_peerings(
+            k8s, vpc.get("metadata", {}).get("name", ""),
+            annotations.get("kubevirt-ui.io/transit-cidr", ""), attached,
+        )
+        items.append(_parse_gateway(vpc, veg, attached, pod_ips, degraded))
 
     return EgressGatewayListResponse(items=items, total=len(items))
 
@@ -315,7 +388,12 @@ async def get_egress_gateway(request: Request, name: str, user: User = Depends(r
     veg = await _get_vpc_egress_gateway(k8s, name)
     attached = await _list_attached_vpcs(k8s, name)
     pod_ips = await _get_gateway_pod_ips(k8s, name)
-    return _parse_gateway(vpc, veg, attached, pod_ips)
+    annotations = vpc.get("metadata", {}).get("annotations", {})
+    degraded = await _verify_and_heal_peerings(
+        k8s, vpc.get("metadata", {}).get("name", ""),
+        annotations.get("kubevirt-ui.io/transit-cidr", ""), attached,
+    )
+    return _parse_gateway(vpc, veg, attached, pod_ips, degraded)
 
 
 @router.post("", response_model=EgressGatewayResponse, status_code=201)
@@ -657,6 +735,24 @@ async def detach_tenant_vpc(
     return {"status": "detached", "gateway": name, "vpc": data.vpc_name}
 
 
+def _reject_self_attach(gateway_name: str, tenant_vpc_name: str) -> None:
+    """A gateway cannot be its own tenant.
+
+    The dialog used to offer exactly one option — the gateway's own VPC — so
+    this was the only attach a user could actually perform, and it would have
+    written a peering from a router to itself.
+    """
+    if tenant_vpc_name == f"egw-{gateway_name}":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"'{tenant_vpc_name}' is this gateway's own VPC. Attach a tenant "
+                "VPC instead — the gateway provides egress for other VPCs, not "
+                "for itself."
+            ),
+        )
+
+
 # ============================================================================
 # Internal Functions (called from tenants.py)
 # ============================================================================
@@ -686,6 +782,8 @@ async def attach_tenant_to_gateway(
         gateway_name = await _find_default_gateway(k8s)
         if not gateway_name:
             return None
+
+    _reject_self_attach(gateway_name, tenant_vpc_name)
 
     vpc = await _get_gateway_config(k8s, gateway_name)
     if not vpc:

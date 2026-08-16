@@ -671,7 +671,18 @@ function AttachVpcModal({
   const [subnetName, setSubnetName] = useState('');
   const [cidr, setCidr] = useState('');
 
-  const availableVpcs = (vpcsData?.items ?? []).filter((v: any) => !existingVpcNames.includes(v.name));
+  // Everything a gateway can actually serve: a tenant VPC that is not already
+  // attached, is not this gateway's own VPC, is not some other gateway's VPC,
+  // and is not kube-ovn's system VPC. Before the VPC list stopped filtering by
+  // the managed label this dropdown could end up offering only `egw-<name>` —
+  // the gateway itself — which is the one attach that makes no sense.
+  const availableVpcs = (vpcsData?.items ?? []).filter(
+    (v: any) =>
+      !existingVpcNames.includes(v.name) &&
+      v.name !== `egw-${gatewayName}` &&
+      !v.name.startsWith('egw-') &&
+      v.origin !== 'system',
+  );
   const selectedVpc = vpcsData?.items.find((v: any) => v.name === vpcName);
 
   const handleVpcChange = (name: string) => {
@@ -922,6 +933,8 @@ export default function EgressGateways() {
   const [showCreate, setShowCreate] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [detailGateway, setDetailGateway] = useState<EgressGateway | null>(null);
+  // Attach used to live only inside the detail panel, two clicks deep.
+  const [attachGateway, setAttachGateway] = useState<EgressGateway | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const { data, isLoading, refetch } = useEgressGateways();
   // const { data: vpcsData } = useVpcs();
@@ -1101,6 +1114,14 @@ export default function EgressGateways() {
       )}
 
       {/* Detail modal */}
+      {attachGateway && (
+        <AttachVpcModal
+          gatewayName={attachGateway.name}
+          existingVpcNames={attachGateway.attached_vpcs.map((v) => v.vpc_name)}
+          onClose={() => setAttachGateway(null)}
+        />
+      )}
+
       {detailGateway && (
         <GatewayDetailModal
           gateway={detailGateway}

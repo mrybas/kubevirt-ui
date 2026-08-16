@@ -153,6 +153,10 @@ class AttachedVpcInfo(BaseModel):
     cidr: str
     transit_ip: str = ""
     peering_name: str = ""
+    # False when this tenant's router does not declare the peering back to the
+    # gateway VPC. kube-ovn needs both halves, so a False here means the
+    # tenant's egress is dropped no matter how healthy the gateway looks.
+    peering_ok: bool = True
 
 
 class GatewayPodInfo(BaseModel):
@@ -176,7 +180,15 @@ class EgressGatewayResponse(BaseModel):
     exclude_ips: list[str] = []
     attached_vpcs: list[AttachedVpcInfo] = []
     assigned_ips: list[GatewayPodInfo] = []
+    # Straight from `VpcEgressGateway.status`. The per-pod list above depends on
+    # matching kube-ovn's own pod labels, which we do not control; this does not.
+    internal_ips: list[str] = []
+    external_ips: list[str] = []
     ready: bool = False
+    # Set when the gateway itself is up but the wiring to a tenant is broken.
+    # Reported instead of a green Ready, which is what let a completely severed
+    # data path look healthy in every view.
+    degraded_reason: Optional[str] = None
     status: Optional[dict] = None
 
 
