@@ -261,6 +261,14 @@ async def test_tenant_deletion_releases_the_transit_objects(
     assert f"cpt-snat-{TENANT}" not in k8s._store["ovn-snat-rules"]
 
 
+def _covered(deny: dict) -> list:
+    """Prefixes on the left-hand side of a deny, however they were summarised."""
+    import ipaddress
+
+    body = deny["match"].split("==", 1)[1].strip().strip("{}")
+    return [ipaddress.ip_network(p.strip()) for p in body.split(",")]
+
+
 class TestTransitDenyBaseline:
     """Allow rules alone leave the transit plane open.
 
@@ -275,19 +283,51 @@ class TestTransitDenyBaseline:
     of the deny while still keeping its own allow.
     """
 
-    def test_the_deny_covers_the_whole_transit_range(self) -> None:
+    def test_the_deny_covers_the_whole_allocation_range(self) -> None:
+        """Scoped to where EIPs come from — not to the whole subnet.
+
+        The subnet is 10.199.0.0/22 but `excludeIps` reserves the first /24
+        for the nodes and the control-plane VIP, so kube-ovn hands EIPs out of
+        10.199.1.0-10.199.3.255. Denying by the whole /22 would put the nodes'
+        own addresses and the VIP on the left-hand side of a drop rule; the
+        set that was measured working on the lab scopes every drop by the EIP
+        range instead.
+        """
         from app.core.tenant_transit import build_transit_deny
 
-        deny = build_transit_deny("10.199.0.0/22")
+        deny = build_transit_deny("10.199.0.0/22", ["10.199.0.1..10.199.0.255"])
+
+        import ipaddress
 
         assert deny["action"] == "drop"
-        assert deny["match"] == "ip4.src == 10.199.0.0/22"
+        covered = _covered(deny)
+        # every address kube-ovn can hand a tenant is denied by default
+        for addr in ("10.199.1.1", "10.199.2.5", "10.199.3.255"):
+            assert any(ipaddress.ip_address(addr) in n for n in covered), addr
+
+    def test_node_and_vip_addresses_are_outside_the_deny(self) -> None:
+        import ipaddress
+
+        from app.core.tenant_transit import build_transit_deny
+
+        deny = build_transit_deny("10.199.0.0/22", ["10.199.0.1..10.199.0.255"])
+        covered = _covered(deny)
+
+        for addr in ("10.199.0.11", "10.199.0.12", "10.199.0.13", "10.199.0.100"):
+            assert not any(ipaddress.ip_address(addr) in n for n in covered), addr
+
+    def test_without_exclusions_the_whole_subnet_is_the_range(self) -> None:
+        from app.core.tenant_transit import build_transit_deny
+
+        deny = build_transit_deny("10.199.0.0/22", [])
+
+        assert "10.199.0.0/22" in deny["match"]
 
     def test_the_deny_sits_below_the_allows(self) -> None:
         from app.core.tenant_transit import build_transit_acls, build_transit_deny
 
         allows = build_transit_acls("10.199.1.1", "10.199.0.100", [16443])
-        deny = build_transit_deny("10.199.0.0/22")
+        deny = build_transit_deny("10.199.0.0/22", ["10.199.0.1..10.199.0.255"])
 
         assert all(a["priority"] > deny["priority"] for a in allows), (
             "the deny would swallow the allows"
@@ -299,11 +339,11 @@ class TestTransitDenyBaseline:
 
         from app.core.tenant_transit import build_transit_deny
 
-        deny = build_transit_deny("10.199.0.0/22")
-        network = ipaddress.ip_network(deny["match"].split("== ")[1])
+        deny = build_transit_deny("10.199.0.0/22", ["10.199.0.1..10.199.0.255"])
+        covered = _covered(deny)
 
-        assert ipaddress.ip_address("10.199.2.5") in network
-        assert ipaddress.ip_address("10.199.3.200") in network
+        assert any(ipaddress.ip_address("10.199.2.5") in n for n in covered)
+        assert any(ipaddress.ip_address("10.199.3.200") in n for n in covered)
 
     @pytest.mark.asyncio
     async def test_the_deny_is_written_once_and_kept(self) -> None:

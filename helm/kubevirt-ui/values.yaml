@@ -97,6 +97,16 @@ backend:
     # control plane. The CIDR and address range are read from the Subnet, so
     # there is nothing else to keep in sync.
     TENANTS_CP_TRANSIT_SUBNET: ""
+    # Prefix length of one tenant VPC, carved out of TENANT_SUPERNET. Must be
+    # what the border router accepts: the lab filter is
+    # `10.200.0.0/14{22,22}`, so a /24 announcement is dropped and a VPC
+    # created the normal way could not be announced at all. Default /22.
+    TENANT_VPC_PREFIX: ""
+    # Where an egress gateway's own VPC and transit link are carved from —
+    # infrastructure space, deliberately outside TENANT_SUPERNET. Suggestions
+    # are checked against the real subnets either way, so a wrong pool yields
+    # an empty answer rather than a colliding one.
+    EGRESS_GW_CIDR_POOL: ""
     # CP port pool on the shared VIP (defaults: 20000 / 60000, 2 ports per
     # tenant) and Kamaji-reserved konnectivity ports to avoid (8133,8134).
     TENANTS_CP_PORT_BASE: ""

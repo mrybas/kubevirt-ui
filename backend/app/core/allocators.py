@@ -3,6 +3,7 @@
 import asyncio
 import ipaddress
 import logging
+import os
 from typing import Any
 
 from fastapi import HTTPException
@@ -13,7 +14,35 @@ from app.core.constants import SYSTEM_NAMESPACE
 logger = logging.getLogger(__name__)
 
 VPC_CIDR_CONFIGMAP = "vpc-cidr-allocator"
-VPC_CIDR_BASE = 200  # 10.{200+N}.0.0/24 — above K8s service CIDR (10.96.0.0/12)
+
+# The address plan comes from configuration, not from constants here. It used
+# to be `10.{200+N}.0.0/24` with both numbers hardcoded and `TENANT_SUPERNET`
+# never read, which left three contracts to agree by luck:
+#
+#   * the isolation ACLs are scoped to TENANT_SUPERNET, so the fifth VPC —
+#     10.204.0.0/24, outside 10.200.0.0/14 — fell out of them;
+#   * the border router accepts `10.200.0.0/14{22,22}`, so a /24 announcement
+#     is rejected and a VPC created the normal way could not be announced.
+#
+# One setting now decides allocation, isolation scope and what the border will
+# accept. The default matches the deployment's own supernet.
+DEFAULT_TENANT_SUPERNET = "10.200.0.0/14"
+DEFAULT_VPC_PREFIX = 22
+
+
+def vpc_supernet() -> str:
+    """The range every tenant VPC is carved from."""
+    return os.getenv("TENANT_SUPERNET") or DEFAULT_TENANT_SUPERNET
+
+
+def vpc_prefix_len() -> int:
+    """Prefix length of one tenant VPC. Must be what the border filter accepts."""
+    raw = os.getenv("TENANT_VPC_PREFIX")
+    try:
+        return int(raw) if raw else DEFAULT_VPC_PREFIX
+    except ValueError:
+        logger.warning("TENANT_VPC_PREFIX=%r is not a number; using /%d", raw, DEFAULT_VPC_PREFIX)
+        return DEFAULT_VPC_PREFIX
 
 MAX_RETRIES = 5
 BASE_DELAY = 0.1  # seconds
@@ -149,24 +178,48 @@ async def _allocate_vpc_cidr_once(k8s) -> tuple[str, str]:
     # what stops the allocator from later handing out a duplicate of one.
     existing = await list_subnet_cidrs(k8s)
 
+    supernet = ipaddress.ip_network(vpc_supernet(), strict=False)
+    prefix = vpc_prefix_len()
+    if prefix < supernet.prefixlen:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"TENANT_VPC_PREFIX /{prefix} is wider than the supernet "
+                f"{supernet} — one VPC would not fit inside it"
+            ),
+        )
+
+    candidates = list(supernet.subnets(new_prefix=prefix))
+
+    # The counter is a hint that keeps concurrent creates off the same range;
+    # the scan is what makes the answer correct. A `subnet_cidr` supplied on
+    # the create request takes a range out of this same pool without touching
+    # the counter, so only looking at real Subnets catches it.
     index = next_index
-    while True:
-        second_octet = VPC_CIDR_BASE + index
-        if second_octet > 254:
-            raise HTTPException(
-                status_code=409, detail="VPC CIDR pool exhausted (max 55 VPCs)",
-            )
-        cidr = f"10.{second_octet}.0.0/24"
+    chosen: str | None = None
+    for offset in range(len(candidates)):
+        i = (index + offset) % len(candidates)
+        cidr = str(candidates[i])
         conflicts = find_cidr_conflicts(cidr, existing)
         if not conflicts:
+            index, chosen = i, cidr
             break
         logger.info(
             f"VPC CIDR {cidr} already taken by {', '.join(conflicts)}; "
-            "skipping to the next index"
+            "trying the next range in the supernet"
         )
-        index += 1
 
-    gateway = f"10.{second_octet}.0.1"
+    if chosen is None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Tenant supernet {supernet} is exhausted at /{prefix} "
+                f"({len(candidates)} ranges, all in use)"
+            ),
+        )
+
+    cidr = chosen
+    gateway = str(ipaddress.ip_network(cidr).network_address + 1)
 
     # Increment counter with optimistic lock (resourceVersion).
     # If another request raced us, this will return 409 Conflict.

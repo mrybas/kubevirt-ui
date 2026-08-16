@@ -14,7 +14,8 @@ from kubernetes_asyncio.client import ApiException
 
 from app.core import allocators
 from app.core.allocators import (
-    VPC_CIDR_BASE,
+    vpc_prefix_len,
+    vpc_supernet,
     allocate_vpc_cidr,
     assert_cidr_free,
     find_cidr_conflicts,
@@ -105,41 +106,51 @@ class TestAssertCidrFree:
 
 @pytest.mark.asyncio
 class TestAllocateVpcCidr:
-    async def test_allocates_from_the_counter(self) -> None:
-        k8s = _k8s([], next_index="0")
-        assert await allocate_vpc_cidr(k8s) == (
-            f"10.{VPC_CIDR_BASE}.0.0/24", f"10.{VPC_CIDR_BASE}.0.1",
-        )
+    """Allocation comes out of TENANT_SUPERNET at TENANT_VPC_PREFIX.
+
+    Both used to be constants in this module (`10.{200+N}.0.0/24`) that no
+    configuration could reach, so the supernet the isolation ACLs are scoped
+    to and the prefix the border router accepts were free to disagree with the
+    allocator — and did.
+    """
+
+    def _nth(self, n: int) -> str:
+        import ipaddress
+        nets = ipaddress.ip_network(vpc_supernet()).subnets(new_prefix=vpc_prefix_len())
+        return str(next(x for i, x in enumerate(nets) if i == n))
+
+    async def test_allocates_the_first_free_range(self) -> None:
+        cidr, gateway = await allocate_vpc_cidr(_k8s([], next_index="0"))
+        assert cidr == self._nth(0)
+        assert gateway == self._nth(0).split("/")[0][:-1] + "1"
 
     async def test_skips_a_range_taken_by_hand(self) -> None:
         # Somebody created a VPC with an explicit subnet_cidr out of this same
-        # pool; the counter never saw it, so without the skip the allocator
+        # pool; the counter never saw it, so without the scan the allocator
         # would hand out a duplicate.
-        k8s = _k8s([("manual", f"10.{VPC_CIDR_BASE}.0.0/24")], next_index="0")
-        cidr, gateway = await allocate_vpc_cidr(k8s)
-
-        assert cidr == f"10.{VPC_CIDR_BASE + 1}.0.0/24"
-        assert gateway == f"10.{VPC_CIDR_BASE + 1}.0.1"
+        k8s = _k8s([("manual", self._nth(0))], next_index="0")
+        cidr, _ = await allocate_vpc_cidr(k8s)
+        assert cidr == self._nth(1)
 
     async def test_skips_a_run_of_taken_ranges(self) -> None:
-        taken = [
-            (f"m{i}", f"10.{VPC_CIDR_BASE + i}.0.0/24") for i in range(3)
-        ]
+        taken = [(f"m{i}", self._nth(i)) for i in range(3)]
         cidr, _ = await allocate_vpc_cidr(_k8s(taken, next_index="0"))
-        assert cidr == f"10.{VPC_CIDR_BASE + 3}.0.0/24"
+        assert cidr == self._nth(3)
 
     async def test_counter_advances_past_the_skipped_ones(self) -> None:
-        k8s = _k8s([("manual", f"10.{VPC_CIDR_BASE}.0.0/24")], next_index="0")
+        k8s = _k8s([("manual", self._nth(0))], next_index="0")
         await allocate_vpc_cidr(k8s)
 
         body = k8s.core_api.replace_namespaced_config_map.await_args.kwargs["body"]
-        assert body.data == {"next_index": str(1 + 1)}
+        assert body.data == {"next_index": "2"}
 
-    async def test_pool_exhaustion_is_409(self) -> None:
-        k8s = _k8s([], next_index=str(255 - VPC_CIDR_BASE))
+    async def test_a_full_supernet_is_409(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("TENANT_SUPERNET", "10.200.0.0/22")
+        monkeypatch.setenv("TENANT_VPC_PREFIX", "22")
         with pytest.raises(HTTPException) as exc:
-            await allocate_vpc_cidr(k8s)
+            await allocate_vpc_cidr(_k8s([("only-one", "10.200.0.0/22")], next_index="0"))
         assert exc.value.status_code == 409
+        assert "supernet" in exc.value.detail.lower()
 
     async def test_retries_on_optimistic_lock_conflict(
         self, monkeypatch: pytest.MonkeyPatch,
@@ -152,5 +163,5 @@ class TestAllocateVpcCidr:
 
         cidr, _ = await allocate_vpc_cidr(k8s)
 
-        assert cidr == f"10.{VPC_CIDR_BASE}.0.0/24"
+        assert cidr == self._nth(0)
         assert k8s.core_api.replace_namespaced_config_map.await_count == 2

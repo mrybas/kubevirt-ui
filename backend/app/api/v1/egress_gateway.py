@@ -13,6 +13,7 @@ Supports flexible topologies:
 import asyncio
 import ipaddress
 import logging
+import os
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -283,10 +284,16 @@ async def allocate_gateway_ips(
     return internal, external
 
 
-# Where a gateway's own networks are carved from. Deliberately a /16 of its
-# own: the gateway VPC and its transit link are infrastructure, not tenant
-# space, and must not be taken out of the tenant supernet.
-GATEWAY_CIDR_POOL = "10.199.128.0/17"
+# Where a gateway's own networks are carved from — infrastructure space, not
+# tenant space, so deliberately outside TENANT_SUPERNET. The default is this
+# deployment's plan; anywhere else it is a setting, not an assumption baked
+# into the code. Every suggestion is still checked against the real subnets,
+# so a wrong pool cannot produce a colliding answer — only an empty one.
+DEFAULT_GATEWAY_CIDR_POOL = "10.199.128.0/17"
+
+
+def gateway_cidr_pool() -> str:
+    return os.getenv("EGRESS_GW_CIDR_POOL") or DEFAULT_GATEWAY_CIDR_POOL
 
 
 async def suggest_gateway_cidrs(k8s, pool: str | None = None) -> dict[str, str]:
@@ -305,7 +312,7 @@ async def suggest_gateway_cidrs(k8s, pool: str | None = None) -> dict[str, str]:
     Returns empty strings when the pool has no room left — an empty field the
     operator must fill is better than a suggestion that collides.
     """
-    network = ipaddress.ip_network(pool or GATEWAY_CIDR_POOL, strict=False)
+    network = ipaddress.ip_network(pool or gateway_cidr_pool(), strict=False)
     existing = await list_subnet_cidrs(k8s)
 
     free: list[str] = []

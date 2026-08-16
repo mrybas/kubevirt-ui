@@ -224,7 +224,7 @@ async def ensure_transit_acls(
             a.get("action") == "drop" and a.get("priority") == TRANSIT_DENY_PRIORITY
             for a in acls
         ):
-            acls.append(build_transit_deny(cidr))
+            acls.append(build_transit_deny(cidr, spec.get("excludeIps") or []))
 
         missing = [a for a in wanted if a not in acls]
         if not missing and acls == (spec.get("acls") or []):
@@ -264,22 +264,83 @@ TRANSIT_ALLOW_PRIORITY = 3200
 TRANSIT_DENY_PRIORITY = 3000
 
 
-def build_transit_deny(transit_cidr: str) -> dict[str, Any]:
+def _allocatable_ranges(cidr: str, exclude_ips: list[str]) -> list[str]:
+    """The part of a subnet kube-ovn can actually hand addresses out of.
+
+    `excludeIps` is where the deployment records what is reserved — on the lab
+    the transit subnet is 10.199.0.0/22 with `10.199.0.1..10.199.0.255`
+    excluded, because the first /24 holds the nodes and the control-plane VIP.
+    What is left is what tenants get.
+    """
+    network = ipaddress.ip_network(cidr, strict=False)
+
+    reserved: list[Any] = []
+    for entry in exclude_ips or []:
+        entry = str(entry).strip()
+        try:
+            if ".." in entry:
+                first, _, last = entry.partition("..")
+                reserved.extend(ipaddress.summarize_address_range(
+                    ipaddress.IPv4Address(first.strip()),
+                    ipaddress.IPv4Address(last.strip()),
+                ))
+            elif "/" in entry:
+                reserved.append(ipaddress.ip_network(entry, strict=False))
+            elif entry:
+                reserved.append(ipaddress.ip_network(f"{entry}/32"))
+        except ValueError:
+            logger.warning("Unparseable excludeIps entry %r on %s", entry, cidr)
+
+    remaining = [network]
+    for block in reserved:
+        nxt = []
+        for net in remaining:
+            if block.subnet_of(net):
+                nxt.extend(net.address_exclude(block))
+            elif not net.overlaps(block):
+                nxt.append(net)
+        remaining = nxt
+
+    # The subnet's own network address survives the exclusion arithmetic as a
+    # /32 that no host can ever hold. Dropping it keeps the rule readable —
+    # these end up in front of whoever is debugging an ACL at 3am.
+    network_addr = network.network_address
+    return [
+        str(n) for n in sorted(remaining)
+        if not (n.prefixlen == 32 and n.network_address == network_addr)
+    ]
+
+
+def build_transit_deny(transit_cidr: str, exclude_ips: list[str]) -> dict[str, Any]:
     """The deny the per-tenant allows are exceptions to.
 
     Without it the transit plane is open: every allow is additive, so one
-    tenant's EIP can still reach another tenant's control-plane ports and the
+    tenant's EIP could still reach another tenant's control-plane ports and the
     nodes sitting on that subnet.
 
-    The match covers the **whole** transit range, not the first /24 of it.
-    A /24-scoped rule is a rule about the tenants that happen to be numbered
-    lowest — the 129th tenant is allocated outside it, keeps its own allow, and
-    quietly falls out of the deny.
+    Scoped by **source** to the range kube-ovn allocates EIPs from — the subnet
+    minus its `excludeIps`. Using the whole subnet instead puts the nodes' own
+    addresses and the control-plane VIP on the left-hand side of a drop rule;
+    the rule set measured working on the lab scopes every drop by the EIP range,
+    and service traffic is not something to leave resting on connection
+    tracking.
+
+    The range is taken whole rather than as its first /24: a /24-scoped rule is
+    a rule about the tenants numbered lowest, and the 129th one is allocated
+    outside it, keeps its own allow, and quietly falls out of the deny.
     """
-    network = ipaddress.ip_network(transit_cidr, strict=False)
+    ranges = _allocatable_ranges(transit_cidr, exclude_ips)
+    if not ranges:
+        ranges = [str(ipaddress.ip_network(transit_cidr, strict=False))]
+
+    match = (
+        f"ip4.src == {ranges[0]}" if len(ranges) == 1
+        else "ip4.src == {" + ", ".join(ranges) + "}"
+    )
     return {
         "action": "drop",
         "direction": "from-lport",
         "priority": TRANSIT_DENY_PRIORITY,
-        "match": f"ip4.src == {network}",
+        "match": match,
     }
+
