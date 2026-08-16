@@ -153,6 +153,11 @@ class OvnGatewayResponse(BaseModel):
     subnet_name: str = ""
     external_subnet: str = ""
     eip: Optional[OvnEipInfo] = None
+    # "ui" when we hold a tracking ConfigMap for this VPC, "external" when the
+    # NAT objects were found in the cluster without one (CLI, GitOps). The page
+    # used to list only the former and therefore claimed an empty cluster while
+    # tenant traffic was being NATed.
+    origin: str = "ui"
     snat_rules: list[OvnSnatRuleInfo] = []
     dnat_rules: list[OvnDnatRuleInfo] = []
     fips: list[OvnFipInfo] = []

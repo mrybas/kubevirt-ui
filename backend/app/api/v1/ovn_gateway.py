@@ -350,19 +350,54 @@ async def _remove_vpc_external_config(
         )
 
 
+async def _rules_for_vpc(k8s, plural: str, vpc_name: str) -> list[dict[str, Any]]:
+    """NAT objects belonging to `vpc_name`, labelled by us or not.
+
+    Anything created outside the console carries none of our labels, so the
+    label selector finds nothing and the VPC looks like it has no NAT at all.
+    Fall back to the field kube-ovn itself keys on — `spec.vpc` / `status.vpc`.
+    """
+    labelled = await _list_crd_by_label(k8s, plural, f"{OVN_GW_LABEL}={vpc_name}")
+    if labelled:
+        return labelled
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural=plural,
+        )
+    except ApiException:
+        return []
+    return [
+        i for i in result.get("items", [])
+        if (i.get("status", {}) or {}).get("vpc", (i.get("spec", {}) or {}).get("vpc")) == vpc_name
+    ]
+
+
 async def _build_gateway_response(k8s, vpc_name: str) -> OvnGatewayResponse:
     """Build full gateway response from tracking CM and CRDs."""
     data, _ = await _get_gateway_tracking(k8s, vpc_name)
     label_sel = f"{OVN_GW_LABEL}={vpc_name}"
 
-    # Get EIP
-    eip_items = await _list_crd_by_label(k8s, "ovn-eips", label_sel)
-    eip = _parse_eip(eip_items[0]) if eip_items else None
-
-    # Get rules
-    snat_items = await _list_crd_by_label(k8s, "ovn-snat-rules", label_sel)
-    dnat_items = await _list_crd_by_label(k8s, "ovn-dnat-rules", label_sel)
+    snat_items = await _rules_for_vpc(k8s, "ovn-snat-rules", vpc_name)
+    dnat_items = await _rules_for_vpc(k8s, "ovn-dnat-rules", vpc_name)
     fip_items = await _list_crd_by_label(k8s, "ovn-fips", label_sel)
+
+    # Get EIP — by label, else the one the discovered SNAT rules point at.
+    eip_items = await _list_crd_by_label(k8s, "ovn-eips", label_sel)
+    if not eip_items:
+        wanted = {(i.get("spec", {}) or {}).get("ovnEip") for i in snat_items}
+        wanted.discard(None)
+        if wanted:
+            try:
+                all_eips = await k8s.custom_api.list_cluster_custom_object(
+                    group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="ovn-eips",
+                )
+                eip_items = [
+                    i for i in all_eips.get("items", [])
+                    if i.get("metadata", {}).get("name") in wanted
+                ]
+            except ApiException:
+                eip_items = []
+    eip = _parse_eip(eip_items[0]) if eip_items else None
 
     snat_rules = [_parse_snat_rule(i) for i in snat_items]
     dnat_rules = [_parse_dnat_rule(i) for i in dnat_items]
@@ -382,6 +417,7 @@ async def _build_gateway_response(k8s, vpc_name: str) -> OvnGatewayResponse:
         fips=fips,
         lsp_patched=data.get("lsp_patched") == "true",
         ready=ready,
+        origin="ui" if data else "external",
     )
 
 
@@ -449,11 +485,27 @@ async def list_ovn_gateways(
             return OvnGatewayListResponse(items=[], total=0)
         raise k8s_error_to_http(e, "listing OVN gateways")
 
-    items = []
-    for cm in cms.items or []:
-        vpc_name = (cm.metadata.labels or {}).get(OVN_GW_LABEL, "")
-        if vpc_name:
-            items.append(await _build_gateway_response(k8s, vpc_name))
+    tracked = [
+        vpc for cm in (cms.items or [])
+        if (vpc := (cm.metadata.labels or {}).get(OVN_GW_LABEL, ""))
+    ]
+
+    # Anything NATed without one of our tracking ConfigMaps is still NAT, and
+    # the operator needs to see it — the page used to report an empty cluster
+    # while tenant traffic was being SNATed by CLI-made rules.
+    discovered: list[str] = []
+    try:
+        rules = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="ovn-snat-rules",
+        )
+        for rule in rules.get("items", []):
+            vpc = (rule.get("status", {}) or {}).get("vpc") or (rule.get("spec", {}) or {}).get("vpc")
+            if vpc and vpc not in tracked and vpc not in discovered:
+                discovered.append(vpc)
+    except ApiException as e:
+        logger.warning(f"Could not scan SNAT rules for untracked gateways: {e}")
+
+    items = [await _build_gateway_response(k8s, vpc) for vpc in tracked + discovered]
 
     return OvnGatewayListResponse(items=items, total=len(items))
 

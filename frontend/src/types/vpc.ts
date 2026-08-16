@@ -43,6 +43,11 @@ export interface Vpc {
   // Label-based scoping (T7 — populated from kubevirt-ui.io/folder + /environment labels)
   folder?: string | null;
   environment?: string | null;
+  /**
+   * Where the object came from. Used to be a visibility filter, which hid
+   * every CLI/GitOps-made VPC from the console; it is a badge now.
+   */
+  origin?: 'ui' | 'system' | 'external';
 }
 
 export interface VpcListResponse {

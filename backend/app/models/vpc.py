@@ -195,6 +195,11 @@ class VpcResponse(BaseModel):
     # subnet. Reports what happened, not what was asked for: requesting
     # isolation without a configured TENANT_SUPERNET leaves this false.
     isolated: bool = False
+    # Where the object came from: "ui" (we created it), "system" (kube-ovn's
+    # own `ovn-cluster`), "external" (CLI, GitOps, another operator). This used
+    # to be a visibility filter, which hid half of a brownfield cluster from
+    # the console; it is a badge now.
+    origin: str = "external"
 
 
 class VpcListResponse(BaseModel):

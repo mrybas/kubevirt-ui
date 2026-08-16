@@ -94,8 +94,17 @@ def _parse_vpc(item: dict[str, Any]) -> VpcResponse:
     if not ready and status.get("standby") is not None:
         ready = status.get("standby", False) or status.get("default", False)
 
+    name = metadata.get("name", "")
+    if name == SYSTEM_VPC_NAME:
+        origin = "system"
+    elif labels.get("kubevirt-ui.io/managed") == "true":
+        origin = "ui"
+    else:
+        origin = "external"
+
     return VpcResponse(
-        name=metadata.get("name", ""),
+        name=name,
+        origin=origin,
         tenant=labels.get("kubevirt-ui.io/tenant"),
         # T7 — surface folder/env scope from labels so the wizard can render
         # them on the dropdown without re-fetching label dicts client-side.
@@ -901,8 +910,11 @@ async def list_vpcs(
         kwargs: dict[str, str] = {}
         if tenant:
             kwargs["label_selector"] = f"kubevirt-ui.io/tenant={tenant}"
-        else:
-            kwargs["label_selector"] = "kubevirt-ui.io/managed=true"
+        # No selector otherwise: a VPC made by CLI or GitOps is still part of
+        # this cluster, and hiding it broke the attach dialog and the CIDR
+        # overlap check as well as the list itself (backlog U24). Provenance
+        # rides along as `origin` for the badge. Non-admins are still narrowed
+        # by the access filter further down.
 
         result = await k8s.custom_api.list_cluster_custom_object(
             group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs", **kwargs,
