@@ -90,6 +90,13 @@ backend:
     # (defaults: traefik / cp-demux).
     TENANTS_CP_METALLB_POOL: ""
     TENANTS_CP_SHARED_IP_KEY: ""
+    # Name of the kube-ovn Subnet carrying the control-plane transit plane —
+    # the one the demux VIP lives on. A VPC tenant gets attached to it, given
+    # an EIP + SNAT rule there, and allowed through to the VIP on its own two
+    # ports. Leave it empty and VPC tenants come up with no path to their own
+    # control plane. The CIDR and address range are read from the Subnet, so
+    # there is nothing else to keep in sync.
+    TENANTS_CP_TRANSIT_SUBNET: ""
     # CP port pool on the shared VIP (defaults: 20000 / 60000, 2 ports per
     # tenant) and Kamaji-reserved konnectivity ports to avoid (8133,8134).
     TENANTS_CP_PORT_BASE: ""

@@ -104,6 +104,7 @@ from app.api.v1.tenants_storage import (
     schedule_credential_replication,
 )
 from app.api.v1.tenants_cp_ports import release_cp_ports
+from app.core.tenant_transit import remove_tenant_transit, transit_subnet_name
 from app.api.v1.tenants_talos import (
     assert_cabpt_installed,
     ensure_talos_bootstrap_provider,
@@ -1360,6 +1361,7 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
         ("drop the control-plane SwitchLBRule", _remove_cp_vpc_publication),
         ("delete the CSI ClusterRoleBinding", delete_csi_cluster_role_binding),
         ("release the CP demux ports", release_cp_ports),
+        ("drop the transit EIP/SNAT and its ACLs", _release_tenant_transit),
     ):
         try:
             await cleanup(k8s, name)
@@ -1378,6 +1380,34 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
             return
         logger.error(f"Failed to delete tenant {name}: {e}")
         raise k8s_error_to_http(e, "tenant operation")
+
+
+async def _release_tenant_transit(k8s, tenant_name: str) -> None:
+    """Give back the transit-plane objects this tenant owns.
+
+    Its EIP address is read before the objects go, because the transit subnet's
+    ACLs are keyed on the address rather than on the tenant's name. The VPC's
+    own attachment and control-plane guard are deliberately left behind: other
+    tenants in the same VPC are still using them, and a leftover entry costs
+    nothing while a missing one costs every tenant behind it their control
+    plane.
+    """
+    transit = transit_subnet_name()
+    if not transit:
+        return
+
+    eip_address = None
+    try:
+        eip = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural="ovn-eips", name=f"cpt-eip-{tenant_name}",
+        )
+        eip_address = (eip.get("status", {}) or {}).get("v4Ip")
+    except ApiException as e:
+        if e.status != 404:
+            raise
+
+    await remove_tenant_transit(k8s, tenant_name, transit, eip_address)
 
 
 async def _rotate_worker_template(

@@ -16,6 +16,13 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
+from app.core.tenant_transit import (
+    attach_vpc_to_transit,
+    ensure_tenant_snat,
+    ensure_transit_acls,
+    remove_tenant_transit,
+    transit_subnet_name,
+)
 from app.models.tenant import TenantCreateRequest
 
 from app.api.v1.tenants_common import (
@@ -1135,6 +1142,41 @@ async def tenant_vpc_name(k8s, tenant_name: str) -> str:
     return ""
 
 
+async def _wire_tenant_to_transit(
+    k8s, tenant_name: str, vpc_name: str, vip: str, ports: list[int],
+) -> None:
+    """Build the tenant's path to the shared control-plane VIP.
+
+    Best-effort by design: a tenant whose transit wiring failed is still a
+    created tenant, and the reconcile on the next read repairs it. Failing the
+    whole creation here would leave a half-built cluster behind for a problem
+    that is usually a missing configuration value.
+    """
+    transit = transit_subnet_name()
+    if not transit:
+        logger.warning(
+            "Tenant %r is in VPC %r but TENANTS_CP_TRANSIT_SUBNET is unset — "
+            "its workers will not reach the control-plane VIP until the transit "
+            "subnet is configured", tenant_name, vpc_name,
+        )
+        return
+
+    try:
+        await attach_vpc_to_transit(k8s, vpc_name, transit)
+        eip = await ensure_tenant_snat(
+            k8s, tenant_name, vpc_name, f"{vpc_name}-default", transit,
+        )
+        if eip:
+            await ensure_transit_acls(k8s, transit, eip, vip, ports)
+        else:
+            logger.info(
+                "Tenant %r: transit EIP has no address yet; ACLs deferred to the "
+                "next reconcile", tenant_name,
+            )
+    except (ApiException, LookupError) as e:
+        logger.error("Tenant %r: transit wiring incomplete: %s", tenant_name, e)
+
+
 async def _ensure_cp_reachable_in_vpc(k8s, tenant_name: str, vpc_name: str) -> bool:
     """Publish the tenant's control-plane ClusterIP inside its own VPC.
 
@@ -1509,6 +1551,15 @@ async def _create_capi_resources(
             f"Created {req.name}-cp-lb on {vip}:{api_port}(api)/{konn_port}(konn)"
         )
         cp_address = vip
+
+        # The Service alone is not reachable from inside the VPC: the tenant's
+        # router has no port on the transit plane, no source address there and
+        # no policy keeping control-plane traffic off an egress gateway's
+        # catch-all reroute. Build that path now — it used to be five manual
+        # `kubectl` steps between "tenant created" and "a worker can join".
+        await _wire_tenant_to_transit(
+            k8s, req.name, req.vpc_name, vip, [api_port, konn_port],
+        )
     else:
         # 3-default. Wait for the Kamaji TCP Service ClusterIP, then PATCH
         #   controlPlaneEndpoint to it. Workers join via the ClusterIP
