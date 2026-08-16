@@ -49,6 +49,16 @@ export default function VPCs() {
               {vpc.folder}{vpc.environment ? `/${vpc.environment}` : ''}
             </span>
           )}
+          {vpc.origin && vpc.origin !== 'ui' && (
+            <span
+              className="px-1.5 py-0.5 text-[11px] font-medium rounded bg-surface-700/60 text-surface-300"
+              title={vpc.origin === 'system'
+                ? "kube-ovn's own VPC"
+                : 'Created outside this console (CLI, GitOps)'}
+            >
+              {vpc.origin}
+            </span>
+          )}
         </div>
       ),
     },

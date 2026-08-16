@@ -972,7 +972,18 @@ export default function EgressGateways() {
       key: 'status',
       header: 'Status',
       accessor: (gw) => (
-        gw.ready ? (
+        gw.degraded_reason ? (
+          // The gateway pods can be perfectly healthy while a tenant cannot
+          // reach them. Saying "Ready" there is how a severed data path went
+          // unnoticed for an afternoon.
+          <span
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-orange-400 bg-orange-500/10"
+            title={gw.degraded_reason}
+          >
+            <AlertTriangle className="h-3.5 w-3.5" />
+            Degraded
+          </span>
+        ) : gw.ready ? (
           <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-emerald-400 bg-emerald-500/10">
             <CheckCircle className="h-3.5 w-3.5" />
             Ready
@@ -996,7 +1007,11 @@ export default function EgressGateways() {
       header: 'External IP',
       hideOnMobile: true,
       accessor: (gw) => {
-        const ips = gw.assigned_ips.filter(p => p.external_ip).map(p => p.external_ip);
+        // `status.externalIPs` first: the per-pod list depends on matching
+        // kube-ovn's own pod labels and comes back empty on a live gateway.
+        const ips = (gw.external_ips?.length ?? 0) > 0
+          ? gw.external_ips!
+          : gw.assigned_ips.filter(p => p.external_ip).map(p => p.external_ip);
         return ips.length > 0
           ? <span className="font-mono text-primary-400">{ips.join(', ')}</span>
           : <span className="text-surface-500">-</span>;
@@ -1015,6 +1030,7 @@ export default function EgressGateways() {
   const getActions = (gw: EgressGateway): MenuItem[] => {
     const items: MenuItem[] = [
       { label: 'View Details', icon: <Eye className="h-4 w-4" />, onClick: () => setDetailGateway(gw) },
+      { label: 'Attach VPC', icon: <Plus className="h-4 w-4" />, onClick: () => setAttachGateway(gw) },
     ];
     if (gw.attached_vpcs.length === 0) {
       items.push({ label: 'Delete', icon: <Trash2 className="h-4 w-4" />, onClick: () => setDeleteConfirm(gw.name), variant: 'danger' });
