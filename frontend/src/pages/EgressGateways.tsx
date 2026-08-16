@@ -4,7 +4,7 @@
  * List, create, delete egress gateways; attach/detach VPCs.
  */
 
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   Plus,
@@ -31,6 +31,7 @@ import { DataTable, type Column } from '@/components/common/DataTable';
 import type { MenuItem } from '@/components/common/KebabMenu';
 import { ActionBar } from '@/components/common/ActionBar';
 import { listSubnets } from '../api/network';
+import { suggestGatewayCidrs } from '../api/egress';
 
 // ---------------------------------------------------------------------------
 // Tooltip helper
@@ -190,8 +191,12 @@ const availableIpsInCidr = (cidr: string, excludeCount: number): number | null =
 
 const DEFAULT_FORM: CreateEgressGatewayRequest = {
   name: '',
-  gw_vpc_cidr: '10.199.0.0/24',
-  transit_cidr: '10.255.0.0/24',
+  // Placeholders only — the create form replaces both with ranges the cluster
+  // is not using (see `suggestGatewayCidrs`). Hardcoding them meant proposing
+  // 10.199.0.0/24 on a deployment whose control-plane transit is
+  // 10.199.0.0/22, and the overlap check approving its own suggestion.
+  gw_vpc_cidr: '',
+  transit_cidr: '',
   replicas: 2,
   bfd_enabled: false,
   node_selector: {},
@@ -209,6 +214,22 @@ export function CreateEgressGatewayModal({
 }) {
   const [form, setForm] = useState<CreateEgressGatewayRequest>(DEFAULT_FORM);
   const { data: bgpConfs } = useBgpConfs();
+
+  // Start from ranges the cluster is not using. Fetched when the dialog opens
+  // rather than baked in, so the answer reflects this cluster; a value the
+  // operator has already typed is never overwritten.
+  const { data: suggested } = useQuery({
+    queryKey: ['egress-gateway-suggested-cidrs'],
+    queryFn: suggestGatewayCidrs,
+  });
+  useEffect(() => {
+    if (!suggested) return;
+    setForm((f) => ({
+      ...f,
+      gw_vpc_cidr: f.gw_vpc_cidr || suggested.gw_vpc_cidr,
+      transit_cidr: f.transit_cidr || suggested.transit_cidr,
+    }));
+  }, [suggested]);
   const [externalMode, setExternalMode] = useState<ExternalMode>(subnets.length > 0 ? 'existing' : 'create');
   const [excludeIpInput, setExcludeIpInput] = useState('');
   const createGateway = useCreateEgressGateway();
@@ -940,15 +961,17 @@ export default function EgressGateways() {
   // const { data: vpcsData } = useVpcs();
   const deleteGateway = useDeleteEgressGateway();
 
-  // Fetch all subnets for macvlan dropdown — filter to VLAN-backed subnets only
+  // Fetch all subnets for the macvlan dropdown. VLAN-backed only, and never
+  // a control-plane transit plane: `cp-transit` is VLAN-backed too, so it sat
+  // in this list next to `external`, and choosing it points a gateway's
+  // internet leg at the control plane.
   const { data: allSubnets } = useQuery({ queryKey: ['subnets'], queryFn: listSubnets });
   const subnetInfos = useMemo(
     () => (allSubnets ?? [])
-      .filter((s) => s.vlan) // Only VLAN-backed subnets can be used for macvlan
+      .filter((s) => s.vlan && !s.used_as_transit)
       .map((s) => ({ name: s.name, cidr: s.cidr_block })),
     [allSubnets],
   );
-
   const gateways = data?.items ?? [];
   const filtered = searchQuery
     ? gateways.filter((gw) => gw.name.toLowerCase().includes(searchQuery.toLowerCase()))

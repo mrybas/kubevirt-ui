@@ -89,6 +89,8 @@ export interface Subnet {
   purpose: 'vm' | 'infrastructure'; // "vm" = for VM attachment, "infrastructure" = for VPC NAT gateway
   statistics?: SubnetStatistics;
   ready: boolean;
+  /** Carries a control-plane transit plane, not an egress uplink. */
+  used_as_transit?: boolean;
 }
 
 // ============================================================================

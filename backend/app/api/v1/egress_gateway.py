@@ -21,6 +21,7 @@ from kubernetes_asyncio.client import ApiException, V1ConfigMap, V1ObjectMeta
 from app.core.auth import User, require_auth, require_admin
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION, SYSTEM_NAMESPACE as _SYSTEM_NS
 from app.core.errors import k8s_error_to_http
+from app.core.allocators import find_cidr_conflicts, list_subnet_cidrs
 from app.core.vpc_peering import (
     ensure_vpc_peering as _ensure_vpc_peering,
     remove_vpc_peering as _remove_vpc_peering,
@@ -280,6 +281,52 @@ async def allocate_gateway_ips(
     external = await _free_addresses(k8s, external_subnet, replicas, taken)
 
     return internal, external
+
+
+# Where a gateway's own networks are carved from. Deliberately a /16 of its
+# own: the gateway VPC and its transit link are infrastructure, not tenant
+# space, and must not be taken out of the tenant supernet.
+GATEWAY_CIDR_POOL = "10.199.128.0/17"
+
+
+async def suggest_gateway_cidrs(k8s, pool: str | None = None) -> dict[str, str]:
+    """A gateway VPC CIDR and a transit CIDR the cluster is not already using.
+
+    The form's default used to be the constant `10.199.0.0/24`, which on a
+    deployment whose control-plane transit is `10.199.0.0/22` overlaps it —
+    and the overlap check then reported "No CIDR overlaps detected" for the
+    pair it had just proposed.
+
+    This is the allocator's own walk without its write: nothing is persisted,
+    so a suggestion costs nothing and does not burn a range per page load.
+    Both /24s are checked against every subnet in the cluster, including the
+    ones we did not create, and against each other.
+
+    Returns empty strings when the pool has no room left — an empty field the
+    operator must fill is better than a suggestion that collides.
+    """
+    network = ipaddress.ip_network(pool or GATEWAY_CIDR_POOL, strict=False)
+    existing = await list_subnet_cidrs(k8s)
+
+    free: list[str] = []
+    for candidate in network.subnets(new_prefix=24):
+        cidr = str(candidate)
+        if find_cidr_conflicts(cidr, existing):
+            continue
+        free.append(cidr)
+        if len(free) == 2:
+            return {"gw_vpc_cidr": free[0], "transit_cidr": free[1]}
+
+    logger.warning("No free /24 pair for a gateway in %s", network)
+    return {"gw_vpc_cidr": "", "transit_cidr": ""}
+
+
+@router.get("/suggest-cidrs")
+async def get_suggested_cidrs(
+    request: Request, user: User = Depends(require_auth),
+) -> dict[str, str]:
+    """Free CIDRs for the create-gateway form to start from."""
+    return await suggest_gateway_cidrs(request.app.state.k8s_client)
 
 
 async def _require_external_subnet(k8s) -> None:

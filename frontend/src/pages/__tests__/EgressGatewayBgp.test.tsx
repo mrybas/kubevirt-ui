@@ -28,6 +28,16 @@ vi.mock('@/hooks/useEgressGateways', () => ({
   useDetachVpc: () => ({ mutateAsync: vi.fn() }),
 }));
 
+// The form asks the cluster for free ranges instead of carrying a constant
+// that overlapped the control-plane transit; without this the CIDR fields stay
+// empty and the dialog cannot be submitted.
+vi.mock('../../api/egress', () => ({
+  suggestGatewayCidrs: vi.fn().mockResolvedValue({
+    gw_vpc_cidr: '10.199.128.0/24',
+    transit_cidr: '10.199.129.0/24',
+  }),
+}));
+
 vi.mock('@/hooks/useBgp', () => ({
   useBgpConfs: () => ({
     data: {

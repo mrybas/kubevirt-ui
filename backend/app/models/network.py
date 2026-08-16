@@ -134,6 +134,10 @@ class SubnetResponse(BaseModel):
     enable_dhcp: bool = True
     disable_gateway_check: bool = False
     purpose: str = "vm"  # "vm" or "infrastructure"
+    # True when this subnet carries a control-plane transit plane rather than
+    # an egress uplink. `purpose` cannot tell them apart — the underlay flow
+    # builds both and marks both "infrastructure".
+    used_as_transit: bool = False
     statistics: Optional[SubnetStatistics] = None
     ready: bool = False
 

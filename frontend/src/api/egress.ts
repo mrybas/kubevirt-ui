@@ -39,3 +39,13 @@ export async function attachVpc(name: string, request: AttachVpcRequest): Promis
 export async function detachVpc(name: string, request: DetachVpcRequest): Promise<DetachVpcResponse> {
   return apiRequest<DetachVpcResponse>(`/egress-gateways/${name}/detach`, { method: 'POST', body: request });
 }
+
+/**
+ * Free CIDRs for a new gateway, checked against every subnet in the cluster.
+ * The form used to start from a constant that overlapped the control-plane
+ * transit on this deployment, and the overlap check then approved its own
+ * suggestion.
+ */
+export async function suggestGatewayCidrs(): Promise<{ gw_vpc_cidr: string; transit_cidr: string }> {
+  return apiRequest<{ gw_vpc_cidr: string; transit_cidr: string }>('/egress-gateways/suggest-cidrs');
+}

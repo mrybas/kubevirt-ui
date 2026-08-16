@@ -733,6 +733,37 @@ async def delete_vlan(request: Request, name: str, user: User = Depends(require_
 # ============================================================================
 
 @router.get("/subnets", response_model=list[SubnetResponse])
+async def transit_subnet_names(k8s) -> set[str]:
+    """Subnets acting as a control-plane transit plane, not as an egress uplink.
+
+    Deliberately not derived from `purpose`: the underlay flow builds both the
+    transit subnet and the egress one, so both are `infrastructure`. Filtering
+    on that would hide the subnet an egress gateway actually needs.
+
+    A failure to look returns nothing rather than everything — dropping the
+    only usable option because a list call failed is the worse outcome.
+    """
+    from app.core.tenant_transit import transit_subnet_name
+
+    names: set[str] = set()
+    configured = transit_subnet_name()
+    if configured:
+        names.add(configured)
+
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="vpcs",
+        )
+    except Exception as e:  # noqa: BLE001 - any read failure means "unknown"
+        logger.warning(f"Could not scan VPCs for transit subnets: {e}")
+        return names
+
+    for vpc in result.get("items", []):
+        for name in (vpc.get("spec", {}) or {}).get("extraExternalSubnets") or []:
+            names.add(name)
+    return names
+
+
 async def list_subnets(request: Request, user: User = Depends(require_auth)) -> list[SubnetResponse]:
     """List all Kube-OVN Subnets.
 
@@ -742,6 +773,11 @@ async def list_subnets(request: Request, user: User = Depends(require_auth)) -> 
     admins.
     """
     k8s = request.app.state.k8s_client
+
+    # Which of these are transit planes rather than egress uplinks — the
+    # egress gateway form must not offer the control-plane transit as an
+    # internet leg.
+    transit_names = await transit_subnet_names(k8s)
 
     try:
         result = await k8s.custom_api.list_cluster_custom_object(
@@ -824,6 +860,7 @@ async def list_subnets(request: Request, user: User = Depends(require_auth)) -> 
             enable_dhcp=spec.get("enableDHCP", True),
             disable_gateway_check=spec.get("disableGatewayCheck", False),
             purpose=purpose,
+            used_as_transit=item["metadata"]["name"] in transit_names,
             statistics=SubnetStatistics(
                 total=available + used,
                 available=available,
