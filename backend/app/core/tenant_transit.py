@@ -197,7 +197,7 @@ def build_transit_acls(eip: str, vip: str, ports: list[int]) -> list[dict[str, A
         acls.append({
             "action": "allow-related",
             "direction": "from-lport",
-            "priority": 3200,
+            "priority": TRANSIT_ALLOW_PRIORITY,
             "match": f"ip4.src == {eip} && ip4.dst == {vip} && tcp.dst == {port}",
         })
     return acls
@@ -206,15 +206,28 @@ def build_transit_acls(eip: str, vip: str, ports: list[int]) -> list[dict[str, A
 async def ensure_transit_acls(
     k8s, transit_subnet: str, eip: str, vip: str, ports: list[int],
 ) -> None:
-    """Add this tenant's allow rules to the transit subnet, keeping the rest."""
+    """This tenant's allows, plus the deny they are exceptions to.
+
+    The deny is written once for the subnet and left alone afterwards: it is
+    the baseline every tenant's allow punches through, so it must not be
+    duplicated per tenant and must not disappear when one is removed.
+    """
     wanted = build_transit_acls(eip, vip, ports)
     if not wanted:
         return
 
     def mutate(spec: dict) -> dict | None:
         acls = list(spec.get("acls") or [])
+
+        cidr = spec.get("cidrBlock", "")
+        if cidr and not any(
+            a.get("action") == "drop" and a.get("priority") == TRANSIT_DENY_PRIORITY
+            for a in acls
+        ):
+            acls.append(build_transit_deny(cidr))
+
         missing = [a for a in wanted if a not in acls]
-        if not missing:
+        if not missing and acls == (spec.get("acls") or []):
             return None
         return {"acls": acls + missing}
 
@@ -246,12 +259,27 @@ async def remove_tenant_transit(
     await patch_spec_with_retry(k8s, "subnets", transit_subnet, mutate)
 
 
-def drop_match_for_range(cidr: str) -> str:
-    """Match string for a drop covering a whole allocation range.
+# The allows sit above the deny; both are on the transit subnet.
+TRANSIT_ALLOW_PRIORITY = 3200
+TRANSIT_DENY_PRIORITY = 3000
 
-    Scoping the transit drop to the first /24 of the range is a rule about the
-    tenants that happen to be numbered lowest: the 129th tenant gets an address
-    outside it and quietly falls out of the deny. The match has to cover the
-    range the allocator can actually hand out.
+
+def build_transit_deny(transit_cidr: str) -> dict[str, Any]:
+    """The deny the per-tenant allows are exceptions to.
+
+    Without it the transit plane is open: every allow is additive, so one
+    tenant's EIP can still reach another tenant's control-plane ports and the
+    nodes sitting on that subnet.
+
+    The match covers the **whole** transit range, not the first /24 of it.
+    A /24-scoped rule is a rule about the tenants that happen to be numbered
+    lowest — the 129th tenant is allocated outside it, keeps its own allow, and
+    quietly falls out of the deny.
     """
-    return f"ip4.src == {ipaddress.ip_network(cidr, strict=False)}"
+    network = ipaddress.ip_network(transit_cidr, strict=False)
+    return {
+        "action": "drop",
+        "direction": "from-lport",
+        "priority": TRANSIT_DENY_PRIORITY,
+        "match": f"ip4.src == {network}",
+    }

@@ -311,6 +311,51 @@ async def _require_external_subnet(k8s) -> None:
         )
 
 
+async def adopt_gateway_pins(k8s, gateway_name: str, veg: dict[str, Any] | None) -> bool:
+    """Write a gateway's current addresses into its spec if nothing pins them.
+
+    Pinning at creation only protects gateways created after that change. One
+    already on the cluster keeps churning: measured while verifying this work,
+    an unpinned gateway had its pods replaced, took `10.199.16.5/.7`, and left
+    the hub's default route pointing at `10.199.16.3` — an address that no
+    longer existed. VpcEgressGateway Ready, BGP Established, peering intact,
+    and every packet the tenant sent going nowhere.
+
+    Adopting on read closes that window without asking anyone to notice first.
+    An existing pin is never overwritten — that would turn a pin into a record
+    of whatever the pods last drifted to, which is the opposite of the point.
+
+    Returns True when something was written.
+    """
+    spec = (veg or {}).get("spec", {}) or {}
+    status = (veg or {}).get("status", {}) or {}
+
+    patch: dict[str, list[str]] = {}
+    for field in ("internalIPs", "externalIPs"):
+        if spec.get(field):
+            continue
+        current = [str(ip).split("/")[0] for ip in (status.get(field) or [])]
+        if current:
+            patch[field] = current
+
+    if not patch:
+        return False
+
+    try:
+        await k8s.custom_api.patch_namespaced_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+            namespace="kube-system", plural="vpc-egress-gateways",
+            name=gateway_name, body={"spec": patch},
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        logger.warning("Could not adopt address pins for %r: %s", gateway_name, e)
+        return False
+
+    logger.info("Gateway %r: adopted its current addresses as pins (%s)", gateway_name, patch)
+    return True
+
+
 async def _get_gateway_pod_ips(k8s, gateway_name: str) -> list[GatewayPodInfo]:
     """Get assigned IPs from egress gateway pods."""
     try:
@@ -519,6 +564,8 @@ async def list_egress_gateways(request: Request, user: User = Depends(require_au
     for vpc in result.get("items", []):
         gw_name = vpc.get("metadata", {}).get("labels", {}).get(GATEWAY_LABEL, "")
         veg = await _get_vpc_egress_gateway(k8s, gw_name)
+        if await adopt_gateway_pins(k8s, gw_name, veg):
+            veg = await _get_vpc_egress_gateway(k8s, gw_name)
         attached = await _list_attached_vpcs(k8s, gw_name)
         pod_ips = await _get_gateway_pod_ips(k8s, gw_name)
         annotations = vpc.get("metadata", {}).get("annotations", {})
@@ -541,6 +588,8 @@ async def get_egress_gateway(request: Request, name: str, user: User = Depends(r
         raise HTTPException(status_code=404, detail=f"Egress gateway '{name}' not found")
 
     veg = await _get_vpc_egress_gateway(k8s, name)
+    if await adopt_gateway_pins(k8s, name, veg):
+        veg = await _get_vpc_egress_gateway(k8s, name)
     attached = await _list_attached_vpcs(k8s, name)
     pod_ips = await _get_gateway_pod_ips(k8s, name)
     annotations = vpc.get("metadata", {}).get("annotations", {})

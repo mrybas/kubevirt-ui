@@ -162,7 +162,9 @@ async def test_transit_acls_keep_other_tenants_rules() -> None:
 
     acls = k8s._store["subnets"][TRANSIT]["spec"]["acls"]
     assert theirs in acls
-    assert len(acls) == 2
+    # theirs + mine + the subnet-wide deny the allows are exceptions to
+    assert len(acls) == 3
+    assert sum(1 for a in acls if a["action"] == "drop") == 1
 
 
 @pytest.mark.asyncio
@@ -257,3 +259,76 @@ async def test_tenant_deletion_releases_the_transit_objects(
 
     assert f"cpt-eip-{TENANT}" not in k8s._store["ovn-eips"]
     assert f"cpt-snat-{TENANT}" not in k8s._store["ovn-snat-rules"]
+
+
+class TestTransitDenyBaseline:
+    """Allow rules alone leave the transit plane open.
+
+    Each tenant gets an allow from its own EIP to the control-plane VIP on its
+    own two ports. Without a deny underneath, everything else sourced in the
+    transit subnet is still permitted — one tenant's EIP can reach another
+    tenant's control-plane ports, and the nodes on that plane.
+
+    The deny has to cover the whole range the allocator hands out. Scoping it
+    to the first /24 is a rule about the tenants that happen to be numbered
+    lowest: the 129th tenant gets an address outside it and silently falls out
+    of the deny while still keeping its own allow.
+    """
+
+    def test_the_deny_covers_the_whole_transit_range(self) -> None:
+        from app.core.tenant_transit import build_transit_deny
+
+        deny = build_transit_deny("10.199.0.0/22")
+
+        assert deny["action"] == "drop"
+        assert deny["match"] == "ip4.src == 10.199.0.0/22"
+
+    def test_the_deny_sits_below_the_allows(self) -> None:
+        from app.core.tenant_transit import build_transit_acls, build_transit_deny
+
+        allows = build_transit_acls("10.199.1.1", "10.199.0.100", [16443])
+        deny = build_transit_deny("10.199.0.0/22")
+
+        assert all(a["priority"] > deny["priority"] for a in allows), (
+            "the deny would swallow the allows"
+        )
+
+    def test_a_tenant_outside_the_first_24_is_still_denied(self) -> None:
+        """The 129th tenant — the case a /24-scoped rule misses."""
+        import ipaddress
+
+        from app.core.tenant_transit import build_transit_deny
+
+        deny = build_transit_deny("10.199.0.0/22")
+        network = ipaddress.ip_network(deny["match"].split("== ")[1])
+
+        assert ipaddress.ip_address("10.199.2.5") in network
+        assert ipaddress.ip_address("10.199.3.200") in network
+
+    @pytest.mark.asyncio
+    async def test_the_deny_is_written_once_and_kept(self) -> None:
+        from app.core.tenant_transit import ensure_transit_acls
+
+        k8s = _k8s(transit_spec={"cidrBlock": TRANSIT_CIDR})
+
+        await ensure_transit_acls(k8s, TRANSIT, "10.199.1.1", "10.199.0.100", [16443])
+        await ensure_transit_acls(k8s, TRANSIT, "10.199.1.3", "10.199.0.100", [16444])
+
+        acls = k8s._store["subnets"][TRANSIT]["spec"]["acls"]
+        denies = [a for a in acls if a["action"] == "drop"]
+        assert len(denies) == 1, "the deny baseline was duplicated per tenant"
+        assert len([a for a in acls if a["action"] == "allow-related"]) == 2
+
+    @pytest.mark.asyncio
+    async def test_removing_a_tenant_leaves_the_deny_alone(self) -> None:
+        from app.core.tenant_transit import ensure_transit_acls
+
+        k8s = _k8s(transit_spec={"cidrBlock": TRANSIT_CIDR})
+        await ensure_transit_acls(k8s, TRANSIT, "10.199.1.1", "10.199.0.100", [16443])
+
+        await remove_tenant_transit(k8s, TENANT, TRANSIT, eip_address="10.199.1.1")
+
+        acls = k8s._store["subnets"][TRANSIT]["spec"]["acls"]
+        assert [a["action"] for a in acls] == ["drop"], (
+            "removing a tenant took the deny baseline with it"
+        )
