@@ -34,6 +34,7 @@ import type { SpeakerDeployRequest, AnnouncementRequest } from '../types/bgp';
 import { Modal } from '@/components/common/Modal';
 import { ActionBar } from '@/components/common/ActionBar';
 import { listNodes } from '../api/cluster';
+import { useEgressGateways } from '../hooks/useEgressGateways';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -443,6 +444,10 @@ export default function BgpPeering() {
   const { data: speaker, isLoading: speakerLoading, refetch: refetchSpeaker } = useSpeakerStatus();
   const { data: sessions, isLoading: sessionsLoading, refetch: refetchSessions } = useBgpSessions();
   const { data: announcements, isLoading: announcementsLoading } = useAnnouncements();
+  // Egress gateways run their own FRR against a BgpConf. Their sessions never
+  // appear in the speaker's view, which is the only view this page had.
+  const { data: gatewaysData } = useEgressGateways();
+  const bgpGateways = (gatewaysData?.items ?? []).filter((g) => g.bgp_conf);
   const deleteSpeaker = useDeleteSpeaker();
   const deleteAnnouncement = useDeleteAnnouncement();
 
@@ -638,6 +643,49 @@ export default function BgpPeering() {
       </div>
 
       {/* ------------------------------------------------------------------ */}
+      {/* ------------------------------------------------------------------ */}
+      {/* Egress gateway sessions — announced through FRR, not the speaker     */}
+      {/* ------------------------------------------------------------------ */}
+      {bgpGateways.length > 0 && (
+        <div className="bg-surface-800/50 border border-surface-700 rounded-xl p-5">
+          <h2 className="text-sm font-semibold text-surface-300 uppercase tracking-wider mb-4">
+            Egress Gateway Sessions
+          </h2>
+          <div className="border border-surface-700 rounded-lg overflow-hidden">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-surface-800/80 text-xs text-surface-400">
+                  <th className="text-left px-4 py-2 font-medium">Gateway</th>
+                  <th className="text-left px-4 py-2 font-medium">BgpConf</th>
+                  <th className="text-left px-4 py-2 font-medium">External IPs</th>
+                  <th className="text-left px-4 py-2 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {bgpGateways.map((g) => (
+                  <tr key={g.name} className="border-t border-surface-800">
+                    <td className="px-4 py-2 font-mono text-surface-200">{g.name}</td>
+                    <td className="px-4 py-2 font-mono text-surface-400">{g.bgp_conf}</td>
+                    <td className="px-4 py-2 font-mono text-primary-400">
+                      {(g.external_ips ?? []).join(', ') || '-'}
+                    </td>
+                    <td className="px-4 py-2">
+                      {g.degraded_reason ? (
+                        <span className="text-orange-400" title={g.degraded_reason}>Degraded</span>
+                      ) : g.ready ? (
+                        <span className="text-emerald-400">Ready</span>
+                      ) : (
+                        <span className="text-amber-400">Not Ready</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Section 3: Announcements                                            */}
       {/* ------------------------------------------------------------------ */}
       <div className="bg-surface-800/50 border border-surface-700 rounded-xl p-5">

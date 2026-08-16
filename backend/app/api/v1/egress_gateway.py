@@ -405,6 +405,7 @@ def _parse_gateway(
         exclude_ips=exclude_ips,
         attached_vpcs=attached,
         assigned_ips=assigned_ips or [],
+        bgp_conf=veg_spec.get("bgpConf", "") or "",
         internal_ips=list(veg_status.get("internalIPs") or []),
         external_ips=list(veg_status.get("externalIPs") or []),
         # A gateway whose tenant cannot reach it is not Ready, whatever the

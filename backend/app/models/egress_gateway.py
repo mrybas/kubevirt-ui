@@ -184,6 +184,10 @@ class EgressGatewayResponse(BaseModel):
     # matching kube-ovn's own pod labels, which we do not control; this does not.
     internal_ips: list[str] = []
     external_ips: list[str] = []
+    # Name of the BgpConf this gateway announces through, if any. The BGP page
+    # only knows about kube-ovn-speaker sessions, so without this a working
+    # gateway's sessions are invisible there.
+    bgp_conf: str = ""
     ready: bool = False
     # Set when the gateway itself is up but the wiring to a tenant is broken.
     # Reported instead of a green Ready, which is what let a completely severed

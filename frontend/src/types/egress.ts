@@ -35,6 +35,8 @@ export interface EgressGateway {
   /** Straight from VpcEgressGateway.status — does not depend on pod labels. */
   internal_ips?: string[];
   external_ips?: string[];
+  /** BgpConf this gateway announces through, if any. */
+  bgp_conf?: string;
   ready: boolean;
   /** Set when the gateway is up but a tenant's wiring to it is broken. */
   degraded_reason?: string | null;
