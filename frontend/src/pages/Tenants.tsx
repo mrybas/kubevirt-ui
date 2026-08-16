@@ -24,6 +24,7 @@ import {
   Trash2,
   HardDrive,
   Info,
+  AlertTriangle,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { useTenants, useCreateTenant, useDeleteTenant, useAddonCatalog, useDiscovery } from '../hooks/useTenants';
@@ -39,9 +40,12 @@ import { DataTable, type Column } from '@/components/common/DataTable';
 import type { MenuItem } from '@/components/common/KebabMenu';
 import { ActionBar } from '@/components/common/ActionBar';
 
-function TenantStatusBadge({ status }: { status: string }) {
+function TenantStatusBadge({ status, detail }: { status: string; detail?: string | null }) {
   const config: Record<string, { icon: typeof CheckCircle; color: string }> = {
     Ready: { icon: CheckCircle, color: 'text-emerald-400 bg-emerald-500/10' },
+    // The control plane can be perfectly Ready while no worker ever joined.
+    // Green there reads as "you can schedule work on this", and you cannot.
+    Degraded: { icon: AlertTriangle, color: 'text-orange-400 bg-orange-500/10' },
     Provisioning: { icon: Clock, color: 'text-amber-400 bg-amber-500/10' },
     Failed: { icon: XCircle, color: 'text-red-400 bg-red-500/10' },
     Deleting: { icon: Loader2, color: 'text-surface-400 bg-surface-500/10' },
@@ -51,7 +55,10 @@ function TenantStatusBadge({ status }: { status: string }) {
   const color = entry!.color;
 
   return (
-    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${color}`}>
+    <span
+      className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium ${color}`}
+      title={detail || undefined}
+    >
       <Icon className={`h-3.5 w-3.5 ${status === 'Provisioning' || status === 'Deleting' ? 'animate-spin' : ''}`} />
       {status}
     </span>
@@ -1726,7 +1733,7 @@ export default function Tenants() {
     {
       key: 'status',
       header: 'Status',
-      accessor: (t) => <TenantStatusBadge status={t.status} />,
+      accessor: (t) => <TenantStatusBadge status={t.status} detail={t.status_detail} />,
     },
     {
       key: 'version',

@@ -304,7 +304,10 @@ class TenantResponse(BaseModel):
     folder: str = ""  # owning folder (from Cluster label)
     environment: str = ""  # owning environment; env ns = {folder}-{environment}
     kubernetes_version: str
-    status: str  # Provisioning, Ready, NotReady, Deleting
+    status: str  # Provisioning, Ready, Degraded, NotReady, Deleting
+    # Why the status is not Ready, when the reason is something the list view
+    # would otherwise hide (no workers joined, an addon wedged).
+    status_detail: str | None = None
     phase: str | None = None  # CAPI Cluster phase
     endpoint: str | None = None  # tenant API URL
     control_plane_replicas: int = 0

@@ -127,6 +127,16 @@ def _build_flux_helmrelease_cr(
             "crds": "CreateReplace",
             "createNamespace": True,
             "remediation": {"retries": 5},
+            # A fresh tenant has no Ready node until its CNI is up, and its CNI
+            # is one of these releases — so waiting for workloads to become
+            # ready is waiting for something this install is supposed to cause.
+            # With the wait on, the install times out, Flux remediates by
+            # uninstalling, and the uninstall's hook pod (tigera-operator-
+            # uninstall) has nowhere to run either. The release then sits in
+            # `uninstalling` forever and never recovers, even once nodes do
+            # appear — measured on the lab, where the tenant's Calico release
+            # was wedged that way with zero nodes registered.
+            "disableWait": True,
         },
         "upgrade": {
             "crds": "CreateReplace",

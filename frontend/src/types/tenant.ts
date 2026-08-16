@@ -110,6 +110,8 @@ export interface Tenant {
   environment?: string;
   kubernetes_version: string;
   status: string;
+  /** Why the status is not Ready (no workers joined, an addon wedged). */
+  status_detail?: string | null;
   phase: string | null;
   endpoint: string | null;
   control_plane_replicas: number;

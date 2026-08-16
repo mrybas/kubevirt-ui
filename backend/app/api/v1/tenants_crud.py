@@ -272,6 +272,38 @@ async def _healthy_worker_count(k8s, namespace: str, fallback: int) -> int:
     return healthy
 
 
+def apply_capacity_to_status(tenant: TenantResponse) -> TenantResponse:
+    """Downgrade Ready when the tenant cannot actually run anything.
+
+    CAPI's `Ready` is about the control plane, and it is right about it — the
+    list view just means something else by the word. A tenant showing Ready at
+    `0/1 workers`, with no Kubernetes version and a CNI release stuck in
+    `uninstalling`, has no capacity whatsoever; the detail page said so and the
+    list did not.
+
+    Only Ready is downgraded. Failed stays Failed (worse), and Provisioning
+    stays Provisioning — missing workers are expected while a cluster builds.
+    """
+    if tenant.status != "Ready":
+        return tenant
+
+    reasons: list[str] = []
+
+    if tenant.worker_count and tenant.workers_ready < tenant.worker_count:
+        reasons.append(f"{tenant.workers_ready}/{tenant.worker_count} workers joined")
+
+    wedged = [a.addon_id or a.name for a in (tenant.addons or []) if not a.ready]
+    if wedged:
+        reasons.append("addon not reconciled: " + ", ".join(wedged))
+
+    if not reasons:
+        return tenant
+
+    tenant.status = "Degraded"
+    tenant.status_detail = "; ".join(reasons)
+    return tenant
+
+
 async def _enrich_with_workers(
     k8s, tenant: TenantResponse,
 ) -> TenantResponse:
@@ -794,7 +826,10 @@ async def list_tenants(
             tenant = await _enrich_with_workers(k8s, tenant)
             tenant = await _enrich_with_control_plane(k8s, tenant)
             tenant = await _enrich_with_folder_env(k8s, tenant)
-            items.append(tenant)
+            # The list is where "Ready" is read as "usable", so the downgrade
+            # matters most here. Addon health is not fetched per row (too
+            # expensive); worker capacity alone covers the case that misled us.
+            items.append(apply_capacity_to_status(tenant))
 
         total = len(items)
         start = (page - 1) * per_page
@@ -1300,7 +1335,7 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
     tenant = await _enrich_with_workers(k8s, tenant)
     tenant = await _enrich_with_control_plane(k8s, tenant)
     tenant = await _enrich_with_folder_env(k8s, tenant)
-    return tenant
+    return apply_capacity_to_status(tenant)
 
 
 @router.delete("/{name}", status_code=204)
