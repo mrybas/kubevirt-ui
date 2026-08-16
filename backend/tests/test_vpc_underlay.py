@@ -146,7 +146,10 @@ class TestWorkaroundsAreLabelled:
     def test_link_watcher_targets_the_configured_interface(self) -> None:
         args = build_link_watcher(_req(interface="eno2"), KUBEOVN_NS)[
             "spec"]["template"]["spec"]["containers"][0]["args"][0]
-        assert "ip link set dev eno2 up" in args
+        # The script iterates now — one DaemonSet has to keep every provider
+        # NIC up, not only the one this build is for.
+        assert "for i in eno2;" in args
+        assert 'ip link set dev "$i" up' in args
 
     def test_link_watcher_only_runs_on_gateway_nodes(self) -> None:
         spec = build_link_watcher(_req(), KUBEOVN_NS)["spec"]["template"]["spec"]
@@ -167,6 +170,9 @@ class TestEnsureEndpoint:
         k8s = MagicMock()
         k8s.custom_api.create_cluster_custom_object = AsyncMock()
         k8s.custom_api.create_namespaced_custom_object = AsyncMock()
+        # The link watcher asks which provider NICs exist so one DaemonSet can
+        # keep all of them up.
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
         k8s.apps_api.create_namespaced_daemon_set = AsyncMock()
         # The ProviderNetwork is read back for the node list.
         nodes = ["worker-1", "worker-2"] if ready_nodes is None else ready_nodes
@@ -212,6 +218,7 @@ class TestEnsureEndpoint:
     async def test_is_idempotent(self) -> None:
         # Everything already there — a re-run must report success, not 409.
         k8s = self._k8s()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
         k8s.custom_api.create_cluster_custom_object = AsyncMock(
             side_effect=ApiException(status=409, reason="AlreadyExists"),
         )
@@ -251,6 +258,7 @@ class TestEnsureEndpoint:
         # A half-built fabric is easier to finish than to diagnose from a
         # single error, so every object is attempted and reported.
         k8s = self._k8s()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
         k8s.custom_api.create_cluster_custom_object = AsyncMock(
             side_effect=ApiException(status=403, reason="Forbidden"),
         )
@@ -376,6 +384,9 @@ class TestGatewayNodesAreLabelled:
         k8s = MagicMock()
         k8s.custom_api.create_cluster_custom_object = AsyncMock()
         k8s.custom_api.create_namespaced_custom_object = AsyncMock()
+        # The link watcher asks which provider NICs exist so one DaemonSet can
+        # keep all of them up.
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
         k8s.apps_api.create_namespaced_daemon_set = AsyncMock()
         k8s.custom_api.get_cluster_custom_object = AsyncMock(
             return_value={"status": {"readyNodes": ready_nodes}},
@@ -474,6 +485,9 @@ class TestTheWatcherCanActuallyStart:
         k8s = MagicMock()
         k8s.custom_api.create_cluster_custom_object = AsyncMock()
         k8s.custom_api.create_namespaced_custom_object = AsyncMock()
+        # The link watcher asks which provider NICs exist so one DaemonSet can
+        # keep all of them up.
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
         k8s.custom_api.get_cluster_custom_object = AsyncMock(
             return_value={"status": {"readyNodes": ["worker-1"]}},
         )
@@ -631,3 +645,44 @@ class TestGetReportsWhatIsRunning:
         exempt = next(o for o in result.objects if o.name == CILIUM_EXEMPT_NAME)
         assert exempt.namespace == "o0-cilium"
         assert exempt.state == "exists"
+
+
+class TestLinkWatcherCoversEveryProvider:
+    """One DaemonSet, every provider interface.
+
+    The watcher used to hold a single hardcoded `ip link set dev <iface> up`,
+    and there is only one DaemonSet per cluster — so building a second underlay
+    rewrote its args and the first provider NIC lost its keeper. Measured in
+    run #2: after the egress underlay was built, the watcher ran only
+    `eth0.310`, and `eth0.300` went down on two of three workers within
+    minutes, taking the control-plane transit with it. Nothing looked wrong —
+    OVS still showed the port, the subnet stayed Ready (backlog U3).
+
+    In the target design there are always at least two underlays, so this is
+    the normal case rather than an edge one.
+    """
+
+    def test_every_interface_is_kept_up(self) -> None:
+        args = build_link_watcher(
+            _req(interface="eth0.310"), KUBEOVN_NS,
+            interfaces=["eth0.300", "eth0.310", "eth0.320"],
+        )["spec"]["template"]["spec"]["containers"][0]["args"][0]
+
+        for iface in ("eth0.300", "eth0.310", "eth0.320"):
+            assert iface in args, f"{iface} lost its keeper"
+
+    def test_the_new_interface_is_included_even_if_not_listed(self) -> None:
+        args = build_link_watcher(
+            _req(interface="eth0.330"), KUBEOVN_NS, interfaces=["eth0.300"],
+        )["spec"]["template"]["spec"]["containers"][0]["args"][0]
+
+        assert "eth0.330" in args
+        assert "eth0.300" in args
+
+    def test_duplicates_do_not_multiply_the_loop(self) -> None:
+        args = build_link_watcher(
+            _req(interface="eth0.300"), KUBEOVN_NS,
+            interfaces=["eth0.300", "eth0.300"],
+        )["spec"]["template"]["spec"]["containers"][0]["args"][0]
+
+        assert args.count("eth0.300") == 1

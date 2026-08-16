@@ -266,19 +266,32 @@ def _workaround_meta(name: str, namespace: str, reason: str, remove_when: str) -
 
 def build_link_watcher(
     data: VpcUnderlayRequest, kubeovn_ns: str, image: str = "",
+    interfaces: list[str] | None = None,
 ) -> dict[str, Any]:
-    """DaemonSet that keeps the provider NIC administratively up.
+    """DaemonSet that keeps every provider NIC administratively up.
 
     A workaround, deliberately labelled as one. `ip link set up` on an
     already-up interface is a no-op, so the loop costs nothing; it exists
     only because kube-ovn never rechecks the link after bridge init.
 
+    It covers **all** provider interfaces, not just the one being built.
+    There is a single DaemonSet per cluster, so a per-underlay script meant the
+    second build silently disowned the first NIC: after the egress underlay was
+    added, the watcher ran only `eth0.310` and `eth0.300` went down on two
+    workers, taking the control-plane transit with it while OVS still showed
+    the port and the subnet still read Ready. Underlays come in pairs in the
+    target design, so that is the normal path.
+
     `image` is the resolved image — normally kube-ovn's own, discovered by the
     caller. An explicit `link_watcher_image` in the request wins over it.
     """
+    wanted = list(dict.fromkeys([*(interfaces or []), data.interface]))
+    watched = " ".join(wanted)
     script = (
         "while true; do\n"
-        f"  ip link set dev {data.interface} up 2>/dev/null\n"
+        f"  for i in {watched}; do\n"
+        '    ip link set dev "$i" up 2>/dev/null\n'
+        "  done\n"
         "  sleep 10\n"
         "done\n"
     )
@@ -527,6 +540,32 @@ def _daemonset_state(ds) -> UnderlayObject:
     )
 
 
+async def _all_provider_interfaces(k8s) -> list[str]:
+    """Default interface of every ProviderNetwork in the cluster.
+
+    Per-node overrides (`customInterfaces`) are included too — a node that
+    carries the NIC under a different name still needs it raised.
+    """
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural="provider-networks",
+        )
+    except ApiException as e:
+        logger.warning(f"Could not list ProviderNetworks for the link watcher: {e}")
+        return []
+
+    names: list[str] = []
+    for item in result.get("items", []):
+        spec = item.get("spec", {}) or {}
+        if spec.get("defaultInterface"):
+            names.append(spec["defaultInterface"])
+        for custom in spec.get("customInterfaces") or []:
+            if custom.get("interface"):
+                names.append(custom["interface"])
+    return list(dict.fromkeys(names))
+
+
 async def _label_gateway_nodes(k8s, provider_network_name: str) -> UnderlayObject:
     """Mark the nodes that carry the provider NIC.
 
@@ -656,7 +695,14 @@ async def ensure_vpc_underlay(
     if data.link_watcher:
         image = await _kubeovn_cni_image(k8s, kubeovn_ns)
         objects.append(await _ensure_daemonset(
-            k8s, build_link_watcher(data, kubeovn_ns, image),
+            k8s,
+            build_link_watcher(
+                data, kubeovn_ns, image,
+                # Every provider NIC in the cluster, not just this build's —
+                # there is one DaemonSet, and rewriting it per underlay is how
+                # the first NIC lost its keeper.
+                interfaces=await _all_provider_interfaces(k8s),
+            ),
         ))
     else:
         objects.append(UnderlayObject(
