@@ -77,3 +77,25 @@ async def test_an_unreadable_cluster_hides_nothing(
     )
 
     assert await transit_subnet_names(k8s) == set()
+
+
+@pytest.mark.asyncio
+async def test_the_subnets_route_still_belongs_to_list_subnets() -> None:
+    """A helper inserted above a decorated function steals its route.
+
+    Adding `transit_subnet_names` immediately before `list_subnets` put it
+    between `@router.get("/subnets")` and the function it decorates, so the
+    route resolved to the helper — which takes a bare `k8s` argument, so
+    FastAPI demanded it as a query parameter and `/network/subnets` started
+    answering 422 to everyone. The whole backend suite stayed green; only
+    calling the endpoint showed it.
+    """
+    from app.api.v1.network import router
+
+    handlers = {
+        (m, r.path): r.endpoint.__name__
+        for r in router.routes
+        if getattr(r, "path", "") == "/subnets"
+        for m in getattr(r, "methods", set())
+    }
+    assert handlers.get(("GET", "/subnets")) == "list_subnets"

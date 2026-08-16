@@ -732,7 +732,6 @@ async def delete_vlan(request: Request, name: str, user: User = Depends(require_
 # Subnets
 # ============================================================================
 
-@router.get("/subnets", response_model=list[SubnetResponse])
 async def transit_subnet_names(k8s) -> set[str]:
     """Subnets acting as a control-plane transit plane, not as an egress uplink.
 
@@ -764,6 +763,7 @@ async def transit_subnet_names(k8s) -> set[str]:
     return names
 
 
+@router.get("/subnets", response_model=list[SubnetResponse])
 async def list_subnets(request: Request, user: User = Depends(require_auth)) -> list[SubnetResponse]:
     """List all Kube-OVN Subnets.
 

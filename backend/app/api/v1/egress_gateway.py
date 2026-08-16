@@ -377,12 +377,19 @@ async def adopt_gateway_pins(k8s, gateway_name: str, veg: dict[str, Any] | None)
     spec = (veg or {}).get("spec", {}) or {}
     status = (veg or {}).get("status", {}) or {}
 
+    # Only adopt a status that is fully populated. Clearing the pins makes
+    # kube-ovn replace pods, and for a few seconds `status` holds one address
+    # for a two-replica gateway — measured live. Pinning that would leave the
+    # second replica with nowhere to come up, which is worse than the churn
+    # this is meant to stop.
+    replicas = spec.get("replicas") or 1
+
     patch: dict[str, list[str]] = {}
     for field in ("internalIPs", "externalIPs"):
         if spec.get(field):
             continue
         current = [str(ip).split("/")[0] for ip in (status.get(field) or [])]
-        if current:
+        if current and len(current) >= replicas:
             patch[field] = current
 
     if not patch:

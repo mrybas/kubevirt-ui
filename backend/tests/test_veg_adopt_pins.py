@@ -78,3 +78,44 @@ async def test_a_half_pinned_gateway_gets_the_missing_half() -> None:
     body = k8s.custom_api.patch_namespaced_custom_object.call_args.kwargs["body"]
     assert body["spec"]["internalIPs"] == ["10.199.16.5"]
     assert "externalIPs" not in body["spec"], "an existing pin must not be rewritten"
+
+
+@pytest.mark.asyncio
+async def test_a_partial_status_is_not_adopted() -> None:
+    """Adopting mid-reconcile would pin fewer addresses than there are replicas.
+
+    Seen live: clearing the pins made kube-ovn replace a pod, and for a few
+    seconds `status.internalIPs` held one address for a two-replica gateway.
+    Adopting that pins the gateway to a single address — the second replica
+    then has nowhere to come up, which is a worse failure than the churn this
+    is meant to stop.
+    """
+    k8s = _k8s(
+        spec={"replicas": 2},
+        status={"internalIPs": ["10.199.16.7"], "externalIPs": ["10.199.4.16"]},
+    )
+
+    assert await adopt_gateway_pins(k8s, GW, k8s._veg) is False
+    k8s.custom_api.patch_namespaced_custom_object.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_complete_status_is_adopted() -> None:
+    k8s = _k8s(
+        spec={"replicas": 2},
+        status={"internalIPs": ["10.199.16.5", "10.199.16.7"],
+                "externalIPs": ["10.199.4.14", "10.199.4.16"]},
+    )
+
+    assert await adopt_gateway_pins(k8s, GW, k8s._veg) is True
+
+
+@pytest.mark.asyncio
+async def test_more_addresses_than_replicas_is_still_adopted() -> None:
+    """A scale-down leaves status ahead of spec; that is not a partial read."""
+    k8s = _k8s(
+        spec={"replicas": 1},
+        status={"internalIPs": ["10.199.16.5", "10.199.16.7"], "externalIPs": []},
+    )
+
+    assert await adopt_gateway_pins(k8s, GW, k8s._veg) is True
