@@ -2,6 +2,7 @@
  * Create VM Wizard - Step-by-step VM creation from template
  */
 
+import { Link } from 'react-router-dom';
 import { useState, useEffect, useRef } from 'react';
 import { X, Server, HardDrive, Cpu, MemoryStick, Check, Loader2, FolderOpen, Network, Globe, Plus, Trash2, Gauge, ChevronRight, Folder } from 'lucide-react';
 import { useTemplates, useGoldenImages, useCreateVMFromTemplate } from '@/hooks/useTemplates';
@@ -332,7 +333,7 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
       {!selectedProject ? (
         <div className="text-center py-12 text-surface-400 bg-surface-800/50 rounded-lg">
           <FolderOpen className="w-12 h-12 mx-auto mb-4 opacity-50" />
-          <p>Select a project first to see available templates.</p>
+          <p>Select an environment first to see available templates.</p>
         </div>
       ) : templatesLoading ? (
         <div className="flex items-center justify-center py-12">
@@ -341,8 +342,21 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
       ) : availableTemplates.length === 0 ? (
         <div className="text-center py-12 text-surface-400 bg-surface-800/50 rounded-lg">
           <Server className="w-12 h-12 mx-auto mb-4 opacity-50" />
-          <p>No templates in project "{selectedProject}".</p>
-          <p className="text-sm mt-2">Create a template first or import images in this project.</p>
+          <p>No templates in environment "{selectedProject}".</p>
+          {/* Saying "create a template first" with no way to get there leaves
+              the operator to find the page themselves. The chain is
+              Import Image → Create Template → Create VM; both ends are one
+              click away from here now. */}
+          <p className="text-sm mt-2">
+            Templates are built from an imported image. Start at{' '}
+            <Link to="/storage/images" className="text-primary-400 hover:underline">
+              Storage → Images
+            </Link>{' '}
+            then{' '}
+            <Link to="/vms/templates" className="text-primary-400 hover:underline">
+              create a template
+            </Link>.
+          </p>
         </div>
       ) : (
         <div className="grid grid-cols-2 gap-4">

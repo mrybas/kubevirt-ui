@@ -570,7 +570,7 @@ function ImportImageModal({
   const [description] = useState('');
   const [osType, setOsType] = useState('linux');
   const [size, setSize] = useState('10Gi');
-  const [storageClass] = useState('');
+  const [storageClass, setStorageClass] = useState('');
   const [sourceType, setSourceType] = useState<'http' | 'registry'>('http');
   const [sourceUrl, setSourceUrl] = useState('');
   const [selectedProject, setSelectedProject] = useState(defaultProject || '');
@@ -685,13 +685,29 @@ function ImportImageModal({
             </div>
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-surface-300 mb-1.5">Source Type</label>
-            <CustomSelect
-              value={sourceType}
-              onChange={(v) => setSourceType(v as 'http' | 'registry')}
-              options={[{ value: 'http', label: 'HTTP/HTTPS URL' }, { value: 'registry', label: 'Container Registry' }]}
-            />
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-surface-300 mb-1.5">Source Type</label>
+              <CustomSelect
+                value={sourceType}
+                onChange={(v) => setSourceType(v as 'http' | 'registry')}
+                options={[{ value: 'http', label: 'HTTP/HTTPS URL' }, { value: 'registry', label: 'Container Registry' }]}
+              />
+            </div>
+            <div>
+              {/* Without this every image lands on the default class, so a
+                  deployment keeping golden images on a cheap erasure-coded pool
+                  and VM disks on replicas cannot express that here at all. CDI
+                  also takes its clone strategy from the target class, so this
+                  decides more than where the bytes sit. */}
+              <label className="block text-sm font-medium text-surface-300 mb-1.5">Storage Class</label>
+              <CustomSelect
+                value={storageClass}
+                onChange={setStorageClass}
+                placeholder={`Default (${defaultSC || 'auto'})`}
+                options={[{ value: '', label: `Default (${defaultSC || 'auto'})` }, ...storageClasses.map(sc => ({ value: sc.name, label: `${sc.name}${sc.is_default ? ' (default)' : ''}` }))]}
+              />
+            </div>
           </div>
 
           <div>

@@ -170,6 +170,11 @@ function AppRoutes() {
                     <Route path="/storage/:namespace/:name" element={<ImageDetail />} />
                     {/* Network — admin only */}
                     <Route path="/network" element={<RequireAdmin><Networks /></RequireAdmin>} />
+                    {/* The breadcrumb reads "Networking" while every route is
+                        /network/*, so the plural is a natural thing to type
+                        (and to paste from a doc) — it used to land on a 404
+                        that still drew the breadcrumb. */}
+                    <Route path="/networking/*" element={<Navigate to="/network" replace />} />
                     <Route path="/network/vpcs" element={<RequireAdmin><Navigate to="/network?tab=vpcs" replace /></RequireAdmin>} />
                     <Route path="/network/subnets" element={<RequireAdmin><Navigate to="/network?tab=subnets" replace /></RequireAdmin>} />
                     <Route path="/network/underlay" element={<RequireAdmin><Navigate to="/network?tab=underlay" replace /></RequireAdmin>} />
