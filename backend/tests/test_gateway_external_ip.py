@@ -59,3 +59,52 @@ def test_pod_derived_ips_still_ride_along() -> None:
 
     assert out.external_ips == ["10.199.4.14"]
     assert out.assigned_ips[0].pod == "p1"
+
+
+def test_a_condition_older_than_ready_is_not_reported() -> None:
+    """A Validated=False left over from generation 1 is history, not a problem.
+
+    kube-ovn does not clear conditions when a later reconcile succeeds, so a
+    gateway that failed validation once and then went Ready keeps both. Passing
+    the raw list through invites every consumer to draw the stale one
+    (backlog U21).
+    """
+    veg = {
+        "spec": {},
+        "status": {
+            "ready": True,
+            "conditions": [
+                {"type": "Validated", "status": "False",
+                 "lastTransitionTime": "2026-08-16T09:20:23Z",
+                 "message": "vpc egw-egw-team-a bfd port is not enabled or not ready"},
+                {"type": "Ready", "status": "True",
+                 "lastTransitionTime": "2026-08-16T09:58:25Z"},
+            ],
+        },
+    }
+
+    out = _parse_gateway(GW_VPC, veg, attached=[], assigned_ips=[])
+
+    types = {c["type"] for c in (out.status or {}).get("conditions", [])}
+    assert "Validated" not in types, "a condition that predates Ready=True is still shown"
+    assert "Ready" in types
+
+
+def test_a_condition_newer_than_ready_is_kept() -> None:
+    veg = {
+        "spec": {},
+        "status": {
+            "ready": False,
+            "conditions": [
+                {"type": "Ready", "status": "True",
+                 "lastTransitionTime": "2026-08-16T09:00:00Z"},
+                {"type": "Validated", "status": "False",
+                 "lastTransitionTime": "2026-08-16T10:00:00Z", "message": "broke later"},
+            ],
+        },
+    }
+
+    out = _parse_gateway(GW_VPC, veg, attached=[], assigned_ips=[])
+
+    types = {c["type"] for c in (out.status or {}).get("conditions", [])}
+    assert "Validated" in types, "a failure newer than Ready must survive"

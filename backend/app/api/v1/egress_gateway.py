@@ -186,6 +186,131 @@ async def _validate_cidr_no_overlap(k8s, gw_vpc_cidr: str, transit_cidr: str) ->
             )
 
 
+def _expand_excluded(entries: list[str]) -> set[str]:
+    """kube-ovn's `excludeIps` holds both single addresses and `a..b` ranges."""
+    out: set[str] = set()
+    for entry in entries or []:
+        entry = str(entry).strip()
+        if ".." in entry:
+            start, _, end = entry.partition("..")
+            try:
+                first = ipaddress.IPv4Address(start.strip())
+                last = ipaddress.IPv4Address(end.strip())
+            except ValueError:
+                continue
+            if int(last) - int(first) > 4096:
+                continue  # absurdly wide; do not materialise it
+            out.update(str(ipaddress.IPv4Address(i)) for i in range(int(first), int(last) + 1))
+        elif entry:
+            out.add(entry)
+    return out
+
+
+async def _addresses_pinned_elsewhere(k8s) -> set[str]:
+    """Every address already written into some VpcEgressGateway's spec."""
+    try:
+        result = await k8s.custom_api.list_namespaced_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION,
+            namespace="kube-system", plural="vpc-egress-gateways",
+        )
+    except ApiException:
+        return set()
+
+    taken: set[str] = set()
+    for item in result.get("items", []):
+        spec = item.get("spec", {}) or {}
+        for key in ("internalIPs", "externalIPs"):
+            taken.update(str(ip).split("/")[0] for ip in (spec.get(key) or []))
+    return taken
+
+
+async def _free_addresses(k8s, subnet_name: str, count: int, taken: set[str]) -> list[str]:
+    """`count` addresses from `subnet_name` that nothing else is using."""
+    try:
+        subnet = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets", name=subnet_name,
+        )
+    except ApiException:
+        return []
+
+    spec = subnet.get("spec", {}) or {}
+    cidr = spec.get("cidrBlock", "")
+    if not cidr:
+        return []
+
+    blocked = set(taken)
+    blocked.update(_expand_excluded(spec.get("excludeIps") or []))
+    gateway = spec.get("gateway", "")
+    if gateway:
+        blocked.add(gateway)
+
+    network = ipaddress.IPv4Network(cidr, strict=False)
+    out: list[str] = []
+    for host in network.hosts():
+        ip = str(host)
+        if ip in blocked:
+            continue
+        out.append(ip)
+        if len(out) == count:
+            break
+    return out
+
+
+async def allocate_gateway_ips(
+    k8s, internal_subnet: str, external_subnet: str, replicas: int,
+) -> tuple[list[str], list[str]]:
+    """Pin one internal and one external address per replica.
+
+    Left unpinned, kube-ovn hands every replacement pod a fresh address. The
+    routing survives that (BIRD withdraws the old route and rebuilds ECMP), but
+    the border router accumulates one dead dynamic BGP session per burned
+    address, and anything keyed on the gateway's address has to be rewritten by
+    hand each time a pod restarts.
+
+    Allocation avoids the subnet gateway, the subnet's `excludeIps` and every
+    address already pinned by another gateway. Returns empty lists when the
+    subnets cannot be read — the caller then leaves the fields off the spec and
+    kube-ovn behaves exactly as before, which is a worse default but not a
+    failure.
+    """
+    taken = await _addresses_pinned_elsewhere(k8s)
+
+    internal = await _free_addresses(k8s, internal_subnet, replicas, taken)
+    taken.update(internal)
+    external = await _free_addresses(k8s, external_subnet, replicas, taken)
+
+    return internal, external
+
+
+async def _require_external_subnet(k8s) -> None:
+    """kube-ovn wants a Subnet named literally `external` before EIP/SNAT works.
+
+    With `enable-eip-snat` on, kube-ovn refuses to program NAT without it:
+
+        enable-eip-snat need external subnet external to be exist
+
+    and the gateway then fails with a message about BFD, which sends you
+    chasing the wrong thing entirely — measured on the lab, where the fix was
+    to rebuild the egress underlay under that exact name.
+    """
+    try:
+        await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets", name="external",
+        )
+    except ApiException as e:
+        if e.status != 404:
+            return  # cannot check — do not block on our own inability to look
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "kube-ovn requires a Subnet named exactly 'external' before it will "
+                "program EIP/SNAT (`enable-eip-snat need external subnet external to "
+                "be exist`). Build the egress underlay with that name — without it "
+                "the gateway fails with an unrelated-looking BFD error."
+            ),
+        )
+
+
 async def _get_gateway_pod_ips(k8s, gateway_name: str) -> list[GatewayPodInfo]:
     """Get assigned IPs from egress gateway pods."""
     try:
@@ -206,6 +331,32 @@ async def _get_gateway_pod_ips(k8s, gateway_name: str) -> list[GatewayPodInfo]:
             external_ip=annotations.get("ovn.kubernetes.io/provider_network_ip", ""),
         ))
     return result
+
+
+def _current_conditions(veg_status: dict[str, Any]) -> list[dict[str, Any]]:
+    """Drop conditions that a later successful reconcile has already answered.
+
+    kube-ovn does not clear a condition when the next generation succeeds, so a
+    gateway that failed validation once and then came up keeps both
+    `Validated=False` and `Ready=True` forever. Handing the raw list to
+    consumers invites them to draw the stale failure next to a healthy gateway.
+
+    Anything stamped at or after the newest `Ready=True` is current and stays.
+    """
+    conditions = list(veg_status.get("conditions") or [])
+    ready_times = [
+        c.get("lastTransitionTime", "")
+        for c in conditions
+        if c.get("type") == "Ready" and c.get("status") == "True"
+    ]
+    if not ready_times:
+        return conditions
+
+    newest_ready = max(ready_times)
+    return [
+        c for c in conditions
+        if c.get("status") != "False" or c.get("lastTransitionTime", "") >= newest_ready
+    ]
 
 
 def _parse_gateway(
@@ -235,6 +386,9 @@ def _parse_gateway(
 
     # Ready comes from VpcEgressGateway status, not VPC status
     ready = veg_status.get("ready", False) if veg_status else False
+
+    if veg_status:
+        veg_status = {**veg_status, "conditions": _current_conditions(veg_status)}
 
     exclude_ips_str = annotations.get("kubevirt-ui.io/exclude-ips", "")
     exclude_ips = [ip.strip() for ip in exclude_ips_str.split(",") if ip.strip()] if exclude_ips_str else []
@@ -440,6 +594,8 @@ async def create_egress_gateway(
     # Name for the external subnet (existing or to-be-created)
     external_subnet_name = data.macvlan_subnet or f"egw-{data.name}-external"
 
+    await _require_external_subnet(k8s)
+
     # Validate CIDRs don't overlap with each other or existing subnets
     await _validate_cidr_no_overlap(k8s, data.gw_vpc_cidr, data.transit_cidr)
 
@@ -605,8 +761,19 @@ async def create_egress_gateway(
         "policies": [{"snat": data.snat, "subnets": [gw_subnet_name]}],
         "bfd": {"enabled": data.bfd_enabled},
     }
+    # Pin the addresses. Unpinned, every replaced pod takes a new one, which
+    # leaves a dead dynamic BGP session behind on the border router and breaks
+    # anything keyed on the gateway's address. An explicit request wins; we
+    # allocate the rest.
+    auto_internal, auto_external = await allocate_gateway_ips(
+        k8s, gw_subnet_name, external_subnet_name, data.replicas,
+    )
     if data.external_ips:
         veg_spec["externalIPs"] = data.external_ips
+    elif auto_external:
+        veg_spec["externalIPs"] = auto_external
+    if auto_internal:
+        veg_spec["internalIPs"] = auto_internal
     if data.bgp_conf:
         # Makes the gateway run FRR and announce the VPC's subnets. Without
         # it the VPC is NAT-only no matter what the upstream router is told.
@@ -989,7 +1156,15 @@ async def _ensure_gateway_default_route(
     which is why this runs on attach rather than at creation time.
     """
     veg = await _get_vpc_egress_gateway(k8s, gateway_name)
-    internal_ips = (veg or {}).get("status", {}).get("internalIPs") or []
+    # Prefer the pinned address from the spec: it is known the moment the
+    # gateway is created, whereas status only fills in once a pod has come up —
+    # and it changes under us whenever one is replaced, silently pointing the
+    # hub's default route at an address that no longer exists.
+    internal_ips = (
+        ((veg or {}).get("spec", {}) or {}).get("internalIPs")
+        or ((veg or {}).get("status", {}) or {}).get("internalIPs")
+        or []
+    )
 
     if not internal_ips:
         logger.warning(
