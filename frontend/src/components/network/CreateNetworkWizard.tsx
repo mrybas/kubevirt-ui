@@ -60,7 +60,6 @@ interface WizardState {
   // VPC
   vpcName: string;
   vpcSubnetCidr: string;
-  vpcEnableNat: boolean;
   vpcEnablePeering: boolean;
   vpcIsolated: boolean;
   /** Comma-separated CIDRs, parsed on submit. */
@@ -93,7 +92,6 @@ const initialState: WizardState = {
   // touched, so the first VPC took a hard-coded prefix and the second was
   // refused for overlapping with it.
   vpcSubnetCidr: '',
-  vpcEnableNat: true,
   vpcEnablePeering: false,
   // Closed by default — every tenant prefix reaches the same upstream router,
   // so an un-isolated VPC is visible to every other tenant from the moment it
@@ -291,7 +289,7 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
     {
       id: 'vpc' as const,
       title: 'VPC Network',
-      description: 'Isolated virtual private cloud with optional NAT gateway',
+      description: 'Isolated virtual private cloud; egress via the shared gateway',
       icon: Building2,
       color: 'amber',
     },
@@ -418,7 +416,6 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
       await createVpcMutation.mutateAsync({
         name: state.vpcName,
         subnet_cidr: state.vpcSubnetCidr || undefined,
-        enable_nat_gateway: state.vpcEnableNat,
         isolated: state.vpcIsolated,
         ...(state.vpcSharedCidrs.trim()
           ? {
@@ -1227,28 +1224,13 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                   tenant supernet.
                 </p>
 
-              {/* NAT Gateway toggle */}
-              <div className="flex items-center justify-between p-4 bg-surface-800/50 rounded-lg border border-surface-700">
-                <div>
-                  <p className="text-sm font-medium text-surface-200">NAT Gateway</p>
-                  <p className="text-xs text-surface-400 mt-1">
-                    Allow VMs in this VPC to access external networks via NAT
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setState((s) => ({ ...s, vpcEnableNat: !s.vpcEnableNat }))}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                    state.vpcEnableNat ? 'bg-primary-500' : 'bg-surface-600'
-                  }`}
-                >
-                  <span
-                    className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                      state.vpcEnableNat ? 'translate-x-6' : 'translate-x-1'
-                    }`}
-                  />
-                </button>
-              </div>
+              {/* Egress is the shared gateway's job, not a per-VPC NAT.
+                  kube-ovn keeps one SNAT per logical IP and on a hybrid VPC
+                  that slot belongs to the control-plane transit path —
+                  taking it leaves the tenant with internet and no control
+                  plane, every resource green. The toggle used to offer
+                  exactly that. Backend keeps the field behind
+                  VPC_NAT_GATEWAY_ENABLED for topologies where it is right. */}
 
               {/* Tenant isolation */}
               <div className="p-4 bg-surface-800/50 rounded-lg border border-surface-700 space-y-3">
@@ -1381,7 +1363,7 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                     <p>
                       <strong className="text-surface-200">Without peering:</strong> The VPC is fully isolated.
                       VMs can only communicate within the VPC network.
-                      {state.vpcEnableNat && ' NAT gateway still provides outbound internet access.'}
+                      {' Outbound internet comes from the shared egress gateway once this VPC is attached to one.'}
                     </p>
                   </div>
                 </div>
@@ -1414,14 +1396,6 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                   <dd className="text-surface-200">{state.vpcName}</dd>
                   <dt className="text-surface-400">Subnet CIDR:</dt>
                   <dd className="text-surface-200 font-mono">{state.vpcSubnetCidr || '(auto-allocated)'}</dd>
-                  <dt className="text-surface-400">NAT Gateway:</dt>
-                  <dd className="text-surface-200">
-                    {state.vpcEnableNat ? (
-                      <span className="text-emerald-400">Enabled</span>
-                    ) : (
-                      <span className="text-surface-500">Disabled</span>
-                    )}
-                  </dd>
                   <dt className="text-surface-400">Namespaces:</dt>
                   <dd className="text-surface-200">
                     {state.vpcNamespaces.length > 0

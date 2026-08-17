@@ -19,6 +19,7 @@ from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.core.tenant_transit import (
     attach_vpc_to_transit,
     ensure_tenant_snat,
+    TransitSnatSlotTaken,
     ensure_transit_acls,
     remove_tenant_transit,
     transit_subnet_name,
@@ -1272,6 +1273,25 @@ async def _wire_tenant_to_transit(
                 "Tenant %r: transit EIP has no address yet; ACLs deferred to the "
                 "next reconcile", tenant_name,
             )
+    except TransitSnatSlotTaken as e:
+        # Not transient and not self-healing: another rule owns the one SNAT
+        # slot this subnet has, on a network the control-plane path cannot use.
+        # Leave a mark the tenant list can show, because nothing else will —
+        # the cluster comes up looking fine and only the control plane is dead.
+        logger.error("Tenant %r: %s", tenant_name, e)
+        try:
+            await k8s.custom_api.patch_namespaced_custom_object(
+                group=CAPI_GROUP, version=CAPI_VERSION,
+                namespace=_tenant_ns(tenant_name), plural="clusters",
+                name=tenant_name,
+                body={"metadata": {"annotations": {
+                    "kubevirt-ui.io/transit-conflict": str(e),
+                }}},
+                _content_type="application/merge-patch+json",
+            )
+        except ApiException:
+            logger.warning("Tenant %r: could not record the transit conflict",
+                           tenant_name)
     except (ApiException, LookupError) as e:
         logger.error("Tenant %r: transit wiring incomplete: %s", tenant_name, e)
 

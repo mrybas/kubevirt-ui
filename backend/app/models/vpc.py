@@ -128,7 +128,14 @@ class VpcCreateRequest(BaseModel):
     )
     enable_nat_gateway: bool = Field(
         False,
-        description="Enable NAT gateway for internet access from VPC",
+        description=(
+            "Deprecated and ignored. Every VPC is a hybrid: its egress goes "
+            "through the shared egress gateway, not a per-VPC OVN NAT gateway. "
+            "kube-ovn keeps one SNAT per logical IP, so a per-VPC NAT gateway "
+            "takes the slot the control-plane transit path needs — the tenant "
+            "then has internet and no control plane, which is how the `t2` "
+            "incident happened. Accepted for API compatibility; has no effect."
+        ),
     )
     static_routes: list[VpcStaticRoute] = Field(
         default_factory=list,

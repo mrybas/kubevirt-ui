@@ -208,6 +208,9 @@ def _parse_tenant_response(
     return TenantResponse(
         name=name,
         display_name=metadata.get("annotations", {}).get("kubevirt-ui.io/display-name", name),
+        transit_conflict=metadata.get("annotations", {}).get(
+            "kubevirt-ui.io/transit-conflict"
+        ),
         namespace=metadata.get("namespace", ""),
         folder=metadata.get("labels", {}).get("kubevirt-ui.io/folder", ""),
         environment=metadata.get("labels", {}).get("kubevirt-ui.io/environment", ""),
@@ -295,6 +298,13 @@ def apply_capacity_to_status(tenant: TenantResponse) -> TenantResponse:
     wedged = [a.addon_id or a.name for a in (tenant.addons or []) if not a.ready]
     if wedged:
         reasons.append("addon not reconciled: " + ", ".join(wedged))
+
+    # A contested SNAT slot is not something the tenant recovers from on its
+    # own, and it is invisible everywhere else: the cluster looks built, the
+    # internet works, and only the control-plane path is dead. Say it here,
+    # where someone is already asking why the tenant is not Ready.
+    if tenant.transit_conflict:
+        reasons.append(tenant.transit_conflict)
 
     if not reasons:
         return tenant

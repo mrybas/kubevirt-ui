@@ -1733,7 +1733,20 @@ export default function Tenants() {
     {
       key: 'status',
       header: 'Status',
-      accessor: (t) => <TenantStatusBadge status={t.status} detail={t.status_detail} />,
+      // The detail used to live only in the badge's `title` — it existed
+      // for anyone who thought to hover a badge they had no reason to
+      // suspect. Some of these read "SNAT slot is held by X — remove it
+      // before attaching a tenant": an instruction, not a footnote.
+      accessor: (t) => (
+        <div className="flex flex-col gap-1 items-start">
+          <TenantStatusBadge status={t.status} detail={t.status_detail} />
+          {t.status !== 'Ready' && t.status_detail && (
+            <span className="text-xs text-surface-400 max-w-md leading-snug">
+              {t.status_detail}
+            </span>
+          )}
+        </div>
+      ),
     },
     {
       key: 'version',

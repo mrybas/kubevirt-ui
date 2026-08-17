@@ -151,7 +151,29 @@ async def _find_kubeovn_namespace(k8s) -> str:
 
 
 async def _find_infra_subnet(k8s) -> dict | None:
-    """Find the infrastructure subnet for VPC NAT Gateway external connectivity."""
+    """The subnet a VPC's NAT gateway SNATs to on its way out.
+
+    This used to return `items[0]` of everything labelled
+    `purpose=infrastructure`, which was right for exactly as long as there was
+    one such subnet. The control-plane transit subnet carries the same label,
+    the API returns subnets in name order, and `cp-transit` sorts before
+    `external` — so every VPC created since then has had its NAT gateway put
+    on the transit network, whose gateway (10.199.0.1 on this lab) has no
+    route to the internet.
+
+    Nothing reported an error: the EIP is created, the SNAT rule goes Ready,
+    the OVN gateway looks configured, and packets leave under an address that
+    cannot come back. Egress simply does not work, and the obvious suspect is
+    the egress gateway — which is only there to announce the tenant CIDR over
+    BGP and was never on this path.
+
+    So: never pick the transit subnet, and prefer one that is actually an
+    underlay (has a VLAN) — that is what has somewhere to route to.
+    `VPC_NAT_EXTERNAL_SUBNET` overrides the choice outright.
+    """
+    forced = os.getenv("VPC_NAT_EXTERNAL_SUBNET")
+    transit = os.getenv("TENANTS_CP_TRANSIT_SUBNET")
+
     try:
         result = await k8s.custom_api.list_cluster_custom_object(
             group=KUBEOVN_API_GROUP,
@@ -159,12 +181,49 @@ async def _find_infra_subnet(k8s) -> dict | None:
             plural="subnets",
             label_selector="kubevirt-ui.io/purpose=infrastructure",
         )
-        items = result.get("items", [])
-        if items:
-            return items[0]
     except ApiException:
-        pass
-    return None
+        return None
+
+    items = result.get("items", []) or []
+    if not items:
+        return None
+
+    by_name = {i.get("metadata", {}).get("name"): i for i in items}
+    if forced:
+        # An explicit answer wins even if it is not labelled — the operator
+        # knows their topology better than a label does.
+        if forced in by_name:
+            return by_name[forced]
+        try:
+            return await k8s.custom_api.get_cluster_custom_object(
+                group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+                plural="subnets", name=forced,
+            )
+        except ApiException:
+            logger.warning(
+                f"VPC_NAT_EXTERNAL_SUBNET={forced!r} does not exist; "
+                "falling back to auto-detection"
+            )
+
+    candidates = [
+        i for i in items
+        if i.get("metadata", {}).get("name") != transit
+    ]
+    if not candidates:
+        logger.warning(
+            "The only infrastructure subnet is the control-plane transit "
+            f"subnet ({transit!r}); a VPC NAT gateway placed there cannot "
+            "reach the internet. Set VPC_NAT_EXTERNAL_SUBNET."
+        )
+        return None
+
+    # An underlay-backed subnet has an upstream to route to; an overlay one
+    # does not. Ties break by name so the choice is reproducible.
+    candidates.sort(
+        key=lambda i: (not (i.get("spec", {}) or {}).get("vlan"),
+                       i.get("metadata", {}).get("name", ""))
+    )
+    return candidates[0]
 
 
 async def _label_nodes_for_external_gw(k8s, vlan_name: str) -> int:

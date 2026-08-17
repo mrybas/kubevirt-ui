@@ -141,10 +141,34 @@ async def attach_vpc_to_transit(k8s, vpc_name: str, transit_subnet: str) -> None
     await patch_spec_with_retry(k8s, "vpcs", vpc_name, mutate)
 
 
+class TransitSnatSlotTaken(Exception):
+    """Something else already SNATs this subnet, and not onto the transit net.
+
+    kube-ovn keeps one SNAT per logical IP. If that slot belongs to a rule whose
+    EIP lives on the external subnet, the tenant cannot have a transit address —
+    and the control-plane path silently dies, because the reply comes back to an
+    address the node does not know on `br-cptransit` and leaves via its default
+    gateway instead, where conntrack has never seen the flow.
+
+    Reusing such a rule is worse than failing: it writes the transit ACLs for an
+    external address, which looks configured and works for nothing. Measured on
+    the lab as the `t2` incident — internet fine, control plane unreachable.
+    """
+
+    def __init__(self, rule: str, address: str, subnet: str) -> None:
+        self.rule, self.address, self.subnet = rule, address, subnet
+        super().__init__(
+            f"SNAT slot for this subnet is held by {rule!r} → {address} on "
+            f"subnet {subnet!r}, which is not the control-plane transit "
+            f"network. Remove that rule (and the VPC's NAT gateway that "
+            f"created it) before attaching a tenant."
+        )
+
+
 async def _existing_snat_address(
-    k8s, vpc_name: str, tenant_subnet: str, skip: str,
+    k8s, vpc_name: str, tenant_subnet: str, skip: str, transit_subnet: str,
 ) -> str | None:
-    """The address already SNATting `tenant_subnet`, if something else set it up.
+    """The transit address already SNATting `tenant_subnet`, if one exists.
 
     A VPC created with a NAT gateway already carries `eip-<vpc>` + `snat-<vpc>`
     for its default subnet. Adding a second rule for the same logical IP does
@@ -154,13 +178,14 @@ async def _existing_snat_address(
     That silence is what made it fatal rather than untidy: the guard ACL is
     written for the address we asked for, traffic leaves under the address OVN
     actually kept, and the baseline deny — which covers the whole allocation
-    range on purpose — drops it. On the lab the tenant's worker sat at
-    `Provisioned` forever because every packet to its own API VIP was dropped:
+    range on purpose — drops it.
 
-        lr-nat-list t1-vpc  ->  snat  10.199.1.5  10.200.8.0/22
-        ACL allow           ->  ip4.src == 10.199.1.6 && ... tcp.dst == 20000
-
-    So: find the address that is already in force and write the ACLs for it.
+    Reuse is therefore right, but only when the incumbent is on the **transit**
+    subnet. An earlier version matched on `(vpc, subnet)` alone and happily
+    inherited a rule whose EIP was on the external network; the transit ACLs
+    were then written for an external address and the tenant's control-plane
+    path was dead while its internet worked. That is a conflict to report, not
+    to absorb — see `TransitSnatSlotTaken`.
     """
     try:
         result = await k8s.custom_api.list_cluster_custom_object(
@@ -183,6 +208,12 @@ async def _existing_snat_address(
         address = ((eip or {}).get("status", {}) or {}).get("v4Ip")
         if not address:
             continue
+
+        on = ((eip or {}).get("spec", {}) or {}).get("externalSubnet")
+        if on != transit_subnet:
+            raise TransitSnatSlotTaken(
+                item["metadata"]["name"], address, on or "<unknown>"
+            )
 
         # Reusing a rule is only safe if the rule is actually in force, and
         # `status.ready` does not tell us that. Cycling the VPC's transit
@@ -235,6 +266,7 @@ async def ensure_tenant_snat(
     """
     inherited = await _existing_snat_address(
         k8s, vpc_name, tenant_subnet, skip=_snat_name(tenant),
+        transit_subnet=transit_subnet,
     )
     if inherited:
         return inherited

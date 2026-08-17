@@ -7,6 +7,7 @@ Dedicated VPC router covering:
 """
 
 import ipaddress
+import os
 import json
 import asyncio
 import logging
@@ -785,6 +786,11 @@ async def _vpc_owning_cidr(k8s, cidr: str) -> str | None:
     return None
 
 
+def _vpc_nat_gateway_enabled() -> bool:
+    """Whether a VPC may own a per-VPC OVN NAT gateway. Off by default."""
+    return (os.getenv("VPC_NAT_GATEWAY_ENABLED") or "").lower() in ("1", "true", "yes")
+
+
 async def _peer_shared_cidrs(k8s, vpc_name: str, shared_cidrs: list[str]) -> None:
     """Peer with whichever VPCs own the shared prefixes.
 
@@ -1180,8 +1186,16 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     vpc_spec: dict[str, Any] = {
         "namespaces": bind_namespaces,
     }
-    if data.enable_nat_gateway:
+    if data.enable_nat_gateway and _vpc_nat_gateway_enabled():
         vpc_spec["enableExternal"] = True
+    elif data.enable_nat_gateway:
+        logger.info(
+            "VPC %r asked for a NAT gateway; ignoring — egress goes through the "
+            "shared egress gateway, and the subnet's single SNAT slot belongs "
+            "to the control-plane transit path. Set VPC_NAT_GATEWAY_ENABLED=true "
+            "to opt in on a topology where that is the right answer.",
+            data.name,
+        )
     if data.static_routes:
         vpc_spec["staticRoutes"] = [
             {"cidr": r.cidr, "nextHopIP": r.next_hop_ip, "policy": r.policy}
@@ -1272,8 +1286,14 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     # Shared networks: build the path, not just the permission.
     await _peer_shared_cidrs(k8s, data.name, data.shared_cidrs or [])
 
-    # Set up OVN NAT if enabled
-    if data.enable_nat_gateway:
+    # Per-VPC OVN NAT gateway. Off unless someone deliberately turns it on:
+    # kube-ovn keeps one SNAT per logical IP, and on a hybrid VPC that slot
+    # belongs to the control-plane transit path. Taking it gives the tenant
+    # internet and no control plane — with every CR green, which is how it
+    # went unnoticed. The code stays because the topology where this is the
+    # right answer (an external subnet the upstream already NATs) is on the
+    # roadmap; the default does not.
+    if data.enable_nat_gateway and _vpc_nat_gateway_enabled():
         from app.api.v1.ovn_gateway import (
             _ensure_vpc_external_config,
             _label_nodes_external_gw,

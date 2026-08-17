@@ -308,6 +308,10 @@ class TenantResponse(BaseModel):
     # Why the status is not Ready, when the reason is something the list view
     # would otherwise hide (no workers joined, an addon wedged).
     status_detail: str | None = None
+    # Set when something else holds this VPC's SNAT slot on a non-transit
+    # network — the tenant's control-plane path cannot be built until it is
+    # released. Surfaced through `status_detail`.
+    transit_conflict: str | None = None
     phase: str | None = None  # CAPI Cluster phase
     endpoint: str | None = None  # tenant API URL
     control_plane_replicas: int = 0
