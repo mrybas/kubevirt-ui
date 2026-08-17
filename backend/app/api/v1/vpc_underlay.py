@@ -566,6 +566,47 @@ async def _all_provider_interfaces(k8s) -> list[str]:
     return list(dict.fromkeys(names))
 
 
+async def _heal_gateway_labels(k8s, provider_network_name: str) -> tuple[list[str], list[str], list[str]]:
+    """Bring `external-gw` back to `true` on every ready node of the network.
+
+    Returns (already correct, healed now, could not touch).
+
+    The label is not set once and kept. On the lab it was found sitting at an
+    explicit `false` on all three workers, with nothing in `managedFields`
+    claiming it — so whoever writes it is not necessarily us, and arguing about
+    the author does not bring the underlay back. What matters is that the
+    DaemonSet that keeps the provider links up selects on this label: no label,
+    no pod, and `kubectl rollout status` still says "successfully rolled out"
+    because zero desired pods are all ready.
+
+    Nothing then reports anything wrong until the links go down on their own —
+    which took two hours, and took the transit and egress planes with them.
+    Hence: re-check on every read, not only at build time.
+    """
+    nodes = await _ready_nodes(k8s, provider_network_name, wait=False)
+    ok, healed, failed = [], [], []
+    for node_name in nodes:
+        try:
+            node = await k8s.core_api.read_node(name=node_name)
+            if (node.metadata.labels or {}).get(EXTERNAL_GW_LABEL) == "true":
+                ok.append(node_name)
+                continue
+            await k8s.core_api.patch_node(
+                name=node_name,
+                body={"metadata": {"labels": {EXTERNAL_GW_LABEL: "true"}}},
+            )
+            healed.append(node_name)
+            logger.warning(
+                "Underlay: %s had %s != true; restored. The link watcher "
+                "selects on it and schedules nowhere without it.",
+                node_name, EXTERNAL_GW_LABEL,
+            )
+        except ApiException as e:
+            logger.warning(f"Underlay: could not label node {node_name}: {e}")
+            failed.append(node_name)
+    return ok, healed, failed
+
+
 async def _label_gateway_nodes(k8s, provider_network_name: str) -> UnderlayObject:
     """Mark the nodes that carry the provider NIC.
 
@@ -773,7 +814,13 @@ async def get_vpc_underlay(
 
     # A fabric whose nodes are unlabelled hosts nothing, and the omission is
     # invisible from the objects above — the DaemonSet exists at 0/0 desired.
+    #
+    # Reading also repairs. The label drifted to an explicit `false` on the lab
+    # and stayed there; the link watcher had nowhere to run, and two hours later
+    # both provider links were down and had taken transit and egress with them.
+    # Reporting that after the fact is not much use when a read can just fix it.
     try:
+        ok, healed, failed = await _heal_gateway_labels(k8s, provider_network_name)
         nodes = await k8s.core_api.list_node(label_selector=f"{EXTERNAL_GW_LABEL}=true")
         names = [n.metadata.name for n in nodes.items]
     except ApiException as e:
@@ -781,15 +828,24 @@ async def get_vpc_underlay(
             kind="NodeLabel", name=EXTERNAL_GW_LABEL, state="failed", detail=str(e.reason),
         ))
     else:
+        if failed:
+            detail = f"could not label: {', '.join(failed)}"
+            state = "failed"
+        elif healed:
+            detail = (
+                f"restored on {', '.join(healed)} — the label had drifted and the "
+                "link watcher was scheduled nowhere"
+            )
+            state = "created"
+        elif names:
+            detail = f"{len(names)} node(s): {', '.join(names)}"
+            state = "exists"
+        else:
+            detail = ("no node carries the provider NIC label — gateways and the "
+                      "link watcher have nowhere to run")
+            state = "missing"
         objects.append(UnderlayObject(
-            kind="NodeLabel", name=EXTERNAL_GW_LABEL,
-            state="exists" if names else "missing",
-            detail=(
-                f"{len(names)} node(s): {', '.join(names)}"
-                if names
-                else "no node carries the provider NIC label — gateways and the "
-                     "link watcher have nowhere to run"
-            ),
+            kind="NodeLabel", name=EXTERNAL_GW_LABEL, state=state, detail=detail,
         ))
 
     # Found by their marker label rather than by name in a known namespace:

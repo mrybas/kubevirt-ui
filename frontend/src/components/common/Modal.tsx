@@ -68,7 +68,10 @@ export function Modal({ isOpen, onClose, title, children, size = 'md' }: ModalPr
     <div
       className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 animate-fade-in"
       onClick={onClose}
-      aria-hidden="true"
+      // No aria-hidden here: the dialog is a *child* of this overlay, so
+      // hiding the backdrop hid every modal in the app from assistive tech —
+      // and from any query that respects it. `role="dialog"` plus
+      // `aria-modal="true"` below is what marks the boundary.
     >
       <div
         ref={dialogRef}

@@ -685,7 +685,7 @@ function AttachVpcModal({
   existingVpcNames: string[];
   onClose: () => void;
 }) {
-  const { data: vpcsData } = useVpcs();
+  const { data: vpcsData, isLoading: vpcsLoading } = useVpcs();
   const attachVpcMutation = useAttachVpc(gatewayName);
 
   const [vpcName, setVpcName] = useState('');
@@ -745,9 +745,15 @@ function AttachVpcModal({
                 </option>
               ))}
             </select>
-            {availableVpcs.length === 0 && (
+            {/* Only once the list has actually arrived. While the query was in
+                flight this read "All VPCs are already attached" over an empty
+                combobox — a confident wrong answer at exactly the moment
+                someone is deciding whether the attach is even possible. */}
+            {vpcsLoading ? (
+              <p className="text-xs text-surface-500 mt-1">Loading VPCs…</p>
+            ) : availableVpcs.length === 0 ? (
               <p className="text-xs text-surface-500 mt-1">All VPCs are already attached</p>
-            )}
+            ) : null}
           </div>
 
           {selectedVpc && (
@@ -953,9 +959,15 @@ function GatewayDetailModal({
 export default function EgressGateways() {
   const [showCreate, setShowCreate] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [detailGateway, setDetailGateway] = useState<EgressGateway | null>(null);
+  // Names, not objects. Holding the gateway itself froze it at the moment the
+  // panel opened: after a detach the row went to "1 VPC" while the open panel
+  // still listed the detached VPC, and the Attach form — which builds its
+  // candidate list from the same object — decided every VPC was already
+  // attached and offered an empty combobox. Detach then re-attach was
+  // impossible without reloading the page.
+  const [detailName, setDetailName] = useState<string | null>(null);
   // Attach used to live only inside the detail panel, two clicks deep.
-  const [attachGateway, setAttachGateway] = useState<EgressGateway | null>(null);
+  const [attachName, setAttachName] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const { data, isLoading, refetch } = useEgressGateways();
   // const { data: vpcsData } = useVpcs();
@@ -973,6 +985,10 @@ export default function EgressGateways() {
     [allSubnets],
   );
   const gateways = data?.items ?? [];
+  // Resolved on every render, so an invalidation after attach/detach reaches
+  // the open panel and the open form, not just the table.
+  const detailGateway = gateways.find((gw) => gw.name === detailName) ?? null;
+  const attachGateway = gateways.find((gw) => gw.name === attachName) ?? null;
   const filtered = searchQuery
     ? gateways.filter((gw) => gw.name.toLowerCase().includes(searchQuery.toLowerCase()))
     : gateways;
@@ -995,28 +1011,41 @@ export default function EgressGateways() {
       key: 'status',
       header: 'Status',
       accessor: (gw) => (
-        gw.degraded_reason ? (
-          // The gateway pods can be perfectly healthy while a tenant cannot
-          // reach them. Saying "Ready" there is how a severed data path went
-          // unnoticed for an afternoon.
-          <span
-            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-orange-400 bg-orange-500/10"
-            title={gw.degraded_reason}
-          >
-            <AlertTriangle className="h-3.5 w-3.5" />
-            Degraded
-          </span>
-        ) : gw.ready ? (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-emerald-400 bg-emerald-500/10">
-            <CheckCircle className="h-3.5 w-3.5" />
-            Ready
-          </span>
-        ) : (
-          <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-amber-400 bg-amber-500/10">
-            <Clock className="h-3.5 w-3.5" />
-            Not Ready
-          </span>
-        )
+        // Both unhappy states carry a sentence, and it is rendered, not hidden
+        // in a title attribute: a tooltip is unreachable on touch and invisible
+        // to anyone scanning the list, which is exactly when the cause matters.
+        <div className="flex flex-col items-start gap-1">
+          {gw.degraded_reason ? (
+            // The gateway pods can be perfectly healthy while a tenant cannot
+            // reach them. Saying "Ready" there is how a severed data path went
+            // unnoticed for an afternoon.
+            <span
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-orange-400 bg-orange-500/10"
+              title={gw.degraded_reason}
+            >
+              <AlertTriangle className="h-3.5 w-3.5" />
+              Degraded
+            </span>
+          ) : gw.ready ? (
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-emerald-400 bg-emerald-500/10">
+              <CheckCircle className="h-3.5 w-3.5" />
+              Ready
+            </span>
+          ) : (
+            <span
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium text-amber-400 bg-amber-500/10"
+              title={gw.not_ready_reason ?? undefined}
+            >
+              <Clock className="h-3.5 w-3.5" />
+              Not Ready
+            </span>
+          )}
+          {(gw.degraded_reason || (!gw.ready && gw.not_ready_reason)) && (
+            <span className="text-xs text-surface-400 max-w-md leading-snug">
+              {gw.degraded_reason || gw.not_ready_reason}
+            </span>
+          )}
+        </div>
       ),
     },
     {
@@ -1052,8 +1081,8 @@ export default function EgressGateways() {
 
   const getActions = (gw: EgressGateway): MenuItem[] => {
     const items: MenuItem[] = [
-      { label: 'View Details', icon: <Eye className="h-4 w-4" />, onClick: () => setDetailGateway(gw) },
-      { label: 'Attach VPC', icon: <Plus className="h-4 w-4" />, onClick: () => setAttachGateway(gw) },
+      { label: 'View Details', icon: <Eye className="h-4 w-4" />, onClick: () => setDetailName(gw.name) },
+      { label: 'Attach VPC', icon: <Plus className="h-4 w-4" />, onClick: () => setAttachName(gw.name) },
     ];
     if (gw.attached_vpcs.length === 0) {
       items.push({ label: 'Delete', icon: <Trash2 className="h-4 w-4" />, onClick: () => setDeleteConfirm(gw.name), variant: 'danger' });
@@ -1082,12 +1111,20 @@ export default function EgressGateways() {
         loading={isLoading}
         keyExtractor={(gw) => gw.name}
         actions={getActions}
-        onRowClick={(gw) => setDetailGateway(gw)}
+        onRowClick={(gw) => setDetailName(gw.name)}
         searchable
         searchPlaceholder="Search egress gateways..."
         onSearch={setSearchQuery}
         expandable={(gw) => (
           <div className="px-4 py-3 bg-surface-900/50">
+            {(gw.degraded_reason || (!gw.ready && gw.not_ready_reason)) && (
+              <div className="flex items-start gap-2 mb-3 p-2.5 rounded-md bg-amber-500/5 border border-amber-500/20">
+                <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+                <span className="text-xs text-surface-300 leading-relaxed">
+                  {gw.degraded_reason || gw.not_ready_reason}
+                </span>
+              </div>
+            )}
             <div className="grid grid-cols-2 gap-4 text-sm mb-3">
               <div>
                 <span className="text-xs text-surface-400">GW VPC CIDR</span>
@@ -1157,14 +1194,14 @@ export default function EgressGateways() {
         <AttachVpcModal
           gatewayName={attachGateway.name}
           existingVpcNames={attachGateway.attached_vpcs.map((v) => v.vpc_name)}
-          onClose={() => setAttachGateway(null)}
+          onClose={() => setAttachName(null)}
         />
       )}
 
       {detailGateway && (
         <GatewayDetailModal
           gateway={detailGateway}
-          onClose={() => setDetailGateway(null)}
+          onClose={() => setDetailName(null)}
         />
       )}
 

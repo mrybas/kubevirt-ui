@@ -12,6 +12,7 @@ Supports flexible topologies:
 
 import asyncio
 import ipaddress
+import json
 import logging
 import os
 from typing import Any
@@ -48,6 +49,23 @@ SYSTEM_NAMESPACE = _SYSTEM_NS
 # Label used on all managed resources
 MANAGED_LABEL = "kubevirt-ui.io/managed"
 GATEWAY_LABEL = "kubevirt-ui.io/egress-gateway"
+
+
+def gateway_pod_selector(gateway_name: str) -> str:
+    """Label selector for a gateway's pods — kube-ovn's label, not ours.
+
+    kube-ovn creates the Deployment, so it decides the labels, and it stamps
+    `ovn.kubernetes.io/vpc-egress-gateway=<name>`. Our own GATEWAY_LABEL is on
+    the VPC and the subnets we create; it is not on those pods, and asking for
+    it returns an empty list against a perfectly healthy gateway.
+
+    That silence is expensive: every pod-level check reads as "nothing wrong".
+    It emptied `assigned_ips`, and it made the announcement-lag check — the one
+    written *because* spec-level checks all passed while a tenant had no
+    internet — pass vacuously on the cluster while its unit tests, which hand
+    the pod list in directly, stayed green.
+    """
+    return f"app=vpc-egress-gateway,ovn.kubernetes.io/vpc-egress-gateway={gateway_name}"
 
 
 # ============================================================================
@@ -456,12 +474,32 @@ async def adopt_gateway_pins(k8s, gateway_name: str, veg: dict[str, Any] | None)
     return True
 
 
+def _secondary_ip(annotations: dict[str, str]) -> str:
+    """The address on the pod's *external* attachment.
+
+    Multus annotates each extra attachment under its own prefix, so the
+    external leg is not `ovn.kubernetes.io/ip_address` (that is the internal
+    gateway-VPC leg) but something like
+
+        external.o0-kube-ovn.ovn.kubernetes.io/ip_address = 10.199.4.7
+
+    where the prefix names the NAD. The key we used to read,
+    `ovn.kubernetes.io/provider_network_ip`, is not a key kube-ovn writes at
+    all, so this field was always "".
+    """
+    prefixed = sorted(
+        k for k in annotations
+        if k.endswith(".ovn.kubernetes.io/ip_address")
+    )
+    return annotations.get(prefixed[0], "") if prefixed else ""
+
+
 async def _get_gateway_pod_ips(k8s, gateway_name: str) -> list[GatewayPodInfo]:
     """Get assigned IPs from egress gateway pods."""
     try:
         pods = await k8s.core_api.list_namespaced_pod(
             namespace="kube-system",
-            label_selector=f"app=vpc-egress-gateway,kubevirt-ui.io/egress-gateway={gateway_name}",
+            label_selector=gateway_pod_selector(gateway_name),
         )
     except ApiException:
         return []
@@ -473,9 +511,156 @@ async def _get_gateway_pod_ips(k8s, gateway_name: str) -> list[GatewayPodInfo]:
             pod=pod.metadata.name,
             node=pod.spec.node_name or "",
             internal_ip=annotations.get("ovn.kubernetes.io/ip_address", ""),
-            external_ip=annotations.get("ovn.kubernetes.io/provider_network_ip", ""),
+            external_ip=_secondary_ip(annotations),
         ))
     return result
+
+
+def _announcement_lag(missing: list[str]) -> str | None:
+    """Wording for the window between attach and the pods carrying the route."""
+    if not missing:
+        return None
+    return (
+        f"{', '.join(missing)} not announced yet — the gateway pods still carry "
+        "the previous route set. Traffic from these VPCs leaves but cannot come "
+        "back until the pods roll."
+    )
+
+
+async def _unannounced_cidrs(
+    k8s, gateway_name: str, attached: list[AttachedVpcInfo],
+) -> list[str]:
+    """Attached tenant CIDRs the gateway pods are not announcing yet.
+
+    The chain from "attached" to "the border can send replies back" is longer
+    than it looks, and only its last link carries traffic:
+
+        spec.policies (ipBlocks)
+          → kube-ovn renders ovn.kubernetes.io/routes on the pod template
+            → the CNI writes kernel routes into the pod at creation
+              → FRR redistributes kernel — there are no `network` statements
+                → the border learns the tenant /22
+
+    Because the routes are written when a pod is created, a policy change only
+    reaches BGP after the pods roll. Between the two, the gateway is configured
+    for a tenant it is not yet announcing: the tenant's SYN goes out and nothing
+    comes back. Every spec-level check passes — policies, address set, peering,
+    router ports were all verified on the lab and all looked complete while a
+    freshly attached VPC had no internet.
+
+    So compare against the pod annotation, which is the level that decides.
+    """
+    try:
+        pods = await k8s.core_api.list_namespaced_pod(
+            namespace="kube-system",
+            label_selector=gateway_pod_selector(gateway_name),
+        )
+    except ApiException:
+        return []
+
+    running = [
+        p for p in (pods.items or [])
+        if (getattr(p.status, "phase", "") or "") == "Running"
+    ]
+    if not running:
+        return []
+
+    # Announced by *every* live pod. One pod still carrying the old set is the
+    # normal middle of a roll, not a fault; the route survives on the other.
+    announced: set[str] | None = None
+    for pod in running:
+        raw = (pod.metadata.annotations or {}).get("ovn.kubernetes.io/routes", "")
+        try:
+            dsts = {r.get("dst") for r in json.loads(raw or "[]") if r.get("dst")}
+        except (ValueError, TypeError):
+            return []
+        announced = dsts if announced is None else (announced & dsts)
+
+    return [v.cidr for v in attached if v.cidr and v.cidr not in (announced or set())]
+
+
+def _condition_cause(veg_status: dict[str, Any]) -> str | None:
+    """The newest failing condition on the VpcEgressGateway, as one line."""
+    failing = [
+        c for c in _current_conditions(veg_status or {})
+        if c.get("status") == "False"
+    ]
+    if not failing:
+        return None
+    newest = max(failing, key=lambda c: c.get("lastTransitionTime", ""))
+    reason = (newest.get("reason") or "").strip()
+    message = (newest.get("message") or "").strip()
+    if reason and message:
+        return f"{reason}: {message}"
+    return reason or message or None
+
+
+async def _pod_cause(k8s, gateway_name: str) -> str | None:
+    """Why the gateway pods are not running, from the pods themselves.
+
+    `Not Ready` with nothing beside it is a dead end for anyone who does not
+    have cluster credentials, and the answer is never far away: the container's
+    waiting reason, or the Warning event kube-ovn writes when it cannot get an
+    address. `AcquireAddressFailed` on an exhausted external subnet is the one
+    this lab hits, and it is invisible from the gateway spec.
+    """
+    try:
+        pods = await k8s.core_api.list_namespaced_pod(
+            namespace="kube-system",
+            label_selector=gateway_pod_selector(gateway_name),
+        )
+    except ApiException:
+        return None
+
+    unhealthy = [
+        p for p in (pods.items or [])
+        if (getattr(p.status, "phase", "") or "") != "Running"
+    ]
+    if not unhealthy:
+        return None
+
+    pod = unhealthy[0]
+    pod_name = pod.metadata.name if pod.metadata else gateway_name
+
+    for cs in (getattr(pod.status, "container_statuses", None) or []):
+        waiting = getattr(getattr(cs, "state", None), "waiting", None)
+        if waiting and (waiting.reason or waiting.message):
+            detail = waiting.message or waiting.reason
+            return f"{pod_name}: {waiting.reason or 'Waiting'} — {detail}"
+
+    # No container state yet — the pod never got that far. The scheduler and
+    # the CNI both report through events at this stage.
+    try:
+        events = await k8s.core_api.list_namespaced_event(
+            namespace="kube-system",
+            field_selector=f"involvedObject.name={pod_name}",
+        )
+    except ApiException:
+        events = None
+
+    warnings = [
+        e for e in (getattr(events, "items", None) or [])
+        if (getattr(e, "type", "") or "") == "Warning"
+    ]
+    if warnings:
+        newest = max(
+            warnings,
+            key=lambda e: str(getattr(e, "last_timestamp", "") or getattr(e, "event_time", "") or ""),
+        )
+        reason = (getattr(newest, "reason", "") or "").strip()
+        message = (getattr(newest, "message", "") or "").strip()
+        if reason or message:
+            return f"{pod_name}: {reason or 'Warning'} — {message}" if message else f"{pod_name}: {reason}"
+
+    phase = (getattr(pod.status, "phase", "") or "Unknown")
+    return f"{pod_name} is {phase} — no events yet"
+
+
+async def _not_ready_cause(k8s, gateway_name: str, veg: dict[str, Any] | None) -> str | None:
+    """One sentence explaining a gateway that has not come up."""
+    if veg is None:
+        return "VpcEgressGateway is missing — the gateway VPC exists but nothing drives it"
+    return _condition_cause(veg.get("status", {}) or {}) or await _pod_cause(k8s, gateway_name)
 
 
 def _current_conditions(veg_status: dict[str, Any]) -> list[dict[str, Any]]:
@@ -510,6 +695,7 @@ def _parse_gateway(
     attached: list[AttachedVpcInfo],
     assigned_ips: list[GatewayPodInfo] | None = None,
     degraded_reason: str | None = None,
+    not_ready_reason: str | None = None,
 ) -> EgressGatewayResponse:
     """Parse gateway VPC + VpcEgressGateway into response model."""
     metadata = vpc.get("metadata", {})
@@ -557,6 +743,7 @@ def _parse_gateway(
         # VpcEgressGateway status says about the gateway pods.
         ready=ready and degraded_reason is None,
         degraded_reason=degraded_reason,
+        not_ready_reason=None if ready else not_ready_reason,
         status=veg_status if veg_status else None,
     )
 
@@ -673,7 +860,13 @@ async def list_egress_gateways(request: Request, user: User = Depends(require_au
             k8s, vpc.get("metadata", {}).get("name", ""),
             annotations.get("kubevirt-ui.io/transit-cidr", ""), attached,
         )
-        items.append(_parse_gateway(vpc, veg, attached, pod_ips, degraded))
+        degraded = degraded or _announcement_lag(
+            await _unannounced_cidrs(k8s, gw_name, attached)
+        )
+        not_ready = None
+        if not ((veg or {}).get("status", {}) or {}).get("ready", False):
+            not_ready = await _not_ready_cause(k8s, gw_name, veg)
+        items.append(_parse_gateway(vpc, veg, attached, pod_ips, degraded, not_ready))
 
     return EgressGatewayListResponse(items=items, total=len(items))
 
@@ -697,7 +890,13 @@ async def get_egress_gateway(request: Request, name: str, user: User = Depends(r
         k8s, vpc.get("metadata", {}).get("name", ""),
         annotations.get("kubevirt-ui.io/transit-cidr", ""), attached,
     )
-    return _parse_gateway(vpc, veg, attached, pod_ips, degraded)
+    degraded = degraded or _announcement_lag(
+        await _unannounced_cidrs(k8s, name, attached)
+    )
+    not_ready = None
+    if not ((veg or {}).get("status", {}) or {}).get("ready", False):
+        not_ready = await _not_ready_cause(k8s, name, veg)
+    return _parse_gateway(vpc, veg, attached, pod_ips, degraded, not_ready)
 
 
 @router.post("", response_model=EgressGatewayResponse, status_code=201)

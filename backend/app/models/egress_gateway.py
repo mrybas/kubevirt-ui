@@ -29,8 +29,13 @@ class EgressGatewayCreateRequest(BaseModel):
         description="Gateway name (used as VPC and resource prefix)",
     )
     gw_vpc_cidr: str = Field(
-        "10.199.0.0/24",
-        description="CIDR for internal gateway VPC subnet",
+        ...,
+        description=(
+            "CIDR for internal gateway VPC subnet. Required: a default here "
+            "silently builds the gateway on someone else's network — the UI "
+            "fills it from GET /egress-gateways/suggest-cidrs, and any other "
+            "caller has to make the same choice deliberately."
+        ),
     )
     transit_cidr: str = Field(
         "10.255.0.0/24",
@@ -193,6 +198,11 @@ class EgressGatewayResponse(BaseModel):
     # Reported instead of a green Ready, which is what let a completely severed
     # data path look healthy in every view.
     degraded_reason: Optional[str] = None
+    # Why the gateway is not Ready yet. `Not Ready` on its own sends people to
+    # `kubectl describe pod`, which is where the answer always was:
+    # AcquireAddressFailed when the external subnet is exhausted, an unschedulable
+    # pod when the node label drifted. Same treatment the tenant list got.
+    not_ready_reason: Optional[str] = None
     status: Optional[dict] = None
 
 

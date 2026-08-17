@@ -65,7 +65,12 @@ class TestBgpConfSpec:
 
 class TestGatewayRequestDefaults:
     def _req(self, **kw: object) -> EgressGatewayCreateRequest:
-        base = {"name": "t1-egress", "macvlan_subnet": "ext-sub"}
+        # gw_vpc_cidr is required — see test_gateway_cidr_has_no_default.
+        base = {
+            "name": "t1-egress",
+            "macvlan_subnet": "ext-sub",
+            "gw_vpc_cidr": "10.199.128.0/24",
+        }
         base.update(kw)
         return EgressGatewayCreateRequest(**base)  # type: ignore[arg-type]
 

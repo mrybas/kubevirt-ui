@@ -31,6 +31,7 @@ caller says this was the last one.
 """
 
 import ipaddress
+import re
 import logging
 import os
 from typing import Any
@@ -324,6 +325,35 @@ def build_transit_acls(eip: str, vip: str, ports: list[int]) -> list[dict[str, A
     return acls
 
 
+def _allow_source(match: str) -> str | None:
+    """The `ip4.src == <addr>` a transit allow is keyed on, if it has one."""
+    m = re.search(r"ip4\.src\s*==\s*([0-9.]+)\b", match or "")
+    return m.group(1) if m else None
+
+
+async def _live_transit_addresses(k8s, transit_subnet: str) -> set[str] | None:
+    """Addresses currently held by an EIP on the transit subnet.
+
+    None means "could not tell" — the caller must then leave the rules alone
+    rather than delete on a guess.
+    """
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="ovn-eips",
+        )
+    except ApiException:
+        return None
+
+    live = set()
+    for item in result.get("items", []) or []:
+        if (item.get("spec", {}) or {}).get("externalSubnet") != transit_subnet:
+            continue
+        addr = (item.get("status", {}) or {}).get("v4Ip")
+        if addr:
+            live.add(addr)
+    return live
+
+
 async def ensure_transit_acls(
     k8s, transit_subnet: str, eip: str, vip: str, ports: list[int],
 ) -> None:
@@ -332,25 +362,45 @@ async def ensure_transit_acls(
     The deny is written once for the subnet and left alone afterwards: it is
     the baseline every tenant's allow punches through, so it must not be
     duplicated per tenant and must not disappear when one is removed.
+
+    Every write also drops allows whose source address no longer belongs to any
+    EIP on this subnet. Removal used to happen only by address, at delete time —
+    so a tenant whose EIP had already gone left its allows behind forever. That
+    is not untidy, it is a hole: the address returns to the pool, the next
+    tenant is handed it, and inherits a permit to a control-plane port that
+    belongs to somebody else. Measured on the lab: an allow for 10.199.1.9
+    survived while .9 sat free in `cp-transit`'s available range.
     """
     wanted = build_transit_acls(eip, vip, ports)
     if not wanted:
         return
 
+    live = await _live_transit_addresses(k8s, transit_subnet)
+    if live is not None:
+        live.add(eip)  # ours may not be observable yet
+
     def mutate(spec: dict) -> dict | None:
-        acls = list(spec.get("acls") or [])
+        before = list(spec.get("acls") or [])
+        acls = before
+
+        if live is not None:
+            acls = [
+                a for a in acls
+                if a.get("priority") != TRANSIT_ALLOW_PRIORITY
+                or (_allow_source(a.get("match", "")) or "") in live
+            ]
 
         cidr = spec.get("cidrBlock", "")
         if cidr and not any(
             a.get("action") == "drop" and a.get("priority") == TRANSIT_DENY_PRIORITY
             for a in acls
         ):
-            acls.append(build_transit_deny(cidr, spec.get("excludeIps") or []))
+            acls = acls + [build_transit_deny(cidr, spec.get("excludeIps") or [])]
 
-        missing = [a for a in wanted if a not in acls]
-        if not missing and acls == (spec.get("acls") or []):
+        acls = acls + [a for a in wanted if a not in acls]
+        if acls == before:
             return None
-        return {"acls": acls + missing}
+        return {"acls": acls}
 
     await patch_spec_with_retry(k8s, "subnets", transit_subnet, mutate)
 

@@ -32,7 +32,18 @@ TRANSIT = "cp-transit"
 TRANSIT_CIDR = "10.199.0.0/22"
 
 
-def _k8s(vpc_spec: dict | None = None, transit_spec: dict | None = None) -> MagicMock:
+def _k8s(
+    vpc_spec: dict | None = None,
+    transit_spec: dict | None = None,
+    live_eips: list[str] | None = None,
+) -> MagicMock:
+    """`live_eips` are addresses held by an EIP on the transit subnet.
+
+    `ensure_transit_acls` prunes allows whose source no longer belongs to one —
+    a released address goes back into the pool and the next tenant would inherit
+    the permit. So a test about another tenant's rule surviving has to say that
+    the other tenant still exists.
+    """
     store = {
         "vpcs": {VPC: {"metadata": {"name": VPC, "resourceVersion": "1"}, "spec": vpc_spec or {}}},
         "subnets": {
@@ -41,7 +52,14 @@ def _k8s(vpc_spec: dict | None = None, transit_spec: dict | None = None) -> Magi
                 "spec": transit_spec or {"cidrBlock": TRANSIT_CIDR},
             },
         },
-        "ovn-eips": {},
+        "ovn-eips": {
+            f"eip-{i}": {
+                "metadata": {"name": f"eip-{i}"},
+                "spec": {"externalSubnet": TRANSIT},
+                "status": {"v4Ip": addr},
+            }
+            for i, addr in enumerate(live_eips or [])
+        },
         "ovn-snat-rules": {},
     }
 
@@ -160,7 +178,10 @@ async def test_transit_acls_keep_other_tenants_rules() -> None:
         "action": "allow-related", "direction": "from-lport", "priority": 3200,
         "match": "ip4.src == 10.199.1.3 && ip4.dst == 10.199.0.100 && tcp.dst == 16444",
     }
-    k8s = _k8s(transit_spec={"cidrBlock": TRANSIT_CIDR, "acls": [theirs]})
+    k8s = _k8s(
+        transit_spec={"cidrBlock": TRANSIT_CIDR, "acls": [theirs]},
+        live_eips=["10.199.1.3", "10.199.1.1"],
+    )
 
     await ensure_transit_acls(k8s, TRANSIT, "10.199.1.1", "10.199.0.100", [16443])
 
@@ -353,7 +374,10 @@ class TestTransitDenyBaseline:
     async def test_the_deny_is_written_once_and_kept(self) -> None:
         from app.core.tenant_transit import ensure_transit_acls
 
-        k8s = _k8s(transit_spec={"cidrBlock": TRANSIT_CIDR})
+        # Both tenants exist, so both allows must survive the prune that keeps
+        # a released address from carrying its permit to whoever gets it next.
+        k8s = _k8s(transit_spec={"cidrBlock": TRANSIT_CIDR},
+                   live_eips=["10.199.1.1", "10.199.1.3"])
 
         await ensure_transit_acls(k8s, TRANSIT, "10.199.1.1", "10.199.0.100", [16443])
         await ensure_transit_acls(k8s, TRANSIT, "10.199.1.3", "10.199.0.100", [16444])

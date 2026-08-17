@@ -40,6 +40,8 @@ export interface EgressGateway {
   ready: boolean;
   /** Set when the gateway is up but a tenant's wiring to it is broken. */
   degraded_reason?: string | null;
+  /** Why the gateway has not come up — failing condition, or the pod's own event. */
+  not_ready_reason?: string | null;
   status: Record<string, unknown> | null; // raw k8s VpcEgressGateway status
 }
 
