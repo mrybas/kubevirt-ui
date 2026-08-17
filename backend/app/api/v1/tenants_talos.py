@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 
 TALOS_TRUSTD_PORT = 50001
 
+# Size of the imported golden image, and therefore the floor for a worker's
+# root clone: CDI rejects a clone into a smaller target at admission, and the
+# failure surfaces as every worker stuck with an error nobody would connect to
+# a disk-size field. One constant so the two cannot drift.
+DEFAULT_TALOS_GOLDEN_SIZE = "20Gi"
+
 # Default golden image for Talos workers, from the image factory.
 #
 #   .../image/<schematic>/<version>/openstack-amd64.raw.xz
@@ -848,7 +854,7 @@ def build_talos_golden_dv(
 async def ensure_talos_golden_image(
     k8s, tenant: str, namespace: str, *,
     image_url: str | None = None,
-    size: str = "20Gi",
+    size: str = DEFAULT_TALOS_GOLDEN_SIZE,
     storage_class: str | None = None,
 ) -> None:
     """Import the Talos golden image into the tenant namespace if absent."""

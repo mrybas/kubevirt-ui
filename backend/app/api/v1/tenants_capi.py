@@ -577,6 +577,15 @@ def talos_golden_pvc_name(req: TenantCreateRequest) -> str:
     return f"{req.name}-talos-golden"
 
 
+# Name of the per-worker root template. CAPK rewrites
+# `dataVolumeTemplates[].metadata.name` to `<vm-name>-<template-name>` and
+# fixes `volumes[].dataVolume.name` to match — proved by experiment on a
+# two-worker MachineDeployment, two separate DVs each with its own controller
+# owner (TARGET-LAB-T3-EXPERIMENT-LOG.md). So the literal here is a suffix,
+# not the DV's actual name.
+WORKER_ROOT_TEMPLATE = "root"
+
+
 def _build_worker_root_volume(req: TenantCreateRequest) -> dict[str, Any]:
     """Root volume for a worker VM.
 
@@ -584,17 +593,103 @@ def _build_worker_root_volume(req: TenantCreateRequest) -> dict[str, Any]:
     it boots a disk image, and its machine config arrives through the
     cloud-init disk KubeVirt attaches (which is what the `nocloud` image
     variant reads). So its root comes from a clone of the imported golden
-    image instead.
+    image.
+
+    A *clone*, per worker. This used to point every worker straight at the
+    golden PVC by name, and the consequences were measured rather than
+    feared:
+
+      * with one worker the golden image is no longer golden — the node
+        writes into it, so the next tenant clones a used disk;
+      * with two it is two writers on one raw block device, and RWX means
+        nothing even complains;
+      * and the sharp one: the DV takes the first VM as its owner with
+        `blockOwnerDeletion`, so deleting worker A — a rolling update, an MHC
+        replacement, a scale-down — deletes the DV and re-imports it. Worker
+        B's root disk is wiped by a routine operation, silently.
     """
     if req.worker_os == "talos":
         return {
             "name": "root",
-            "dataVolume": {"name": talos_golden_pvc_name(req)},
+            "dataVolume": {"name": WORKER_ROOT_TEMPLATE},
         }
     return {
         "name": "root",
         "containerDisk": {"image": _resolve_worker_container_disk_image(req)},
     }
+
+
+def _build_worker_data_volume_templates(req: TenantCreateRequest) -> list[dict[str, Any]]:
+    """One root disk per worker, cloned from the tenant's golden image.
+
+    `source.pvc` + `storage` (not `pvc`) is the shape the VM-create path
+    already uses: CDI then takes the clone strategy from the *target* storage
+    profile instead of being told one that the backend may not support.
+
+    Size follows the golden image unless the tenant asked for more — a clone
+    smaller than its source is rejected by CDI at admission, which would fail
+    every worker with an error nobody would connect to a disk-size field.
+    """
+    if req.worker_os != "talos":
+        return []
+
+    storage: dict[str, Any] = {
+        "resources": {"requests": {"storage": _worker_root_size(req)}},
+    }
+    if req.storage_class:
+        storage["storageClassName"] = req.storage_class
+
+    return [{
+        "metadata": {
+            "name": WORKER_ROOT_TEMPLATE,
+            "labels": {
+                "kubevirt-ui.io/managed": "true",
+                "kubevirt-ui.io/tenant": req.name,
+                "kubevirt-ui.io/worker-root": "true",
+            },
+        },
+        "spec": {
+            "source": {
+                "pvc": {
+                    "name": talos_golden_pvc_name(req),
+                    "namespace": _tenant_ns(req.name),
+                },
+            },
+            "storage": storage,
+        },
+    }]
+
+
+def _worker_root_size(req: TenantCreateRequest) -> str:
+    """At least the golden image, and never silently smaller than asked."""
+    from app.api.v1.tenants_talos import DEFAULT_TALOS_GOLDEN_SIZE
+
+    return _larger_size(req.worker_disk, DEFAULT_TALOS_GOLDEN_SIZE)
+
+
+def _larger_size(a: str, b: str) -> str:
+    """The bigger of two Kubernetes quantities, falling back to `b` if either
+    cannot be parsed — the golden size is the one that must not be undercut."""
+    units = {"Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40,
+             "K": 10**3, "M": 10**6, "G": 10**9, "T": 10**12}
+
+    def _bytes(q: str) -> int | None:
+        q = (q or "").strip()
+        for suffix, mult in units.items():
+            if q.endswith(suffix):
+                try:
+                    return int(float(q[: -len(suffix)]) * mult)
+                except ValueError:
+                    return None
+        try:
+            return int(q)
+        except ValueError:
+            return None
+
+    av, bv = _bytes(a), _bytes(b)
+    if av is None or bv is None:
+        return b
+    return a if av >= bv else b
 
 
 def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, Any]:
@@ -655,6 +750,10 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
                     "virtualMachineTemplate": {
                         "spec": {
                             "runStrategy": "Always",
+                            **(
+                                {"dataVolumeTemplates": _build_worker_data_volume_templates(req)}
+                                if req.worker_os == "talos" else {}
+                            ),
                             "template": {
                                 "metadata": {
                                     "labels": pod_labels,
