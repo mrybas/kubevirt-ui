@@ -15,6 +15,7 @@ import {
   RefreshCw,
   Plus,
   Trash2,
+  Radio,
   CheckCircle,
   XCircle,
   AlertTriangle,
@@ -28,6 +29,7 @@ import {
   useUpsertBgpConf,
   useDeleteBgpConf,
 } from '../hooks/useBgp';
+import { getGatewayConfigExamples, type GatewayConfigExample } from '../api/bgp';
 import type {
   BgpConfRequest,
   BgpConfResponse,
@@ -307,6 +309,9 @@ function BgpConfModal({
 // ---------------------------------------------------------------------------
 
 export default function BgpPeering() {
+  const [showGatewayConfig, setShowGatewayConfig] = useState(false);
+  const [gatewayConfigs, setGatewayConfigs] = useState<GatewayConfigExample[]>([]);
+  const [activeConfigTab, setActiveConfigTab] = useState('bird');
   // The routed external plane is what this cluster actually announces.
   // kube-ovn-speaker was removed from this page: it announces from the default
   // VPC only, so for a custom VPC it has nothing to say — and its empty view
@@ -605,6 +610,81 @@ export default function BgpPeering() {
           </div>
         </div>
       )}
+      <div className="bg-surface-800 border border-surface-700 rounded-xl p-5">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h2 className="text-sm font-semibold text-surface-200 flex items-center gap-2">
+              <Radio className="w-4 h-4 text-primary-400" />
+              Upstream Router Configuration
+            </h2>
+            <p className="text-xs text-surface-500 mt-1">
+              What the router on the other side of the session has to be told
+              before any of the prefixes above are usable.
+            </p>
+          </div>
+          <button
+            onClick={async () => {
+              if (!showGatewayConfig) {
+                try {
+                  const configs = await getGatewayConfigExamples();
+                  setGatewayConfigs(configs);
+                } catch { /* ignore */ }
+              }
+              setShowGatewayConfig(!showGatewayConfig);
+            }}
+            className="btn-secondary text-xs"
+          >
+            {showGatewayConfig ? 'Hide' : 'Show Config Examples'}
+          </button>
+        </div>
+
+        {!showGatewayConfig && (
+          <p className="text-xs text-surface-500">
+            Generated with this cluster's ASNs, node range and tenant supernet
+            filled in — the filter comes from the same setting that allocates
+            the VPCs, so a prefix this cluster hands out is a prefix the router
+            is told to accept.
+          </p>
+        )}
+
+        {showGatewayConfig && gatewayConfigs.length > 0 && (
+          <div>
+            <div className="flex gap-1 mb-3">
+              {gatewayConfigs.map((cfg) => (
+                <button
+                  key={cfg.name}
+                  onClick={() => setActiveConfigTab(cfg.name)}
+                  className={clsx(
+                    'px-3 py-1.5 rounded-lg text-xs font-medium transition-colors',
+                    activeConfigTab === cfg.name
+                      ? 'bg-primary-500/20 text-primary-400 border border-primary-500/40'
+                      : 'bg-surface-700 text-surface-400 hover:bg-surface-600 border border-transparent',
+                  )}
+                >
+                  {cfg.title}
+                </button>
+              ))}
+            </div>
+            {gatewayConfigs.filter((c) => c.name === activeConfigTab).map((cfg) => (
+              <div key={cfg.name}>
+                <p className="text-xs text-surface-400 mb-2">{cfg.description}</p>
+                <div className="relative">
+                  <pre className="bg-surface-900 border border-surface-700 rounded-lg p-4 text-xs text-surface-300 font-mono overflow-auto max-h-72 whitespace-pre">
+                    {cfg.config}
+                  </pre>
+                  <button
+                    onClick={() => navigator.clipboard.writeText(cfg.config)}
+                    className="absolute top-2 right-2 px-2 py-1 bg-surface-700 hover:bg-surface-600 rounded text-xs text-surface-400 transition-colors"
+                  >
+                    Copy
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
       {/* ------------------------------------------------------------------ */}
       {/* Modals                                                               */}
       {/* ------------------------------------------------------------------ */}

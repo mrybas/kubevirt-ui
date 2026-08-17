@@ -417,3 +417,181 @@ async def ensure_announcements(k8s) -> dict[str, object]:
         "nodes": nodes,
         "failures": failures,
     }
+
+
+# ---------------------------------------------------------------------------
+# What the upstream router has to be told
+# ---------------------------------------------------------------------------
+
+async def external_subnet_cidr(k8s) -> str:
+    """CIDR of the network the VPC legs sit in — where the next hops live."""
+    try:
+        subnets = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
+        )
+    except ApiException:
+        return ""
+    name = external_subnet()
+    for item in subnets.get("items", []) or []:
+        if item.get("metadata", {}).get("name") == name:
+            return (item.get("spec", {}) or {}).get("cidrBlock", "")
+    return ""
+
+
+def _one_announcer_note(node_cidr: str) -> str:
+    """A /32 is one node. Said out loud, because the config looks complete."""
+    if not node_cidr.endswith("/32"):
+        return ""
+    return (
+        "\n# NOTE: this range covers a single node. Every tenant prefix then has\n"
+        "# exactly one announcer, and losing that node withdraws all of them.\n"
+        "# Widen it to the node subnet once more than one node announces.\n"
+    )
+
+
+def render_border_bird(*, node_cidr: str, supernet: str, prefix_len: int,
+                       leg_cidr: str, local: int, remote: int) -> str:
+    """BIRD stanza for the router this cluster peers with.
+
+    Transcribed from the configuration that is live on the lab border, with
+    the two lines that were paid for:
+
+      * `graceful restart off` — with it on, BIRD kept a dead session's routes
+        and built ECMP across a live and a dead next hop; half the traffic
+        went into a hole.
+      * `merge paths on` — several nodes announce the same prefix; without it
+        BIRD installs one path and the redundancy is decorative.
+
+    The import filter is generated from the same setting that allocates the
+    VPCs, because these two disagreeing is a VPC that exists and cannot be
+    reached: the filter took `{22,22}` while a VPC was carved as a /24, and
+    the announcement was rejected by a router nobody thought to look at.
+    """
+    return f"""# Upstream side of the routed egress plane.
+# Announcements arrive from the cluster nodes, but their next hop is a VPC
+# router leg in {leg_cidr or "the external subnet"} — a third-party next hop.
+# This router must have an interface in that network (list it under
+# `protocol direct`), or every accepted route is installed as unreachable.
+{_one_announcer_note(node_cidr)}
+log syslog all;
+router id <THIS_ROUTER_IP>;
+
+protocol device {{ scan time 10; }}
+
+# The leg addresses are only usable as next hops because this router is on
+# their L2. List the interface that carries {leg_cidr or "the external subnet"}.
+protocol direct {{
+  ipv4;
+  interface "<IFACE_IN_{leg_cidr or "EXTERNAL_SUBNET"}>";
+}}
+
+protocol kernel {{
+  ipv4 {{ export all; import all; }};
+  learn;
+  # Several nodes announce the same prefix; without this only one path is
+  # installed and losing that node takes the tenant down.
+  merge paths on;
+}}
+
+protocol bgp k8s_nodes {{
+  local as {remote};
+  # A range, not a list: nodes are replaced, and a /32 per node means the
+  # cluster silently has exactly one announcer.
+  neighbor range {node_cidr} as {local};
+  dynamic name "k8s";
+  # OFF on purpose. With graceful restart on, a restarting speaker's routes
+  # are kept and ECMP is built across a live and a dead next hop.
+  graceful restart off;
+  connect retry time 10;
+  hold time 30;
+  keepalive time 10;
+  ipv4 {{
+    import filter {{
+      if net ~ [ {supernet}{{{prefix_len},{prefix_len}}} ] then accept;
+      reject;
+    }};
+    export none;
+  }};
+}}
+
+# BFD is not requested from this side, so no `protocol bfd` is needed for
+# these sessions; failure detection is the 30s hold time.
+#
+# Verify: birdc show protocols | grep k8s
+# Routes: birdc show route
+"""
+
+
+def render_border_frr(*, node_cidr: str, supernet: str, prefix_len: int,
+                      leg_cidr: str, local: int, remote: int) -> str:
+    """The same thing for a router running FRR."""
+    return f"""! Upstream side of the routed egress plane.
+! The next hop of each announcement is a VPC router leg in
+! {leg_cidr or "the external subnet"}, not the peer address — this router needs
+! an interface in that network or the routes are installed as inaccessible.
+{_one_announcer_note(node_cidr).replace("#", "!")}
+router bgp {remote}
+  no bgp ebgp-requires-policy
+  bgp listen range {node_cidr} peer-group k8s
+  neighbor k8s peer-group
+  neighbor k8s remote-as {local}
+  neighbor k8s timers 10 30
+  !
+  address-family ipv4 unicast
+    neighbor k8s activate
+    neighbor k8s route-map tenants in
+    ! Several nodes announce the same prefix — without multipath only one
+    ! is installed and losing that node takes the tenant down.
+    maximum-paths 4
+  exit-address-family
+!
+ip prefix-list tenants seq 10 permit {supernet} ge {prefix_len} le {prefix_len}
+route-map tenants permit 10
+  match ip address prefix-list tenants
+!
+! Verify: vtysh -c "show bgp summary"
+! Routes: vtysh -c "show ip bgp"
+"""
+
+
+async def node_peer_range(k8s) -> str:
+    """The range the upstream should accept sessions from.
+
+    Derived from the announcing nodes' own addresses. A single node yields a
+    /32, which is honest — and is exactly the state worth widening before
+    announcement redundancy means anything.
+    """
+    import ipaddress
+
+    nodes = await pick_announce_nodes(k8s, announce_replicas())
+    addresses: list[str] = []
+    for name in nodes:
+        try:
+            node = await k8s.core_api.read_node(name)
+        except Exception:  # noqa: BLE001 - a missing node must not kill the page
+            continue
+        for addr in (node.status.addresses or []):
+            if addr.type == "InternalIP":
+                addresses.append(addr.address)
+                break
+
+    if not addresses:
+        return "<NODE_SUBNET>"
+    if len(addresses) == 1:
+        return f"{addresses[0]}/32"
+    try:
+        return str(_supernet_of([ipaddress.ip_network(f"{a}/32") for a in addresses]))
+    except ValueError:
+        return f"{addresses[0]}/32"
+
+
+def _supernet_of(nets: list) -> object:
+    """Smallest prefix covering every address — never wider than needed."""
+    import ipaddress
+
+    candidate = nets[0]
+    while not all(n.subnet_of(candidate) for n in nets):
+        candidate = candidate.supernet()
+        if candidate.prefixlen == 0:
+            break
+    return ipaddress.ip_network(candidate)

@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
 from app.api.v1.network import _find_kubeovn_namespace
+from app.core.allocators import vpc_prefix_len, vpc_supernet
 from app.core.auth import User, require_auth, require_admin
 from app.core.b3_announce import (
     FRRK8S_GROUP,
@@ -20,9 +21,14 @@ from app.core.b3_announce import (
     border_peer,
     collect_announcements,
     frr_namespace,
+    external_subnet_cidr,
     local_asn,
+    node_peer_range,
+    peer_asn,
     pick_announce_nodes,
     reload_failures,
+    render_border_bird,
+    render_border_frr,
 )
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.core.errors import k8s_error_to_http
@@ -767,12 +773,48 @@ template bgp k8s_nodes {{
 async def get_gateway_config_examples(
     request: Request, user: User = Depends(require_auth),
 ) -> list[GatewayConfigExample]:
-    """Generate gateway config examples with actual ASN and node IPs from speaker config.
+    """What to paste into the upstream router so it accepts this cluster.
 
-    Returns 404 when the speaker DaemonSet is not deployed yet — the UI should
-    hide the example-config button until listeners exist.
+    Generated from the routed egress plane when there is one — the speaker is
+    not involved in it, and gating this behind a speaker DaemonSet hid the
+    examples on exactly the stands that need them. The speaker's own numbers
+    are still used where it is the thing that peers.
     """
     k8s = request.app.state.k8s_client
+
+    if b3_enabled():
+        node_cidr = await node_peer_range(k8s)
+        leg_cidr = await external_subnet_cidr(k8s)
+        supernet, prefix_len = vpc_supernet(), vpc_prefix_len()
+        return [
+            GatewayConfigExample(
+                name="bird",
+                title="BIRD Internet Routing Daemon",
+                description=(
+                    "Transcribed from the configuration proven on the lab "
+                    "border. Install: apt install bird2 / apk add bird"
+                ),
+                config=render_border_bird(
+                    node_cidr=node_cidr, supernet=supernet,
+                    prefix_len=prefix_len, leg_cidr=leg_cidr,
+                    local=local_asn(), remote=peer_asn(),
+                ),
+            ),
+            GatewayConfigExample(
+                name="frr",
+                title="FRRouting (FRR)",
+                description=(
+                    "The same peering for an FRR router. Install: "
+                    "apt install frr / apk add frr"
+                ),
+                config=render_border_frr(
+                    node_cidr=node_cidr, supernet=supernet,
+                    prefix_len=prefix_len, leg_cidr=leg_cidr,
+                    local=local_asn(), remote=peer_asn(),
+                ),
+            ),
+        ]
+
     namespace = await _find_kubeovn_namespace(k8s)
 
     cluster_as = 65001
