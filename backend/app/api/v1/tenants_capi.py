@@ -801,6 +801,33 @@ def _build_kubeadm_config_template_cr(
                 "spec": {
                     "files": [
                         {
+                            # Written as a file, not an inline command: the
+                            # inline shape cost a whole 15-minute tenant cycle
+                            # to shell quoting instead of the bug. A script is
+                            # quoted once, here, where it can be read.
+                            "path": "/usr/local/bin/kubelet-postmortem.sh",
+                            "owner": "root:root",
+                            "permissions": "0755",
+                            "content": (
+                                "#!/bin/sh\n"
+                                "exec > /dev/ttyS0 2>&1\n"
+                                "for i in 1 2 3 4; do\n"
+                                "  sleep 60\n"
+                                "  echo \"===== postmortem $i =====\"\n"
+                                "  echo '--- kubeadm-flags.env:'\n"
+                                "  cat /var/lib/kubelet/kubeadm-flags.env\n"
+                                "  echo '--- config.yaml, registration-related:'\n"
+                                "  grep -iE 'registerNode|staticPodPath|providerID|failSwapOn'"
+                                " /var/lib/kubelet/config.yaml\n"
+                                "  echo '--- times it tried to register:'\n"
+                                "  grep -c 'Attempting to register node'"
+                                " /var/log/kubelet-stderr.log\n"
+                                "  echo '--- last words:'\n"
+                                "  tail -6 /var/log/kubelet-stderr.log\n"
+                                "done\n"
+                            ),
+                        },
+                        {
                             # klog writes to stderr, and so does whatever kills
                             # the process. Sending stderr to a file that
                             # systemd truncates on every start means the file
@@ -878,27 +905,14 @@ def _build_kubeadm_config_template_cr(
                     # "Attempting to register node" never appeared while
                     # "dropped/suppressed" did. So dump a filtered slice
                     # instead, a few times, spaced out.
+                    # A worker that fails to join is otherwise a black box:
+                    # the console carries only systemd, the image ships no SSH
+                    # key, and the qemu guest agent is not connected. This dumps
+                    # what is needed to answer "why did the kubelet die" without
+                    # logging in. Kept as a script file, not an inline command —
+                    # the inline shape cost a whole tenant cycle to quoting.
                     "postKubeadmCommands": [
-                        # A bounded tail, not a filter: when the kubelet dies
-                        # the line that says why is whatever systemd logged
-                        # last, and no grep written in advance reliably
-                        # matches it. 40 lines is small enough not to trip the
-                        # console rate-limiter.
-                        "sh -c 'for i in 1 2 3 4; do sleep 60;"
-                        " echo \"===== kubelet unit $i =====\" > /dev/ttyS0;"
-                        # The lines immediately before systemd reports the
-                        # exit. A plain tail is useless here: a kubelet that
-                        # cannot find its own Node writes ~10 lines/s, so 40
-                        # lines cover under a second and never include the
-                        # fatal one. Anchoring on "Main process exited" lands
-                        # exactly on it.
-                        #
-                        # Measured on the lab: the unit dies with
-                        # status=255/EXCEPTION roughly every 30s, restart
-                        # counter climbing — a Go fatal, not a config parse
-                        # error.
-                        " tail -30 /var/log/kubelet-stderr.log > /dev/ttyS0 2>&1;"
-                        " done' &",
+                        "/usr/local/bin/kubelet-postmortem.sh &",
                     ],
                     "joinConfiguration": {
                         "nodeRegistration": {
