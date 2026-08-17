@@ -132,3 +132,39 @@ class BgpConfResponse(BaseModel):
 class BgpConfListResponse(BaseModel):
     items: list[BgpConfResponse]
     total: int
+
+
+class RoutedAnnouncement(BaseModel):
+    """One tenant prefix and the router leg the border sends it to."""
+
+    vpc: str
+    cidr: str
+    next_hop: str
+
+
+class RoutedSession(BaseModel):
+    node: str
+    peer: str
+    status: str = ""
+    bfd: str = ""
+
+
+class RoutedEgressResponse(BaseModel):
+    """State of the routed external plane, in the tiers that can be trusted.
+
+    Deliberately does not claim to show what is *actually advertised*. Only
+    `show bgp ... advertised-routes` knows that, and it needs an exec into the
+    FRR pod; the configuration alone cannot answer it — a config missing
+    `no bgp ebgp-requires-policy` reads as perfectly healthy while the session
+    is Established and nothing at all is announced. Saying "announced" about
+    intent would rebuild the exact illusion this plane was built to remove.
+    """
+
+    enabled: bool = False
+    peer: str = ""
+    local_asn: int = 0
+    nodes: list[str] = []
+    intended: list[RoutedAnnouncement] = []
+    sessions: list[RoutedSession] = []
+    # node -> what FRR said when it refused the generated configuration
+    config_errors: dict[str, str] = {}

@@ -89,3 +89,30 @@ export interface BgpConfListResponse {
   items: BgpConfResponse[];
   total: number;
 }
+
+/** The routed external plane (B3): VPCs announced from their own router legs. */
+export interface RoutedAnnouncement {
+  vpc: string;
+  cidr: string;
+  next_hop: string;
+}
+
+export interface RoutedSession {
+  node: string;
+  peer: string;
+  status: string;
+  bfd: string;
+}
+
+export interface RoutedEgressResponse {
+  enabled: boolean;
+  peer: string;
+  local_asn: number;
+  nodes: string[];
+  /** What the generator derived from the VPCs — intent, not proof of
+   *  advertisement. Only `show bgp ... advertised-routes` knows the latter. */
+  intended: RoutedAnnouncement[];
+  sessions: RoutedSession[];
+  /** node → FRR's own words when it refused the generated configuration. */
+  config_errors: Record<string, string>;
+}

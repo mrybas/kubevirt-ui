@@ -33,14 +33,7 @@ let confs = [
 let gateways: any[] = [];
 
 vi.mock('@/hooks/useBgp', () => ({
-  useSpeakerStatus: () => ({ data: { deployed: false, config: {}, node_labels: [] }, isLoading: false, refetch: vi.fn() }),
-  useDeploySpeaker: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useUpdateSpeaker: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useDeleteSpeaker: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useAnnouncements: () => ({ data: [], isLoading: false }),
-  useCreateAnnouncement: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useDeleteAnnouncement: () => ({ mutateAsync: vi.fn(), isPending: false }),
-  useBgpSessions: () => ({ data: [], isLoading: false, refetch: vi.fn() }),
+  useRoutedEgress: () => ({ data: { enabled: false }, refetch: vi.fn() }),
   useBgpConfs: () => ({ data: { items: confs, total: confs.length }, isLoading: false }),
   useUpsertBgpConf: () => ({ mutateAsync: upsert, isPending: false }),
   useDeleteBgpConf: () => ({ mutateAsync: remove, isPending: false }),
@@ -50,9 +43,6 @@ vi.mock('@/hooks/useEgressGateways', () => ({
   useEgressGateways: () => ({ data: { items: gateways } }),
 }));
 
-vi.mock('@/hooks/useNetwork', () => ({ useSubnets: () => ({ data: { items: [] } }) }));
-vi.mock('../../api/bgp', () => ({ getGatewayConfigExamples: vi.fn().mockResolvedValue([]) }));
-vi.mock('../../api/cluster', () => ({ listNodes: vi.fn().mockResolvedValue({ items: [] }) }));
 
 function renderPage() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });

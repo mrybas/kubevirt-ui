@@ -12,9 +12,24 @@ from kubernetes_asyncio.client import ApiException
 
 from app.api.v1.network import _find_kubeovn_namespace
 from app.core.auth import User, require_auth, require_admin
+from app.core.b3_announce import (
+    FRRK8S_GROUP,
+    FRRK8S_VERSION,
+    announce_replicas,
+    b3_enabled,
+    border_peer,
+    collect_announcements,
+    frr_namespace,
+    local_asn,
+    pick_announce_nodes,
+    reload_failures,
+)
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.core.errors import k8s_error_to_http
 from app.models.bgp import (
+    RoutedAnnouncement,
+    RoutedEgressResponse,
+    RoutedSession,
     AnnouncementRequest,
     AnnouncementResponse,
     BgpConfListResponse,
@@ -969,3 +984,66 @@ async def delete_bgp_conf(
             raise HTTPException(status_code=404, detail=f"BgpConf '{name}' not found")
         raise k8s_error_to_http(e, "deleting BgpConf")
     return {"message": f"BgpConf '{name}' deleted"}
+
+
+@router.get("/routed-egress", response_model=RoutedEgressResponse)
+async def get_routed_egress(
+    request: Request, user: User = Depends(require_auth),
+) -> RoutedEgressResponse:
+    """The routed external plane: what we asked for, and what FRR made of it.
+
+    The page it feeds used to say "No BGP sessions. Deploy the speaker first."
+    while a session to the border was Established and five tenant prefixes were
+    being announced — it only knew about kube-ovn-speaker, and this plane runs
+    on frr-k8s.
+
+    Three tiers, of which two are declarative and returned here:
+
+      * `intended` — the prefixes the generator derived from the VPCs;
+      * `sessions` — `BGPSessionState`, one per (node, peer);
+      * `config_errors` — `FRRNodeState.lastReloadResult`, which carries FRR's
+        own words when it refuses what we generated. A refusal is fail-safe —
+        FRR keeps the previous configuration, so live announcements survive
+        while a newly attached VPC is silently not added, which is exactly the
+        state worth showing.
+
+    The third tier, what is genuinely advertised, is not here: it needs an
+    exec into the FRR pod, and no CR carries it.
+    """
+    k8s = request.app.state.k8s_client
+
+    if not b3_enabled():
+        return RoutedEgressResponse(enabled=False)
+
+    announcements = await collect_announcements(k8s)
+    nodes = await pick_announce_nodes(k8s, announce_replicas())
+
+    sessions: list[RoutedSession] = []
+    try:
+        found = await k8s.custom_api.list_namespaced_custom_object(
+            group=FRRK8S_GROUP, version=FRRK8S_VERSION,
+            namespace=frr_namespace(), plural="bgpsessionstates",
+        )
+        for item in found.get("items", []) or []:
+            status = item.get("status", {}) or {}
+            if status.get("node") in nodes:
+                sessions.append(RoutedSession(
+                    node=status.get("node", ""), peer=status.get("peer", ""),
+                    status=status.get("bgpStatus", ""),
+                    bfd=status.get("bfdStatus", ""),
+                ))
+    except ApiException as e:
+        logger.debug(f"No BGPSessionState available: {e}")
+
+    return RoutedEgressResponse(
+        enabled=True,
+        peer=border_peer() or "",
+        local_asn=local_asn(),
+        nodes=nodes,
+        intended=[
+            RoutedAnnouncement(vpc=a.vpc, cidr=a.cidr, next_hop=a.next_hop)
+            for a in announcements
+        ],
+        sessions=sorted(sessions, key=lambda s: (s.node, s.peer)),
+        config_errors=await reload_failures(k8s, nodes),
+    )

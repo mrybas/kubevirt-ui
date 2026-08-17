@@ -14,6 +14,7 @@ import type {
   BgpConfRequest,
   BgpConfResponse,
   GatewayConfigExample,
+  RoutedEgressResponse,
 } from '../types/bgp';
 
 const BASE = '/bgp';
@@ -54,6 +55,10 @@ export type { GatewayConfigExample };
 
 export async function getGatewayConfigExamples(): Promise<GatewayConfigExample[]> {
   return apiRequest<GatewayConfigExample[]>(`${BASE}/gateway-config`);
+}
+
+export async function getRoutedEgress(): Promise<RoutedEgressResponse> {
+  return apiRequest<RoutedEgressResponse>('/bgp/routed-egress');
 }
 
 export async function listBgpConfs(): Promise<BgpConfListResponse> {

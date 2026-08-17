@@ -13,6 +13,7 @@ import {
   deleteAnnouncement,
   listBgpSessions,
   listBgpConfs,
+  getRoutedEgress,
   upsertBgpConf,
   deleteBgpConf,
 } from '../api/bgp';
@@ -116,6 +117,14 @@ export function useBgpSessions() {
 
 // BgpConf — what an egress gateway's FRR peers with. One shared config serves
 // every gateway; see the note in types/bgp.ts.
+
+export function useRoutedEgress() {
+  return useQuery({
+    queryKey: ['bgp-routed-egress'],
+    queryFn: getRoutedEgress,
+    refetchInterval: 15000,
+  });
+}
 
 export function useBgpConfs() {
   return useQuery({
