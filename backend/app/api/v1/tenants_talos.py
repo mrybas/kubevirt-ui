@@ -148,13 +148,27 @@ def build_talos_service(tenant: str, namespace: str, api_port: int) -> dict[str,
     }
 
 
-def worker_endpoint(tenant: str, namespace: str, api_port: int) -> str:
-    """Control-plane endpoint for a Talos worker — a NAME, never an address.
+def worker_endpoint(
+    tenant: str, namespace: str, api_port: int, vip: str | None = None,
+) -> str:
+    """Where a Talos worker looks for its control plane — and for trustd.
 
-    This is what makes SNI possible, and therefore what lets tenants share
-    one listener on port 50001. An IP endpoint sends no SNI at all, so the
-    ingress has nothing to match `HostSNI` against.
+    Talos takes the host from here and dials trustd on its fixed :50001, so
+    this single value decides both halves of the join.
+
+    **With a VIP of its own (`vip` set), the endpoint is that address.** No
+    SNI is needed because nothing is shared: the tenant owns :50001 on its
+    own IP. This is also the only form a VPC worker can use — the name below
+    resolves through cluster DNS to a ClusterIP, and an isolated VPC has
+    neither.
+
+    **Without one, the endpoint is a NAME**, which is what produces SNI and
+    therefore what lets tenants share one listener on port 50001 behind the
+    ingress. An IP endpoint sends no SNI at all, so the ingress would have
+    nothing to match `HostSNI` against.
     """
+    if vip:
+        return f"https://{vip}:{api_port}"
     return f"https://{talos_service_name(tenant)}.{namespace}.svc:{api_port}"
 
 
@@ -278,16 +292,24 @@ async def ensure_kubelet_bootstrap_token(k8s, tenant: str, namespace: str) -> bo
 # PKI
 # ---------------------------------------------------------------------------
 
-def build_talos_pki(tenant: str, namespace: str) -> list[dict[str, Any]]:
+def build_talos_pki(
+    tenant: str, namespace: str, vip: str | None = None,
+) -> list[dict[str, Any]]:
     """cert-manager chain for the CSR signer: selfSigned → CA → signer cert.
 
-    **DNS SANs only, no IP SANs.** Not cosmetic: an IP SAN can only be filled
-    in once the address is known, which means patching the certificate after
-    the fact — and a changed certificate then requires restarting the control
-    plane, because the signer reads its certificate once at startup and never
-    watches the file. A `rollout restart` will not do it either, since Kamaji
-    owns that Deployment and reverts the annotation. Issuing DNS SANs up front
-    removes the ordering dependency entirely.
+    **DNS SANs always; an IP SAN when the address is known up front.**
+
+    The rule used to be DNS-only, for a good reason: an IP SAN could only be
+    filled in after the address existed, which meant patching the certificate
+    afterwards — and the signer reads its certificate once at startup and
+    never watches the file, so it would also need a restart that Kamaji
+    reverts (it owns the Deployment and drops the annotation).
+
+    Per-tenant VIPs remove that ordering problem: the address is settled
+    before anything is built from it, so the SAN can be issued with the
+    certificate. It is required, too — a worker with its own VIP dials
+    `<vip>:50001` by address, sends no SNI, and a DNS-only certificate fails
+    the handshake before trustd is ever asked for anything.
 
     Ed25519 for the CA: small, fast, and supported by Talos's own tooling.
     """
@@ -339,8 +361,9 @@ def build_talos_pki(tenant: str, namespace: str) -> list[dict[str, Any]]:
                 "duration": "8760h",
                 "renewBefore": "720h",
                 "privateKey": {"algorithm": "Ed25519"},
-                # DNS only — see the docstring.
+                # DNS always; the address too when the tenant owns one.
                 "dnsNames": dns_names,
+                **({"ipAddresses": [vip]} if vip else {}),
                 "issuerRef": {
                     "name": f"{tenant}-talos-ca-issuer",
                     "kind": "Issuer",
@@ -473,13 +496,18 @@ def build_talos_worker_config(
     ca_cert_b64: str = "",
     k8s_ca_cert_b64: str = "",
     kubernetes_version: str = "",
+    own_vip: str | None = None,
+    nameservers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Talos machine config for a worker node.
 
     Three settings carry the design:
 
-    * the endpoint is a **name**, which is what produces SNI and therefore
-      what lets tenants share one listener on port 50001;
+    * the endpoint is the tenant's **own address** when it has one, and a
+      **name** otherwise. The name is what produces SNI, and SNI is only
+      needed while tenants share one listener on port 50001. A VPC worker
+      can use nothing but the address: the name resolves through cluster DNS
+      to a ClusterIP, and an isolated VPC has neither;
     * `extraHostEntries` pins that name to the control-plane VIP inside the
       node itself, so joining needs no working DNS — which matters because
       the node has none until it has joined;
@@ -500,6 +528,15 @@ def build_talos_worker_config(
                     "ip": control_plane_vip,
                     "aliases": signer_dns_names(tenant, namespace),
                 }],
+                # Measured, not assumed: with bridge binding KubeVirt runs the
+                # guest's DHCP itself and hands over the *launcher pod's*
+                # resolv.conf — the host cluster's kube-dns, which a VPC cannot
+                # reach. kube-ovn's own subnet DHCP option never gets there. The
+                # node then resolves nothing, NTP fails, and Talos parks the
+                # kubelet on "Waiting for time sync" with no error naming DNS.
+                # The cloud-init branch works around the same thing by writing
+                # resolv.conf; Talos has no cloud-init, so it goes here.
+                **({"nameservers": nameservers} if nameservers else {}),
             },
             "features": {"kubePrism": {"enabled": False}},
             "kubelet": {
@@ -532,7 +569,7 @@ def build_talos_worker_config(
             # kube-system carries.
             "token": machine_token,
             "controlPlane": {
-                "endpoint": worker_endpoint(tenant, namespace, api_port),
+                "endpoint": worker_endpoint(tenant, namespace, api_port, own_vip),
             },
             "network": {
                 "podSubnets": [pod_cidr],
@@ -851,6 +888,7 @@ async def ensure_talos_golden_image(
 
 async def ensure_talos_tenant_objects(
     k8s, tenant: str, namespace: str, api_port: int = 6443,
+    vip: str | None = None,
 ) -> None:
     """Create the per-tenant Talos objects that must exist before the CAPI ones.
 
@@ -893,7 +931,7 @@ async def ensure_talos_tenant_objects(
             raise
         logger.info(f"Talos secrets for tenant {tenant!r} already exist; keeping them")
 
-    for obj in build_talos_pki(tenant, namespace):
+    for obj in build_talos_pki(tenant, namespace, vip):
         plural = f"{obj['kind'].lower()}s"
         try:
             await k8s.custom_api.create_namespaced_custom_object(

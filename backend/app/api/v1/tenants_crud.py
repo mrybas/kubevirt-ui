@@ -105,6 +105,7 @@ from app.api.v1.tenants_storage import (
     schedule_credential_replication,
 )
 from app.api.v1.tenants_cp_ports import release_cp_ports
+from app.api.v1.tenants_cp_vip import acquire_tenant_vip, per_tenant_vip_enabled
 from app.core.tenant_transit import (
     effective_snat_address,
     remove_tenant_transit,
@@ -1178,7 +1179,18 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         #     another per-tenant ingress alongside the apiserver's.
         if req.worker_os == "talos":
             await ensure_talos_bootstrap_provider(k8s)
-            await ensure_talos_tenant_objects(k8s, req.name, ns)
+            # A VPC tenant with its own VIP needs that address inside the
+            # signer certificate: the worker dials <vip>:50001 by address and
+            # sends no SNI, so a DNS-only certificate fails the handshake
+            # before trustd is ever asked anything. Acquiring here is safe —
+            # `acquire_tenant_vip` reuses an existing Service, so the address
+            # `_create_capi_resources` reads later is this same one.
+            talos_vip = None
+            if req.vpc_name and per_tenant_vip_enabled():
+                talos_vip = await acquire_tenant_vip(
+                    k8s, req.name, ns, worker_os=req.worker_os,
+                )
+            await ensure_talos_tenant_objects(k8s, req.name, ns, vip=talos_vip)
             await ensure_talos_golden_image(
                 k8s, req.name, ns,
                 image_url=req.worker_image_url or None,

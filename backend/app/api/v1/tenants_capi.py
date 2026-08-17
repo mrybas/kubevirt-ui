@@ -42,6 +42,15 @@ from app.api.v1.tenants_common import (
     _external_dns_target,
 )
 from app.api.v1.tenants_cp_ports import allocate_cp_ports
+from app.api.v1.tenants_cp_vip import (
+    TENANT_API_PORT,
+    TENANT_KONN_PORT,
+    TENANT_TRUSTD_PORT,
+    acquire_tenant_vip,
+    assert_pool_excluded_from_ovn,
+    cp_metallb_pool,
+    per_tenant_vip_enabled,
+)
 from app.api.v1.tenants_talos import (
     TALOS_TRUSTD_PORT,
     build_talos_config_template,
@@ -133,6 +142,7 @@ def _build_cluster_cr(
     req: TenantCreateRequest,
     cp_host: str | None = None,
     api_port: int | None = None,
+    tenant_vip: str | None = None,
 ) -> dict[str, Any]:
     # Two worker-reachability models, keyed on api_port:
     #
@@ -169,11 +179,16 @@ def _build_cluster_cr(
     #   /tenants/{name}/kubeconfig` rewrites `server` to the ingress host
     #   for both admin and OIDC kubeconfigs, so kubectl-from-outside never
     #   reads this field.
+    #   With a VIP per tenant the address is no longer a deployment constant:
+    #   MetalLB assigns it and the caller passes it in. Falling back to the
+    #   env VIP here would point every tenant's endpoint at the old shared
+    #   address while its own Service holds a different one — green spec,
+    #   unreachable control plane.
     vpc = api_port is not None
     host = cp_host or _endpoint_host(req.name)
     on_vip = False
     if vpc and not cp_host:
-        vip = _cp_demux_vip()
+        vip = tenant_vip or _cp_demux_vip()
         if vip:
             host, on_vip = vip, True
     cluster_network: dict[str, Any] = {
@@ -701,6 +716,27 @@ def _build_kubevirt_machine_template_cr(req: TenantCreateRequest) -> dict[str, A
 
 _TENANT_WORKER_PRIMARY_DNS = "1.1.1.1"
 _TENANT_WORKER_FALLBACK_DNS = "8.8.8.8"
+
+
+def _talos_worker_nameservers(req: TenantCreateRequest) -> list[str]:
+    """Resolvers for a Talos worker, which has no cloud-init to fix them up.
+
+    A VPC worker must use the VpcDns VIP: the public resolvers below are only
+    reachable once the VPC has internet egress, and a tenant is normally
+    created before any gateway is attached to it. The VIP resolves public
+    names too (it forwards to the cluster's CoreDNS), so it covers image
+    pulls as well as anything in-fabric.
+
+    Outside a VPC the guest is on the default overlay and the ordinary list
+    applies.
+    """
+    from app.api.v1.tenants_common import _vpcdns_vip
+
+    public = _resolve_worker_dns(req)
+    if not req.vpc_name:
+        return public
+    vip = _vpcdns_vip()
+    return [vip, *public] if vip else public
 
 
 def _resolve_worker_dns(req: TenantCreateRequest) -> list[str]:
@@ -1616,12 +1652,33 @@ async def _create_capi_resources(
     custom = k8s.custom_api
     ns = _tenant_ns(req.name)
 
-    # 0. VPC tenant? Allocate the per-tenant CP ports on the shared demux VIP.
-    #    Default-overlay tenant (vpc_name=None) → all the *_port/vip stay None
-    #    and every builder takes its unchanged default-overlay branch.
+    # 0. VPC tenant? Settle the control-plane address before anything is built
+    #    from it. Default-overlay tenant (vpc_name=None) → all the *_port/vip
+    #    stay None and every builder takes its unchanged default-overlay branch.
     vpc = bool(req.vpc_name)
     vip = api_port = konn_port = None
-    if vpc:
+    own_vip = False
+    if vpc and per_tenant_vip_enabled():
+        # An address each, standard ports. The Service is created FIRST and
+        # without an address: MetalLB assigns one and we read the fact back,
+        # so there is exactly one owner of the pool. See tenants_cp_vip.
+        await assert_pool_excluded_from_ovn(
+            k8s, cp_metallb_pool(), transit_subnet_name() or "",
+        )
+        vip = await acquire_tenant_vip(
+            k8s, req.name, ns, worker_os=req.worker_os,
+        )
+        api_port, konn_port = TENANT_API_PORT, TENANT_KONN_PORT
+        own_vip = True
+        logger.info(
+            f"VPC tenant {req.name!r}: own VIP {vip} "
+            f"(api={api_port} konn={konn_port}"
+            f"{' trustd=' + str(TENANT_TRUSTD_PORT) if req.worker_os == 'talos' else ''})"
+        )
+    elif vpc:
+        # Legacy shared-VIP model, kept behind TENANTS_CP_PER_TENANT_VIP=false
+        # for the migration window. Talos cannot use it: trustd's fixed :50001
+        # can belong to only one tenant on a shared address.
         vip = _cp_demux_vip()
         if not vip:
             raise HTTPException(
@@ -1630,6 +1687,17 @@ async def _create_capi_resources(
                     "VPC tenant requested but no shared CP demux VIP is "
                     "configured — set TENANTS_CP_DEMUX_VIP (a MetalLB IP) "
                     "or create the tenant without a VPC."
+                ),
+            )
+        if req.worker_os == "talos":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Talos workers in a VPC need their own control-plane "
+                    "address: Talos dials trustd on a fixed :50001 of the "
+                    "endpoint host, and a shared VIP can give that port to "
+                    "only one tenant. Unset TENANTS_CP_PER_TENANT_VIP=false "
+                    "to use the per-tenant VIP model."
                 ),
             )
         api_port, konn_port = await allocate_cp_ports(k8s, req.name)
@@ -1653,7 +1721,7 @@ async def _create_capi_resources(
         )
 
     # 2. Create CAPI Cluster.
-    cluster_cr = _build_cluster_cr(req, api_port=api_port)
+    cluster_cr = _build_cluster_cr(req, api_port=api_port, tenant_vip=vip)
     await custom.create_namespaced_custom_object(
         group=CAPI_GROUP, version=CAPI_VERSION, namespace=ns,
         plural="clusters", body=cluster_cr,
@@ -1661,14 +1729,20 @@ async def _create_capi_resources(
 
     if vpc:
         # 3-VPC. advertiseAddress model: cluster-info is already correct
-        #   (<vip>:<api_port> baked by KCP), so NO endpoint patch. Create the
-        #   per-tenant MetalLB shared-IP Service that fronts this tenant's CP
-        #   pods on the shared VIP; workers reach it via native kube-proxy.
-        cp_lb = _build_cp_lb_service(req, vip, api_port, konn_port)
-        await k8s.core_api.create_namespaced_service(namespace=ns, body=cp_lb)
-        logger.info(
-            f"Created {req.name}-cp-lb on {vip}:{api_port}(api)/{konn_port}(konn)"
-        )
+        #   (<vip>:<api_port> baked by KCP), so NO endpoint patch.
+        if own_vip:
+            # The Service already exists — it is what produced `vip` in step 0.
+            logger.info(
+                f"{req.name}-cp-lb holds {vip}:{api_port}(api)/{konn_port}(konn)"
+            )
+        else:
+            # Legacy: the shared-VIP Service is created here, after the ports
+            # were allocated for it.
+            cp_lb = _build_cp_lb_service(req, vip, api_port, konn_port)
+            await k8s.core_api.create_namespaced_service(namespace=ns, body=cp_lb)
+            logger.info(
+                f"Created {req.name}-cp-lb on {vip}:{api_port}(api)/{konn_port}(konn)"
+            )
         cp_address = vip
 
         # The Service alone is not reachable from inside the VPC: the tenant's
@@ -1676,8 +1750,14 @@ async def _create_capi_resources(
         # no policy keeping control-plane traffic off an egress gateway's
         # catch-all reroute. Build that path now — it used to be five manual
         # `kubectl` steps between "tenant created" and "a worker can join".
+        #
+        # Talos also needs trustd's fixed :50001 through the same guard, or the
+        # worker's CSR never reaches a signer and the node never appears.
+        transit_ports = [api_port, konn_port]
+        if own_vip and req.worker_os == "talos":
+            transit_ports.append(TENANT_TRUSTD_PORT)
         await _wire_tenant_to_transit(
-            k8s, req.name, req.vpc_name, vip, [api_port, konn_port],
+            k8s, req.name, req.vpc_name, vip, transit_ports,
         )
     else:
         # 3-default. Wait for the Kamaji TCP Service ClusterIP, then PATCH
@@ -1733,6 +1813,11 @@ async def _create_capi_resources(
                     ca_cert_b64=talos_ca,
                     k8s_ca_cert_b64=k8s_ca,
                     kubernetes_version=req.kubernetes_version,
+                    # With an address of its own, the worker goes straight
+                    # there: <vip>:6443 for the apiserver and <vip>:50001 for
+                    # trustd. The *.svc name is unreachable from a VPC.
+                    own_vip=vip if own_vip else None,
+                    nameservers=_talos_worker_nameservers(req),
                 ),
                 default_flow_style=False, sort_keys=False,
             )
