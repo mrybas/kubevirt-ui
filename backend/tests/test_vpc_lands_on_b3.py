@@ -25,7 +25,7 @@ from app.api.v1.subnet_acls import MGMT_DENY_PRIORITY, build_mgmt_deny_acls
 
 class TestTheManagementDeny:
     def test_it_blocks_connections_coming_at_the_tenant(self) -> None:
-        acls = build_mgmt_deny_acls("10.198.160.0/20")
+        acls = build_mgmt_deny_acls(["10.198.160.0/20"])
 
         assert len(acls) == 1
         acl = acls[0]
@@ -33,10 +33,23 @@ class TestTheManagementDeny:
         assert acl.direction == "to-lport"
         assert acl.match == "ip4.src == 10.198.160.0/20"
 
+    def test_a_management_plane_is_a_set_of_prefixes(self) -> None:
+        """T21: one cluster's is a /10, another's a /24 — and there may be
+        several. A single derived number is what made the first version hold
+        by coincidence."""
+        acls = build_mgmt_deny_acls(["10.198.160.0/20", "10.50.0.0/16"])
+
+        assert {a.match for a in acls} == {
+            "ip4.src == 10.198.160.0/20", "ip4.src == 10.50.0.0/16",
+        }
+
+    def test_duplicates_collapse(self) -> None:
+        assert len(build_mgmt_deny_acls(["10.0.0.0/8", "10.0.0.0/8"])) == 1
+
     def test_it_does_not_touch_what_the_tenant_starts(self) -> None:
         """Dropping from-lport toward mgmt would be the easiest way to break
         the control-plane path, which is reached through the same egress."""
-        assert all(a.direction != "from-lport" for a in build_mgmt_deny_acls("10.0.0.0/8"))
+        assert all(a.direction != "from-lport" for a in build_mgmt_deny_acls(["10.0.0.0/8"]))
 
     def test_it_outranks_the_isolation_band(self) -> None:
         """Not an exception anybody carves out of isolation — it sits above."""
@@ -46,7 +59,51 @@ class TestTheManagementDeny:
 
     def test_without_a_known_mgmt_network_it_writes_nothing(self) -> None:
         """A drop scoped to nothing is either useless or catastrophic."""
-        assert build_mgmt_deny_acls("") == []
+        assert build_mgmt_deny_acls([]) == []
+        assert build_mgmt_deny_acls([""]) == []
+
+
+class TestWhereTheManagementPlaneIsLookedUp:
+    @pytest.mark.asyncio
+    async def test_the_explicit_setting_wins_and_is_a_list(self, monkeypatch) -> None:
+        from unittest.mock import MagicMock
+
+        from app.api.v1.vpcs import _mgmt_deny_sources
+
+        monkeypatch.setenv("TENANTS_MGMT_CIDR", "10.198.160.0/20, 10.50.0.0/16")
+
+        assert await _mgmt_deny_sources(MagicMock()) == [
+            "10.198.160.0/20", "10.50.0.0/16",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_otherwise_each_node_exactly_and_never_a_guessed_mask(
+        self, monkeypatch,
+    ) -> None:
+        """The API reports node addresses, not the network they sit on. The
+        old fallback guessed /24 from the first node and covered a /20 lab by
+        coincidence; a /32 each is exact and follows the node list."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.api.v1.vpcs import _mgmt_deny_sources
+
+        monkeypatch.delenv("TENANTS_MGMT_CIDR", raising=False)
+
+        def _node(ip: str):
+            n = MagicMock()
+            a = MagicMock()
+            a.type, a.address = "InternalIP", ip
+            n.status.addresses = [a]
+            return n
+
+        result = MagicMock()
+        result.items = [_node("10.198.160.4"), _node("10.198.160.1")]
+        k8s = MagicMock()
+        k8s.core_api.list_node = AsyncMock(return_value=result)
+
+        assert await _mgmt_deny_sources(k8s) == [
+            "10.198.160.1/32", "10.198.160.4/32",
+        ]
 
 
 class TestB3IsOnlyOnWhenBothHalvesAreConfigured:
@@ -150,7 +207,8 @@ class TestTheBaselineSurvivesTheOtherAuthor:
 
         monkeypatch.setenv("B3_BGP_PEER", "10.198.175.254")
         monkeypatch.setenv("B3_VPC_GATEWAY", "10.199.4.254")
-        monkeypatch.setattr(vpcs, "_mgmt_cidr", AsyncMock(return_value="10.198.160.0/24"))
+        monkeypatch.setattr(vpcs, "_mgmt_deny_sources",
+                            AsyncMock(return_value=["10.198.160.0/24"]))
 
         patched: list[dict] = []
 

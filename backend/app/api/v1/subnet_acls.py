@@ -198,7 +198,7 @@ def build_isolation_acls(
 MGMT_DENY_PRIORITY = 3300
 
 
-def build_mgmt_deny_acls(mgmt_cidr: str) -> list[SubnetAcl]:
+def build_mgmt_deny_acls(mgmt_cidrs: list[str] | str) -> list[SubnetAcl]:
     """Keep the management network from opening connections into a tenant.
 
     Before B3 this cost nothing to state, because it was already true by
@@ -217,14 +217,20 @@ def build_mgmt_deny_acls(mgmt_cidr: str) -> list[SubnetAcl]:
     replies to its own flows would be the easiest way to break the control
     plane path, which lives on a different network but is reached through the
     same egress.
+
+    Takes a **list**: a management plane is a set of prefixes, not a number
+    somebody derived. The first version took one CIDR guessed as `/24` from a
+    node's address, on a lab whose node network is a `/20` — it covered every
+    node by coincidence, which is the least durable reason for a security rule
+    to hold.
     """
-    if not mgmt_cidr:
-        return []
+    prefixes = [mgmt_cidrs] if isinstance(mgmt_cidrs, str) else list(mgmt_cidrs)
     return [
         SubnetAcl(
             action="drop", direction="to-lport",
-            match=f"ip4.src == {mgmt_cidr}", priority=MGMT_DENY_PRIORITY,
-        ),
+            match=f"ip4.src == {cidr}", priority=MGMT_DENY_PRIORITY,
+        )
+        for cidr in dict.fromkeys(p for p in prefixes if p)
     ]
 
 

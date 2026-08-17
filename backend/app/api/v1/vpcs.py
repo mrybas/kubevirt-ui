@@ -131,27 +131,51 @@ def _parse_vpc(item: dict[str, Any]) -> VpcResponse:
     )
 
 
-async def _mgmt_cidr(k8s) -> str:
-    """The node/management network.
+async def _mgmt_deny_sources(k8s) -> list[str]:
+    """Where "the management plane" is, for the deny that keeps it out.
 
-    Two traps here, both hit on the way in:
+    `TENANTS_MGMT_CIDR` is authoritative and takes a **list** — a management
+    plane is a set of prefixes, and in one cluster it is a /10 while in another
+    it is a /24 (T21).
+
+    Without it, fall back to **each node's own address as a /32** rather than
+    to a prefix length nobody knows. Autodiscovery genuinely cannot learn the
+    mask: the API reports node addresses, not the network they sit on. The
+    previous fallback guessed `/24` from the first node it saw and, on a lab
+    whose node network is a `/20`, covered every node by coincidence — a
+    security rule holding for a reason that could change with one new node.
+    A `/32` per node is exact, cannot over-block, and follows the node list.
+
+    Two traps were hit reaching this value, both worth keeping in view:
 
     * nothing on the VPC path populates the cluster-config cache, so it has to
       be loaded first — otherwise the deny is simply not written;
-    * it must be read through the accessor, not with
+    * it must be read through the accessor, never with
       `from ... import _cluster_config`. That binds the module's value **at
       import time** — `None` — and no later assignment inside that module ever
       reaches this name. The rule then exists in the code, passes its tests,
-      and is absent from the cluster, which is the worst of the three.
+      is present in the created object, and is absent from the cluster.
     """
-    from app.api.v1.tenants_common import _ensure_cluster_config, _mgmt_cidr_drop
+    explicit = [
+        c.strip() for c in (os.getenv("TENANTS_MGMT_CIDR") or "").split(",")
+        if c.strip()
+    ]
+    if explicit:
+        return explicit
 
     try:
-        await _ensure_cluster_config(k8s)
-        return _mgmt_cidr_drop() or ""
+        nodes = await k8s.core_api.list_node()
     except Exception as exc:  # noqa: BLE001 - a diagnostic must not block create
-        logger.warning("Could not load cluster config for the mgmt deny: %s", exc)
-        return ""
+        logger.warning("Could not list nodes for the mgmt deny: %s", exc)
+        return []
+
+    addresses = [
+        addr.address
+        for node in (nodes.items or [])
+        for addr in (getattr(node.status, "addresses", None) or [])
+        if addr.type == "InternalIP" and addr.address
+    ]
+    return [f"{ip}/32" for ip in sorted(dict.fromkeys(addresses))]
 
 
 def _has_isolation_acls(spec: dict[str, Any]) -> bool:
@@ -1042,7 +1066,7 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
     tenant is reachable from every tenant that predates it.
     """
     updated = 0
-    mgmt_cidr = await _mgmt_cidr(k8s_client) if b3_enabled() else ""
+    mgmt_cidr = await _mgmt_deny_sources(k8s_client) if b3_enabled() else []
     try:
         subnets = await k8s_client.custom_api.list_cluster_custom_object(
             group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
@@ -1221,7 +1245,7 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     # rule is reachable from every node for as long as the gap lasts.
     if b3_enabled():
         isolation_acls = [
-            *isolation_acls, *build_mgmt_deny_acls(await _mgmt_cidr(k8s)),
+            *isolation_acls, *build_mgmt_deny_acls(await _mgmt_deny_sources(k8s)),
         ]
 
     labels: dict[str, str] = {"kubevirt-ui.io/managed": "true"}
