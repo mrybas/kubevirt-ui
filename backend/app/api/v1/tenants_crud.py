@@ -1023,6 +1023,25 @@ def _tenant_quota(req: Any) -> dict[str, str]:
         + req.control_plane_replicas * _CP_MEMORY
     )
     storage = surge * (parse_quantity(req.worker_disk) or 0)
+    # Talos workers each clone their own root from the tenant's golden image,
+    # and both are real PVCs in this namespace. Counting only `worker_disk`
+    # left the quota one clone short of the cluster it was provisioning:
+    # measured on a two-worker tenant, the first root bound and the second
+    # stopped at
+    #
+    #   ErrExceededQuota ... requested: requests.storage=21474836480,
+    #   used: 53687091200, limited: 64424509440
+    #
+    # which reads as a storage failure and is arithmetic. `surge` covers the
+    # roots as well, for the same reason it covers the workers: a replacement
+    # clone exists alongside the disk it replaces, and CDI stages a clone
+    # through a scratch PVC of the target size.
+    if req.worker_os == "talos":
+        from app.api.v1.tenants_capi import _worker_root_size
+        from app.api.v1.tenants_talos import DEFAULT_TALOS_GOLDEN_SIZE
+
+        storage += (parse_quantity(DEFAULT_TALOS_GOLDEN_SIZE) or 0)
+        storage += surge * (parse_quantity(_worker_root_size(req)) or 0)
     return {
         "cpu": f"{cpu:g}",
         "memory": f"{int(memory)}",

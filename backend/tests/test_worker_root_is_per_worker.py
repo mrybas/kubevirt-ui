@@ -147,3 +147,55 @@ class TestStorageClass:
         [tpl] = _build_worker_data_volume_templates(_req(storage_class=None))
 
         assert "storageClassName" not in tpl["spec"]["storage"]
+
+
+class TestTheQuotaCountsTheDisksTheTenantProvisionsForItself:
+    """The fix ran out of quota on its own acceptance run.
+
+    `_tenant_quota` sized storage from `worker_disk` alone, which was right
+    while every Talos worker shared one golden PVC. With a root clone per
+    worker the namespace needs golden + N roots before a single tenant
+    workload exists, and the two-worker tenant stopped halfway:
+
+        ErrExceededQuota ... requested: requests.storage=21474836480,
+        used: 53687091200, limited: 64424509440
+
+    A quota that cannot fit the cluster it is provisioning is not a limit, it
+    is a broken build — and it presents as a storage problem.
+    """
+
+    def test_talos_storage_covers_golden_and_the_roots(self) -> None:
+        from app.api.v1.tenants_crud import _tenant_quota
+
+        q = _tenant_quota(_req(worker_count=2, worker_disk="20Gi"))
+
+        # data 3x20 + golden 20 + roots 3x20  (surge = workers + 1)
+        assert int(q["storage"]) == (3 * 20 + 20 + 3 * 20) * 2**30
+
+    def test_cloud_init_is_unchanged(self) -> None:
+        """They boot a containerDisk — no DataVolume, nothing to count."""
+        from app.api.v1.tenants_crud import _tenant_quota
+
+        q = _tenant_quota(_req(worker_os="cloud-init", worker_count=2,
+                               worker_disk="20Gi"))
+
+        assert int(q["storage"]) == 3 * 20 * 2**30
+
+    def test_the_surge_covers_a_replacement_clone(self) -> None:
+        """Sized to exactly `worker_count`, the quota would refuse every
+        worker replacement: the new clone exists while the old disk is still
+        there, and CDI stages through a scratch PVC of the target size."""
+        from app.api.v1.tenants_crud import _tenant_quota
+
+        one = int(_tenant_quota(_req(worker_count=1))["storage"])
+        two = int(_tenant_quota(_req(worker_count=2))["storage"])
+
+        # One more worker costs one data disk and one root, not just one disk.
+        assert two - one == (20 + 20) * 2**30
+
+    def test_a_bigger_worker_disk_raises_both_halves(self) -> None:
+        from app.api.v1.tenants_crud import _tenant_quota
+
+        q = _tenant_quota(_req(worker_count=1, worker_disk="40Gi"))
+
+        assert int(q["storage"]) == (2 * 40 + 20 + 2 * 40) * 2**30
