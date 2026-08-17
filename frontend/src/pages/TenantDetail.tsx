@@ -392,6 +392,21 @@ export default function TenantDetail() {
             </p>
           </div>
         </div>
+        {/* The address the workers actually leave under on the transit network.
+            The guard ACLs are keyed on it, so it decides whether a worker can
+            reach its own control plane — and it used to be visible only by
+            reading OVN's northbound database by hand. */}
+        {tenant.transit_snat_ip && (
+          <div className="card">
+            <div className="card-body text-center">
+              <p className="text-xs text-surface-500 uppercase tracking-wider mb-1">
+                Transit SNAT
+              </p>
+              <p className="text-sm font-mono text-surface-200">{tenant.transit_snat_ip}</p>
+              <p className="text-xs text-surface-500">control-plane path</p>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* CNI installation info */}

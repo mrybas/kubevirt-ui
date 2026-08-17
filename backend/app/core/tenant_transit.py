@@ -166,6 +166,128 @@ class TransitSnatSlotTaken(Exception):
         )
 
 
+class _SnatCandidate:
+    """One OvnSnatRule that claims the SNAT slot for a tenant subnet."""
+
+    def __init__(self, item: dict[str, Any], eip_name: str, address: str, subnet: str) -> None:
+        self.item = item
+        self.name: str = item["metadata"]["name"]
+        self.labels: dict[str, str] = item.get("metadata", {}).get("labels") or {}
+        self.eip_name = eip_name
+        self.address = address
+        self.subnet = subnet
+
+
+async def _rules_covering(
+    k8s, vpc_name: str, tenant_subnet: str, skip: str,
+) -> tuple[list[_SnatCandidate], list[_SnatCandidate]]:
+    """Every rule claiming `(vpc, tenant_subnet)`: resolvable ones, and dangling.
+
+    Sorted by name so a cluster carrying two rules resolves the same way on
+    every reconcile — with `EnableEcmp: false` and one SNAT per logical IP,
+    "whichever the API listed first" is not a tie-break anyone can reason
+    about later.
+
+    A rule whose EIP does not exist is returned separately. It cannot possibly
+    be programmed, yet it reports `ready: true` like any other — the lab's
+    `snat-t1-vpc` pointed at an `eip-t1-vpc` that had been gone for days. It is
+    still not deleted on sight: during a create the EIP may simply not exist
+    yet, and the caller only prunes once it has a real winner to keep.
+    """
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural="ovn-snat-rules",
+        )
+    except ApiException:
+        return [], []
+
+    found: list[_SnatCandidate] = []
+    dangling: list[_SnatCandidate] = []
+    for item in sorted(
+        result.get("items", []) or [],
+        key=lambda i: i.get("metadata", {}).get("name", ""),
+    ):
+        if item.get("metadata", {}).get("name") == skip:
+            continue
+        spec = item.get("spec", {}) or {}
+        if spec.get("vpc") != vpc_name or spec.get("vpcSubnet") != tenant_subnet:
+            continue
+        eip_name = spec.get("ovnEip")
+        if not eip_name:
+            continue
+        eip = await _get(k8s, "ovn-eips", eip_name)
+        address = ((eip or {}).get("status", {}) or {}).get("v4Ip")
+        subnet = ((eip or {}).get("spec", {}) or {}).get("externalSubnet") or "<unknown>"
+        if not address:
+            dangling.append(_SnatCandidate(item, eip_name, "<no address>", subnet))
+            continue
+        found.append(_SnatCandidate(item, eip_name, address, subnet))
+    return found, dangling
+
+
+async def _drop_losing_rule(k8s, loser: _SnatCandidate, keep_eip: str) -> None:
+    """Remove a rule that cannot be in force, and the EIP it was holding.
+
+    OVN programs one SNAT per logical IP; the loser never appears in
+    `lr-nat-list` yet keeps `status.ready: true` forever. Leaving it there is
+    not untidy, it is misleading in the one place it matters: the guard ACLs
+    are keyed on an *address*, so the next operator reading two ready rules
+    cannot tell which address the tenant actually leaves under.
+
+    The EIP goes with it — it is holding a transit address that the allocator
+    would otherwise never hand out again — unless the winner is using it.
+    """
+    logger.info(
+        "SNAT slot for %s: dropping %r (%s on %s), which cannot be in force",
+        loser.item.get("spec", {}).get("vpcSubnet"), loser.name,
+        loser.address, loser.subnet,
+    )
+    await _delete_ignore_missing(k8s, "ovn-snat-rules", loser.name)
+    await _unwedge_if_terminating(k8s, loser)
+    if loser.eip_name and loser.eip_name != keep_eip:
+        await _delete_ignore_missing(k8s, "ovn-eips", loser.eip_name)
+
+
+async def _unwedge_if_terminating(k8s, loser: _SnatCandidate) -> None:
+    """Release a rule whose finalizer can never complete.
+
+    Deleting is not enough when someone already deleted it. kube-ovn's
+    finalizer wants to unprogram a NAT from the EIP the rule names, and when
+    that EIP is gone the controller loops forever:
+
+        failed to delete v4 snat ... not found ..., requeuing
+
+    The lab's `snat-t1-vpc` sat like that for ten hours — `deletionTimestamp`
+    set, finalizer held, `status.ready: true` the whole time, and still listed
+    beside the rule that was actually in force.
+
+    Only for a rule that is already terminating *and* whose EIP is missing:
+    there is then no NB state left for the finalizer to clean up, so removing
+    it orphans nothing. A rule with a live EIP keeps its finalizer — that one
+    has real work to do.
+    """
+    if not loser.item.get("metadata", {}).get("deletionTimestamp"):
+        return
+    if await _get(k8s, "ovn-eips", loser.eip_name) is not None:
+        return
+    logger.warning(
+        "SNAT rule %r has been terminating since %s and its EIP %r is gone — "
+        "releasing the finalizer it can never satisfy",
+        loser.name, loser.item["metadata"]["deletionTimestamp"], loser.eip_name,
+    )
+    try:
+        await k8s.custom_api.patch_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural="ovn-snat-rules", name=loser.name,
+            body={"metadata": {"finalizers": []}},
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        if e.status != 404:
+            logger.warning("Could not release %r: %s", loser.name, e)
+
+
 async def _existing_snat_address(
     k8s, vpc_name: str, tenant_subnet: str, skip: str, transit_subnet: str,
 ) -> str | None:
@@ -187,69 +309,90 @@ async def _existing_snat_address(
     were then written for an external address and the tenant's control-plane
     path was dead while its internet worked. That is a conflict to report, not
     to absorb — see `TransitSnatSlotTaken`.
+
+    When several rules claim the same logical IP, at most one of them is real.
+    The lab carried exactly that for days:
+
+        snat-t1-vpc  ready=true  EIP 10.199.1.5   10.200.8.0/22  ← absent in NB
+        cpt-snat-t1  ready=true  EIP 10.199.1.20  10.200.8.0/22  ← programmed
+        ovn-nbctl lr-nat-list t1-vpc: snat 10.199.1.20 10.200.8.0/22
+
+    Both said ready; only one was in force, and nothing in the API distinguished
+    them. Since the decision "the SNAT slot belongs to the control-plane path"
+    settles which one *should* win, the transit rule is kept and the rest are
+    deleted rather than left to lie. A non-transit rule is only ever removed as
+    a duplicate — when it is the sole claimant it is still reported, never
+    silently taken away.
     """
-    try:
-        result = await k8s.custom_api.list_cluster_custom_object(
-            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
-            plural="ovn-snat-rules",
-        )
-    except ApiException:
+    candidates, dangling = await _rules_covering(k8s, vpc_name, tenant_subnet, skip)
+
+    # Decide on the whole set, never on the first match. Two rules for one
+    # logical IP cannot both be in force — OVN keeps one — so a transit rule
+    # present anywhere in the set is the winner, and the others are leftovers
+    # that lie with `status.ready: true` about a NAT the router does not have.
+    transit = [c for c in candidates if c.subnet == transit_subnet]
+    if not transit:
+        if candidates:
+            first = candidates[0]
+            raise TransitSnatSlotTaken(first.name, first.address, first.subnet)
         return None
 
-    for item in result.get("items", []) or []:
-        if item.get("metadata", {}).get("name") == skip:
-            continue
-        spec = item.get("spec", {}) or {}
-        if spec.get("vpc") != vpc_name or spec.get("vpcSubnet") != tenant_subnet:
-            continue
-        eip_name = spec.get("ovnEip")
-        if not eip_name:
-            continue
-        eip = await _get(k8s, "ovn-eips", eip_name)
-        address = ((eip or {}).get("status", {}) or {}).get("v4Ip")
-        if not address:
-            continue
+    winner, *extra_transit = transit
+    losers = extra_transit + [c for c in candidates if c.subnet != transit_subnet]
+    for loser in losers + dangling:
+        await _drop_losing_rule(k8s, loser, keep_eip=winner.eip_name)
 
-        on = ((eip or {}).get("spec", {}) or {}).get("externalSubnet")
-        if on != transit_subnet:
-            raise TransitSnatSlotTaken(
-                item["metadata"]["name"], address, on or "<unknown>"
-            )
+    # Reusing a rule is only safe if the rule is actually in force, and
+    # `status.ready` does not tell us that. Cycling the VPC's transit
+    # attachment — which is exactly what deleting the last tenant does —
+    # leaves the CR reporting ready while the router has no NAT at all,
+    # and kube-ovn never recovers on its own:
+    #
+    #     OvnSnatRule snat-t1-vpc: status.ready = true, v4Eip = 10.199.1.5
+    #     ovn-nbctl lr-nat-list t1-vpc: <empty>
+    #     controller: failed to delete v4 snat ... not found ..., requeuing
+    #
+    # It loops trying to remove a NAT that is not there and never gets as
+    # far as creating one. Recreating the rule is the only exit — the same
+    # lesson `recreate_snat_rule` already records for updates.
+    #
+    # The cost is a momentary SNAT reset for anything already using this
+    # VPC. That is worth paying here: this runs on tenant create, and the
+    # alternative is a tenant whose worker can never reach its own control
+    # plane, which is how this cost three lab runs.
+    await _delete_ignore_missing(k8s, "ovn-snat-rules", winner.name)
+    await _create_ignore_conflict(k8s, "ovn-snat-rules", {
+        "apiVersion": f"{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}",
+        "kind": "OvnSnatRule",
+        "metadata": {"name": winner.name, "labels": winner.labels},
+        "spec": {
+            "ovnEip": winner.eip_name,
+            "vpc": vpc_name,
+            "vpcSubnet": tenant_subnet,
+        },
+    })
+    return winner.address
 
-        # Reusing a rule is only safe if the rule is actually in force, and
-        # `status.ready` does not tell us that. Cycling the VPC's transit
-        # attachment — which is exactly what deleting the last tenant does —
-        # leaves the CR reporting ready while the router has no NAT at all,
-        # and kube-ovn never recovers on its own:
-        #
-        #     OvnSnatRule snat-t1-vpc: status.ready = true, v4Eip = 10.199.1.5
-        #     ovn-nbctl lr-nat-list t1-vpc: <empty>
-        #     controller: failed to delete v4 snat ... not found ..., requeuing
-        #
-        # It loops trying to remove a NAT that is not there and never gets as
-        # far as creating one. Recreating the rule is the only exit — the same
-        # lesson `recreate_snat_rule` already records for updates.
-        #
-        # The cost is a momentary SNAT reset for anything already using this
-        # VPC. That is worth paying here: this runs on tenant create, and the
-        # alternative is a tenant whose worker can never reach its own control
-        # plane, which is how this cost three lab runs.
-        await _delete_ignore_missing(k8s, "ovn-snat-rules", item["metadata"]["name"])
-        await _create_ignore_conflict(k8s, "ovn-snat-rules", {
-            "apiVersion": f"{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}",
-            "kind": "OvnSnatRule",
-            "metadata": {
-                "name": item["metadata"]["name"],
-                "labels": (item.get("metadata", {}).get("labels") or {}),
-            },
-            "spec": {
-                "ovnEip": eip_name,
-                "vpc": vpc_name,
-                "vpcSubnet": tenant_subnet,
-            },
-        })
-        return address
-    return None
+
+async def effective_snat_address(
+    k8s, vpc_name: str, tenant_subnet: str, transit_subnet: str,
+) -> str | None:
+    """The transit address this subnet leaves under — read-only.
+
+    Deliberately not `ensure_*`: a GET must not delete anything, so this
+    reports what it finds rather than resolving a contest. It picks the same
+    winner `_existing_snat_address` would (transit rule, first by name), so
+    what the API shows is the address the guard ACLs are keyed on.
+
+    Returns None when nothing covers the subnet, or when the only claimant is
+    on another network — there is no honest single address to show then, and
+    `transit_conflict` is the field that says so.
+    """
+    candidates, _dangling = await _rules_covering(
+        k8s, vpc_name, tenant_subnet, skip="",
+    )
+    transit = [c for c in candidates if c.subnet == transit_subnet]
+    return transit[0].address if transit else None
 
 
 async def ensure_tenant_snat(

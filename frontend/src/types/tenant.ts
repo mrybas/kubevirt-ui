@@ -112,6 +112,9 @@ export interface Tenant {
   status: string;
   /** Why the status is not Ready (no workers joined, an addon wedged). */
   status_detail?: string | null;
+  /** Address this tenant's subnet SNATs to on the transit network — the one
+   *  the control-plane guard ACLs are keyed on. Detail view only. */
+  transit_snat_ip?: string | null;
   phase: string | null;
   endpoint: string | null;
   control_plane_replicas: number;

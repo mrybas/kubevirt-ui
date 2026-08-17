@@ -312,6 +312,12 @@ class TenantResponse(BaseModel):
     # network — the tenant's control-plane path cannot be built until it is
     # released. Surfaced through `status_detail`.
     transit_conflict: str | None = None
+    # The address this tenant's subnet actually SNATs to on the transit
+    # network. Read from the one rule left standing for its logical IP, because
+    # the guard ACLs are keyed on this address and nothing else in the API says
+    # which one won: the lab carried two rules for one logical IP, both
+    # `ready: true`, only one programmed.
+    transit_snat_ip: str | None = None
     phase: str | None = None  # CAPI Cluster phase
     endpoint: str | None = None  # tenant API URL
     control_plane_replicas: int = 0

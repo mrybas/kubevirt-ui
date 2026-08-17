@@ -88,6 +88,7 @@ from app.api.v1.tenants_capi import (
     _create_capi_resources,
     _detach_tenant_ns_from_vpc_subnet,
     _remove_cp_vpc_publication,
+    tenant_vpc_name,
 )
 from app.api.v1.tenants_addons import (
     _build_helm_values,
@@ -104,7 +105,11 @@ from app.api.v1.tenants_storage import (
     schedule_credential_replication,
 )
 from app.api.v1.tenants_cp_ports import release_cp_ports
-from app.core.tenant_transit import remove_tenant_transit, transit_subnet_name
+from app.core.tenant_transit import (
+    effective_snat_address,
+    remove_tenant_transit,
+    transit_subnet_name,
+)
 from app.api.v1.tenants_talos import (
     assert_cabpt_installed,
     ensure_talos_bootstrap_provider,
@@ -394,6 +399,31 @@ async def _enrich_with_control_plane(k8s, tenant: TenantResponse) -> TenantRespo
     if ready is None:
         ready = kcp_status.get("replicas", 0) if kcp_status.get("ready") else 0
     tenant.control_plane_ready_replicas = ready or 0
+    return tenant
+
+
+async def _enrich_with_transit_snat(k8s, tenant: TenantResponse) -> TenantResponse:
+    """Show the address the tenant's workers actually leave under.
+
+    The transit guard ACLs are keyed on this address, so it is the one fact
+    that decides whether a worker can reach its own control plane — and it was
+    nowhere in the API. When the lab carried two SNAT rules for one logical IP,
+    both `status.ready: true`, there was no way to tell from here which one was
+    programmed. Detail view only: it costs a read per tenant and the list does
+    not need it.
+    """
+    transit = transit_subnet_name()
+    if not transit:
+        return tenant
+    vpc = await tenant_vpc_name(k8s, tenant.name)
+    if not vpc:
+        return tenant  # a default-overlay tenant does not use the transit path
+    try:
+        tenant.transit_snat_ip = await effective_snat_address(
+            k8s, vpc, f"{vpc}-default", transit,
+        )
+    except ApiException as e:
+        logger.debug(f"Could not read the transit SNAT for {tenant.name}: {e}")
     return tenant
 
 
@@ -1345,6 +1375,7 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
     tenant = await _enrich_with_workers(k8s, tenant)
     tenant = await _enrich_with_control_plane(k8s, tenant)
     tenant = await _enrich_with_folder_env(k8s, tenant)
+    tenant = await _enrich_with_transit_snat(k8s, tenant)
     return apply_capacity_to_status(tenant)
 
 
