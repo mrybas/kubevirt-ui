@@ -26,6 +26,7 @@ from app.core.tenant_transit import transit_subnet_name
 from app.api.v1.subnet_acls import (
     ISOLATION_PRIORITY_DROP,
     ISOLATION_PRIORITY_OWN,
+    MGMT_DENY_PRIORITY,
     SubnetAcl,
     _acls_to_spec,
     build_isolation_acls,
@@ -194,6 +195,35 @@ async def _mgmt_deny_sources(k8s) -> list[str]:
 #
 # Inferring a choice from a state is the mirror of the T14 rule. The datapath
 # is the right source for a fact; a user's decision has to be written down.
+# Infrastructure VPCs are not tenants, and the difference has to be declared.
+#
+# The census that builds the peer drops filtered on `vpc != system && no vlan`,
+# which is a description of a *shape*, not of a *role* — so the shared egress
+# gateway's own VPC was counted as a tenant and every tenant was given
+# `3000 drop 10.199.128.0/24`, the address of the thing several of them egress
+# *through*. It kept working only because the hub tenants also carry a legacy
+# `allow` at 3100 that shadows the drop: correct behaviour resting on rule
+# ordering rather than on the classification being right. The same CIDR was
+# being emitted by the allow-writer and the drop-writer at once.
+#
+# Same lesson as the isolation guard: a role is a decision, so it is written
+# down. `kubevirt-ui.io/egress-gateway` already was such a declaration and is
+# honoured as one; new roles use the general label.
+VPC_ROLE_LABEL = "kubevirt-ui.io/role"
+EGRESS_GATEWAY_LABEL = "kubevirt-ui.io/egress-gateway"
+ROLE_INFRASTRUCTURE = "infrastructure"
+
+
+def _vpc_role(item: dict[str, Any]) -> str | None:
+    """The declared role of the VPC this subnet belongs to, if any."""
+    labels = (item.get("metadata", {}) or {}).get("labels") or {}
+    if labels.get(VPC_ROLE_LABEL):
+        return labels[VPC_ROLE_LABEL]
+    if labels.get(EGRESS_GATEWAY_LABEL):
+        return "egress-gateway"
+    return None
+
+
 ISOLATION_OPT_OUT_ANNOTATION = "kubevirt-ui.io/isolation"
 ISOLATION_OPT_OUT_VALUE = "disabled"
 
@@ -1080,6 +1110,10 @@ async def _tenant_vpc_cidrs(k8s_client: Any, exclude: str | None = None) -> list
             continue  # on its way out; not a peer to block
         if spec.get("vlan"):        # underlay/provider subnet, not a tenant VPC
             continue
+        if _vpc_role(item):
+            # Infrastructure. Tenants are meant to reach it — several egress
+            # through it — so putting it in the drop census was never right.
+            continue
         out.append(cidr)
     return out
 
@@ -1118,6 +1152,27 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
         spec = item.get("spec", {}) or {}
         name = item["metadata"]["name"]
         existing = spec.get("acls") or []
+        if _vpc_role(item):
+            # Infrastructure is not a tenant. It is also not merely skipped:
+            # this pass had already written tenant drops and the management
+            # baseline onto the shared gateway's own subnet, and a pod on a hub
+            # tenant's subnet lost the internet for it — the blocking rules
+            # have to be taken back off, not just stopped.
+            blocking = {ISOLATION_PRIORITY_DROP, MGMT_DENY_PRIORITY}
+            body = [a for a in existing if a.get("priority") not in blocking]
+            if body != existing:
+                await k8s_client.custom_api.patch_cluster_custom_object(
+                    group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+                    plural="subnets", name=name,
+                    body={"spec": {"acls": body}},
+                    _content_type="application/merge-patch+json",
+                )
+                logger.info(
+                    "Isolation reconcile: %s carries a role, took back %d "
+                    "blocking rule(s)", name, len(existing) - len(body),
+                )
+                updated += 1
+            continue
         if _isolation_opted_out(item):
             continue                      # opened on purpose, and it says so
         shared = [
@@ -1128,7 +1183,9 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
         ]
         peers = [
             (s.get("spec") or {}).get("cidrBlock") for s in tenant_subnets
-            if s["metadata"]["name"] != name
+            # Role-marked subnets stay in the iteration — this pass has damage
+            # of its own to undo on them — but they are not peers to block.
+            if s["metadata"]["name"] != name and not _vpc_role(s)
         ]
         acls = build_isolation_acls(
             subnet_cidr=spec.get("cidrBlock", ""),
