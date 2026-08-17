@@ -862,10 +862,27 @@ def _build_kubeadm_config_template_cr(
                     # "dropped/suppressed" did. So dump a filtered slice
                     # instead, a few times, spaced out.
                     "postKubeadmCommands": [
+                        # A bounded tail, not a filter: when the kubelet dies
+                        # the line that says why is whatever systemd logged
+                        # last, and no grep written in advance reliably
+                        # matches it. 40 lines is small enough not to trip the
+                        # console rate-limiter.
                         "sh -c 'for i in 1 2 3 4; do sleep 60;"
+                        " echo \"===== kubelet unit $i =====\" > /dev/ttyS0;"
+                        # The lines immediately before systemd reports the
+                        # exit. A plain tail is useless here: a kubelet that
+                        # cannot find its own Node writes ~10 lines/s, so 40
+                        # lines cover under a second and never include the
+                        # fatal one. Anchoring on "Main process exited" lands
+                        # exactly on it.
+                        #
+                        # Measured on the lab: the unit dies with
+                        # status=255/EXCEPTION roughly every 30s, restart
+                        # counter climbing — a Go fatal, not a config parse
+                        # error.
                         " journalctl -u kubelet --no-pager"
-                        " | grep -iE \"register|unable to|failed to (get|contact)|forbidden|unauthorized\""
-                        " | tail -25 > /dev/ttyS0 2>&1; done' &",
+                        " | grep -B 8 \"Main process exited\" | tail -30 > /dev/ttyS0 2>&1;"
+                        " done' &",
                     ],
                     "joinConfiguration": {
                         "nodeRegistration": {
