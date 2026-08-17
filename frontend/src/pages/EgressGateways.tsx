@@ -717,7 +717,7 @@ export function CreateEgressGatewayModal({
 // Attach VPC Modal
 // ---------------------------------------------------------------------------
 
-function AttachVpcModal({
+export function AttachVpcModal({
   gatewayName,
   existingVpcNames,
   onClose,
@@ -743,8 +743,18 @@ function AttachVpcModal({
       !existingVpcNames.includes(v.name) &&
       v.name !== `egw-${gatewayName}` &&
       !v.name.startsWith('egw-') &&
-      v.origin !== 'system',
+      v.origin !== 'system' &&
+      // A VPC already leaving through its own router leg must not be hubbed:
+      // attaching rewrites its default route to this gateway's transit and
+      // takes it off that leg, so traffic that works today stops. The VPC page
+      // stopped offering the action for this reason and this one kept
+      // offering it — the hazard had moved one screen across, not gone.
+      !v.routed_egress,
   );
+  const routedCount = (vpcsData?.items ?? []).filter(
+    (v: any) => v.routed_egress && !existingVpcNames.includes(v.name)
+      && !v.name.startsWith('egw-'),
+  ).length;
   const selectedVpc = vpcsData?.items.find((v: any) => v.name === vpcName);
 
   const handleVpcChange = (name: string) => {
@@ -793,8 +803,23 @@ function AttachVpcModal({
             {vpcsLoading ? (
               <p className="text-xs text-surface-500 mt-1">Loading VPCs…</p>
             ) : availableVpcs.length === 0 ? (
-              <p className="text-xs text-surface-500 mt-1">All VPCs are already attached</p>
+              <p className="text-xs text-surface-500 mt-1">
+                {routedCount > 0
+                  ? 'Nothing to attach — every remaining VPC already egresses '
+                    + 'through its own router leg.'
+                  : 'All VPCs are already attached'}
+              </p>
             ) : null}
+            {routedCount > 0 && (
+              // Said, not silently filtered: a VPC missing from the list with
+              // no explanation reads as a bug and invites someone to go and
+              // write the attach by hand.
+              <p className="text-xs text-surface-500 mt-1">
+                {routedCount} VPC{routedCount === 1 ? '' : 's'} not offered — they
+                egress through their own router leg, and attaching would rewrite
+                the default route that carries them.
+              </p>
+            )}
           </div>
 
           {selectedVpc && (

@@ -1392,6 +1392,40 @@ async def detach_tenant_vpc(
     return {"status": "detached", "gateway": name, "vpc": data.vpc_name}
 
 
+async def _reject_routed_vpc(k8s, tenant_vpc_name: str) -> None:
+    """A VPC that already leaves through its own leg must not be hubbed.
+
+    Attaching rewrites the VPC's default route to the gateway's transit
+    address, which takes it off the external plane. The VPC page stopped
+    offering the action for exactly this reason, and the gateway page kept
+    offering it — the hazard moved one screen across rather than going away.
+
+    Same predicate as everywhere else on B3: the default route's next hop is
+    inside the external subnet. The datapath, not a label somebody has to
+    remember to set.
+    """
+    from app.core.b3_announce import (
+        _vpcs_routed_via, b3_enabled, external_subnet_cidr,
+    )
+
+    if not b3_enabled():
+        return
+    external_cidr = await external_subnet_cidr(k8s)
+    if not external_cidr:
+        return
+    if tenant_vpc_name in await _vpcs_routed_via(k8s, external_cidr):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"'{tenant_vpc_name}' already egresses through its own router "
+                f"leg on {external_cidr}. Attaching it here would rewrite its "
+                "default route to this gateway's transit address and take it "
+                "off that leg — traffic that works today would stop. Detach it "
+                "from the routed plane first if that is really the intent."
+            ),
+        )
+
+
 def _reject_self_attach(gateway_name: str, tenant_vpc_name: str) -> None:
     """A gateway cannot be its own tenant.
 
@@ -1441,6 +1475,7 @@ async def attach_tenant_to_gateway(
             return None
 
     _reject_self_attach(gateway_name, tenant_vpc_name)
+    await _reject_routed_vpc(k8s, tenant_vpc_name)
 
     vpc = await _get_gateway_config(k8s, gateway_name)
     if not vpc:
