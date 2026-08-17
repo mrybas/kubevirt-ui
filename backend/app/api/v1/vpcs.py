@@ -6,6 +6,7 @@ Dedicated VPC router covering:
   - Static route management
 """
 
+import asyncio
 import ipaddress
 import os
 import json
@@ -116,6 +117,10 @@ def _parse_vpc(item: dict[str, Any]) -> VpcResponse:
     return VpcResponse(
         name=name,
         origin=origin,
+        # The VPC's own labels, read the same way the census reads the
+        # subnet's — so the page and the reconciler cannot disagree on what
+        # this VPC is for.
+        role=_vpc_role(item),
         tenant=labels.get("kubevirt-ui.io/tenant"),
         # T7 — surface folder/env scope from labels so the wizard can render
         # them on the dropdown without re-fetching label dicts client-side.
@@ -1118,6 +1123,96 @@ async def _tenant_vpc_cidrs(k8s_client: Any, exclude: str | None = None) -> list
     return out
 
 
+# Creations arrive together — a tenant wizard makes one VPC per environment —
+# so several passes of the reconciler run at once. Re-reading before each write
+# does not help: all of them read before any of them writes, and the peering
+# list is patched wholesale, so the later write replaces the earlier and the
+# first VPC is left routed to a leg that no longer exists. Measured with three
+# concurrent passes: every leg built three times.
+#
+# Scope of this lock, said plainly: one backend process. A second replica would
+# race again, and the durable fix is optimistic concurrency on the patch.
+_INFRA_PEERING_LOCK = asyncio.Lock()
+
+
+async def reconcile_infra_peerings(k8s_client: Any) -> int:
+    """Every tenant VPC is peered with every infrastructure VPC.
+
+    An infrastructure VPC exists to be reached — a VPN concentrator, a shared
+    service, the thing a whole environment routes through. Left to the operator
+    it is N manual peerings that have to be repeated for every VPC created
+    afterwards, and the one that is forgotten fails as silence: the VPC is
+    healthy, the service is healthy, and there is no route between them.
+
+    Missing legs are added; nothing is removed. A peering someone deliberately
+    deleted would otherwise come back on the next pass, and a reconciler that
+    argues with the operator is worse than one that does too little.
+    """
+    try:
+        subnets = await k8s_client.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Infra peering reconcile: could not list subnets: %s", e)
+        return 0
+
+    infra: set[str] = set()
+    tenants: set[str] = set()
+    for item in subnets.get("items", []):
+        spec = item.get("spec", {}) or {}
+        vpc = spec.get("vpc")
+        if not vpc or vpc == SYSTEM_VPC_NAME or spec.get("vlan"):
+            continue
+        if (item.get("metadata") or {}).get("deletionTimestamp"):
+            continue
+        if not spec.get("cidrBlock"):
+            continue          # nothing to route to; _create_peering_pair refuses it
+        role = _vpc_role(item)
+        if role == ROLE_INFRASTRUCTURE:
+            infra.add(vpc)
+        elif role is None:
+            tenants.add(vpc)
+
+    if not infra:
+        return 0
+
+    async def _peers_of(hub: str) -> set[str] | None:
+        try:
+            item = await k8s_client.custom_api.get_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs", name=hub,
+            )
+        except ApiException:
+            return None
+        return {
+            p.get("remoteVpc")
+            for p in (item.get("spec", {}) or {}).get("vpcPeerings", []) or []
+        }
+
+    created = 0
+    async with _INFRA_PEERING_LOCK:
+        for hub in sorted(infra):
+            have = await _peers_of(hub)
+            if have is None:
+                continue
+            for tenant in sorted(tenants - have):
+                # Re-read per leg as well: inside the lock this is what makes a
+                # pass see the legs a previous pass has just written.
+                fresh = await _peers_of(hub)
+                if fresh is None or tenant in fresh:
+                    continue
+                try:
+                    await _create_peering_pair(k8s_client, hub, tenant)
+                    created += 1
+                    logger.info("Infra peering: %s <-> %s", hub, tenant)
+                except HTTPException as e:
+                    logger.warning(
+                        "Infra peering %s <-> %s failed: %s", hub, tenant, e.detail)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Infra peering %s <-> %s failed: %s", hub, tenant, e)
+    return created
+
+
 async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
     """Re-scope every isolated VPC's drop rules to the current set of peers.
 
@@ -1346,6 +1441,8 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
         ]
 
     labels: dict[str, str] = {"kubevirt-ui.io/managed": "true"}
+    if data.role:
+        labels[VPC_ROLE_LABEL] = data.role
     if data.tenant:
         labels["kubevirt-ui.io/tenant"] = data.tenant
     # T7 — folder/env scoping. Stamped on VPC + default subnet so the
@@ -1623,11 +1720,15 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     try:
         n = await reconcile_isolation_acls(k8s)
         logger.info(f"Isolation ACLs re-scoped on {n} VPC subnet(s)")
+        p = await reconcile_infra_peerings(k8s)
+        if p:
+            logger.info(f"Infra peerings created: {p}")
     except Exception as e:
         logger.warning(f"Isolation reconcile after creating {data.name!r} failed: {e}")
 
     return VpcResponse(
         name=data.name,
+        role=data.role,
         tenant=data.tenant,
         folder=data.folder,
         environment=data.environment,

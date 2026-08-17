@@ -77,6 +77,17 @@ class VpcCreateRequest(BaseModel):
         None,
         description="CIDR for default subnet (auto-assigned from 10.{200+N}.0.0/24 if empty)",
     )
+    # Declared, never inferred. The peer census used to read the role off the
+    # shape of the object and counted the egress gateway's own VPC as a tenant,
+    # which handed every tenant a drop on the address it egresses through.
+    role: Optional[str] = Field(
+        None,
+        description=(
+            "Declared role. `infrastructure` means this VPC serves the others: "
+            "it is excluded from the isolation peer census and every tenant VPC "
+            "is peered with it automatically."
+        ),
+    )
     # Default ON: every tenant prefix is announced to the same upstream
     # router, which forwards between them, so an un-isolated VPC is reachable
     # from every other tenant the moment it exists. That has to be closed at
@@ -186,6 +197,9 @@ class VpcResponse(BaseModel):
     """Response model for a VPC."""
     name: str
     tenant: Optional[str] = None
+    # Declared role, if any: `infrastructure`, or `egress-gateway` for the VPC
+    # an egress gateway owns. Absence means "an ordinary tenant VPC".
+    role: Optional[str] = None
     # T7 — folder/env scoping (sourced from labels). None means the VPC is
     # not scoped to a specific folder/env (cluster-wide).
     folder: Optional[str] = None
