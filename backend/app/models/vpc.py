@@ -198,6 +198,16 @@ class VpcResponse(BaseModel):
     namespaces: list[str] = []
     ready: bool = False
     conditions: list[dict] = []
+    # Egress on the routed plane (B3): the VPC leaves through its own leg on
+    # the external network, with no gateway pods in the path. Read from the
+    # same fact the announcement generator reads — the default route — so the
+    # page cannot claim something the datapath contradicts. It did: a VPC with
+    # working internet was described as "None (no internet)", next to a button
+    # that would have attached a hub and rewritten the route that was carrying
+    # its traffic.
+    routed_egress: bool = False
+    egress_next_hop: str | None = None
+    announced_cidrs: list[str] = []
     # Whether tenant-isolation ACLs were actually written on the default
     # subnet. Reports what happened, not what was asked for: requesting
     # isolation without a configured TENANT_SUPERNET leaves this false.

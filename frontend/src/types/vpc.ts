@@ -43,6 +43,11 @@ export interface Vpc {
   // Label-based scoping (T7 — populated from kubevirt-ui.io/folder + /environment labels)
   folder?: string | null;
   environment?: string | null;
+  /** Egress on the routed plane: the VPC leaves through its own external leg,
+   *  with no gateway pods in the path. Same fact the announcer reads. */
+  routed_egress?: boolean;
+  egress_next_hop?: string | null;
+  announced_cidrs?: string[];
   /**
    * Where the object came from. Used to be a visibility filter, which hid
    * every CLI/GitOps-made VPC from the console; it is a badge now.

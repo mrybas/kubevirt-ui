@@ -79,6 +79,37 @@ function renderPage() {
 
 beforeEach(() => setScope.mockClear());
 
+describe('what the page says about egress', () => {
+  it('does not call a routed VPC "no internet"', async () => {
+    // Measured: b3v had working internet through its own leg while the page
+    // read "None (no internet)" — next to a Configure button that would have
+    // attached a hub and rewritten the route carrying its traffic.
+    vpc = { ...vpc, routed_egress: true, egress_next_hop: '10.199.4.11',
+            announced_cidrs: ['10.200.36.0/22'] };
+    renderPage();
+
+    expect(await screen.findByText(/routed — via its own leg/i)).toBeInTheDocument();
+    expect(screen.getByText('10.199.4.11')).toBeInTheDocument();
+    expect(screen.queryByText(/no internet/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/configure/i)).not.toBeInTheDocument();
+  });
+
+  it('shows what the upstream router was told', async () => {
+    vpc = { ...vpc, routed_egress: true, egress_next_hop: '10.199.4.11',
+            announced_cidrs: ['10.200.36.0/22'] };
+    renderPage();
+
+    expect(await screen.findByText(/10\.200\.36\.0\/22/)).toBeInTheDocument();
+  });
+
+  it('still offers a gateway to a VPC that has neither', async () => {
+    vpc = { ...vpc, routed_egress: false };
+    renderPage();
+
+    expect(await screen.findByText(/none \(no internet\)/i)).toBeInTheDocument();
+  });
+});
+
 describe('the VPC scope editor', () => {
   it('offers the short environment name, not the namespace', async () => {
     // VPCs are labelled `kubevirt-ui.io/environment=dev` and the tenant wizard

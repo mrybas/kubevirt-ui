@@ -300,7 +300,12 @@ function ScopeSection({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['dat
   );
 }
 
-function EgressGatewaySection({ vpcName }: { vpcName: string }) {
+function EgressGatewaySection({
+  vpcName, vpc,
+}: {
+  vpcName: string;
+  vpc: NonNullable<ReturnType<typeof useVpc>['data']>;
+}) {
   const { data: egressData } = useEgressGateways();
   const navigate = useNavigate();
 
@@ -318,6 +323,30 @@ function EgressGatewaySection({ vpcName }: { vpcName: string }) {
       subnet_name: attachedVpc.subnet_name,
     });
   };
+
+  // Routed egress has no gateway to show, and offering to attach one here is
+  // worse than unhelpful: the hub rewrites the default route this VPC's
+  // traffic is currently using. The page said "None (no internet)" next to a
+  // Configure button while the VPC had working internet.
+  if (vpc.routed_egress) {
+    return (
+      <div className="text-sm">
+        <div className="flex items-center justify-between">
+          <span className="text-surface-400">Egress</span>
+          <span className="text-surface-200">
+            Routed — via its own leg{' '}
+            <span className="font-mono text-surface-300">{vpc.egress_next_hop}</span>
+          </span>
+        </div>
+        <p className="text-xs text-surface-500 mt-1">
+          No gateway pods in the path. Announced to the upstream router:{' '}
+          <span className="font-mono">
+            {(vpc.announced_cidrs ?? []).join(', ') || '—'}
+          </span>
+        </p>
+      </div>
+    );
+  }
 
   if (!attachedGateway) {
     return (
@@ -385,7 +414,7 @@ function OverviewTab({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data
             <ScopeSection vpc={vpc} />
           </div>
           <div className="border-t border-surface-700 pt-3">
-            <EgressGatewaySection vpcName={vpc.name} />
+            <EgressGatewaySection vpcName={vpc.name} vpc={vpc} />
           </div>
         </div>
       </div>

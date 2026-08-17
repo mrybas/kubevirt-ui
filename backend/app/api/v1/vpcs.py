@@ -16,7 +16,12 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
-from app.core.b3_announce import b3_enabled, external_subnet, vpc_gateway
+from app.core.b3_announce import (
+    b3_enabled,
+    collect_announcements,
+    external_subnet,
+    vpc_gateway,
+)
 from app.core.tenant_transit import transit_subnet_name
 from app.api.v1.subnet_acls import (
     ISOLATION_PRIORITY_DROP,
@@ -1558,6 +1563,15 @@ async def get_vpc(request: Request, name: str, user: User = Depends(require_auth
     vpc = _parse_vpc(item)
     vpc.subnets, vpc.isolated = await _get_vpc_subnets(k8s, name)
     vpc.peerings = await _get_vpc_peerings(k8s, name)
+
+    # What the announcement generator would say about this VPC — literally the
+    # same call, so the page and the datapath cannot disagree.
+    if b3_enabled():
+        mine = [a for a in await collect_announcements(k8s) if a.vpc == name]
+        if mine:
+            vpc.routed_egress = True
+            vpc.egress_next_hop = mine[0].next_hop
+            vpc.announced_cidrs = [a.cidr for a in mine]
     return vpc
 
 
