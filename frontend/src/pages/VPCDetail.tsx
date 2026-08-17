@@ -19,7 +19,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes, useVpcDns, useUpdateVpcDns, useRecreateVpcDns, useVpcDnsPolicy, useUpdateVpcDnsPolicy, useRecreateVpcDnsPolicy, useDisableVpcDnsPolicy, useSetVpcScope } from '../hooks/useVpcs';
+import { useVpcs, useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes, useVpcDns, useUpdateVpcDns, useRecreateVpcDns, useVpcDnsPolicy, useUpdateVpcDnsPolicy, useRecreateVpcDnsPolicy, useDisableVpcDnsPolicy, useSetVpcScope } from '../hooks/useVpcs';
 import { useEgressGateways, useDetachVpc } from '../hooks/useEgressGateways';
 import { useFoldersFlat } from '../hooks/useFolders';
 import { ApiError } from '../api/client';
@@ -473,15 +473,51 @@ function SubnetsTab({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data'
 // PeeringsTab
 // ---------------------------------------------------------------------------
 
+/** Do these two sets of prefixes overlap? A peering between overlapping VPCs
+ *  builds cleanly and routes nothing — each router already has a more specific
+ *  route for the other's range, pointing at itself. */
+function cidrsOverlap(a: string, b: string): boolean {
+  const parse = (c: string) => {
+    const [addr, bits] = c.split('/');
+    const octets = addr.split('.').map(Number);
+    if (octets.length !== 4 || octets.some((o) => Number.isNaN(o))) return null;
+    const n = ((octets[0] << 24) >>> 0) + (octets[1] << 16) + (octets[2] << 8) + octets[3];
+    const len = Number(bits);
+    if (Number.isNaN(len) || len < 0 || len > 32) return null;
+    const mask = len === 0 ? 0 : (0xffffffff << (32 - len)) >>> 0;
+    return { start: (n & mask) >>> 0, mask, len };
+  };
+  const x = parse(a), y = parse(b);
+  if (!x || !y) return false;
+  const shorter = Math.min(x.len, y.len);
+  const mask = shorter === 0 ? 0 : (0xffffffff << (32 - shorter)) >>> 0;
+  return ((x.start & mask) >>> 0) === ((y.start & mask) >>> 0);
+}
+
 function PeeringsTab({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data']> }) {
   const [showAdd, setShowAdd] = useState(false);
   const [remoteVpc, setRemoteVpc] = useState('');
   const addPeering = useAddVpcPeering(vpc.name);
   const removePeering = useRemoveVpcPeering(vpc.name);
+  const { data: allVpcs } = useVpcs();
+
+  // A free-text box accepted names that do not exist and names already peered,
+  // and gave no way to see that the other end is written for you.
+  const peered = new Set(vpc.peerings.map((p) => p.remote_vpc));
+  const candidates = (allVpcs?.items ?? []).filter(
+    (v) => v.name !== vpc.name && !peered.has(v.name) && v.origin !== 'system',
+  );
+  const selected = candidates.find((v) => v.name === remoteVpc);
+  const ownCidrs = vpc.subnets.map((s) => s.cidr_block).filter(Boolean);
+  const remoteCidrs = (selected?.subnets ?? []).map((s) => s.cidr_block).filter(Boolean);
+  const overlap = ownCidrs.flatMap((a) =>
+    remoteCidrs.filter((b) => cidrsOverlap(a, b)).map((b) => `${a} / ${b}`),
+  );
+  const remoteHasNoSubnet = !!selected && remoteCidrs.length === 0;
 
   const handleAdd = async () => {
     const trimmed = remoteVpc.trim();
-    if (!trimmed) return;
+    if (!trimmed || overlap.length > 0 || remoteHasNoSubnet) return;
     await addPeering.mutateAsync({ remote_vpc: trimmed });
     setRemoteVpc('');
     setShowAdd(false);
@@ -532,29 +568,72 @@ function PeeringsTab({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data
           )}
 
           {showAdd ? (
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={remoteVpc}
-                onChange={(e) => setRemoteVpc(e.target.value)}
-                placeholder="Remote VPC name"
-                className="flex-1 input font-mono text-sm"
-                onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
-                autoFocus
-              />
-              <button
-                onClick={handleAdd}
-                disabled={!remoteVpc.trim() || addPeering.isPending}
-                className="btn-primary text-sm"
-              >
-                {addPeering.isPending ? '...' : 'Add'}
-              </button>
-              <button
-                onClick={() => { setShowAdd(false); setRemoteVpc(''); }}
-                className="p-2 text-surface-400 hover:text-surface-200"
-              >
-                <X className="w-4 h-4" />
-              </button>
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <select
+                  value={remoteVpc}
+                  onChange={(e) => setRemoteVpc(e.target.value)}
+                  className="flex-1 input font-mono text-sm"
+                  autoFocus
+                >
+                  <option value="">Select a VPC…</option>
+                  {candidates.map((v) => (
+                    <option key={v.name} value={v.name}>
+                      {v.name}
+                      {v.subnets.length
+                        ? ` — ${v.subnets.map((s) => s.cidr_block).join(', ')}`
+                        : ' — no subnet yet'}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={handleAdd}
+                  disabled={
+                    !remoteVpc || addPeering.isPending
+                    || overlap.length > 0 || remoteHasNoSubnet
+                  }
+                  className="btn-primary text-sm"
+                >
+                  {addPeering.isPending ? '...' : 'Add'}
+                </button>
+                <button
+                  onClick={() => { setShowAdd(false); setRemoteVpc(''); }}
+                  className="p-2 text-surface-400 hover:text-surface-200"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              {candidates.length === 0 && (
+                <p className="text-xs text-surface-500">
+                  Every other VPC is already peered with this one.
+                </p>
+              )}
+
+              {overlap.length > 0 && (
+                // Refused rather than warned: the objects would be written on
+                // both routers and look healthy, and no packet would cross.
+                <p className="text-xs text-red-400">
+                  Overlapping prefixes ({overlap.join('; ')}) — a peering
+                  between these would be built and route nothing, because each
+                  router already has a more specific route for the other's
+                  range.
+                </p>
+              )}
+
+              {remoteHasNoSubnet && (
+                <p className="text-xs text-red-400">
+                  That VPC has no subnet yet — there would be nothing to route to.
+                </p>
+              )}
+
+              {remoteVpc && overlap.length === 0 && !remoteHasNoSubnet && (
+                <p className="text-xs text-surface-500">
+                  Both ends are written: {vpc.name} and {remoteVpc} each get the
+                  peering and a route to the other. Nothing to add by hand on
+                  the far side.
+                </p>
+              )}
             </div>
           ) : (
             <button
