@@ -181,8 +181,42 @@ async def _existing_snat_address(
             continue
         eip = await _get(k8s, "ovn-eips", eip_name)
         address = ((eip or {}).get("status", {}) or {}).get("v4Ip")
-        if address:
-            return address
+        if not address:
+            continue
+
+        # Reusing a rule is only safe if the rule is actually in force, and
+        # `status.ready` does not tell us that. Cycling the VPC's transit
+        # attachment — which is exactly what deleting the last tenant does —
+        # leaves the CR reporting ready while the router has no NAT at all,
+        # and kube-ovn never recovers on its own:
+        #
+        #     OvnSnatRule snat-t1-vpc: status.ready = true, v4Eip = 10.199.1.5
+        #     ovn-nbctl lr-nat-list t1-vpc: <empty>
+        #     controller: failed to delete v4 snat ... not found ..., requeuing
+        #
+        # It loops trying to remove a NAT that is not there and never gets as
+        # far as creating one. Recreating the rule is the only exit — the same
+        # lesson `recreate_snat_rule` already records for updates.
+        #
+        # The cost is a momentary SNAT reset for anything already using this
+        # VPC. That is worth paying here: this runs on tenant create, and the
+        # alternative is a tenant whose worker can never reach its own control
+        # plane, which is how this cost three lab runs.
+        await _delete_ignore_missing(k8s, "ovn-snat-rules", item["metadata"]["name"])
+        await _create_ignore_conflict(k8s, "ovn-snat-rules", {
+            "apiVersion": f"{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}",
+            "kind": "OvnSnatRule",
+            "metadata": {
+                "name": item["metadata"]["name"],
+                "labels": (item.get("metadata", {}).get("labels") or {}),
+            },
+            "spec": {
+                "ovnEip": eip_name,
+                "vpc": vpc_name,
+                "vpcSubnet": tenant_subnet,
+            },
+        })
+        return address
     return None
 
 

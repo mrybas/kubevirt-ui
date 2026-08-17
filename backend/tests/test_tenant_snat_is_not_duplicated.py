@@ -38,10 +38,17 @@ def _k8s(snats: list[dict], eips: dict[str, str]) -> tuple[MagicMock, list]:
         created.append((kw["plural"], kw["body"]["metadata"]["name"]))
         return {}
 
+    async def delete_obj(**kw):
+        deleted.append(kw["name"])
+        return {}
+
+    deleted: list = []
     k8s = MagicMock()
     k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=list_obj)
     k8s.custom_api.get_cluster_custom_object = AsyncMock(side_effect=get_obj)
     k8s.custom_api.create_cluster_custom_object = AsyncMock(side_effect=create_obj)
+    k8s.custom_api.delete_cluster_custom_object = AsyncMock(side_effect=delete_obj)
+    k8s._deleted = deleted
     return k8s, created
 
 
@@ -64,7 +71,12 @@ async def test_an_existing_vpc_snat_is_reused_not_duplicated() -> None:
     )
 
     assert address == "10.199.1.5", "the ACLs must name the address OVN keeps"
-    assert created == [], f"a competing SNAT must not be created: {created}"
+    assert [n for _, n in created] == ["snat-t1-vpc"], (
+        f"the covering rule is recreated, never duplicated: {created}"
+    )
+    assert k8s._deleted == ["snat-t1-vpc"], (
+        "delete-then-create is the only way kube-ovn re-programs a stale rule"
+    )
 
 
 @pytest.mark.asyncio

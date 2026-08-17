@@ -146,10 +146,35 @@ def _build_cluster_cr(
     #   advertised in cluster-info as <advertiseAddress>:<api_port>. That
     #   address is the shared MetalLB CP VIP, reachable from the isolated
     #   VPC, so kube-proxy DNATs 10.96.0.1 natively — no node-DNAT, no
-    #   ClusterIP patch. controlPlaneEndpoint is the external Traefik SNI
-    #   host:443 (what kubectl-from-outside dials).
+    #   ClusterIP patch.
+    #
+    #   controlPlaneEndpoint used to be the external Traefik SNI host:443,
+    #   on the assumption that cluster-info already carries the VIP so the
+    #   worker would use it. It cannot: CAPI copies this field into the
+    #   worker's `discovery.bootstrapToken.apiServerEndpoint`, and kubeadm
+    #   has to *fetch* cluster-info before it can learn anything from it.
+    #   So the worker dialled the ingress name, which an isolated VPC can
+    #   neither resolve (its DNS is public and unreachable) nor route to:
+    #
+    #       error execution phase preflight: couldn't validate the identity
+    #       of the API Server: Get "https://t1.<ingress>/.../cluster-info":
+    #       lookup t1.<ingress> on 8.8.8.8:53: i/o timeout
+    #
+    #   Three lab runs read that as "CAPK will not bootstrap". It is simply
+    #   the wrong address: the whole transit datapath — VIP, EIP, SNAT,
+    #   guard ACLs — was never on the path the worker took.
+    #
+    #   Pointing this at the VIP costs nothing outside: `GET
+    #   /tenants/{name}/kubeconfig` rewrites `server` to the ingress host
+    #   for both admin and OIDC kubeconfigs, so kubectl-from-outside never
+    #   reads this field.
     vpc = api_port is not None
     host = cp_host or _endpoint_host(req.name)
+    on_vip = False
+    if vpc and not cp_host:
+        vip = _cp_demux_vip()
+        if vip:
+            host, on_vip = vip, True
     cluster_network: dict[str, Any] = {
         "pods": {"cidrBlocks": [req.pod_cidr]},
         "services": {"cidrBlocks": [req.service_cidr]},
@@ -179,7 +204,9 @@ def _build_cluster_cr(
         "spec": {
             "controlPlaneEndpoint": {
                 "host": host,
-                "port": 443 if vpc else 6443,
+                # The VIP listens on the tenant's own api port; an ingress
+                # name terminates SNI on 443.
+                "port": api_port if on_vip else (443 if vpc else 6443),
             },
             "clusterNetwork": cluster_network,
             "controlPlaneRef": {

@@ -78,15 +78,40 @@ class TestKamajiAdvertisesTheVip:
         assert "advertiseAddress" not in (cr["spec"].get("network") or {})
 
 
-class TestTheClusterKeepsItsSniEndpoint:
-    def test_a_vpc_tenant_keeps_the_ingress_host(self) -> None:
+class TestTheClusterEndpointIsTheWorkersJoinAddress:
+    """This class used to assert the opposite, and the lab proved it wrong.
+
+    It read `controlPlaneEndpoint` as "the address a human dials" and kept the
+    Traefik SNI hostname there, on the assumption that a worker would learn the
+    VIP from cluster-info. CAPI copies this field into the worker's
+    `discovery.bootstrapToken.apiServerEndpoint`, and kubeadm must reach that
+    endpoint *to fetch* cluster-info — so the worker dialled a name its
+    isolated VPC could neither resolve nor route to, and three runs read the
+    result as "CAPK will not bootstrap".
+
+    Admin access did not depend on this field even then:
+    `GET /tenants/{name}/kubeconfig` rewrites `server` to the ingress host.
+    """
+
+    def test_a_vpc_tenant_joins_at_the_vip(self, monkeypatch) -> None:
+        monkeypatch.setenv("TENANTS_CP_DEMUX_VIP", "10.198.175.201")
+
+        cr = _build_cluster_cr(_req(vpc_name="acme-net"), api_port=20001)
+
+        assert cr["spec"]["controlPlaneEndpoint"] == {
+            "host": "10.198.175.201", "port": 20001,
+        }
+        assert cr["spec"]["clusterNetwork"]["apiServerPort"] == 20001
+
+    def test_no_vip_configured_leaves_the_ingress_host(self, monkeypatch) -> None:
+        """A deployment without the VIP must not be silently mis-wired."""
+        monkeypatch.delenv("TENANTS_CP_DEMUX_VIP", raising=False)
+
         cr = _build_cluster_cr(_req(vpc_name="acme-net"), api_port=20001)
 
         host = cr["spec"]["controlPlaneEndpoint"]["host"]
-        assert not host[0].isdigit(), (
-            f"expected the Traefik SNI hostname for admin access, got {host!r}"
-        )
-        assert cr["spec"]["clusterNetwork"]["apiServerPort"] == 20001
+        assert not host[0].isdigit(), f"expected the SNI hostname, got {host!r}"
+        assert cr["spec"]["controlPlaneEndpoint"]["port"] == 443
 
     def test_a_default_overlay_tenant_has_no_apiserver_port(self) -> None:
         cr = _build_cluster_cr(_req())
