@@ -104,14 +104,21 @@ class TestReconcileTeachesTheOldVpcsAboutTheNewOne:
         assert any("10.201.0.0/24" in m for m in a_drops), a_drops
         assert not any("10.200.0.0/24" in m for m in a_drops), "not its own prefix"
 
-    async def test_it_leaves_un_isolated_vpcs_alone(self) -> None:
+    async def test_it_leaves_vpcs_alone_that_say_they_are_open(self) -> None:
+        """This test used to assert the same thing about a subnet with an empty
+        ACL list, and that contract is what left `team-a` reachable from every
+        node: "no rules" was read as "somebody chose not to isolate", when it
+        equally covers a VPC that predates isolation or had its rules cleared.
+        The choice is an annotation now; an empty list is no longer a claim
+        about anybody's intent."""
         from unittest.mock import AsyncMock, MagicMock
 
         from app.api.v1.vpcs import reconcile_isolation_acls
 
         k8s = MagicMock()
         k8s.custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": [
-            {"metadata": {"name": "open-default"},
+            {"metadata": {"name": "open-default",
+                          "annotations": {"kubevirt-ui.io/isolation": "disabled"}},
              "spec": {"vpc": "open", "cidrBlock": "10.202.0.0/24", "acls": []}},
         ]})
         k8s.custom_api.patch_cluster_custom_object = AsyncMock()

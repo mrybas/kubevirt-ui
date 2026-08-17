@@ -281,3 +281,104 @@ class TestTheIsolatedFlagStillMeansWhatTheCheckboxMeant:
         indent = len(body[line_start:]) - len(body[line_start:].lstrip())
         assert isolated_branch < baseline
         assert indent == 4, f"the baseline is nested {indent} deep"
+
+
+class TestIntentIsRecorded_NotInferred:
+    """`team-a` sat open for as long as it did *because* it was open.
+
+    The reconciler skipped any subnet with no drop rule, reading that as
+    "created un-isolated". But an empty ACL list equally means the VPC predates
+    isolation, or predates B3, or had its rules cleared by hand — and the one
+    state that could never fix itself was the one that most needed fixing.
+    Measured: a plain curl from a node into `team-a` returned 200 while the
+    same call into an isolated VPC timed out.
+
+    Inferring a choice from a state is the mirror of the T14 rule: the datapath
+    is the right source for a *fact*, and a user's *decision* has to be written
+    down. So it is, and silence now means "no decision recorded" — which the
+    reconciler resolves by isolating, not by leaving the VPC open.
+    """
+
+    def _k8s(self, items, patched):
+        from unittest.mock import AsyncMock, MagicMock
+
+        async def list_obj(**kw):
+            return {"items": items}
+
+        async def patch_obj(**kw):
+            patched.append(kw)
+            return {}
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=list_obj)
+        k8s.custom_api.patch_cluster_custom_object = AsyncMock(side_effect=patch_obj)
+        return k8s
+
+    def _subnet(self, name, vpc, cidr, acls, *, opted_out=False):
+        meta = {"name": name}
+        if opted_out:
+            meta["annotations"] = {"kubevirt-ui.io/isolation": "disabled"}
+        return {"metadata": meta, "spec": {"vpc": vpc, "cidrBlock": cidr, "acls": acls}}
+
+    @pytest.mark.asyncio
+    async def test_a_subnet_with_no_rules_is_backfilled(self, monkeypatch) -> None:
+        from app.api.v1 import vpcs
+
+        monkeypatch.setenv("B3_BGP_PEER", "10.198.175.254")
+        monkeypatch.setenv("B3_VPC_GATEWAY", "10.199.4.254")
+        monkeypatch.setattr(vpcs, "_mgmt_deny_sources",
+                            AsyncMock_return(["10.198.160.3/32"]))
+
+        patched: list[dict] = []
+        k8s = self._k8s([
+            self._subnet("team-a-default", "team-a", "10.200.0.0/22", []),
+            self._subnet("b3v-default", "b3v", "10.200.36.0/22",
+                         [{"action": "drop", "direction": "to-lport",
+                           "match": "ip4.src == 10.200.0.0/22", "priority": 3000}]),
+        ], patched)
+
+        await vpcs.reconcile_isolation_acls(k8s)
+
+        team = [c for c in patched if c["name"] == "team-a-default"]
+        assert team, "the subnet with no rules was skipped again"
+        written = team[0]["body"]["spec"]["acls"]
+        assert any(a["match"] == "ip4.src == 10.198.160.3/32"
+                   and a["priority"] == 3300 for a in written), written
+        assert any(a["action"] == "drop" and "10.200.36.0/22" in a["match"]
+                   for a in written), "it was not isolated from its peer"
+
+    @pytest.mark.asyncio
+    async def test_the_marker_is_honoured(self, monkeypatch) -> None:
+        """Opting out is legitimate — it just has to be said out loud."""
+        from app.api.v1 import vpcs
+
+        monkeypatch.setenv("B3_BGP_PEER", "10.198.175.254")
+        monkeypatch.setenv("B3_VPC_GATEWAY", "10.199.4.254")
+        monkeypatch.setattr(vpcs, "_mgmt_deny_sources",
+                            AsyncMock_return(["10.198.160.3/32"]))
+
+        patched: list[dict] = []
+        k8s = self._k8s([
+            self._subnet("open-default", "open", "10.200.0.0/22", [], opted_out=True),
+            self._subnet("b3v-default", "b3v", "10.200.36.0/22", []),
+        ], patched)
+
+        await vpcs.reconcile_isolation_acls(k8s)
+
+        assert not [c for c in patched if c["name"] == "open-default"]
+
+    def test_creation_writes_the_marker_only_when_the_box_is_unticked(self) -> None:
+        from pathlib import Path
+
+        src = Path("app/api/v1/vpcs.py").read_text()
+        body = src[src.index("subnet_manifest: dict[str, Any] = {"):]
+        body = body[:body.index("\n    try:")]
+
+        assert "ISOLATION_OPT_OUT_ANNOTATION" in body
+        assert "if not data.isolated else {}" in body
+
+
+def AsyncMock_return(value):
+    from unittest.mock import AsyncMock
+
+    return AsyncMock(return_value=value)

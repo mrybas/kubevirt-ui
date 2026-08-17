@@ -183,6 +183,27 @@ async def _mgmt_deny_sources(k8s) -> list[str]:
     return [f"{ip}/32" for ip in sorted(dict.fromkeys(addresses))]
 
 
+# The one legitimate way to say "this VPC is deliberately open to its peers".
+#
+# It replaces reading that intent off the ACL list. "No drop rules" was taken
+# to mean somebody chose not to isolate, when it equally means the VPC predates
+# isolation, or was created before B3, or had its ACLs cleared by hand — and
+# under B3 the difference is not academic: `team-a`, un-isolated by accident,
+# answered a plain curl from a node (200) while an isolated VPC timed out, and
+# the reconciler skipped it every pass precisely *because* it was open.
+#
+# Inferring a choice from a state is the mirror of the T14 rule. The datapath
+# is the right source for a fact; a user's decision has to be written down.
+ISOLATION_OPT_OUT_ANNOTATION = "kubevirt-ui.io/isolation"
+ISOLATION_OPT_OUT_VALUE = "disabled"
+
+
+def _isolation_opted_out(item: dict[str, Any]) -> bool:
+    """Whether someone deliberately asked for this subnet to stay open."""
+    annotations = (item.get("metadata", {}) or {}).get("annotations") or {}
+    return annotations.get(ISOLATION_OPT_OUT_ANNOTATION) == ISOLATION_OPT_OUT_VALUE
+
+
 def _has_isolation_acls(spec: dict[str, Any]) -> bool:
     """Whether a subnet spec carries the tenant-isolation catch-all drop.
 
@@ -1097,8 +1118,8 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
         spec = item.get("spec", {}) or {}
         name = item["metadata"]["name"]
         existing = spec.get("acls") or []
-        if not any(a.get("action") == "drop" for a in existing):
-            continue                      # this VPC was created un-isolated
+        if _isolation_opted_out(item):
+            continue                      # opened on purpose, and it says so
         shared = [
             a["match"].split("== ")[-1] for a in existing
             if a.get("action") == "allow-related"
@@ -1126,14 +1147,21 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
             # in place is not harmless: the allocator hands those very CIDRs
             # to the next VPC, so the new tenant would be born unreachable
             # from this one for a reason nobody could see in its own spec.
-            # Keep the management deny: it is a drop, but not one of the
-            # peer drops this branch exists to retire.
-            keep = {(a.direction, a.match) for a in build_mgmt_deny_acls(mgmt_cidr)}
+            # Keep the management deny — it is a drop, but not one of the
+            # peer drops this branch exists to retire — and *add* it when this
+            # subnet never had one. Preserving only what is already there was
+            # enough while every VPC came through the create path; a VPC that
+            # predates it would otherwise reach this branch and stay open.
+            baseline = build_mgmt_deny_acls(mgmt_cidr)
+            keep = {(a.direction, a.match) for a in baseline}
             body = [
                 a for a in existing
                 if a.get("action") != "drop"
                 or (a.get("direction"), a.get("match")) in keep
             ]
+            have = {(a.get("direction"), a.get("match")) for a in body}
+            body += _acls_to_spec(
+                [a for a in baseline if (a.direction, a.match) not in have])
             if body == existing:
                 continue
             await k8s_client.custom_api.patch_cluster_custom_object(
@@ -1360,7 +1388,16 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     subnet_manifest: dict[str, Any] = {
         "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",
         "kind": "Subnet",
-        "metadata": {"name": default_subnet_name, "labels": labels},
+        "metadata": {
+            "name": default_subnet_name,
+            "labels": labels,
+            # Written only when the choice was made, so its absence means "no
+            # choice recorded" and the reconciler isolates. The old default ran
+            # the other way: silence read as consent to stay open.
+            **({"annotations": {
+                ISOLATION_OPT_OUT_ANNOTATION: ISOLATION_OPT_OUT_VALUE,
+            }} if not data.isolated else {}),
+        },
         "spec": {
             "protocol": "IPv4",
             "cidrBlock": cidr,
