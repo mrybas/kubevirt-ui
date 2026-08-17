@@ -29,6 +29,22 @@ from app.core.b3_announce import (
     render_raw_config,
 )
 
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No ambient B3 configuration.
+
+    The test container inherits the backend service's environment, so a
+    deployment value like B3_ANNOUNCE_NODE_LIST silently decided what these
+    tests measured. Each test sets what it needs.
+    """
+    for name in (
+        "B3_BGP_PEER", "B3_VPC_GATEWAY", "B3_ANNOUNCE_NODE_LIST",
+        "B3_ANNOUNCE_NODES", "B3_EXTERNAL_SUBNET", "B3_FRR_NAMESPACE",
+        "B3_LOCAL_ASN", "B3_PEER_ASN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 TEAM_A = Announcement(vpc="team-a", cidr="10.200.0.0/22", next_hop="10.199.4.1")
 T8V = Announcement(vpc="t8v", cidr="10.200.24.0/22", next_hop="10.199.4.9")
 

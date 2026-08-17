@@ -1,0 +1,187 @@
+"""A VPC created on B3 gets both halves, and the deny that must ride with them.
+
+Two lines put a VPC on the routed external plane, and each was learned the
+hard way:
+
+  * the attachment is **declared**. `enableExternal: true` alone produced no
+    external port at all on a fresh VPC — measured. An older VPC that did have
+    one had it left from a previous life, which is exactly what made the flag
+    look sufficient.
+  * the default route into the external subnet is what puts the VPC *on* B3.
+    The announcement generator reads that same fact, so the datapath and the
+    announcement cannot drift: there is only one of them.
+
+And the rule that has to ship in the same change: with the prefix routed, a
+node reaches a tenant pod directly (measured — a plain curl from a node
+returned 200). Before B3 "the management network cannot open connections into
+a tenant" was true by accident; a VPC that gets the route without the rule is
+reachable from every node for as long as the gap lasts.
+"""
+
+import pytest
+
+from app.api.v1.subnet_acls import MGMT_DENY_PRIORITY, build_mgmt_deny_acls
+
+
+class TestTheManagementDeny:
+    def test_it_blocks_connections_coming_at_the_tenant(self) -> None:
+        acls = build_mgmt_deny_acls("10.198.160.0/20")
+
+        assert len(acls) == 1
+        acl = acls[0]
+        assert acl.action == "drop"
+        assert acl.direction == "to-lport"
+        assert acl.match == "ip4.src == 10.198.160.0/20"
+
+    def test_it_does_not_touch_what_the_tenant_starts(self) -> None:
+        """Dropping from-lport toward mgmt would be the easiest way to break
+        the control-plane path, which is reached through the same egress."""
+        assert all(a.direction != "from-lport" for a in build_mgmt_deny_acls("10.0.0.0/8"))
+
+    def test_it_outranks_the_isolation_band(self) -> None:
+        """Not an exception anybody carves out of isolation — it sits above."""
+        from app.api.v1.subnet_acls import ISOLATION_PRIORITY_OWN
+
+        assert MGMT_DENY_PRIORITY > ISOLATION_PRIORITY_OWN
+
+    def test_without_a_known_mgmt_network_it_writes_nothing(self) -> None:
+        """A drop scoped to nothing is either useless or catastrophic."""
+        assert build_mgmt_deny_acls("") == []
+
+
+class TestB3IsOnlyOnWhenBothHalvesAreConfigured:
+    def test_a_peer_without_a_gateway_is_not_enough(self, monkeypatch) -> None:
+        """They are different addresses of the same box: one is where BGP is
+        spoken, the other is where packets go. A VPC pointed at the BGP
+        address would default-route into a network its leg cannot reach."""
+        from app.core.b3_announce import b3_enabled
+
+        monkeypatch.setenv("B3_BGP_PEER", "10.198.175.254")
+        monkeypatch.delenv("B3_VPC_GATEWAY", raising=False)
+
+        assert b3_enabled() is False
+
+    def test_a_gateway_without_a_peer_is_not_enough(self, monkeypatch) -> None:
+        """Routed out and never announced is the "attached but not announced"
+        state — traffic leaves and nothing comes back."""
+        from app.core.b3_announce import b3_enabled
+
+        monkeypatch.delenv("B3_BGP_PEER", raising=False)
+        monkeypatch.setenv("B3_VPC_GATEWAY", "10.199.4.254")
+
+        assert b3_enabled() is False
+
+    def test_both_together(self, monkeypatch) -> None:
+        from app.core.b3_announce import b3_enabled
+
+        monkeypatch.setenv("B3_BGP_PEER", "10.198.175.254")
+        monkeypatch.setenv("B3_VPC_GATEWAY", "10.199.4.254")
+
+        assert b3_enabled() is True
+
+
+class TestTheGeneratorAgreesWithWhatCreationWrites:
+    """The two must describe the same VPC or B3 is half-applied in silence."""
+
+    @pytest.mark.asyncio
+    async def test_a_vpc_created_on_b3_is_the_one_the_generator_announces(
+        self, monkeypatch,
+    ) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.core.b3_announce import collect_announcements
+
+        monkeypatch.setenv("B3_EXTERNAL_SUBNET", "external")
+
+        # Exactly what creation writes: an attachment and a default route into
+        # the external subnet.
+        created_vpc = {
+            "metadata": {"name": "newvpc"},
+            "spec": {
+                "extraExternalSubnets": ["cp-transit", "external"],
+                "staticRoutes": [
+                    {"cidr": "0.0.0.0/0", "nextHopIP": "10.199.4.254",
+                     "policy": "policyDst"},
+                ],
+            },
+        }
+
+        async def list_obj(**kw):
+            if kw["plural"] == "vpcs":
+                return {"items": [created_vpc]}
+            if kw["plural"] == "ovn-eips":
+                return {"items": [{
+                    "metadata": {"name": "newvpc-external"},
+                    "spec": {"type": "lrp", "externalSubnet": "external"},
+                    "status": {"v4Ip": "10.199.4.11"},
+                }]}
+            return {"items": [
+                {"metadata": {"name": "external"},
+                 "spec": {"vpc": "ovn-cluster", "cidrBlock": "10.199.4.0/22"}},
+                {"metadata": {"name": "newvpc-default"},
+                 "spec": {"vpc": "newvpc", "cidrBlock": "10.200.28.0/22"}},
+            ]}
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=list_obj)
+
+        announced = await collect_announcements(k8s)
+
+        assert [(a.vpc, a.cidr, a.next_hop) for a in announced] == [
+            ("newvpc", "10.200.28.0/22", "10.199.4.11"),
+        ]
+
+
+class TestTheBaselineSurvivesTheOtherAuthor:
+    """`reconcile_isolation_acls` replaces `spec.acls` wholesale.
+
+    Measured: the management deny was written at create time, appeared in the
+    created object, and was gone from the cluster within the minute — stripped
+    by the reconciler, which rebuilds the list from the isolation rules alone.
+    A rule present in the code, in its tests and in the API response, and
+    absent where it matters. Both authors of that list carry the baseline now.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_reconciler_rewrites_it_back_in(self, monkeypatch) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.api.v1 import vpcs
+
+        monkeypatch.setenv("B3_BGP_PEER", "10.198.175.254")
+        monkeypatch.setenv("B3_VPC_GATEWAY", "10.199.4.254")
+        monkeypatch.setattr(vpcs, "_mgmt_cidr", AsyncMock(return_value="10.198.160.0/24"))
+
+        patched: list[dict] = []
+
+        async def list_obj(**kw):
+            return {"items": [
+                {"metadata": {"name": "a-default",
+                              "labels": {"kubevirt-ui.io/managed": "true"}},
+                 "spec": {"vpc": "a", "cidrBlock": "10.200.0.0/22",
+                          "acls": [{"action": "drop", "direction": "from-lport",
+                                    "match": "ip4.dst == 10.200.4.0/22",
+                                    "priority": 3000}]}},
+                {"metadata": {"name": "b-default",
+                              "labels": {"kubevirt-ui.io/managed": "true"}},
+                 "spec": {"vpc": "b", "cidrBlock": "10.200.4.0/22", "acls": []}},
+            ]}
+
+        async def patch_obj(**kw):
+            patched.append(kw)
+            return {}
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=list_obj)
+        k8s.custom_api.patch_cluster_custom_object = AsyncMock(side_effect=patch_obj)
+
+        await vpcs.reconcile_isolation_acls(k8s)
+
+        assert patched, "the reconciler rewrote nothing at all"
+        written = [
+            a for call in patched for a in call["body"]["spec"]["acls"]
+            if a["match"] == "ip4.src == 10.198.160.0/24"
+        ]
+        assert written, "the management deny did not survive the rewrite"
+        assert all(a["direction"] == "to-lport" and a["action"] == "drop"
+                   for a in written)

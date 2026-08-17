@@ -194,6 +194,40 @@ def build_isolation_acls(
     return acls
 
 
+# Above the isolation band: this one is not an exception anybody carves out.
+MGMT_DENY_PRIORITY = 3300
+
+
+def build_mgmt_deny_acls(mgmt_cidr: str) -> list[SubnetAcl]:
+    """Keep the management network from opening connections into a tenant.
+
+    Before B3 this cost nothing to state, because it was already true by
+    accident: nothing routed from the node network into a tenant VPC, so a
+    kubelet probe into a pod on a custom VPC simply never worked.
+
+    B3 ends that accident. The tenant's prefix is announced and the border
+    routes to it, so a node reaches a tenant pod directly — measured, a plain
+    `curl` from a node to a pod returned 200. NAT used to do this work
+    implicitly; with real addresses in both directions the only thing left
+    holding the boundary is this rule.
+
+    One direction only, and deliberately: `to-lport` drops connections coming
+    *at* the tenant. Traffic the tenant itself starts toward the management
+    network is a different question and is not answered here — dropping the
+    replies to its own flows would be the easiest way to break the control
+    plane path, which lives on a different network but is reached through the
+    same egress.
+    """
+    if not mgmt_cidr:
+        return []
+    return [
+        SubnetAcl(
+            action="drop", direction="to-lport",
+            match=f"ip4.src == {mgmt_cidr}", priority=MGMT_DENY_PRIORITY,
+        ),
+    ]
+
+
 def _get_preset_templates(subnet_cidr: str = "") -> list[AclPresetTemplate]:
     """Return static ACL preset templates."""
     templates = [

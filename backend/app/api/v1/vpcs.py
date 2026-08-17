@@ -16,12 +16,15 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client import ApiException
 
+from app.core.b3_announce import b3_enabled, external_subnet, vpc_gateway
+from app.core.tenant_transit import transit_subnet_name
 from app.api.v1.subnet_acls import (
     ISOLATION_PRIORITY_DROP,
     ISOLATION_PRIORITY_OWN,
     SubnetAcl,
     _acls_to_spec,
     build_isolation_acls,
+    build_mgmt_deny_acls,
 )
 from app.api.v1.tenants_common import (
     _ensure_cluster_config,
@@ -126,6 +129,29 @@ def _parse_vpc(item: dict[str, Any]) -> VpcResponse:
         ready=ready,
         conditions=conditions,
     )
+
+
+async def _mgmt_cidr(k8s) -> str:
+    """The node/management network.
+
+    Two traps here, both hit on the way in:
+
+    * nothing on the VPC path populates the cluster-config cache, so it has to
+      be loaded first — otherwise the deny is simply not written;
+    * it must be read through the accessor, not with
+      `from ... import _cluster_config`. That binds the module's value **at
+      import time** — `None` — and no later assignment inside that module ever
+      reaches this name. The rule then exists in the code, passes its tests,
+      and is absent from the cluster, which is the worst of the three.
+    """
+    from app.api.v1.tenants_common import _ensure_cluster_config, _mgmt_cidr_drop
+
+    try:
+        await _ensure_cluster_config(k8s)
+        return _mgmt_cidr_drop() or ""
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not block create
+        logger.warning("Could not load cluster config for the mgmt deny: %s", exc)
+        return ""
 
 
 def _has_isolation_acls(spec: dict[str, Any]) -> bool:
@@ -1008,7 +1034,7 @@ async def _tenant_vpc_cidrs(k8s_client: Any, exclude: str | None = None) -> list
     return out
 
 
-async def reconcile_isolation_acls(k8s_client: Any) -> int:
+async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
     """Re-scope every isolated VPC's drop rules to the current set of peers.
 
     A VPC created later is a prefix the older ones have never heard of, and
@@ -1016,6 +1042,7 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:
     tenant is reachable from every tenant that predates it.
     """
     updated = 0
+    mgmt_cidr = await _mgmt_cidr(k8s_client) if b3_enabled() else ""
     try:
         subnets = await k8s_client.custom_api.list_cluster_custom_object(
             group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
@@ -1058,12 +1085,25 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:
             shared_cidrs=sorted(set(shared)),
             peer_cidrs=[p for p in peers if p],
         )
+        # This function replaces `spec.acls` wholesale, so anything it does not
+        # know about is deleted by it. The management deny is written at create
+        # time by a different author, and was silently stripped here within the
+        # minute — a rule present in the code, in the tests and in the created
+        # object, and gone from the cluster. Both authors carry the baseline.
+        acls = [*acls, *build_mgmt_deny_acls(mgmt_cidr)] if acls else acls
         if not acls:
             # Nothing left to be isolated from. Leaving the old literal drops
             # in place is not harmless: the allocator hands those very CIDRs
             # to the next VPC, so the new tenant would be born unreachable
             # from this one for a reason nobody could see in its own spec.
-            body = [a for a in existing if a.get("action") != "drop"]
+            # Keep the management deny: it is a drop, but not one of the
+            # peer drops this branch exists to retire.
+            keep = {(a.direction, a.match) for a in build_mgmt_deny_acls(mgmt_cidr)}
+            body = [
+                a for a in existing
+                if a.get("action") != "drop"
+                or (a.get("direction"), a.get("match")) in keep
+            ]
             if body == existing:
                 continue
             await k8s_client.custom_api.patch_cluster_custom_object(
@@ -1173,6 +1213,17 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
                 "— creating without isolation ACLs."
             )
 
+    # Baseline, on every VPC and not only the isolated ones: with B3 the
+    # tenant's prefix is routed from the node network, so "the management
+    # network cannot open connections into a tenant" stops being true by
+    # accident and has to be written down. Shipped in the same change as the
+    # B3 attachment above on purpose — a VPC that gets the route without the
+    # rule is reachable from every node for as long as the gap lasts.
+    if b3_enabled():
+        isolation_acls = [
+            *isolation_acls, *build_mgmt_deny_acls(await _mgmt_cidr(k8s)),
+        ]
+
     labels: dict[str, str] = {"kubevirt-ui.io/managed": "true"}
     if data.tenant:
         labels["kubevirt-ui.io/tenant"] = data.tenant
@@ -1202,6 +1253,40 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             {"cidr": r.cidr, "nextHopIP": r.next_hop_ip, "policy": r.policy}
             for r in data.static_routes
         ]
+
+    # B3: the VPC routes out through its own leg on the external VLAN, with no
+    # SNAT there and no gateway pods in the path. Two lines, and both are
+    # required:
+    #
+    #   * **both** `enableExternal` and the named attachment are required, and
+    #     each alone does nothing. A fresh VPC with the flag and no `external`
+    #     in the array had no external port; a VPC with the array and no flag
+    #     had no ports at all — both measured, a day apart. The flag is the
+    #     master switch that makes kube-ovn process the array; the array says
+    #     which subnets. `attach_vpc_to_transit` sets the flag too, which is
+    #     why an existing tenant VPC looked like the array alone sufficed.
+    #   * the default route is what puts the VPC *on* B3. The announcement
+    #     generator reads exactly this — a VPC is announced when its default
+    #     route leads into the external subnet — so the datapath and the
+    #     announcement cannot drift apart: they are the same fact.
+    if b3_enabled():
+        vpc_spec["enableExternal"] = True
+        attachments = list(vpc_spec.get("extraExternalSubnets") or [])
+        transit = transit_subnet_name()
+        # The array is replaced wholesale by a merge patch, so it is built in
+        # full here rather than appended to later.
+        for name in (transit, external_subnet()):
+            if name and name not in attachments:
+                attachments.append(name)
+        vpc_spec["extraExternalSubnets"] = attachments
+        routes = list(vpc_spec.get("staticRoutes") or [])
+        if not any(r.get("cidr") == "0.0.0.0/0" for r in routes):
+            routes.append({
+                "cidr": "0.0.0.0/0",
+                "nextHopIP": vpc_gateway(),
+                "policy": "policyDst",
+            })
+        vpc_spec["staticRoutes"] = routes
 
     vpc_manifest: dict[str, Any] = {
         "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",

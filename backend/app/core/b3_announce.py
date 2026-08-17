@@ -76,6 +76,26 @@ def peer_asn() -> int:
     return int(os.getenv("B3_PEER_ASN", "65000"))
 
 
+def external_subnet() -> str:
+    return os.getenv("B3_EXTERNAL_SUBNET", "external")
+
+
+def vpc_gateway() -> str | None:
+    """The border's address on the external VLAN — the VPCs' default next hop.
+
+    A different address of the same box than `border_peer()`: that one is where
+    BGP is spoken, this one is where packets go. Conflating them was tempting
+    and would have produced a VPC whose default route pointed at a management
+    address the external plane cannot reach.
+    """
+    return os.getenv("B3_VPC_GATEWAY") or None
+
+
+def b3_enabled() -> bool:
+    """B3 needs both halves configured: somewhere to send, someone to tell."""
+    return bool(border_peer() and vpc_gateway())
+
+
 def announce_replicas() -> int:
     """How many nodes carry the announcement.
 
