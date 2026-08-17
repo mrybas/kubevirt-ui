@@ -842,6 +842,31 @@ def _build_kubeadm_config_template_cr(
                         },
                     ],
                     "preKubeadmCommands": pre_commands,
+                    # A worker that fails to join is otherwise a black box: the
+                    # serial console carries only systemd's own output, the
+                    # image ships no SSH key, and the qemu guest agent is not
+                    # connected (`virsh qemu-agent-command` → "Guest agent is
+                    # not responding"). Three lab runs had to infer kubelet
+                    # failures from the outside — by creating a Node by hand,
+                    # by reading `involvedObject.uid` on its events — instead
+                    # of reading the error.
+                    #
+                    # Forwarding journald to the console costs nothing, adds
+                    # nothing to the image, and lands in the same
+                    # `guest-console-log` container we already read.
+                    # Streaming the whole journal to the console does not work:
+                    # a kubelet that cannot find its own Node logs that at
+                    # ~10/s, the console rate-limiter drops lines, and the few
+                    # that matter are the ones lost. Measured on the lab —
+                    # "Attempting to register node" never appeared while
+                    # "dropped/suppressed" did. So dump a filtered slice
+                    # instead, a few times, spaced out.
+                    "postKubeadmCommands": [
+                        "sh -c 'for i in 1 2 3 4; do sleep 60;"
+                        " journalctl -u kubelet --no-pager"
+                        " | grep -iE \"register|unable to|failed to (get|contact)|forbidden|unauthorized\""
+                        " | tail -25 > /dev/ttyS0 2>&1; done' &",
+                    ],
                     "joinConfiguration": {
                         "nodeRegistration": {
                             "kubeletExtraArgs": {
