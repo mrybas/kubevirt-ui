@@ -238,6 +238,30 @@ export function CreateEgressGatewayModal({
   const transitCidrValid = form.transit_cidr.length === 0 || isValidCIDR(form.transit_cidr);
   const cidrOverlap = isValidCIDR(form.gw_vpc_cidr) && isValidCIDR(form.transit_cidr) && cidrsOverlap(form.gw_vpc_cidr, form.transit_cidr);
 
+  // The preflight has to read what the backend reads. Comparing the two typed
+  // CIDRs against each other and nothing else let 10.199.0.0/24 pass while
+  // `cp-transit` was 10.199.0.0/22 — the banner stayed green, the button
+  // stayed enabled, and the 422 arrived *next to* the green banner. A green
+  // banner is a promise that submitting will work, so it is only drawn once
+  // the cluster's own subnets have been checked. Same source as
+  // `suggest-cidrs`, which is why its suggestions never collide.
+  const { data: clusterSubnets, isLoading: subnetsLoading } = useQuery({
+    queryKey: ['subnets'],
+    queryFn: listSubnets,
+  });
+  const collisions = useMemo(() => {
+    const typed = [
+      ['Gateway VPC CIDR', form.gw_vpc_cidr] as const,
+      ['Transit CIDR', form.transit_cidr] as const,
+    ].filter(([, cidr]) => isValidCIDR(cidr));
+    return (clusterSubnets ?? []).flatMap((s) =>
+      typed
+        .filter(([, cidr]) => s.cidr_block && cidrsOverlap(cidr, s.cidr_block))
+        .map(([label]) => `${label} overlaps subnet ${s.name} (${s.cidr_block})`),
+    );
+  }, [clusterSubnets, form.gw_vpc_cidr, form.transit_cidr]);
+  const checkedAgainstCluster = !subnetsLoading && clusterSubnets !== undefined;
+
   const excludeIpCount = (form.exclude_ips ?? []).reduce((sum, e) => sum + countExcludeEntry(e), 0);
   const externalCidr = externalMode === 'existing'
     ? subnets.find((s) => s.name === form.macvlan_subnet)?.cidr
@@ -291,7 +315,11 @@ export function CreateEgressGatewayModal({
     externalValid &&
     isValidCIDR(form.gw_vpc_cidr) &&
     isValidCIDR(form.transit_cidr) &&
-    !cidrOverlap;
+    !cidrOverlap &&
+    // Don't let the form send what the backend will refuse with a 422. The
+    // banner said "can submit" and the button agreed, so the collision was
+    // only ever discovered by submitting it.
+    collisions.length === 0;
 
   return (
     <Modal isOpen onClose={onClose} title="Create Egress Gateway" size="lg">
@@ -355,17 +383,30 @@ export function CreateEgressGatewayModal({
             )}
           </div>
 
-          {/* CIDR overlap check */}
+          {/* CIDR overlap check — against each other *and* the cluster */}
           {isValidCIDR(form.gw_vpc_cidr) && isValidCIDR(form.transit_cidr) && (
-            cidrOverlap ? (
-              <div className="flex items-center gap-2 p-2 bg-red-900/10 border border-red-800/30 rounded-lg">
-                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0" />
-                <p className="text-xs text-red-400">Gateway VPC CIDR and Transit CIDR overlap. They must use separate address ranges.</p>
+            cidrOverlap || collisions.length > 0 ? (
+              <div className="flex items-start gap-2 p-2 bg-red-900/10 border border-red-800/30 rounded-lg">
+                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <div className="text-xs text-red-400 space-y-0.5">
+                  {cidrOverlap && (
+                    <p>Gateway VPC CIDR and Transit CIDR overlap. They must use separate address ranges.</p>
+                  )}
+                  {collisions.map((c) => <p key={c}>{c}</p>)}
+                </div>
               </div>
-            ) : (
+            ) : checkedAgainstCluster ? (
               <div className="flex items-center gap-2 p-2 bg-emerald-900/10 border border-emerald-800/30 rounded-lg">
                 <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                <p className="text-xs text-emerald-400">No CIDR overlaps detected</p>
+                <p className="text-xs text-emerald-400">
+                  No overlap with the transit range or any subnet on this cluster
+                </p>
+              </div>
+            ) : (
+              // Silence beats a green tick we have not earned yet.
+              <div className="flex items-center gap-2 p-2 bg-surface-800/40 border border-surface-700 rounded-lg">
+                <Clock className="w-3.5 h-3.5 text-surface-400 shrink-0" />
+                <p className="text-xs text-surface-400">Checking against the cluster's subnets…</p>
               </div>
             )
           )}
@@ -1074,7 +1115,20 @@ export default function EgressGateways() {
       header: 'Attached VPCs',
       hideOnMobile: true,
       accessor: (gw) => (
-        <span>{gw.attached_vpcs.length} VPC{gw.attached_vpcs.length !== 1 ? 's' : ''}</span>
+        // Against the ceiling, not on its own. One transit address goes per
+        // attached VPC and the transit width is fixed at creation, so this is
+        // a limit that has to be seen coming — not met as a 409.
+        <span>
+          {gw.attached_vpcs.length}
+          {gw.vpc_capacity ? (
+            <span className={clsx(
+              gw.attached_vpcs.length / gw.vpc_capacity > 0.9 ? 'text-amber-400' : 'text-surface-500',
+            )}>
+              {' / '}{gw.vpc_capacity}
+            </span>
+          ) : null}
+          {' '}VPC{gw.attached_vpcs.length !== 1 ? 's' : ''}
+        </span>
       ),
     },
   ];

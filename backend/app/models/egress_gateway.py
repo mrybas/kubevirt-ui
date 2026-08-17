@@ -185,6 +185,11 @@ class EgressGatewayResponse(BaseModel):
     exclude_ips: list[str] = []
     attached_vpcs: list[AttachedVpcInfo] = []
     assigned_ips: list[GatewayPodInfo] = []
+    # How many VPCs this hub can serve at all: one transit address per attached
+    # VPC, so the transit width is the fan-out limit for the gateway's whole
+    # life. Shown next to the count so the ceiling is visible long before the
+    # attach that would hit it.
+    vpc_capacity: int = 0
     # Straight from `VpcEgressGateway.status`. The per-pod list above depends on
     # matching kube-ovn's own pod labels, which we do not control; this does not.
     internal_ips: list[str] = []

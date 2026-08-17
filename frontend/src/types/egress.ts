@@ -37,6 +37,9 @@ export interface EgressGateway {
   external_ips?: string[];
   /** BgpConf this gateway announces through, if any. */
   bgp_conf?: string;
+  /** VPCs this hub can serve at all — one transit address each, fixed at
+   *  creation time. Zero when the transit CIDR is unreadable. */
+  vpc_capacity?: number;
   ready: boolean;
   /** Set when the gateway is up but a tenant's wiring to it is broken. */
   degraded_reason?: string | null;

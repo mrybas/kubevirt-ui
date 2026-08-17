@@ -115,6 +115,23 @@ async def _save_transit_allocator(
         )
 
 
+def transit_capacity(transit_cidr: str) -> int:
+    """How many VPCs this hub can ever serve.
+
+    Every attached VPC takes one address on the transit network for its peering
+    leg, so the transit width *is* the fan-out limit — a /24 hub tops out at 253
+    VPCs and there is nothing to be done about it at attach time. That is a
+    number worth stating up front rather than discovering as a 409 on the day it
+    runs out.
+    """
+    try:
+        network = ipaddress.IPv4Network(transit_cidr, strict=False)
+    except ValueError:
+        return 0
+    # hosts() already drops network and broadcast; .1 is the gateway's own leg.
+    return max(0, network.num_addresses - 2 - 1)
+
+
 def _allocate_transit_ip(transit_cidr: str, used_ips: set[str]) -> str:
     """Allocate next available IP from transit CIDR, skipping network/gateway/broadcast."""
     network = ipaddress.IPv4Network(transit_cidr, strict=False)
@@ -123,7 +140,17 @@ def _allocate_transit_ip(transit_cidr: str, used_ips: set[str]) -> str:
         ip_str = str(host)
         if ip_str not in used_ips and host != network.network_address + 1:
             return ip_str
-    raise HTTPException(status_code=409, detail=f"Transit CIDR {transit_cidr} exhausted")
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"This gateway is full: its transit network {transit_cidr} has "
+            f"{transit_capacity(transit_cidr)} peering slots and every one is "
+            f"taken. A hub cannot be widened in place — the transit subnet's "
+            f"prefix is fixed when the gateway is created. Create a second "
+            f"egress gateway and attach further VPCs to it, or recreate this "
+            f"one with a wider transit range (EGRESS_GW_SUBNET_PREFIX)."
+        ),
+    )
 
 
 def _gateway_transit_ip(transit_cidr: str) -> str:
@@ -353,6 +380,30 @@ def gateway_cidr_pool() -> str:
     return os.getenv("EGRESS_GW_CIDR_POOL") or DEFAULT_GATEWAY_CIDR_POOL
 
 
+# Width of the two subnets a gateway is suggested. The transit one decides the
+# hub's fan-out for its whole life — a /24 is 253 VPCs — and it cannot be
+# widened afterwards, so a deployment that expects more has to say so before
+# the first gateway is created.
+DEFAULT_GATEWAY_SUBNET_PREFIX = 24
+
+
+def gateway_subnet_prefix() -> int:
+    raw = os.getenv("EGRESS_GW_SUBNET_PREFIX")
+    if not raw:
+        return DEFAULT_GATEWAY_SUBNET_PREFIX
+    try:
+        prefix = int(raw)
+    except ValueError:
+        logger.warning("EGRESS_GW_SUBNET_PREFIX=%r is not a number; using /%d",
+                       raw, DEFAULT_GATEWAY_SUBNET_PREFIX)
+        return DEFAULT_GATEWAY_SUBNET_PREFIX
+    if not 8 <= prefix <= 30:
+        logger.warning("EGRESS_GW_SUBNET_PREFIX=/%d is out of range; using /%d",
+                       prefix, DEFAULT_GATEWAY_SUBNET_PREFIX)
+        return DEFAULT_GATEWAY_SUBNET_PREFIX
+    return prefix
+
+
 async def suggest_gateway_cidrs(k8s, pool: str | None = None) -> dict[str, str]:
     """A gateway VPC CIDR and a transit CIDR the cluster is not already using.
 
@@ -372,8 +423,9 @@ async def suggest_gateway_cidrs(k8s, pool: str | None = None) -> dict[str, str]:
     network = ipaddress.ip_network(pool or gateway_cidr_pool(), strict=False)
     existing = await list_subnet_cidrs(k8s)
 
+    width = max(gateway_subnet_prefix(), network.prefixlen)
     free: list[str] = []
-    for candidate in network.subnets(new_prefix=24):
+    for candidate in network.subnets(new_prefix=width):
         cidr = str(candidate)
         if find_cidr_conflicts(cidr, existing):
             continue
@@ -736,6 +788,9 @@ def _parse_gateway(
         exclude_ips=exclude_ips,
         attached_vpcs=attached,
         assigned_ips=assigned_ips or [],
+        vpc_capacity=transit_capacity(
+            annotations.get("kubevirt-ui.io/transit-cidr", "")
+        ),
         bgp_conf=veg_spec.get("bgpConf", "") or "",
         internal_ips=list(veg_status.get("internalIPs") or []),
         external_ips=list(veg_status.get("externalIPs") or []),
