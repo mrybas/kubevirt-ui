@@ -730,7 +730,11 @@ function GatewayDetailModal({
 export default function OvnGateways() {
   const [showCreate, setShowCreate] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
-  const [detailGateway, setDetailGateway] = useState<OvnGateway | null>(null);
+  // A name, not the object. The detail panel deletes DNAT rules and FIPs while
+  // staying open, and a frozen snapshot kept listing them afterwards — the same
+  // defect measured on the egress-gateway panel, where a detached VPC stayed on
+  // screen and the attach form then refused to offer it again.
+  const [detailName, setDetailName] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const { data, isLoading, refetch } = useOvnGateways();
   const deleteGateway = useDeleteOvnGateway();
@@ -746,6 +750,9 @@ export default function OvnGateways() {
   );
 
   const gateways = data?.items ?? [];
+  // Re-resolved every render, so the invalidation each mutation already fires
+  // reaches the open panel too.
+  const detailGateway = gateways.find((gw) => gw.name === detailName) ?? null;
   const filtered = searchQuery
     ? gateways.filter((gw) => gw.name.toLowerCase().includes(searchQuery.toLowerCase()))
     : gateways;
@@ -820,7 +827,7 @@ export default function OvnGateways() {
     {
       label: 'View Details',
       icon: <Eye className="h-4 w-4" />,
-      onClick: () => setDetailGateway(gw),
+      onClick: () => setDetailName(gw.name),
     },
     {
       label: 'Delete',
@@ -851,7 +858,7 @@ export default function OvnGateways() {
         loading={isLoading}
         keyExtractor={(gw) => gw.name}
         actions={getActions}
-        onRowClick={(gw) => setDetailGateway(gw)}
+        onRowClick={(gw) => setDetailName(gw.name)}
         searchable
         searchPlaceholder="Search OVN gateways..."
         onSearch={setSearchQuery}
@@ -906,7 +913,7 @@ export default function OvnGateways() {
       {detailGateway && (
         <GatewayDetailModal
           gateway={detailGateway}
-          onClose={() => setDetailGateway(null)}
+          onClose={() => setDetailName(null)}
         />
       )}
 
