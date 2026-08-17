@@ -1403,6 +1403,25 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                       : <span className="text-surface-500">Unrestricted</span>
                     }
                   </dd>
+                  {/* Chosen two steps earlier and then never shown again, which
+                      is how VPCs ended up in the wrong folder. Editable
+                      afterwards now, but it belongs on the last screen before
+                      the thing is built. */}
+                  <dt className="text-surface-400">Scope:</dt>
+                  <dd className="text-surface-200">
+                    {state.vpcFolder ? (
+                      <>
+                        {state.vpcFolder}
+                        {state.vpcEnvironment
+                          ? ` / ${state.vpcEnvironment}`
+                          : <span className="text-surface-400"> (all environments)</span>}
+                      </>
+                    ) : (
+                      <span className="text-surface-500">
+                        Unscoped — visible to every folder
+                      </span>
+                    )}
+                  </dd>
                 </dl>
               </div>
 

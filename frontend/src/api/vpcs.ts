@@ -30,6 +30,15 @@ export async function createVpc(request: CreateVpcRequest): Promise<Vpc> {
   return apiRequest<Vpc>('/vpcs', { method: 'POST', body: request });
 }
 
+/** Move a VPC to a different folder/environment. Labels only — kube-ovn does
+ *  not read them, so nothing about the dataplane changes. */
+export async function setVpcScope(
+  name: string,
+  request: { folder: string | null; environment: string | null },
+): Promise<Vpc> {
+  return apiRequest<Vpc>(`/vpcs/${name}/scope`, { method: 'PATCH', body: request });
+}
+
 export async function deleteVpc(name: string): Promise<void> {
   await apiRequest<void>(`/vpcs/${name}`, { method: 'DELETE' });
 }

@@ -19,8 +19,9 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes, useVpcDns, useUpdateVpcDns, useRecreateVpcDns, useVpcDnsPolicy, useUpdateVpcDnsPolicy, useRecreateVpcDnsPolicy, useDisableVpcDnsPolicy } from '../hooks/useVpcs';
+import { useVpc, useDeleteVpc, useAddVpcPeering, useRemoveVpcPeering, useVpcRoutes, useUpdateVpcRoutes, useVpcDns, useUpdateVpcDns, useRecreateVpcDns, useVpcDnsPolicy, useUpdateVpcDnsPolicy, useRecreateVpcDnsPolicy, useDisableVpcDnsPolicy, useSetVpcScope } from '../hooks/useVpcs';
 import { useEgressGateways, useDetachVpc } from '../hooks/useEgressGateways';
+import { useFoldersFlat } from '../hooks/useFolders';
 import { ApiError } from '../api/client';
 import { notify } from '../store/notifications';
 import type { VpcRoute, VpcSubnet, UpdateVpcDnsRequest } from '../types/vpc';
@@ -187,6 +188,118 @@ export default function VPCDetail() {
 // OverviewTab
 // ---------------------------------------------------------------------------
 
+/**
+ * Folder / environment, editable.
+ *
+ * These were write-once: chosen in the create wizard, which did not even show
+ * them on its Review step, and after that the only correction was to delete the
+ * VPC and everything in it. The tenant wizard, meanwhile, advises scoping a VPC
+ * to the folder you are creating in — advice whose action did not exist.
+ *
+ * Nothing here touches the dataplane; kube-ovn does not read these labels.
+ */
+function ScopeSection({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data']> }) {
+  const [editing, setEditing] = useState(false);
+  const [folder, setFolder] = useState(vpc.folder ?? '');
+  const [environment, setEnvironment] = useState(vpc.environment ?? '');
+  const { data: foldersData } = useFoldersFlat();
+  const setScope = useSetVpcScope(vpc.name);
+
+  const folders = foldersData?.items ?? [];
+  const environments = folders.find((f) => f.name === folder)?.environments ?? [];
+
+  const save = async () => {
+    await setScope.mutateAsync({
+      folder: folder || null,
+      environment: folder ? environment || null : null,
+    });
+    setEditing(false);
+  };
+
+  if (!editing) {
+    return (
+      <div className="flex items-center justify-between text-sm">
+        <span className="text-surface-400">Scope</span>
+        <div className="flex items-center gap-2">
+          <span className="text-surface-200">
+            {vpc.folder ? (
+              <>
+                {vpc.folder}
+                {vpc.environment ? ` / ${vpc.environment}` : ' (all environments)'}
+              </>
+            ) : (
+              <span className="text-surface-500">Unscoped</span>
+            )}
+          </span>
+          <button
+            onClick={() => {
+              setFolder(vpc.folder ?? '');
+              setEnvironment(vpc.environment ?? '');
+              setEditing(true);
+            }}
+            className="text-xs text-primary-400 hover:text-primary-300 transition-colors"
+          >
+            Change
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <span className="text-sm text-surface-400">Scope</span>
+      <div className="grid grid-cols-2 gap-2">
+        <select
+          value={folder}
+          onChange={(e) => {
+            setFolder(e.target.value);
+            setEnvironment('');
+          }}
+          className="px-2 py-1.5 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 text-sm focus:outline-none focus:border-primary-500"
+        >
+          <option value="">Unscoped</option>
+          {folders.map((f) => (
+            <option key={f.name} value={f.name}>{f.name}</option>
+          ))}
+        </select>
+        <select
+          value={environment}
+          onChange={(e) => setEnvironment(e.target.value)}
+          disabled={!folder}
+          className="px-2 py-1.5 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 text-sm focus:outline-none focus:border-primary-500 disabled:opacity-50"
+        >
+          <option value="">All environments</option>
+          {/* `e.environment` (short: "dev"), never `e.name` (the namespace,
+              "<folder>-<env>"). VPCs are labelled with the short value and the
+              tenant wizard filters on it, so writing the namespace here would
+              scope the VPC to a value nothing ever matches — the same trap the
+              create wizard already carries a warning about. */}
+          {environments.map((env: any) => (
+            <option key={env.environment} value={env.environment}>{env.environment}</option>
+          ))}
+        </select>
+      </div>
+      <p className="text-xs text-surface-500">
+        Decides who sees this VPC and which tenants can be placed in it. Labels
+        only — no traffic is affected.
+      </p>
+      <div className="flex justify-end gap-2">
+        <button onClick={() => setEditing(false)} className="btn-secondary text-xs px-3 py-1">
+          Cancel
+        </button>
+        <button
+          onClick={save}
+          disabled={setScope.isPending}
+          className="px-3 py-1 bg-primary-600 hover:bg-primary-500 disabled:opacity-50 text-white rounded-lg text-xs font-medium transition-colors"
+        >
+          {setScope.isPending ? 'Saving...' : 'Save'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function EgressGatewaySection({ vpcName }: { vpcName: string }) {
   const { data: egressData } = useEgressGateways();
   const navigate = useNavigate();
@@ -267,6 +380,9 @@ function OverviewTab({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data
                 ))}
               </div>
             </div>
+          </div>
+          <div className="border-t border-surface-700 pt-3">
+            <ScopeSection vpc={vpc} />
           </div>
           <div className="border-t border-surface-700 pt-3">
             <EgressGatewaySection vpcName={vpc.name} />

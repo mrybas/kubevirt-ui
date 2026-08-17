@@ -62,6 +62,7 @@ from app.models.vpc import (
     VpcPeeringCreateRequest,
     VpcPeeringInfo,
     VpcResponse,
+    VpcScopeRequest,
     VpcStaticRoute,
     VpcStaticRoutesUpdateRequest,
     VpcSubnetInfo,
@@ -1449,6 +1450,88 @@ async def get_vpc(request: Request, name: str, user: User = Depends(require_auth
     vpc.subnets, vpc.isolated = await _get_vpc_subnets(k8s, name)
     vpc.peerings = await _get_vpc_peerings(k8s, name)
     return vpc
+
+
+@router.patch("/{name}/scope", response_model=VpcResponse)
+async def set_vpc_scope(
+    request: Request, name: str, data: VpcScopeRequest,
+    user: User = Depends(require_admin),
+) -> VpcResponse:
+    """Move a VPC to a different folder/environment.
+
+    Scope was write-once: chosen in the create wizard — which did not show it
+    on the Review step — and after that the only way to correct it was to
+    delete the VPC and everything in it. The tenant wizard meanwhile tells
+    people to "scope a VPC to this folder", which was advice with no
+    corresponding action.
+
+    Nothing here touches the dataplane. `kubevirt-ui.io/folder` and
+    `kubevirt-ui.io/environment` are labels kube-ovn never reads; they decide
+    who sees the VPC and which tenants may be placed in it. The default subnet
+    carries the same pair — the tenant wizard filters on it — so both move
+    together or the VPC becomes invisible to the very filter it was scoped for.
+    """
+    k8s = request.app.state.k8s_client
+
+    try:
+        item = await k8s.custom_api.get_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=404, detail=f"VPC '{name}' not found")
+        raise k8s_error_to_http(e, "VPC operation")
+
+    if data.folder:
+        folders = await load_folders(k8s)  # {folder_name: meta}
+        if data.folder not in folders:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"No folder named {data.folder!r}. Scoping a VPC to a folder "
+                    f"that does not exist hides it from every view."
+                ),
+            )
+
+    # An explicit null clears the label; kubernetes removes a label set to None
+    # under a merge patch, which is exactly the semantics we want here.
+    labels = {
+        "kubevirt-ui.io/folder": data.folder or None,
+        "kubevirt-ui.io/environment": data.environment or None,
+    }
+    patch = {"metadata": {"labels": labels}}
+
+    try:
+        await k8s.custom_api.patch_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
+            name=name, body=patch,
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        raise k8s_error_to_http(e, "VPC operation")
+
+    # The wizard's filter reads the *subnet* labels, so a VPC whose subnets
+    # kept the old scope would move for the VPC list and not for the thing the
+    # scope exists to drive.
+    subnets, _ = await _get_vpc_subnets(k8s, name)
+    for subnet in subnets:
+        try:
+            await k8s.custom_api.patch_cluster_custom_object(
+                group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets",
+                name=subnet.name, body=patch,
+                _content_type="application/merge-patch+json",
+            )
+        except ApiException as e:
+            logger.warning("VPC %r: could not rescope subnet %r: %s", name, subnet.name, e)
+
+    logger.info(
+        "VPC %r rescoped to folder=%r environment=%r by %s",
+        name, data.folder, data.environment, user.username,
+    )
+    # Keyword form on purpose: a direct call must hand the real user across, and
+    # `user=` is what the guard test greps for. FastAPI only resolves
+    # `Depends(require_auth)` for requests it routes.
+    return await get_vpc(request, name, user=user)
 
 
 async def _still_present(k8s_client: Any, plural: str, names: list[str]) -> list[str]:

@@ -120,3 +120,60 @@ async def test_the_missing_leg_is_written_back() -> None:
     remotes = {p["remoteVpc"]: p["localConnectIP"] for p in peerings}
     assert remotes.get(GW_VPC) == "10.255.0.2/24", "the gateway leg was not restored"
     assert "ovn-cluster" in remotes, "self-heal clobbered the unrelated peering"
+
+
+@pytest.mark.asyncio
+async def test_a_repair_that_failed_does_not_read_like_one_that_worked() -> None:
+    """"Restored; re-check in a moment" used to be printed either way.
+
+    The write is the part that can fail — RBAC, a conflict, the VPC vanishing
+    mid-read — and when it did, the message still told the operator that the
+    leg had been restored and to wait. That is the worst possible advice for
+    egress that is not coming back on its own.
+    """
+    from kubernetes_asyncio.client.exceptions import ApiException
+
+    from app.api.v1.egress_gateway import get_egress_gateway
+
+    k8s = _k8s([{"remoteVpc": "ovn-cluster", "localConnectIP": "10.255.1.2/24"}])
+    k8s.custom_api.patch_cluster_custom_object = AsyncMock(
+        side_effect=ApiException(status=403, reason="Forbidden"),
+    )
+
+    out = await get_egress_gateway(request=_request(k8s), name=GW)
+
+    assert out.ready is False
+    assert "could NOT be restored" in out.degraded_reason
+    assert "re-check in a moment" not in (out.degraded_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_a_repair_that_worked_says_what_it_is_waiting_for() -> None:
+    """Still Degraded — the spec is back, but kube-ovn has yet to program it.
+
+    Reporting Ready here would repeat the mistake this whole check exists to
+    catch: treating "the spec looks right" as evidence that traffic flows.
+    """
+    from app.api.v1.egress_gateway import get_egress_gateway
+
+    k8s = _k8s([{"remoteVpc": "ovn-cluster", "localConnectIP": "10.255.1.2/24"}])
+    out = await get_egress_gateway(request=_request(k8s), name=GW)
+
+    assert out.ready is False
+    assert "rewritten" in out.degraded_reason
+    assert "could NOT be restored" not in out.degraded_reason
+
+
+@pytest.mark.asyncio
+async def test_the_next_read_is_clean_once_the_leg_is_back() -> None:
+    """F9: the refresh after a self-heal shows Ready, without another repair."""
+    from app.api.v1.egress_gateway import get_egress_gateway
+
+    k8s = _k8s([{"remoteVpc": "ovn-cluster", "localConnectIP": "10.255.1.2/24"}])
+    await get_egress_gateway(request=_request(k8s), name=GW)
+
+    again = await get_egress_gateway(request=_request(k8s), name=GW)
+
+    assert again.ready is True
+    assert again.degraded_reason is None
+    assert again.attached_vpcs[0].peering_ok is True

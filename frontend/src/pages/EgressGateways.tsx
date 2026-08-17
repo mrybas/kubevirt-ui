@@ -583,7 +583,7 @@ export function CreateEgressGatewayModal({
             </select>
             <p className="text-xs text-surface-500 mt-1">
               {(bgpConfs?.items?.length ?? 0) === 0
-                ? 'No BgpConf exists yet — create one under Network → BGP Peering first.'
+                ? 'No BgpConf exists yet — create one under Network → BGP Peering → Gateway BGP Config first.'
                 : "The gateway's FRR peers with this neighbour and announces the CIDRs of every attached VPC."}
             </p>
           </div>

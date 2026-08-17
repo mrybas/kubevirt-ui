@@ -526,6 +526,58 @@ async def adopt_gateway_pins(k8s, gateway_name: str, veg: dict[str, Any] | None)
     return True
 
 
+async def realign_gateway_default_route(
+    k8s, gateway_name: str, veg: dict[str, Any] | None,
+) -> bool:
+    """Repoint the gateway VPC's default route if it names a dead pod address.
+
+    A gateway that ran unpinned through a pod replacement leaves
+    `0.0.0.0/0 → 10.199.16.3` in the gateway VPC's spec while the pods now hold
+    .5 and .7. Measured on the lab, this does **not** break traffic: kube-ovn
+    keeps its own reroute policy at priority 29100 pointing at the live pods,
+    and policy runs after routing in the OVN pipeline. So this is a spec that
+    lies rather than an outage — which is why it is fixed on read and not
+    reported as Degraded.
+
+    It still has to be fixed. The next person to read the VPC sees a next hop
+    that does not exist and has to work out, from the pipeline order, whether
+    that is the fault they are looking for. It was not, twice.
+
+    Returns True when the route was rewritten.
+    """
+    live = [
+        str(ip).split("/")[0]
+        for ip in (
+            ((veg or {}).get("spec", {}) or {}).get("internalIPs")
+            or ((veg or {}).get("status", {}) or {}).get("internalIPs")
+            or []
+        )
+    ]
+    if not live:
+        return False
+
+    gw_vpc_name = f"egw-{gateway_name}"
+    vpc = await _get_vpc(k8s, gw_vpc_name)
+    if vpc is None:
+        return False
+
+    routes = ((vpc.get("spec", {}) or {}).get("staticRoutes") or [])
+    stale = [
+        r for r in routes
+        if r.get("cidr") == "0.0.0.0/0" and r.get("nextHopIP") not in live
+    ]
+    if not stale:
+        return False
+
+    logger.warning(
+        "Gateway VPC %r: default route points at %s, which is not a live gateway "
+        "pod address (%s) — repointing",
+        gw_vpc_name, ", ".join(r.get("nextHopIP", "?") for r in stale), ", ".join(live),
+    )
+    await _add_static_route(k8s, gw_vpc_name, "0.0.0.0/0", live[0])
+    return True
+
+
 def _secondary_ip(annotations: dict[str, str]) -> str:
     """The address on the pod's *external* attachment.
 
@@ -820,7 +872,8 @@ async def _verify_and_heal_peerings(
     than Ready). Repair is safe — `ensure_vpc_peering` upserts under
     compare-and-set and leaves unrelated peerings alone.
     """
-    broken: list[str] = []
+    repaired: list[str] = []
+    unrepaired: list[str] = []
 
     for vpc in attached:
         item = await _get_vpc(k8s, vpc.vpc_name)
@@ -831,27 +884,58 @@ async def _verify_and_heal_peerings(
             continue
 
         vpc.peering_ok = False
-        broken.append(vpc.vpc_name)
         logger.warning(
             "Tenant VPC %r lost its peering to gateway VPC %r; restoring it",
             vpc.vpc_name, gw_vpc_name,
         )
-        if vpc.transit_ip and transit_cidr:
-            prefix = _transit_prefix_len(transit_cidr)
-            try:
-                await _ensure_vpc_peering(
-                    k8s, vpc.vpc_name, gw_vpc_name, f"{vpc.transit_ip}/{prefix}",
-                )
-            except ApiException as e:
-                logger.error("Could not restore peering for %r: %s", vpc.vpc_name, e)
+        if not (vpc.transit_ip and transit_cidr):
+            unrepaired.append(vpc.vpc_name)
+            continue
 
-    if not broken:
+        prefix = _transit_prefix_len(transit_cidr)
+        try:
+            await _ensure_vpc_peering(
+                k8s, vpc.vpc_name, gw_vpc_name, f"{vpc.transit_ip}/{prefix}",
+            )
+        except ApiException as e:
+            logger.error("Could not restore peering for %r: %s", vpc.vpc_name, e)
+            unrepaired.append(vpc.vpc_name)
+            continue
+
+        # Confirm the spec came back before claiming the write worked. This is
+        # not a claim that traffic flows: kube-ovn still has to program the
+        # peering, and "the spec looks right" is precisely the evidence that let
+        # a severed data path read as healthy. So a repaired leg still reports
+        # Degraded on this read and clears on the next one, once the invariant
+        # holds without us having to fix it.
+        after = await _get_vpc(k8s, vpc.vpc_name)
+        confirmed = any(
+            p.get("remoteVpc") == gw_vpc_name
+            for p in ((after or {}).get("spec", {}) or {}).get("vpcPeerings") or []
+        )
+        (repaired if confirmed else unrepaired).append(vpc.vpc_name)
+
+    if not (repaired or unrepaired):
         return None
-    return (
-        "tenant side peering missing for "
-        + ", ".join(broken)
-        + " (restored; re-check in a moment)"
-    )
+
+    # The old wording said "(restored; re-check in a moment)" for every case,
+    # including the ones where the write had just failed — so a repair that
+    # never happened read exactly like one that did, and the advice to wait was
+    # the worst possible thing to tell someone whose egress was not coming back.
+    parts = []
+    if repaired:
+        parts.append(
+            "tenant side peering was missing for "
+            + ", ".join(repaired)
+            + " (rewritten; clears once kube-ovn programs it)"
+        )
+    if unrepaired:
+        parts.append(
+            "tenant side peering missing for "
+            + ", ".join(unrepaired)
+            + " and could NOT be restored — this VPC's egress stays down until it is"
+        )
+    return "; ".join(parts)
 
 
 async def _get_vpc(k8s, name: str) -> dict[str, Any] | None:
@@ -908,6 +992,7 @@ async def list_egress_gateways(request: Request, user: User = Depends(require_au
         veg = await _get_vpc_egress_gateway(k8s, gw_name)
         if await adopt_gateway_pins(k8s, gw_name, veg):
             veg = await _get_vpc_egress_gateway(k8s, gw_name)
+        await realign_gateway_default_route(k8s, gw_name, veg)
         attached = await _list_attached_vpcs(k8s, gw_name)
         pod_ips = await _get_gateway_pod_ips(k8s, gw_name)
         annotations = vpc.get("metadata", {}).get("annotations", {})
@@ -938,6 +1023,7 @@ async def get_egress_gateway(request: Request, name: str, user: User = Depends(r
     veg = await _get_vpc_egress_gateway(k8s, name)
     if await adopt_gateway_pins(k8s, name, veg):
         veg = await _get_vpc_egress_gateway(k8s, name)
+    await realign_gateway_default_route(k8s, name, veg)
     attached = await _list_attached_vpcs(k8s, name)
     pod_ips = await _get_gateway_pod_ips(k8s, name)
     annotations = vpc.get("metadata", {}).get("annotations", {})

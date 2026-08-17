@@ -122,6 +122,11 @@ export function useBgpConfs() {
     queryKey: ['bgp-confs'],
     queryFn: listBgpConfs,
     staleTime: 60000,
+    // The create-gateway form reads this list, and the usual path is "create a
+    // BgpConf, then immediately create the gateway that uses it". Inside the
+    // stale window that form opened without the config that had just been
+    // made, so the only choice it offered was "No BGP".
+    refetchOnMount: 'always',
   });
 }
 

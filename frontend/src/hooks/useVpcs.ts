@@ -8,6 +8,7 @@ import {
   getVpc,
   createVpc,
   deleteVpc,
+  setVpcScope,
   addVpcPeering,
   removeVpcPeering,
   getVpcRoutes,
@@ -22,6 +23,7 @@ import {
 } from '../api/vpcs';
 import type { CreateVpcRequest, AddVpcPeeringRequest, UpdateVpcRoutesRequest, UpdateVpcDnsRequest } from '../types/vpc';
 import { ApiError } from '../api/client';
+import { notify } from '../store/notifications';
 
 export function useVpcs(params?: { folder?: string; environment?: string }) {
   return useQuery({
@@ -53,6 +55,19 @@ export function useCreateVpc() {
   return useMutation({
     mutationFn: (request: CreateVpcRequest) => createVpc(request),
     onSuccess: () => invalidateVpcAndSubnets(queryClient),
+  });
+}
+
+export function useSetVpcScope(vpcName: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (request: { folder: string | null; environment: string | null }) =>
+      setVpcScope(vpcName, request),
+    onSuccess: () => {
+      invalidateVpcAndSubnets(queryClient);
+      notify.success('VPC scope updated');
+    },
+    onError: (err: Error) => notify.error(err.message || 'Failed to update VPC scope'),
   });
 }
 

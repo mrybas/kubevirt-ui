@@ -404,3 +404,36 @@ class VMSecurityGroupsResponse(BaseModel):
 class VMSecurityGroupAssignRequest(BaseModel):
     """Request to assign a SecurityGroup to a VM."""
     security_group: str = Field(..., description="SecurityGroup name to assign")
+
+
+class VpcScopeRequest(BaseModel):
+    """Move a VPC to a different folder/environment.
+
+    These are labels only: kube-ovn never reads them, so nothing about the
+    dataplane changes. They decide which folder's operators see the VPC and
+    which tenants may be placed in it, which is why getting the scope wrong at
+    creation used to mean deleting the VPC — with everything in it — and
+    building it again.
+
+    An explicit null clears the field. `environment: null` widens the VPC to
+    the whole folder; clearing `folder` unscopes it entirely.
+    """
+
+    folder: Optional[str] = Field(
+        None, description="Owning folder, or null to unscope the VPC.",
+    )
+    environment: Optional[str] = Field(
+        None,
+        description=(
+            "Environment under that folder, or null to make the VPC "
+            "folder-wide (eligible for every env under `folder`)."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _env_requires_folder(self) -> "VpcScopeRequest":
+        if self.environment and not self.folder:
+            raise ValueError(
+                "`environment` requires `folder` (an env is always scoped under a folder)"
+            )
+        return self
