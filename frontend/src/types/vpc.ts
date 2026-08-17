@@ -53,6 +53,8 @@ export interface Vpc {
    * every CLI/GitOps-made VPC from the console; it is a badge now.
    */
   origin?: 'ui' | 'system' | 'external';
+  /** Declared role, if any: `infrastructure`, or `egress-gateway`. */
+  role?: string | null;
 }
 
 export interface VpcListResponse {
@@ -66,6 +68,9 @@ export interface CreateVpcRequest {
   enable_nat_gateway?: boolean;
   /** Write tenant-isolation ACLs on the default subnet. Defaults to true server-side. */
   isolated?: boolean;
+  /** Declared role. `infrastructure` — served to the others: auto-peered with
+   *  every tenant VPC and never counted as a peer to block. */
+  role?: string;
   /** Prefixes this VPC may still reach while isolated (shared services). */
   shared_cidrs?: string[];
   namespaces?: string[];

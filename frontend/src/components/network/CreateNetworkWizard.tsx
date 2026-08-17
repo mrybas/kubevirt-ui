@@ -62,6 +62,7 @@ interface WizardState {
   vpcSubnetCidr: string;
   vpcEnablePeering: boolean;
   vpcIsolated: boolean;
+  vpcInfrastructure: boolean;
   /** Comma-separated CIDRs, parsed on submit. */
   vpcSharedCidrs: string;
   vpcNamespaces: string[];
@@ -97,6 +98,7 @@ const initialState: WizardState = {
   // so an un-isolated VPC is visible to every other tenant from the moment it
   // exists.
   vpcIsolated: true,
+  vpcInfrastructure: false,
   vpcSharedCidrs: '',
   vpcNamespaces: [],
   vpcFolder: '',
@@ -289,7 +291,7 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
     {
       id: 'vpc' as const,
       title: 'VPC Network',
-      description: 'Isolated virtual private cloud; egress via the shared gateway',
+      description: 'Isolated virtual private cloud with its own routed egress',
       icon: Building2,
       color: 'amber',
     },
@@ -417,6 +419,7 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
         name: state.vpcName,
         subnet_cidr: state.vpcSubnetCidr || undefined,
         isolated: state.vpcIsolated,
+        ...(state.vpcInfrastructure ? { role: 'infrastructure' } : {}),
         ...(state.vpcSharedCidrs.trim()
           ? {
               shared_cidrs: state.vpcSharedCidrs
@@ -1231,6 +1234,40 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                   plane, every resource green. The toggle used to offer
                   exactly that. Backend keeps the field behind
                   VPC_NAT_GATEWAY_ENABLED for topologies where it is right. */}
+
+              {/* Infrastructure role — declared, never inferred. The peer
+                  census used to read the role off the shape of the object,
+                  which handed every tenant a drop on the address it egresses
+                  through. */}
+              <div className="p-4 bg-surface-800/50 rounded-lg border border-surface-700">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-surface-200">
+                      Infrastructure VPC
+                      <span className="ml-2 text-xs text-amber-400/80">admin</span>
+                    </p>
+                    <p className="text-xs text-surface-400 mt-1">
+                      A VPC that serves the others — a VPN concentrator, a shared
+                      service. Every tenant VPC is peered with it automatically,
+                      and no tenant is given a rule blocking it. Leave off for an
+                      ordinary tenant network.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setState((s) => ({ ...s, vpcInfrastructure: !s.vpcInfrastructure }))}
+                    className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ${
+                      state.vpcInfrastructure ? 'bg-amber-500' : 'bg-surface-600'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                        state.vpcInfrastructure ? 'translate-x-6' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
 
               {/* Tenant isolation */}
               <div className="p-4 bg-surface-800/50 rounded-lg border border-surface-700 space-y-3">

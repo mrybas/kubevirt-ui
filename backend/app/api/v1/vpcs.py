@@ -233,6 +233,17 @@ ISOLATION_OPT_OUT_ANNOTATION = "kubevirt-ui.io/isolation"
 ISOLATION_OPT_OUT_VALUE = "disabled"
 
 
+def _within(cidr: str, supernet: str) -> bool:
+    """Is this prefix part of the range tenant VPCs are carved from?"""
+    if not cidr or not supernet:
+        return False
+    try:
+        return ipaddress.ip_network(cidr, strict=False).subnet_of(
+            ipaddress.ip_network(supernet, strict=False))
+    except ValueError:
+        return False
+
+
 def _isolation_opted_out(item: dict[str, Any]) -> bool:
     """Whether someone deliberately asked for this subnet to stay open."""
     annotations = (item.get("metadata", {}) or {}).get("annotations") or {}
@@ -1243,6 +1254,37 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
     ]
     supernet = get_settings().tenant_supernet
 
+    # A peering is a declared intent to reach the other VPC. It writes the
+    # route and, until now, nothing lifted the isolation drop — so the product
+    # built a peering on both routers, showed it Active, and dropped every
+    # packet. Measured: b3v <-> b3w peered from the UI, both sides written,
+    # both directions still exit=28.
+    #
+    # Read from the peerings rather than remembered in an ACL, so the two
+    # cannot drift: the drop follows the peering list, including when someone
+    # removes a peering.
+    peered: dict[str, set[str]] = {}
+    try:
+        vpc_list = await k8s_client.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
+        )
+        cidrs_of: dict[str, list[str]] = {}
+        for sub in tenant_subnets:
+            sp = sub.get("spec", {}) or {}
+            if sp.get("cidrBlock"):
+                cidrs_of.setdefault(sp.get("vpc"), []).append(sp["cidrBlock"])
+        for v in vpc_list.get("items", []):
+            name_ = (v.get("metadata") or {}).get("name")
+            remotes = [
+                p.get("remoteVpc")
+                for p in (v.get("spec", {}) or {}).get("vpcPeerings", []) or []
+            ]
+            peered[name_] = {
+                c for r in remotes for c in cidrs_of.get(r, [])
+            }
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Isolation reconcile: could not read peerings: %s", e)
+
     for item in tenant_subnets:
         spec = item.get("spec", {}) or {}
         name = item["metadata"]["name"]
@@ -1270,11 +1312,23 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
             continue
         if _isolation_opted_out(item):
             continue                      # opened on purpose, and it says so
+        # Legacy allows are re-read from the object, which means this list is
+        # fed by its own previous output — a stale entry never ages out. It
+        # showed itself the moment a peered VPC was deleted: peerings and
+        # routes were cleaned up, and 18 allows for its prefix stayed behind.
+        #
+        # So inside the tenant supernet the peering list is the only source;
+        # an allow there has to be justified by a live peering. Outside it —
+        # corporate git, a shared service on another network — there is no
+        # peering to consult, and the existing rule is all we have.
         shared = [
-            a["match"].split("== ")[-1] for a in existing
-            if a.get("action") == "allow-related"
-            and a.get("priority", 0) < ISOLATION_PRIORITY_OWN
-            and "== " in a.get("match", "")
+            m for m in (
+                a["match"].split("== ")[-1] for a in existing
+                if a.get("action") == "allow-related"
+                and a.get("priority", 0) < ISOLATION_PRIORITY_OWN
+                and "== " in a.get("match", "")
+            )
+            if not _within(m, supernet)
         ]
         peers = [
             (s.get("spec") or {}).get("cidrBlock") for s in tenant_subnets
@@ -1285,7 +1339,7 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
         acls = build_isolation_acls(
             subnet_cidr=spec.get("cidrBlock", ""),
             tenant_supernet=supernet,
-            shared_cidrs=sorted(set(shared)),
+            shared_cidrs=sorted(set(shared) | peered.get(spec.get("vpc"), set())),
             peer_cidrs=[p for p in peers if p],
         )
         # This function replaces `spec.acls` wholesale, so anything it does not
@@ -1718,11 +1772,14 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     # Isolation is about who may reach *this* VPC; the other side's setting
     # has no say in it.
     try:
-        n = await reconcile_isolation_acls(k8s)
-        logger.info(f"Isolation ACLs re-scoped on {n} VPC subnet(s)")
+        # Peerings first: the isolation pass derives its allow rules from
+        # them, so running it first would leave a new infra leg routed and
+        # dropped until the pass after next.
         p = await reconcile_infra_peerings(k8s)
         if p:
             logger.info(f"Infra peerings created: {p}")
+        n = await reconcile_isolation_acls(k8s)
+        logger.info(f"Isolation ACLs re-scoped on {n} VPC subnet(s)")
     except Exception as e:
         logger.warning(f"Isolation reconcile after creating {data.name!r} failed: {e}")
 
@@ -2117,7 +2174,16 @@ async def create_vpc_peering(
     anyway and the peering looks broken for no visible reason.
     """
     k8s = request.app.state.k8s_client
-    return await _create_peering_pair(k8s, name, data.remote_vpc, data.link_cidr)
+    result = await _create_peering_pair(k8s, name, data.remote_vpc, data.link_cidr)
+    # The routes alone are not the peering. Isolation still drops the peer's
+    # prefix, so without this the pair is written on both routers, shows
+    # Active, and carries nothing — measured, both directions timed out.
+    try:
+        await reconcile_isolation_acls(k8s)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Isolation reconcile after peering %s <-> %s failed: %s",
+                       name, data.remote_vpc, e)
+    return result
 
 
 async def _create_peering_pair(
@@ -2331,6 +2397,15 @@ async def delete_vpc_peering(request: Request, name: str, remote_vpc: str, user:
             removed.append(local)
         except ApiException as e:
             raise k8s_error_to_http(e, f"removing peering from VPC '{local}'")
+
+    # And put the drop back: the allow is derived from the peering list, so a
+    # torn-down peering that leaves the hole open is the mirror of a built one
+    # that leaves the drop in place.
+    try:
+        await reconcile_isolation_acls(k8s)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Isolation reconcile after unpeering %s <-> %s failed: %s",
+                       name, remote_vpc, e)
 
     logger.info(f"Removed peering between {name!r} and {remote_vpc!r}")
     return {

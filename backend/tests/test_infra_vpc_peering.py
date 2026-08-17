@@ -20,10 +20,10 @@ import pytest
 from app.api.v1 import vpcs
 
 
-def _subnet(name, vpc, cidr, *, role=None):
+def _subnet(name, vpc, cidr, *, role=None, acls=None):
     labels = {"kubevirt-ui.io/role": role} if role else {}
     return {"metadata": {"name": name, "labels": labels},
-            "spec": {"vpc": vpc, "cidrBlock": cidr}}
+            "spec": {"vpc": vpc, "cidrBlock": cidr, "acls": acls or []}}
 
 
 def _k8s(subnets, peerings_by_vpc):
@@ -218,3 +218,161 @@ class TestWhatItRefusesToTouch:
 
         assert await vpcs.reconcile_infra_peerings(k8s) == 0
         k8s.custom_api.get_cluster_custom_object.assert_not_awaited()
+
+
+class TestAPeeringWithoutAnAllowCarriesNothing:
+    """Measured, and it is the reason this pass exists.
+
+    `b3v` and `b3w` were peered from the UI. Both sides written, both routes
+    present, the row showed Active — and both directions timed out (exit=28),
+    because isolation still dropped the peer's prefix. The peering built the
+    path and lifted nothing.
+
+    So the allow is derived from the peering list: one fact, read where it
+    lives, rather than a second record that has to be kept in step.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_peered_prefix_is_allowed(self, monkeypatch) -> None:
+        monkeypatch.setattr(vpcs, "_mgmt_deny_sources", AsyncMock(return_value=[]))
+
+        patched: list[dict] = []
+
+        async def list_obj(**kw):
+            if kw["plural"] == "vpcs":
+                return {"items": [
+                    {"metadata": {"name": "b3v"},
+                     "spec": {"vpcPeerings": [{"remoteVpc": "b3w"}]}},
+                    {"metadata": {"name": "b3w"},
+                     "spec": {"vpcPeerings": [{"remoteVpc": "b3v"}]}},
+                    {"metadata": {"name": "t8v"}, "spec": {}},
+                ]}
+            return {"items": [
+                _subnet("b3v-default", "b3v", "10.200.36.0/22"),
+                _subnet("b3w-default", "b3w", "10.200.40.0/22"),
+                _subnet("t8v-default", "t8v", "10.200.24.0/22"),
+            ]}
+
+        async def patch_obj(**kw):
+            patched.append(kw)
+            return {}
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=list_obj)
+        k8s.custom_api.patch_cluster_custom_object = AsyncMock(side_effect=patch_obj)
+
+        await vpcs.reconcile_isolation_acls(k8s)
+
+        b3v = [c for c in patched if c["name"] == "b3v-default"][0]
+        acls = b3v["body"]["spec"]["acls"]
+        allows = [a for a in acls if a["action"] == "allow-related"
+                  and "10.200.40.0/22" in a["match"]]
+        drops = [a for a in acls if a["action"] == "drop"
+                 and "10.200.40.0/22" in a["match"]]
+        assert allows, "the peered prefix was not allowed"
+        assert all(a["priority"] > d["priority"] for a in allows for d in drops), (
+            "the allow does not outrank the drop it has to lift"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unpeered_tenant_is_still_dropped(self, monkeypatch) -> None:
+        """The control that makes the measurement above mean anything."""
+        monkeypatch.setattr(vpcs, "_mgmt_deny_sources", AsyncMock(return_value=[]))
+
+        patched: list[dict] = []
+
+        async def list_obj(**kw):
+            if kw["plural"] == "vpcs":
+                return {"items": [{"metadata": {"name": "b3v"},
+                                   "spec": {"vpcPeerings": [{"remoteVpc": "b3w"}]}}]}
+            return {"items": [
+                _subnet("b3v-default", "b3v", "10.200.36.0/22"),
+                _subnet("b3w-default", "b3w", "10.200.40.0/22"),
+                _subnet("t8v-default", "t8v", "10.200.24.0/22"),
+            ]}
+
+        async def patch_obj(**kw):
+            patched.append(kw)
+            return {}
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=list_obj)
+        k8s.custom_api.patch_cluster_custom_object = AsyncMock(side_effect=patch_obj)
+
+        await vpcs.reconcile_isolation_acls(k8s)
+
+        acls = [c for c in patched if c["name"] == "b3v-default"][0]["body"]["spec"]["acls"]
+        assert not [a for a in acls if a["action"] == "allow-related"
+                    and "10.200.24.0/22" in a["match"]]
+
+
+class TestTheAllowListDoesNotFeedItself:
+    """Deleting a peered VPC left 18 allows for its prefix behind.
+
+    `shared` was re-read from the ACLs this same pass had written, so a stale
+    entry could never age out — the list was fed by its own previous output.
+    Inside the tenant supernet the peering is the source now; outside it (a
+    corporate network, a service on another range) there is no peering to
+    consult and the existing rule is all there is.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_allow_for_a_departed_vpc_is_dropped(self, monkeypatch) -> None:
+        monkeypatch.setattr(vpcs, "_mgmt_deny_sources", AsyncMock(return_value=[]))
+
+        patched: list[dict] = []
+        stale = {"action": "allow-related", "direction": "to-lport",
+                 "match": "ip4.src == 10.200.52.0/22", "priority": 3101}
+
+        async def list_obj(**kw):
+            if kw["plural"] == "vpcs":
+                return {"items": [{"metadata": {"name": "b3v"}, "spec": {}}]}
+            return {"items": [_subnet("b3v-default", "b3v", "10.200.36.0/22",
+                                      acls=[stale])]}
+
+        async def patch_obj(**kw):
+            patched.append(kw)
+            return {}
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=list_obj)
+        k8s.custom_api.patch_cluster_custom_object = AsyncMock(side_effect=patch_obj)
+
+        await vpcs.reconcile_isolation_acls(k8s)
+
+        acls = patched[0]["body"]["spec"]["acls"]
+        assert not [a for a in acls if "10.200.52.0/22" in a["match"]
+                    and a["action"] == "allow-related"]
+
+    @pytest.mark.asyncio
+    async def test_a_shared_network_outside_the_supernet_survives(
+        self, monkeypatch,
+    ) -> None:
+        """t1/t3 reach the egress hub on 10.199.128.0/24 through exactly such a
+        rule. Ageing those out would cut the tenants off the gateway."""
+        monkeypatch.setattr(vpcs, "_mgmt_deny_sources", AsyncMock(return_value=[]))
+
+        patched: list[dict] = []
+        legacy = {"action": "allow-related", "direction": "to-lport",
+                  "match": "ip4.src == 10.199.128.0/24", "priority": 3100}
+
+        async def list_obj(**kw):
+            if kw["plural"] == "vpcs":
+                return {"items": [{"metadata": {"name": "t1-vpc"}, "spec": {}}]}
+            return {"items": [_subnet("t1-vpc-default", "t1-vpc", "10.200.8.0/22",
+                                      acls=[legacy])]}
+
+        async def patch_obj(**kw):
+            patched.append(kw)
+            return {}
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=list_obj)
+        k8s.custom_api.patch_cluster_custom_object = AsyncMock(side_effect=patch_obj)
+
+        await vpcs.reconcile_isolation_acls(k8s)
+
+        if patched:
+            acls = patched[0]["body"]["spec"]["acls"]
+            assert [a for a in acls if "10.199.128.0/24" in a["match"]
+                    and a["action"] == "allow-related"]
