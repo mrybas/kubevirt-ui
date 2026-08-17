@@ -18,6 +18,8 @@ from kubernetes_asyncio.client import ApiException
 from app.core.k8s_client import K8sClient
 from app.models.tenant import AddonCatalog, AddonComponent
 
+from app.core.b3_announce import ensure_announcements
+
 logger = logging.getLogger(__name__)
 
 # Constants (same as tenants.py)
@@ -296,6 +298,15 @@ async def reconcile_loop(k8s: K8sClient) -> None:
 
 async def _reconcile_once(k8s: K8sClient) -> None:
     """Run one reconciliation pass across all tenants."""
+    # B3 announcements first, and independently of the addon catalog below:
+    # a VPC's return path must not wait on Flux being configured. Failures are
+    # logged inside and never abort the pass — an addon reconcile has no
+    # business being blocked by BGP, or the reverse.
+    try:
+        await ensure_announcements(k8s)
+    except Exception as e:  # noqa: BLE001 - one subsystem must not stop another
+        logger.error(f"B3 announcement reconcile failed: {e}")
+
     # Load catalog
     catalog = await _get_addon_catalog(k8s)
     if not catalog.components or not catalog.git_repository_ref:
