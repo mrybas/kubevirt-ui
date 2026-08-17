@@ -46,6 +46,7 @@ from app.models.tenant import (
     TenantAddon,
     TenantAddonStatus,
     TenantCondition,
+    TenantControlPlaneAddress,
     TenantCreateRequest,
     TenantKubeconfigResponse,
     TenantListResponse,
@@ -408,6 +409,98 @@ async def _enrich_with_control_plane(k8s, tenant: TenantResponse) -> TenantRespo
     # version, which is a different number during an upgrade).
     if not tenant.kubernetes_version:
         tenant.kubernetes_version = kcp_spec.get("version", "")
+    return tenant
+
+
+async def _enrich_with_cp_address(k8s, tenant: TenantResponse) -> TenantResponse:
+    """The address a worker joins through, with the ports that make it usable.
+
+    Read from the control-plane LoadBalancer Service rather than from the
+    KamajiControlPlane, because the Service is what MetalLB actually assigned
+    and what the node actually dials; `advertiseAddress` is the intent and is
+    used only as a fallback. Where neither exists the tenant is reachable
+    through the ingress alone, and saying that plainly beats an empty field.
+    """
+    ports: dict[str, int] = {}
+    address = ""
+    shared: list[str] = []
+    source = "service"
+
+    try:
+        services = await k8s.core_api.list_service_for_all_namespaces(
+            field_selector="metadata.name!=kubernetes",
+        )
+    except ApiException as e:
+        logger.debug(f"Could not list services for {tenant.name}: {e}")
+        services = None
+
+    own = None
+    if services is not None:
+        for svc in services.items:
+            if (svc.metadata.namespace == tenant.namespace
+                    and svc.metadata.name == f"{tenant.name}-cp-lb"):
+                own = svc
+                break
+
+    if own is not None:
+        ingress = ((own.status.load_balancer.ingress or [])
+                   if own.status and own.status.load_balancer else [])
+        address = (ingress[0].ip or "") if ingress else ""
+        for port in (own.spec.ports or []):
+            # The port *names* are ours; the numbers are what a node dials.
+            if port.port and port.name:
+                ports[port.name] = port.port
+        if address and services is not None:
+            for svc in services.items:
+                if svc.metadata.namespace == tenant.namespace:
+                    continue
+                if not svc.metadata.name.endswith("-cp-lb"):
+                    continue
+                other = ((svc.status.load_balancer.ingress or [])
+                         if svc.status and svc.status.load_balancer else [])
+                if other and other[0].ip == address:
+                    shared.append(svc.metadata.name.removesuffix("-cp-lb"))
+
+    if not address:
+        try:
+            kcp = await k8s.custom_api.get_namespaced_custom_object(
+                group=KAMAJI_CP_GROUP, version=KAMAJI_CP_VERSION,
+                namespace=tenant.namespace, plural="kamajicontrolplanes",
+                name=tenant.name,
+            )
+            address = ((kcp.get("spec", {}) or {}).get("network", {}) or {}).get(
+                "advertiseAddress", "")
+            source = "advertised" if address else "ingress"
+        except ApiException:
+            source = "ingress"
+
+    if not address:
+        # Not "unknown": this tenant has no address of its own, and the join
+        # path is the ingress. An empty field would read as a gap in the UI
+        # rather than as the fact that there is nothing else to reach.
+        # Taken from the endpoint already on this object rather than
+        # recomputed: two derivations of the same host can drift, and the two
+        # would then sit next to each other on the page disagreeing.
+        tenant.control_plane_address = TenantControlPlaneAddress(
+            address=(tenant.endpoint or "").removeprefix("https://") or "unknown",
+            api_port=443, source="ingress",
+        )
+        return tenant
+
+    def _port(*names: str) -> int | None:
+        for n in names:
+            if n in ports:
+                return ports[n]
+        return None
+
+    tenant.control_plane_address = TenantControlPlaneAddress(
+        address=address,
+        api_port=_port("api", "kube-apiserver", "apiserver") or 6443,
+        konnectivity_port=_port("konnectivity", "konn"),
+        trustd_port=_port("trustd"),
+        shared_with=sorted(shared),
+        source=source,
+    )
     return tenant
 
 
@@ -1394,6 +1487,7 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
     tenant = _parse_tenant_response(cluster, addon_statuses)
     tenant = await _enrich_with_workers(k8s, tenant)
     tenant = await _enrich_with_control_plane(k8s, tenant)
+    tenant = await _enrich_with_cp_address(k8s, tenant)
     tenant = await _enrich_with_folder_env(k8s, tenant)
     tenant = await _enrich_with_transit_snat(k8s, tenant)
     return apply_capacity_to_status(tenant)

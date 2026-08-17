@@ -115,6 +115,17 @@ export interface Tenant {
   /** Address this tenant's subnet SNATs to on the transit network — the one
    *  the control-plane guard ACLs are keyed on. Detail view only. */
   transit_snat_ip?: string | null;
+  /** Where the control plane answers for a *joining node* — not the human
+   *  endpoint. Three schemes coexist, and the ports carry the identity when
+   *  the address is shared. */
+  control_plane_address?: {
+    address: string;
+    api_port: number;
+    konnectivity_port?: number | null;
+    trustd_port?: number | null;
+    shared_with: string[];
+    source: 'service' | 'advertised' | 'ingress';
+  } | null;
   phase: string | null;
   endpoint: string | null;
   control_plane_replicas: number;

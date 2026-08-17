@@ -295,6 +295,36 @@ class TenantCondition(BaseModel):
     last_transition_time: str | None = None
 
 
+class TenantControlPlaneAddress(BaseModel):
+    """Where this tenant's control plane actually answers.
+
+    `endpoint` is the ingress URL a human uses. It is not the address a worker
+    dials: a joining node reaches the API, konnectivity and — for Talos —
+    trustd by address and port, and those are what a failed join has to be
+    diagnosed against. None of it was in the API.
+
+    It is not one scheme, either. This stand runs three at once and nothing in
+    the product distinguished them:
+
+      * a per-tenant VIP with standard ports (6443 / 8132 / 50001);
+      * a VIP shared between tenants, where each gets non-standard ports
+        (20000, 20002, …) — the address alone is then useless, and quoting it
+        without the port is worse than saying nothing;
+      * no load balancer at all — reachable only through the ingress.
+    """
+
+    address: str
+    api_port: int = 6443
+    konnectivity_port: int | None = None
+    trustd_port: int | None = None
+    # Other tenants answering on this same address. Non-empty means the ports
+    # carry the identity, not the address.
+    shared_with: list[str] = Field(default_factory=list)
+    # "service" — a LoadBalancer exists; "advertised" — only the control
+    # plane's advertiseAddress is known; "ingress" — neither.
+    source: str = "service"
+
+
 class TenantResponse(BaseModel):
     """Tenant detail response."""
 
@@ -319,7 +349,9 @@ class TenantResponse(BaseModel):
     # `ready: true`, only one programmed.
     transit_snat_ip: str | None = None
     phase: str | None = None  # CAPI Cluster phase
-    endpoint: str | None = None  # tenant API URL
+    endpoint: str | None = None  # tenant API URL (ingress; for humans)
+    # The address workers join through. Detail view only.
+    control_plane_address: TenantControlPlaneAddress | None = None
     control_plane_replicas: int = 0
     control_plane_ready_replicas: int = 0
     control_plane_ready: bool = False

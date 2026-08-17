@@ -392,6 +392,40 @@ export default function TenantDetail() {
             </p>
           </div>
         </div>
+        {/* The address a joining node dials. `endpoint` above is the ingress
+            URL for a human and is not it: a worker reaches the API,
+            konnectivity and trustd by address and port, and a join that fails
+            is diagnosed against those. Invisible in the product until now,
+            which made the per-tenant VIP work impossible to check from here. */}
+        {tenant.control_plane_address && (
+          <div className="card">
+            <div className="card-body text-center">
+              <p className="text-xs text-surface-500 uppercase tracking-wider mb-1">
+                CP address
+              </p>
+              <p className="text-sm font-mono text-surface-200 break-all">
+                {tenant.control_plane_address.address}:{tenant.control_plane_address.api_port}
+              </p>
+              {tenant.control_plane_address.source === 'ingress' ? (
+                <p className="text-xs text-surface-500">through the ingress — no address of its own</p>
+              ) : (
+                <p className="text-xs text-surface-500">
+                  konnectivity {tenant.control_plane_address.konnectivity_port ?? '—'}
+                  {tenant.control_plane_address.trustd_port
+                    ? ` · trustd ${tenant.control_plane_address.trustd_port}`
+                    : ''}
+                </p>
+              )}
+              {tenant.control_plane_address.shared_with.length > 0 && (
+                // A shared address means the port is the identity. Quoting the
+                // address alone here would be worse than saying nothing.
+                <p className="text-xs text-amber-400/80 mt-1">
+                  shared with {tenant.control_plane_address.shared_with.join(', ')}
+                </p>
+              )}
+            </div>
+          </div>
+        )}
         {/* The address the workers actually leave under on the transit network.
             The guard ACLs are keyed on it, so it decides whether a worker can
             reach its own control plane — and it used to be visible only by
