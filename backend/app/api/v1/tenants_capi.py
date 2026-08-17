@@ -801,6 +801,23 @@ def _build_kubeadm_config_template_cr(
                 "spec": {
                     "files": [
                         {
+                            # klog writes to stderr, and so does whatever kills
+                            # the process. Sending stderr to a file that
+                            # systemd truncates on every start means the file
+                            # holds exactly one kubelet lifetime — and its tail
+                            # is the death. That is the one thing the console
+                            # could never give us: the console rate-limits
+                            # under the ~10 lines/s this kubelet produces, so
+                            # the fatal line was always among the dropped.
+                            "path": "/etc/systemd/system/kubelet.service.d/99-stderr-to-file.conf",
+                            "owner": "root:root",
+                            "permissions": "0644",
+                            "content": (
+                                "[Service]\n"
+                                "StandardError=file:/var/log/kubelet-stderr.log\n"
+                            ),
+                        },
+                        {
                             "path": "/usr/local/bin/fix-kubelet-config.sh",
                             "owner": "root:root",
                             "permissions": "0755",
@@ -880,8 +897,7 @@ def _build_kubeadm_config_template_cr(
                         # status=255/EXCEPTION roughly every 30s, restart
                         # counter climbing — a Go fatal, not a config parse
                         # error.
-                        " journalctl -u kubelet --no-pager"
-                        " | grep -B 8 \"Main process exited\" | tail -30 > /dev/ttyS0 2>&1;"
+                        " tail -30 /var/log/kubelet-stderr.log > /dev/ttyS0 2>&1;"
                         " done' &",
                     ],
                     "joinConfiguration": {
