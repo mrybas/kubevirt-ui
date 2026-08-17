@@ -1407,8 +1407,8 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                     <p>
                       <strong className="text-surface-200">Off (default):</strong> the VPC
                       is isolated from the host cluster. It still has DNS, from its own
-                      VpcDns, and outbound internet through the shared egress gateway once
-                      it is attached to one. This is what a tenant VPC normally wants.
+                      VpcDns, and outbound internet through its own routed leg. This is
+                      what a tenant VPC normally wants.
                     </p>
                     <p>
                       <strong className="text-surface-200">On:</strong> workloads here can

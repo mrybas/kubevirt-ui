@@ -136,9 +136,13 @@ describe('how the peering step frames the choice', () => {
   /**
    * U11. The step used to call peering "Recommended for most use cases",
    * which is backwards: a tenant VPC gets DNS from its own VpcDns and the
-   * internet from the shared egress gateway, and needs no route into the host
-   * cluster at all. That recommendation was read as a requirement for two
-   * runs. Peering a tenant network to the host is a boundary being opened.
+   * internet from its own routed leg, and needs no route into the host cluster
+   * at all. That recommendation was read as a requirement for two runs.
+   * Peering a tenant network to the host is a boundary being opened.
+   *
+   * The copy said "through the shared egress gateway once it is attached to
+   * one" until B3 made that false as well — a VPC egresses through its own leg
+   * now, and no gateway pods are in the path.
    */
   it('does not recommend peering', async () => {
     renderWizard();
@@ -152,7 +156,7 @@ describe('how the peering step frames the choice', () => {
     await walkToPeering();
 
     expect(screen.getByText(/admin action/i)).toBeInTheDocument();
-    expect(screen.getByText(/shared egress gateway/i)).toBeInTheDocument();
+    expect(screen.getByText(/its own routed leg/i)).toBeInTheDocument();
   });
 
   it('warns about the blast radius only once it is switched on', async () => {
