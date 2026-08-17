@@ -243,3 +243,41 @@ class TestTheBaselineSurvivesTheOtherAuthor:
         assert written, "the management deny did not survive the rewrite"
         assert all(a["direction"] == "to-lport" and a["action"] == "drop"
                    for a in written)
+
+
+class TestTheIsolatedFlagStillMeansWhatTheCheckboxMeant:
+    """The baseline is a drop that every VPC gets. Counted as isolation, it
+    made the create response report `isolated: true` for a VPC created with the
+    box unticked — one list serving two questions, which is this file's whole
+    theme, this time in the field that tells the operator what they just built.
+    """
+
+    def test_the_flag_is_taken_before_the_baseline_is_appended(self) -> None:
+        from pathlib import Path
+
+        src = Path("app/api/v1/vpcs.py").read_text()
+        body = src[src.index("async def create_vpc("):]
+        body = body[:body.index("\n@router")]
+
+        capture = body.index("tenant_isolation = list(isolation_acls)")
+        append = body.index("build_mgmt_deny_acls(")
+        assert capture < append, "the baseline is already in the list being read"
+        assert "isolated=bool(tenant_isolation)" in body
+
+    def test_the_baseline_is_not_conditional_on_the_checkbox(self) -> None:
+        """An un-isolated VPC is still routed, so it still needs the barrier;
+        the two settings are unrelated and were never meant to be nested."""
+        from pathlib import Path
+
+        src = Path("app/api/v1/vpcs.py").read_text()
+        body = src[src.index("async def create_vpc("):]
+        body = body[:body.index("\n@router")]
+
+        baseline = body.index("build_mgmt_deny_acls(")
+        isolated_branch = body.index("if data.isolated:")
+        # The baseline sits after the isolation branch has closed, at function
+        # indentation — not inside it.
+        line_start = body.rfind("\n", 0, body.rindex("if b3_enabled():", 0, baseline)) + 1
+        indent = len(body[line_start:]) - len(body[line_start:].lstrip())
+        assert isolated_branch < baseline
+        assert indent == 4, f"the baseline is nested {indent} deep"

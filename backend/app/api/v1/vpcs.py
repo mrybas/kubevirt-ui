@@ -1072,6 +1072,7 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
     """
     updated = 0
     mgmt_cidr = await _mgmt_deny_sources(k8s_client) if b3_enabled() else []
+
     try:
         subnets = await k8s_client.custom_api.list_cluster_custom_object(
             group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="subnets",
@@ -1248,6 +1249,12 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     # accident and has to be written down. Shipped in the same change as the
     # B3 attachment above on purpose — a VPC that gets the route without the
     # rule is reachable from every node for as long as the gap lasts.
+    # Kept apart from the baseline below: "isolated" is a statement about
+    # tenant-to-tenant traffic, and the baseline is a drop that every VPC gets.
+    # Folding them into one list made an un-isolated VPC report `isolated:
+    # true` the moment B3 was switched on — the flag stopped meaning what the
+    # checkbox meant.
+    tenant_isolation = list(isolation_acls)
     if b3_enabled():
         isolation_acls = [
             *isolation_acls, *build_mgmt_deny_acls(await _mgmt_deny_sources(k8s)),
@@ -1540,8 +1547,10 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             for r in data.static_routes
         ],
         namespaces=bind_namespaces,
-        # What was actually written, not what was asked for.
-        isolated=bool(isolation_acls),
+        # What was actually written, not what was asked for — and only the
+        # tenant-isolation half of it. The management baseline is on every VPC
+        # and says nothing about whether this one is isolated.
+        isolated=bool(tenant_isolation),
         ready=False,
     )
 
