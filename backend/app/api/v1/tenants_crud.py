@@ -399,6 +399,14 @@ async def _enrich_with_control_plane(k8s, tenant: TenantResponse) -> TenantRespo
     if ready is None:
         ready = kcp_status.get("replicas", 0) if kcp_status.get("ready") else 0
     tenant.control_plane_ready_replicas = ready or 0
+
+    # The K8S VERSION column was empty for every tenant. It was read from
+    # `Cluster.status.version`, which CAPI leaves unset here — the version this
+    # control plane actually runs is `KamajiControlPlane.spec.version`, and it
+    # is the only place it appears (the tenant's own Machines carry the kubelet
+    # version, which is a different number during an upgrade).
+    if not tenant.kubernetes_version:
+        tenant.kubernetes_version = kcp_spec.get("version", "")
     return tenant
 
 

@@ -5,7 +5,7 @@
  */
 
 import { useState, useEffect, useRef } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import {
   Plus,
   RefreshCw,
@@ -231,7 +231,7 @@ function DnsServerList({ servers, onChange }: { servers: string[]; onChange: (s:
 }
 
 
-function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<WizardState>(defaultWizard);
   const [secretInput, setSecretInput] = useState('');
@@ -417,19 +417,28 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
     onCreated();
   };
 
-  const canNext = () => {
+  /**
+   * What is still missing before this step can be left.
+   *
+   * U12. A greyed-out Next with nothing beside it makes people hunt the form
+   * for the field they missed — and `display_name` is the easiest one to miss,
+   * because a tenant name is the obvious thing to type and the display name
+   * reads like a nicety.
+   */
+  const missingForNext = (): string[] => {
     if (step === 0) {
-      if (!form.name || !form.display_name) return false;
-      if (!form.folder) return false; // T8: folder required
-      if (!form.environment) return false; // T8: environment required
-      return true;
+      const missing: string[] = [];
+      if (!form.name) missing.push('a tenant name');
+      if (!form.display_name) missing.push('a display name');
+      if (!form.folder) missing.push('a folder');
+      if (!form.environment) missing.push('an environment');
+      return missing;
     }
-    if (step === 1) {
-      if (form.worker_count <= 0) return false;
-      return true;
-    }
-    return true;
+    if (step === 1 && form.worker_count <= 0) return ['at least one worker'];
+    return [];
   };
+
+  const canNext = () => missingForNext().length === 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
@@ -526,7 +535,24 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                     ))}
                   </select>
                   {visibleFolders.length === 0 && (
-                    <p className="text-xs text-amber-400 mt-1">No folders available. Ask an admin to create one.</p>
+                    // U15. "Ask an admin" is a dead end for the admin who is
+                    // standing here — on a fresh cluster this is the first
+                    // screen anyone opens, and every tenant needs a folder.
+                    <div className="mt-2 flex items-start gap-2 p-2.5 rounded-lg bg-amber-500/5 border border-amber-500/20">
+                      <AlertTriangle className="h-4 w-4 text-amber-400 shrink-0 mt-0.5" />
+                      <div className="text-xs text-surface-300 space-y-1.5">
+                        <p>
+                          No folders exist yet, and every tenant belongs to one.
+                          Folders carry the quotas and the access bindings.
+                        </p>
+                        <Link
+                          to="/folders/new"
+                          className="inline-block text-primary-400 hover:text-primary-300 font-medium"
+                        >
+                          Create a folder →
+                        </Link>
+                      </div>
+                    </div>
                   )}
                 </div>
                 <div>
@@ -1313,12 +1339,32 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
                     </label>
 
                     {(vpcsData?.items ?? []).length === 0 ? (
+                      // U14. "Ask an admin to label a VPC" left out which
+                      // labels, so the admin being asked had to go and find
+                      // out. Both the screen that does it and the exact keys
+                      // are named here.
                       <div className="flex items-start gap-3 p-3 bg-surface-800/50 border border-surface-700/50 rounded-lg">
                         <Info className="h-4 w-4 text-surface-500 shrink-0 mt-0.5" />
-                        <p className="text-xs text-surface-500">
-                          No VPCs scoped to <span className="font-mono text-surface-400">{form.folder}/{form.environment}</span>.
-                          Ask an admin to label a VPC with this folder/environment.
-                        </p>
+                        <div className="text-xs text-surface-500 space-y-1.5">
+                          <p>
+                            No VPCs scoped to{' '}
+                            <span className="font-mono text-surface-400">
+                              {form.folder}/{form.environment}
+                            </span>. This tenant will use the default cluster network.
+                          </p>
+                          <p>
+                            To offer one here, set its scope on the VPC's page
+                            (Network → VPCs → <em>Scope</em> → Change), which writes{' '}
+                            <span className="font-mono text-surface-400">
+                              kubevirt-ui.io/folder={form.folder}
+                            </span>{' '}
+                            and{' '}
+                            <span className="font-mono text-surface-400">
+                              kubevirt-ui.io/environment={form.environment}
+                            </span>{' '}
+                            on the VPC and its subnets.
+                          </p>
+                        </div>
                       </div>
                     ) : (
                       (vpcsData?.items ?? []).map(vpc => (
@@ -1622,14 +1668,21 @@ function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCre
           </button>
 
           {step < steps.length - 1 ? (
-            <button
-              onClick={() => setStep(step + 1)}
-              disabled={!canNext()}
-              className="flex items-center gap-1 px-4 py-2 bg-primary-600 hover:bg-primary-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm transition-colors"
-            >
-              Next
-              <ChevronRight className="h-4 w-4" />
-            </button>
+            <div className="flex items-center gap-3">
+              {!canNext() && (
+                <span className="text-xs text-surface-400">
+                  Still needed: {missingForNext().join(', ')}
+                </span>
+              )}
+              <button
+                onClick={() => setStep(step + 1)}
+                disabled={!canNext()}
+                className="flex items-center gap-1 px-4 py-2 bg-primary-600 hover:bg-primary-500 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm transition-colors"
+              >
+                Next
+                <ChevronRight className="h-4 w-4" />
+              </button>
+            </div>
           ) : (
             <button
               onClick={handleSubmit}

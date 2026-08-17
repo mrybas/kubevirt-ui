@@ -1332,9 +1332,14 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
             <div className="space-y-4">
               <div className="flex items-center justify-between p-4 bg-surface-800/50 rounded-lg border border-surface-700">
                 <div>
-                  <p className="text-sm font-medium text-surface-200">Enable host cluster access</p>
+                  <p className="text-sm font-medium text-surface-200">
+                    Peer with the host cluster VPC
+                    <span className="ml-2 text-xs text-amber-400 font-normal">admin action</span>
+                  </p>
                   <p className="text-xs text-surface-400 mt-1">
-                    Allow VMs in this VPC to communicate with services in the host cluster default VPC
+                    Opens a route between this VPC and the host cluster's own
+                    network. Leave it off unless something in this VPC has to
+                    reach a host-cluster service directly.
                   </p>
                 </div>
                 <button
@@ -1352,22 +1357,42 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                 </button>
               </div>
 
+              {/* U11. This used to read "Recommended for most use cases",
+                  which is backwards: a tenant VPC needs neither peering nor
+                  the host's DNS — it gets DNS from its own VpcDns and the
+                  internet from the shared egress gateway. The recommendation
+                  was talked into being a requirement, and peering a tenant to
+                  the host cluster is a boundary being opened, not a default. */}
               <div className="bg-surface-800/30 rounded-lg p-4 border border-surface-700">
                 <div className="flex items-start gap-2">
                   <Info className="h-4 w-4 text-primary-400 mt-0.5 shrink-0" />
                   <div className="text-sm text-surface-400 space-y-2">
                     <p>
-                      <strong className="text-surface-200">With peering enabled:</strong> VMs can reach host cluster services
-                      (DNS, monitoring, storage). Recommended for most use cases.
+                      <strong className="text-surface-200">Off (default):</strong> the VPC
+                      is isolated from the host cluster. It still has DNS, from its own
+                      VpcDns, and outbound internet through the shared egress gateway once
+                      it is attached to one. This is what a tenant VPC normally wants.
                     </p>
                     <p>
-                      <strong className="text-surface-200">Without peering:</strong> The VPC is fully isolated.
-                      VMs can only communicate within the VPC network.
-                      {' Outbound internet comes from the shared egress gateway once this VPC is attached to one.'}
+                      <strong className="text-surface-200">On:</strong> workloads here can
+                      reach host cluster services directly — and the route exists in both
+                      directions. Turn it on for an infrastructure VPC that genuinely needs
+                      it, not for internet access.
                     </p>
                   </div>
                 </div>
               </div>
+
+              {state.vpcEnablePeering && (
+                <div className="flex items-start gap-2 p-3 rounded-lg bg-red-900/10 border border-red-800/30">
+                  <AlertTriangle className="h-4 w-4 text-red-400 shrink-0 mt-0.5" />
+                  <p className="text-xs text-red-400">
+                    This connects a tenant network to the host cluster's own VPC.
+                    Anything reachable there becomes reachable from workloads in
+                    this VPC.
+                  </p>
+                </div>
+              )}
             </div>
           </div>
         );

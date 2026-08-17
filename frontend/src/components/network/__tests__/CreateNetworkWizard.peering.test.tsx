@@ -65,7 +65,7 @@ async function walkToPeering(name = 't1') {
     target: { value: name },
   });
   fireEvent.click(screen.getByRole('button', { name: /next/i }));
-  await screen.findByText('Enable host cluster access');
+  await screen.findByText('Peer with the host cluster VPC');
 }
 
 describe('host cluster access', () => {
@@ -129,5 +129,41 @@ describe('host cluster access', () => {
     expect(
       screen.getByText(/traffic to and from other tenant VPCs is blocked/i),
     ).toBeInTheDocument();
+  });
+});
+
+describe('how the peering step frames the choice', () => {
+  /**
+   * U11. The step used to call peering "Recommended for most use cases",
+   * which is backwards: a tenant VPC gets DNS from its own VpcDns and the
+   * internet from the shared egress gateway, and needs no route into the host
+   * cluster at all. That recommendation was read as a requirement for two
+   * runs. Peering a tenant network to the host is a boundary being opened.
+   */
+  it('does not recommend peering', async () => {
+    renderWizard();
+    await walkToPeering();
+
+    expect(screen.queryByText(/recommended for most use cases/i)).not.toBeInTheDocument();
+  });
+
+  it('marks it as an admin action and says what off means', async () => {
+    renderWizard();
+    await walkToPeering();
+
+    expect(screen.getByText(/admin action/i)).toBeInTheDocument();
+    expect(screen.getByText(/shared egress gateway/i)).toBeInTheDocument();
+  });
+
+  it('warns about the blast radius only once it is switched on', async () => {
+    renderWizard();
+    await walkToPeering();
+
+    expect(screen.queryByText(/becomes reachable from workloads/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('Peer with the host cluster VPC').closest('div')!
+      .parentElement!.querySelector('button')!);
+
+    expect(await screen.findByText(/becomes reachable from workloads/i)).toBeInTheDocument();
   });
 });
