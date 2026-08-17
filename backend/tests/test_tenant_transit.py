@@ -72,6 +72,10 @@ def _k8s(vpc_spec: dict | None = None, transit_spec: dict | None = None) -> Magi
             raise ApiException(status=404, reason="NotFound")
         del bucket[kw["name"]]
 
+    async def list_obj(**kw):
+        return {"items": list(store.get(kw["plural"], {}).values())}
+
+    k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=list_obj)
     k8s.custom_api.get_cluster_custom_object = AsyncMock(side_effect=get_obj)
     k8s.custom_api.patch_cluster_custom_object = AsyncMock(side_effect=patch_obj)
     k8s.custom_api.create_cluster_custom_object = AsyncMock(side_effect=create_obj)

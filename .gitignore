@@ -84,3 +84,6 @@ backend/kubectl
 notes/
 deploy/
 TODO.md
+
+# local run harness (holds lab credentials)
+docker-compose.override.yml

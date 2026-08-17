@@ -141,15 +141,70 @@ async def attach_vpc_to_transit(k8s, vpc_name: str, transit_subnet: str) -> None
     await patch_spec_with_retry(k8s, "vpcs", vpc_name, mutate)
 
 
+async def _existing_snat_address(
+    k8s, vpc_name: str, tenant_subnet: str, skip: str,
+) -> str | None:
+    """The address already SNATting `tenant_subnet`, if something else set it up.
+
+    A VPC created with a NAT gateway already carries `eip-<vpc>` + `snat-<vpc>`
+    for its default subnet. Adding a second rule for the same logical IP does
+    not give the tenant its own address — OVN keeps one SNAT per logical IP and
+    the loser simply never appears in `lr-nat-list`.
+
+    That silence is what made it fatal rather than untidy: the guard ACL is
+    written for the address we asked for, traffic leaves under the address OVN
+    actually kept, and the baseline deny — which covers the whole allocation
+    range on purpose — drops it. On the lab the tenant's worker sat at
+    `Provisioned` forever because every packet to its own API VIP was dropped:
+
+        lr-nat-list t1-vpc  ->  snat  10.199.1.5  10.200.8.0/22
+        ACL allow           ->  ip4.src == 10.199.1.6 && ... tcp.dst == 20000
+
+    So: find the address that is already in force and write the ACLs for it.
+    """
+    try:
+        result = await k8s.custom_api.list_cluster_custom_object(
+            group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION,
+            plural="ovn-snat-rules",
+        )
+    except ApiException:
+        return None
+
+    for item in result.get("items", []) or []:
+        if item.get("metadata", {}).get("name") == skip:
+            continue
+        spec = item.get("spec", {}) or {}
+        if spec.get("vpc") != vpc_name or spec.get("vpcSubnet") != tenant_subnet:
+            continue
+        eip_name = spec.get("ovnEip")
+        if not eip_name:
+            continue
+        eip = await _get(k8s, "ovn-eips", eip_name)
+        address = ((eip or {}).get("status", {}) or {}).get("v4Ip")
+        if address:
+            return address
+    return None
+
+
 async def ensure_tenant_snat(
     k8s, tenant: str, vpc_name: str, tenant_subnet: str, transit_subnet: str,
 ) -> str | None:
-    """One EIP on the transit subnet plus the SNAT rule that uses it.
+    """The address this tenant's subnet SNATs to on the transit network.
 
-    Returns the EIP's address once kube-ovn has assigned one, else None — the
-    caller can still finish; the ACLs that need the address are written on the
-    next reconcile.
+    Reuses whatever rule already covers `tenant_subnet` — see
+    `_existing_snat_address` for why a second one is worse than none. Only when
+    nothing covers it do we create the tenant's own EIP and rule.
+
+    Returns the address once kube-ovn has assigned one, else None — the caller
+    can still finish; the ACLs that need the address are written on the next
+    reconcile.
     """
+    inherited = await _existing_snat_address(
+        k8s, vpc_name, tenant_subnet, skip=_snat_name(tenant),
+    )
+    if inherited:
+        return inherited
+
     eip = _eip_name(tenant)
     await _create_ignore_conflict(k8s, "ovn-eips", {
         "apiVersion": f"{KUBEOVN_API_GROUP}/{KUBEOVN_API_VERSION}",

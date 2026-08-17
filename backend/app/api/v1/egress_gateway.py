@@ -226,8 +226,44 @@ async def _addresses_pinned_elsewhere(k8s) -> set[str]:
     return taken
 
 
+def _expand_status_ranges(entry: str) -> set[str]:
+    """kube-ovn's `status.v4usingIPrange` — comma-separated `a-b` spans.
+
+    Note the separator: `excludeIps` uses `a..b`, subnet status uses `a-b`.
+    """
+    out: set[str] = set()
+    for span in (entry or "").split(","):
+        span = span.strip()
+        if not span:
+            continue
+        start, _, end = span.partition("-")
+        try:
+            first = ipaddress.IPv4Address(start.strip())
+            last = ipaddress.IPv4Address(end.strip() or start.strip())
+        except ValueError:
+            continue
+        if int(last) - int(first) > 4096:
+            continue  # absurdly wide; do not materialise it
+        out.update(str(ipaddress.IPv4Address(i)) for i in range(int(first), int(last) + 1))
+    return out
+
+
 async def _free_addresses(k8s, subnet_name: str, count: int, taken: set[str]) -> list[str]:
-    """`count` addresses from `subnet_name` that nothing else is using."""
+    """`count` addresses from `subnet_name` that nothing else is using.
+
+    `spec.excludeIps` is not the whole story. A VPC created with a NAT gateway
+    (`enableExternal: true`) gets a router port on the external subnet, and
+    kube-ovn allocates its address from its own IPAM — no IP CR, nothing in the
+    subnet spec. Allocating around only excludeIps therefore hands out addresses
+    that are already in use: on this lab, two tenant VPCs held 10.199.4.1 and
+    10.199.4.2, the gateway pinned exactly those, and its pods never got past
+    `Init` (`AcquireAddressFailed: NoAvailableAddress`).
+
+    kube-ovn publishes what it actually holds in `status.v4usingIPrange`, which
+    already accounts for the gateway address and excludeIps. That is the source
+    of truth; the spec-derived set stays as a fallback for a subnet whose status
+    has not been written yet.
+    """
     try:
         subnet = await k8s.custom_api.get_cluster_custom_object(
             group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="subnets", name=subnet_name,
@@ -245,6 +281,9 @@ async def _free_addresses(k8s, subnet_name: str, count: int, taken: set[str]) ->
     gateway = spec.get("gateway", "")
     if gateway:
         blocked.add(gateway)
+
+    status = subnet.get("status", {}) or {}
+    blocked.update(_expand_status_ranges(status.get("v4usingIPrange", "")))
 
     network = ipaddress.IPv4Network(cidr, strict=False)
     out: list[str] = []
@@ -1290,7 +1329,27 @@ async def _ensure_gateway_default_route(
 
 
 async def _add_static_route(k8s, vpc_name: str, cidr: str, next_hop_ip: str) -> None:
-    """Add a static route to a VPC (idempotent)."""
+    """Point `cidr` at `next_hop_ip`, replacing any route for the same prefix.
+
+    Matching on the (cidr, next-hop) pair leaves a second route for the same
+    prefix behind, and for `0.0.0.0/0` that is not a harmless duplicate.
+    kube-ovn writes its own default on a VPC created with `enableExternal:
+    true`; attaching a gateway then appended a second one, and the tenant VPC
+    carried both:
+
+        {0.0.0.0/0 -> 10.199.0.1}      # kube-ovn
+        {0.0.0.0/0 -> 10.199.129.1}    # attach
+
+    `EnableEcmp` is false, so OVN programs exactly one of them and which one
+    is not ours to choose. Measured on the lab: right after attach it took the
+    working next hop, then the next reconcile (triggered by an unrelated
+    peering edit) flipped to the stale one and tenant egress went dead with
+    nothing in the spec having changed. Deleting the stale entry brought it
+    back immediately.
+
+    One next hop per prefix is also what every caller here means: gateway
+    default, tenant return route, transit route. None of them wants two.
+    """
     try:
         vpc = await k8s.custom_api.get_cluster_custom_object(
             group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
@@ -1301,18 +1360,16 @@ async def _add_static_route(k8s, vpc_name: str, cidr: str, next_hop_ip: str) -> 
             raise HTTPException(status_code=404, detail=f"VPC '{vpc_name}' not found")
         raise
 
-    routes = vpc.get("spec", {}).get("staticRoutes", [])
+    routes = vpc.get("spec", {}).get("staticRoutes", []) or []
+    wanted = {"cidr": cidr, "nextHopIP": next_hop_ip, "policy": "policyDst"}
 
-    # Check if route already exists
-    for r in routes:
-        if r.get("cidr") == cidr and r.get("nextHopIP") == next_hop_ip:
-            return  # Already exists
-
-    routes.append({"cidr": cidr, "nextHopIP": next_hop_ip, "policy": "policyDst"})
+    kept = [r for r in routes if r.get("cidr") != cidr]
+    if len(kept) == len(routes) - 1 and wanted in routes:
+        return  # already the only route for this prefix
 
     await k8s.custom_api.patch_cluster_custom_object(
         group=KUBEOVN_GROUP, version=KUBEOVN_VERSION, plural="vpcs",
-        name=vpc_name, body={"spec": {"staticRoutes": routes}},
+        name=vpc_name, body={"spec": {"staticRoutes": kept + [wanted]}},
         _content_type="application/merge-patch+json",
     )
 
