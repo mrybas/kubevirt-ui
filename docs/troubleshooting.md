@@ -49,6 +49,85 @@ exactly like no NTP service at all.
 
 ---
 
+## A Talos node boots, is "running and ready", and no node appears
+
+Read the guest console before anything else:
+
+```
+kubectl logs -n tenant-<t> virt-launcher-<vm>-xxxxx -c guest-console-log --tail=40
+```
+
+Talos names its own stage there. Two very different stalls look identical from
+the outside:
+
+```
+[talos] task startAllServices (1/1): service "kubelet" to be "up"
+pulling image ghcr.io/siderolabs/kubelet:v1.32.1: starting...
+fetch failed ... dial tcp 140.82.121.34:443: i/o timeout host=ghcr.io
+```
+
+That is **not** the clock — it is the kubelet image. Talos pulls it at runtime
+from ghcr.io, so a worker in a VPC with no egress cannot start a kubelet even
+with its time perfectly synchronised. Measured as a clean A/B on one node,
+changing only the VPC's default route:
+
+| egress | result |
+|---|---|
+| removed | no `waiting for time sync` anywhere; stuck on the image pull |
+| restored | `machine is running and ready`, node joined, tenant Ready |
+
+So "the join must survive an egress outage" needs a registry reachable from
+the tenant network — a mirror or a pull-through cache — not just local NTP.
+Time was one soft dependency on the internet plane; the registry is the next
+one, and it is larger.
+
+---
+
+## A server answers nothing — check its endpoints before its configuration
+
+An address that resolves, accepts packets and never replies looks exactly like
+a daemon refusing to serve. Check this first:
+
+```
+kubectl get endpointslice -n <ns> -l kubernetes.io/service-name=<svc>
+```
+
+Empty endpoints and a healthy pod almost always mean the Service and the pods
+are in **different namespaces**. A Service selects only pods beside it; the
+selector matching by label is not enough.
+
+This cost most of an afternoon on the tenant NTP service: it was created in
+the tenant namespace while chrony runs in `kubevirt-ui-system`, so the address
+was announced, the ACL passed it, the pods were Ready — and every query timed
+out. The diagnosis went into chrony's configuration and found two genuine but
+unrelated bugs on the way down before reaching the empty endpoint list.
+
+Order to work in: endpoints → the Service's own selector and ports → the
+server's configuration. It is the cheapest check and it is the one that
+distinguishes "nothing is listening for you" from "something refused you".
+
+---
+
+## Before measuring anything, prove the change arrived
+
+A pod whose Deployment you just edited may still be the previous ReplicaSet.
+A rollout that cannot start leaves the old pods serving, and `kubectl get
+deploy` showing `1/2` reads as "scaling up", not "the new one cannot run".
+
+```
+kubectl get rs -n <ns> -l app=<app>          # old must be desired=0
+kubectl get pod <pod> -o jsonpath='{.spec.containers[0].command}'
+kubectl logs <pod> | head                    # does it say what the new config says?
+```
+
+Three times now a conclusion has been drawn from an object the change never
+reached: an ACL still in its old `/24` form, a shadow drop that a reconcile had
+not yet removed, and a chrony pod serving the image's built-in configuration
+(`Selected source time.cloudflare.com`) while the ConfigMap said `local
+stratum 10`. In every case the measurement was correct and meaningless.
+
+---
+
 ## A VPC is reachable from the management network
 
 Every VPC on the routed plane carries a baseline deny at priority 3300 —
