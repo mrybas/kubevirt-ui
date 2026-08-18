@@ -54,6 +54,26 @@ rules:
       - cdis
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
+  # Cross-namespace clone. CDI gates this on a subresource that grants nothing
+  # by itself: its mutating webhook checks that whoever creates the DataVolume
+  # may `create datavolumes/source` in the **source** namespace, and refuses
+  # otherwise —
+  #
+  #   admission webhook "datavolume-mutate.cdi.kubevirt.io" denied the request:
+  #   User ... has insufficient permissions in clone source namespace ...
+  #
+  # T2 puts one golden image per Talos version in a shared namespace and clones
+  # it into each tenant, so every worker disk crosses that boundary. Measured as
+  # an A/B on one subject: with the rules above alone the clone is denied; with
+  # this rule added the same request succeeds.
+  #
+  # The lab cannot catch this. Its backend holds an admin kubeconfig in
+  # `system:masters`, for which the check always passes — so this is a
+  # production-only failure, and the only place it shows is here.
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes/source"]
+    verbs: ["create"]
+
   # -----------------------------------------------------------------------
   # KubeVirt snapshots (VirtualMachineSnapshot / VirtualMachineRestore)
   # -----------------------------------------------------------------------
