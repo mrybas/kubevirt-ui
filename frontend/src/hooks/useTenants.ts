@@ -4,6 +4,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
+  listTalosVersions,
   listTenants,
   getTenant,
   createTenant,
@@ -21,6 +22,15 @@ import {
   deleteTenantImage,
 } from '../api/tenants';
 import type { TenantCreateRequest, TenantScaleRequest, TenantAddon } from '../types/tenant';
+
+export function useTalosVersions(kubernetesVersion?: string) {
+  return useQuery({
+    queryKey: ['talos-versions', kubernetesVersion ?? null],
+    queryFn: () => listTalosVersions(kubernetesVersion),
+    // The catalogue changes with a release, not with the clock.
+    staleTime: 5 * 60_000,
+  });
+}
 
 export function useTenants() {
   return useQuery({

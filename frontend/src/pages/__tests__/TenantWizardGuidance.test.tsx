@@ -26,6 +26,18 @@ vi.mock('@/hooks/useTenants', () => ({
   useDeleteTenant: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useAddonCatalog: () => ({ data: { addons: [] } }),
   useDiscovery: () => ({ data: null }),
+  // T4: the wizard lists Talos releases from the server, filtered for the
+  // chosen Kubernetes version. One entry is enough here — these tests are
+  // about the guidance text, not the picker.
+  useTalosVersions: () => ({
+    data: {
+      items: [{ talos: '1.13.8', image_url: '', sha: '',
+                k8s_min: '1.31', k8s_max: '1.36', default: true }],
+      hidden: 0,
+      default: '1.13.8',
+    },
+    isLoading: false,
+  }),
 }));
 
 vi.mock('@/hooks/useStorage', () => ({ useStorageClasses: () => ({ data: { items: [] } }) }));

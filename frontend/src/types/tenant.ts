@@ -217,3 +217,21 @@ export interface DiscoveryResponse {
   logging: LoggingDiscovery[];
   registry: RegistryDiscovery[];
 }
+
+export interface TalosRelease {
+  talos: string;
+  image_url: string;
+  sha: string;
+  k8s_min: string;
+  k8s_max: string;
+  default: boolean;
+}
+
+export interface TalosVersionsResponse {
+  /** Releases that support the Kubernetes version asked for. Already filtered
+   *  by the server; the client does not apply the rule again. */
+  items: TalosRelease[];
+  /** How many the filter removed — said out loud rather than silently absent. */
+  hidden: number;
+  default: string;
+}

@@ -27,13 +27,13 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import clsx from 'clsx';
-import { useTenants, useCreateTenant, useDeleteTenant, useAddonCatalog, useDiscovery } from '../hooks/useTenants';
+import { useTenants, useCreateTenant, useDeleteTenant, useAddonCatalog, useDiscovery, useTalosVersions } from '../hooks/useTenants';
 import { useStorageClasses } from '../hooks/useStorage';
 import { useFoldersFlat } from '../hooks/useFolders';
 import { useVpcs } from '../hooks/useVpcs';
 import { useAuthStore } from '../store/auth';
 import { useAppStore } from '../store';
-import type { Tenant, TenantCreateRequest, TenantAddon, AddonComponent } from '../types/tenant';
+import type { Tenant, TenantCreateRequest, TenantAddon, AddonComponent, TalosRelease } from '../types/tenant';
 import { WizardStepIndicator } from '../components/common/WizardStepIndicator';
 import { tenantNamespace, withDerivedAddonParams } from '@/utils/addonParams';
 import { DataTable, type Column } from '@/components/common/DataTable';
@@ -94,6 +94,7 @@ interface WizardState {
   control_plane_replicas: number;
   worker_type: 'vm' | 'bare_metal';
   worker_os: 'cloud-init' | 'talos';
+  talos_version: string;
   worker_count: number;
   worker_vcpu: number;
   worker_memory: string;
@@ -130,6 +131,7 @@ const defaultWizard: WizardState = {
   control_plane_replicas: 2,
   worker_type: 'vm',
   worker_os: 'cloud-init',
+  talos_version: '',
   worker_count: 2,
   worker_vcpu: 2,
   worker_memory: '2Gi',
@@ -240,6 +242,16 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
   const [showCidrSection, setShowCidrSection] = useState(false);
   const { data: catalog } = useAddonCatalog();
   const { data: discovery } = useDiscovery();
+  // Asked for this Kubernetes version specifically. The server applies
+  // `is_compatible()` — the same function the create validator reads — and
+  // returns what survives, so the page cannot offer a pair the backend then
+  // refuses. Filtering here instead would have been a second implementation
+  // of the rule, which is the defect this contract exists to prevent.
+  const { data: talosVersions, isLoading: talosVersionsLoading } =
+    useTalosVersions(form.kubernetes_version);
+  const talosCompatible = talosVersions?.items ?? [];
+  const talosHidden = talosVersions?.hidden ?? 0;
+  const talosDefault = talosVersions?.default ?? '';
   const { data: foldersData } = useFoldersFlat();
   const { data: storageClassesData } = useStorageClasses();
   // VPCs scoped to the chosen folder/env (re-fetches when they change).
@@ -365,6 +377,8 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
       control_plane_replicas: form.control_plane_replicas,
       worker_type: form.worker_type,
       worker_os: form.worker_os,
+      ...(form.worker_os === 'talos' && form.talos_version
+        ? { talos_version: form.talos_version } : {}),
       worker_count: form.worker_count,
       worker_vcpu: form.worker_vcpu,
       worker_memory: form.worker_memory,
@@ -793,6 +807,51 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
                     forced to bridge networking — with masquerade every guest sees itself as
                     the same address and only the first node can join.
                   </p>
+                )}
+
+                {/* T4. The list and the compatibility window both come from the
+                    server, which is also what the create validator reads. The
+                    wizard renders and decides nothing: a client that worked out
+                    compatibility for itself would be a second record for one
+                    fact, and would show up as an option the backend refuses. */}
+                {form.worker_os === 'talos' && (
+                  <div className="mt-3">
+                    <label className="block text-sm text-surface-300 mb-1">
+                      Talos version
+                    </label>
+                    {talosVersionsLoading ? (
+                      <p className="text-xs text-surface-500">Loading versions…</p>
+                    ) : talosCompatible.length === 0 ? (
+                      <p className="text-xs text-red-400">
+                        No Talos release in this deployment's catalogue supports
+                        Kubernetes {form.kubernetes_version}. Pick another
+                        Kubernetes version, or add a release to the catalogue.
+                      </p>
+                    ) : (
+                      <>
+                        <select
+                          value={form.talos_version || talosDefault}
+                          onChange={(e) => setForm({ ...form, talos_version: e.target.value })}
+                          className="w-full px-3 py-2 bg-surface-900 border border-surface-700 rounded-lg text-surface-100 text-sm"
+                        >
+                          {talosCompatible.map((r: TalosRelease) => (
+                            <option key={r.talos} value={r.talos}>
+                              Talos {r.talos} — Kubernetes {r.k8s_min}–{r.k8s_max}
+                              {r.default ? ' (default)' : ''}
+                            </option>
+                          ))}
+                        </select>
+                        {talosHidden > 0 && (
+                          // Said, not silently filtered: a version missing with
+                          // no explanation reads as a catalogue that lost it.
+                          <p className="text-xs text-surface-500 mt-1">
+                            {talosHidden} other release{talosHidden === 1 ? '' : 's'} not
+                            shown — they do not support Kubernetes {form.kubernetes_version}.
+                          </p>
+                        )}
+                      </>
+                    )}
+                  </div>
                 )}
               </div>
 
@@ -1547,7 +1606,9 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
                       <span className="text-surface-200">{form.worker_disk}</span>
                       <span className="text-surface-500">Worker OS</span>
                       <span className="text-surface-200">
-                        {form.worker_os === 'talos' ? 'Talos' : 'Standard (cloud-init)'}
+                        {form.worker_os === 'talos'
+                          ? `Talos ${form.talos_version || talosDefault} / Kubernetes ${form.kubernetes_version}`
+                          : 'Standard (cloud-init)'}
                       </span>
                       {/* The CAPK disk is only sent for cloud-init workers
                           (see handleSubmit). Printing it under Talos claimed

@@ -156,7 +156,7 @@ class TestTheTwoReadersCannotDrift:
         from app.api.v1.tenants_crud import list_talos_versions
         from app.api.v1.tenants_talos import resolve_talos_release
 
-        published = await list_talos_versions(user=MagicMock())
+        published = await list_talos_versions(kubernetes_version=None, user=MagicMock())
 
         for item in published["items"]:
             lo = int(item["k8s_min"].split(".")[1])
@@ -172,7 +172,7 @@ class TestTheTwoReadersCannotDrift:
         from app.api.v1.tenants_crud import list_talos_versions
         from app.api.v1.tenants_talos import resolve_talos_release
 
-        published = await list_talos_versions(user=MagicMock())
+        published = await list_talos_versions(kubernetes_version=None, user=MagicMock())
 
         for item in published["items"]:
             lo = int(item["k8s_min"].split(".")[1])
@@ -200,7 +200,7 @@ class TestTheTwoReadersCannotDrift:
 
         published = {
             (i["talos"], f"1.{m}")
-            for i in (await list_talos_versions(user=MagicMock()))["items"]
+            for i in (await list_talos_versions(kubernetes_version=None, user=MagicMock()))["items"]
             for m in range(int(i["k8s_min"].split(".")[1]),
                            int(i["k8s_max"].split(".")[1]) + 1)
         }
@@ -241,3 +241,92 @@ class TestTheHardcodeIsGone:
         # halves of the identity: which version to import, and from where.
         assert "release.image_url" in body
         assert "release.talos" in body
+
+
+class TestTheEndpointFiltersSoTheWizardNeedNot:
+    """T4's contract, enforced where it can be.
+
+    The wizard renders what this returns and applies no rule of its own — the
+    first cut of it filtered client-side by comparing minor versions, which is
+    a second implementation of `is_compatible()` and exactly the shape that has
+    cost this project repeatedly. Asking the server per Kubernetes version
+    removes the copy rather than keeping the two in step.
+    """
+
+    @pytest.mark.asyncio
+    async def test_it_returns_only_releases_that_take_this_kubernetes(self) -> None:
+        from unittest.mock import MagicMock
+
+        from app.api.v1.tenants_crud import list_talos_versions
+
+        ok = await list_talos_versions(kubernetes_version="v1.33.5", user=MagicMock())
+        assert [i["talos"] for i in ok["items"]] == ["1.13.8"]
+        assert ok["hidden"] == 0
+
+    @pytest.mark.asyncio
+    async def test_an_unsupported_kubernetes_yields_nothing_and_says_how_many(
+        self,
+    ) -> None:
+        """Empty with a count, not empty in silence: a version missing without
+        explanation reads as a catalogue that lost it."""
+        from unittest.mock import MagicMock
+
+        from app.api.v1.tenants_crud import list_talos_versions
+
+        out = await list_talos_versions(kubernetes_version="v1.30.1", user=MagicMock())
+
+        assert out["items"] == []
+        assert out["hidden"] == 1
+        assert out["default"] == ""
+
+    @pytest.mark.asyncio
+    async def test_the_default_never_survives_the_filter_alone(
+        self, monkeypatch,
+    ) -> None:
+        """Offering a preselected release the validator would refuse is the
+        drift this endpoint exists to prevent."""
+        import json
+        from unittest.mock import MagicMock
+
+        from app.api.v1.tenants_crud import list_talos_versions
+
+        monkeypatch.setenv(CATALOG_ENV, json.dumps([
+            {"talos": "1.13.8", "k8s_min": "1.31", "k8s_max": "1.33",
+             "default": True},
+            {"talos": "1.14.1", "k8s_min": "1.34", "k8s_max": "1.36"},
+        ]))
+
+        out = await list_talos_versions(kubernetes_version="v1.35.0", user=MagicMock())
+
+        assert [i["talos"] for i in out["items"]] == ["1.14.1"]
+        assert out["default"] == "1.14.1", "it offered a default it just filtered out"
+
+    @pytest.mark.asyncio
+    async def test_without_the_parameter_it_still_lists_everything(self) -> None:
+        """Anything that wants the whole catalogue — a settings screen, a
+        support dump — must not have to name a Kubernetes version."""
+        from unittest.mock import MagicMock
+
+        from app.api.v1.tenants_crud import list_talos_versions
+
+        out = await list_talos_versions(kubernetes_version=None, user=MagicMock())
+
+        assert out["items"] and out["hidden"] == 0
+
+    @pytest.mark.asyncio
+    async def test_what_it_offers_is_what_the_validator_accepts(self) -> None:
+        """The anti-drift check, now at the level the wizard actually consumes."""
+        from unittest.mock import MagicMock
+
+        from app.api.v1.tenants_crud import list_talos_versions
+        from app.api.v1.tenants_talos import resolve_talos_release
+
+        for minor in range(29, 38):
+            k8s = f"v1.{minor}.0"
+            offered = await list_talos_versions(
+                kubernetes_version=k8s, user=MagicMock())
+            for item in offered["items"]:
+                resolve_talos_release(k8s, item["talos"])   # must not raise
+            if not offered["items"]:
+                with pytest.raises(HTTPException):
+                    resolve_talos_release(k8s, None)

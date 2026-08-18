@@ -29,8 +29,20 @@ describe('tenant review, worker image', () => {
   });
 
   it('says which worker OS was chosen, so the reader can tell', () => {
+    // Asserted as meaning, not as text. This held the exact ternary until T4
+    // made the Talos branch print the pair — "Talos 1.13.8 / Kubernetes
+    // v1.33.5" — and the test failed while the property it guards was not only
+    // intact but stronger. A test that pins a string pins the wrong thing.
     expect(SRC).toContain('Worker OS');
-    expect(SRC).toMatch(/worker_os === 'talos' \? 'Talos' : 'Standard \(cloud-init\)'/);
+    expect(SRC).toMatch(/worker_os === 'talos'\s*\n?\s*\?/);
+    expect(SRC).toContain("'Standard (cloud-init)'");
+  });
+
+  it('names the Talos and Kubernetes versions together', () => {
+    // The pair is what the operator is choosing; either number alone is not
+    // a decision they can check.
+    expect(SRC).toMatch(/Talos \$\{form\.talos_version \|\| talosDefault\}/);
+    expect(SRC).toMatch(/Kubernetes \$\{form\.kubernetes_version\}/);
   });
 
   it('still only submits the image for cloud-init', () => {

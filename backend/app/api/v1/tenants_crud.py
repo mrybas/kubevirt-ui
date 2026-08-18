@@ -896,7 +896,18 @@ async def discover_host_infrastructure(request: Request, user: User = Depends(re
 
 
 @router.get("/talos-versions")
-async def list_talos_versions(user: User = Depends(require_auth)) -> dict[str, Any]:
+async def list_talos_versions(
+    kubernetes_version: str | None = Query(
+        None,
+        description=(
+            "Return only releases that support this Kubernetes version. The "
+            "filtering happens here, with the same `is_compatible()` the create "
+            "validator uses — a client that applied the rule itself would be a "
+            "second implementation of it."
+        ),
+    ),
+    user: User = Depends(require_auth),
+) -> dict[str, Any]:
     """What the wizard renders. It computes nothing.
 
     The pairs come from the same `is_compatible()` the create validator uses,
@@ -909,11 +920,19 @@ async def list_talos_versions(user: User = Depends(require_auth)) -> dict[str, A
     and `talos-versions` would otherwise be read as a tenant called
     "talos-versions".
     """
-    from app.core.talos_catalog import catalog, default_release
+    from app.core.talos_catalog import catalog, default_release, is_compatible
 
-    entries = catalog()
+    all_entries = catalog()
+    entries = (
+        [e for e in all_entries if is_compatible(e, kubernetes_version)]
+        if kubernetes_version else all_entries
+    )
     default = default_release()
     return {
+        # How many the filter removed, so the wizard can say "3 others not
+        # shown" instead of silently presenting a shorter list — a version
+        # missing with no explanation reads as a catalogue that lost it.
+        "hidden": len(all_entries) - len(entries),
         "items": [
             {
                 "talos": e.talos,
@@ -925,7 +944,13 @@ async def list_talos_versions(user: User = Depends(require_auth)) -> dict[str, A
             }
             for e in entries
         ],
-        "default": default.talos,
+        # The preselected one, but only if it survived the filter: offering a
+        # default the validator would refuse is the drift this endpoint exists
+        # to prevent.
+        "default": next(
+            (e.talos for e in entries if e.talos == default.talos),
+            entries[0].talos if entries else "",
+        ),
     }
 
 

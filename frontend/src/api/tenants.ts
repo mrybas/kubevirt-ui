@@ -11,6 +11,7 @@ import type {
   TenantScaleRequest,
   TenantStorageReconcileResponse,
   TenantStorageStatus,
+  TalosVersionsResponse,
 } from '@/types/tenant';
 import type { GoldenImageListResponse } from '@/types/template';
 
@@ -97,4 +98,21 @@ export async function listTenantImages(tenantName: string): Promise<GoldenImageL
 
 export async function deleteTenantImage(tenantName: string, imageName: string): Promise<void> {
   await apiRequest<void>(`/tenants/${tenantName}/images/${imageName}`, { method: 'DELETE' });
+}
+
+/** Talos releases this deployment offers, with the Kubernetes window each takes.
+ *
+ *  The wizard renders these and computes nothing: `is_compatible()` lives in
+ *  one module on the server and is read by both the list below and the
+ *  validator that accepts the create request. A client that decided
+ *  compatibility for itself would be the second record for one fact — the
+ *  shape that has bitten this codebase repeatedly, and which here would show
+ *  as the wizard offering a pair the backend then refuses. */
+export async function listTalosVersions(
+  kubernetesVersion?: string,
+): Promise<TalosVersionsResponse> {
+  const q = kubernetesVersion
+    ? `?kubernetes_version=${encodeURIComponent(kubernetesVersion)}`
+    : '';
+  return apiRequest<TalosVersionsResponse>(`/tenants/talos-versions${q}`);
 }
