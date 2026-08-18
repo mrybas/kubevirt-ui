@@ -493,6 +493,10 @@ protocol kernel {{
   merge paths on;
 }}
 
+# Only one protocol may range over these addresses. If this router already
+# has a BGP protocol whose `neighbor range` covers {node_cidr}, widen that
+# one instead of adding this — two overlapping ranges take each other's
+# sessions and report it as "Bad peer AS".
 protocol bgp k8s_nodes {{
   local as {remote};
   # A range, not a list: nodes are replaced, and a /32 per node means the

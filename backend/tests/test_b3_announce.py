@@ -491,3 +491,27 @@ class TestTheReconcilerWritesOnlyWhenItMust:
 
         assert "skipped" in report
         assert k8s._state["created"] == []
+
+
+def test_the_generated_stanza_warns_against_a_second_overlapping_range():
+    """A live router already ranges over the announcer nodes.
+
+    The generated config is written for a clean upstream. Pasted onto a router
+    that already has such a protocol, it adds a second `neighbor range` over
+    the same addresses — the two then take each other's sessions and bird
+    reports "Bad peer AS", which reads as a misconfigured AS number rather than
+    a duplicate range. The generator has to say so, because whoever copies it
+    is by definition not reading the rest of that router's config.
+    """
+    from app.core.b3_announce import render_border_bird
+
+    out = render_border_bird(
+        node_cidr="10.198.160.0/29", supernet="10.200.0.0/14", prefix_len=22,
+        leg_cidr="10.199.4.0/24", local=65030, remote=65000,
+    )
+
+    assert "Bad peer AS" in out
+    # The warning has to name the range being claimed, or a reader cannot tell
+    # which of that router's existing protocols to check against.
+    warning = out[out.index("Only one protocol"):out.index("protocol bgp k8s_nodes")]
+    assert "10.198.160.0/29" in warning
