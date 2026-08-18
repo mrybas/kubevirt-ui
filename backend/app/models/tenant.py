@@ -118,6 +118,10 @@ class TenantCreateRequest(BaseModel):
     # they ask a trustd signer for a certificate instead — so this is a
     # different mechanism, not a different image.
     worker_os: Literal["cloud-init", "talos"] = "cloud-init"
+    # Which Talos release to build the workers from. Empty means the
+    # catalogue's default; the value is validated against the same
+    # `is_compatible()` the wizard's list is rendered from.
+    talos_version: str | None = None
     worker_count: int = Field(default=2, ge=1, le=20)
     worker_vcpu: int = Field(default=2, ge=1, le=32)
     worker_memory: str = "2Gi"

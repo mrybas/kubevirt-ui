@@ -282,14 +282,40 @@ class TestGoldenImageSourceGuard:
         assert TALOS_GOLDEN_IMAGE_URL.startswith(("http://", "https://"))
         assert TALOS_GOLDEN_IMAGE_URL.endswith(".raw.xz")
 
-    def test_the_guard_rejects_non_url_sources(self) -> None:
-        import inspect
+    @pytest.mark.asyncio
+    async def test_the_guard_rejects_non_url_sources(self) -> None:
+        """Asserted through what gets created, not through the source text.
 
-        from app.api.v1 import tenants_talos
+        This used to grep the function for the name `TALOS_GOLDEN_IMAGE_URL`,
+        and T1 replaced that constant with a catalogue lookup — so the test
+        failed while the guard it protects was working perfectly. A test that
+        holds an identifier in place instead of a behaviour is the U11 shape:
+        it guards the transcription, not the meaning.
+        """
+        from unittest.mock import AsyncMock, MagicMock
 
-        source = inspect.getsource(tenants_talos.ensure_talos_golden_image)
-        assert 'startswith(("http://", "https://"))' in source
-        assert "TALOS_GOLDEN_IMAGE_URL" in source
+        from app.api.v1.tenants_talos import ensure_talos_golden_image
+
+        created: list[dict] = []
+
+        async def create(**kw):
+            created.append(kw["body"])
+            return {}
+
+        k8s = MagicMock()
+        k8s.custom_api.create_namespaced_custom_object = AsyncMock(side_effect=create)
+
+        # A CAPK container-disk reference, which is what the shared wizard
+        # field holds on the cloud-init path. CDI would reject it as a source.
+        await ensure_talos_golden_image(
+            k8s, "t1", "tenant-t1",
+            image_url="quay.io/capk/ubuntu-2404-container-disk:v1.32.1",
+        )
+
+        assert created, "no DataVolume was created at all"
+        url = created[0]["spec"]["source"]["http"]["url"]
+        assert url.startswith("https://")
+        assert url.endswith(".raw.xz")
 
 
 class TestBootstrapProviderNamespace:

@@ -73,11 +73,17 @@ DEFAULT_TALOS_GOLDEN_SIZE = "20Gi"
 # import is done once, centrally, and each worker gets a CSI clone: importing
 # over HTTP into every tenant namespace would depend on DNS inside the VPC,
 # which is exactly what is least reliable there.
-TALOS_GOLDEN_IMAGE_URL = (
-    "https://factory.talos.dev/image/"
-    "376567988ad370138ad8b2698212367b8edcb69b5fd68c80be1f2ec7d603b4ba"
-    "/v1.13.8/openstack-amd64.raw.xz"
-)
+# Kept as a name because the reasoning above is about *this* URL's shape, but
+# the value now comes from the catalogue: one Talos version for everyone was
+# the thing T1 exists to remove, and a constant here would be a second source
+# of truth next to it.
+def _default_golden_url() -> str:
+    from app.core.talos_catalog import default_release
+
+    return default_release().image_url
+
+
+TALOS_GOLDEN_IMAGE_URL = _default_golden_url()
 
 CERT_MANAGER_GROUP = "cert-manager.io"
 CERT_MANAGER_VERSION = "v1"
@@ -823,6 +829,45 @@ async def read_talos_secrets(k8s, tenant: str, namespace: str) -> dict[str, str]
     }
 
 
+def resolve_talos_release(k8s_version: str, talos_version: str | None):
+    """The catalogue entry a create request resolves to, or a 422 that lists
+    what would have worked.
+
+    This is the validator half of T1. It shares `is_compatible()` with the
+    endpoint the wizard renders, so the wizard cannot offer a pair this
+    refuses — the failure this codebase keeps meeting is exactly that gap.
+    """
+    from fastapi import HTTPException
+
+    from app.core.talos_catalog import (
+        catalog, default_release, find, is_compatible,
+    )
+
+    release = find(talos_version) if talos_version else default_release()
+    if release is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Talos {talos_version} is not in this deployment's catalogue. "
+                f"Offered: {', '.join(e.talos for e in catalog())}."
+            ),
+        )
+    if not is_compatible(release, k8s_version):
+        pairs = ", ".join(
+            f"Talos {e.talos} -> Kubernetes {e.k8s_min}-{e.k8s_max}"
+            for e in catalog()
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Talos {release.talos} does not support Kubernetes "
+                f"{k8s_version} (it takes {release.k8s_min}-{release.k8s_max}). "
+                f"Compatible pairs: {pairs}."
+            ),
+        )
+    return release
+
+
 def build_talos_golden_dv(
     tenant: str, namespace: str, image_url: str, size: str, storage_class: str | None,
 ) -> dict[str, Any]:
@@ -858,7 +903,7 @@ async def ensure_talos_golden_image(
     storage_class: str | None = None,
 ) -> None:
     """Import the Talos golden image into the tenant namespace if absent."""
-    url = image_url or TALOS_GOLDEN_IMAGE_URL
+    url = image_url or _default_golden_url()
 
     # The wizard's worker image field is shared with the cloud-init path,
     # where it holds a CAPK *container disk* reference. CDI takes this one as
@@ -874,10 +919,10 @@ async def ensure_talos_golden_image(
     if not url.startswith(("http://", "https://")):
         logger.warning(
             f"Talos golden image for tenant {tenant!r} was given {url!r}, which "
-            f"is not an HTTP(S) URL — using {TALOS_GOLDEN_IMAGE_URL} instead. "
+            f"is not an HTTP(S) URL — using {_default_golden_url()} instead. "
             f"A container-disk reference belongs to the cloud-init worker path.",
         )
-        url = TALOS_GOLDEN_IMAGE_URL
+        url = _default_golden_url()
 
     body = build_talos_golden_dv(tenant, namespace, url, size, storage_class)
     try:

@@ -113,6 +113,7 @@ from app.core.tenant_transit import (
     transit_subnet_name,
 )
 from app.api.v1.tenants_talos import (
+    resolve_talos_release,
     assert_cabpt_installed,
     ensure_talos_bootstrap_provider,
     ensure_talos_golden_image,
@@ -891,6 +892,40 @@ async def discover_host_infrastructure(request: Request, user: User = Depends(re
     )
 
 
+@router.get("/talos-versions")
+async def list_talos_versions(user: User = Depends(require_auth)) -> dict[str, Any]:
+    """What the wizard renders. It computes nothing.
+
+    The pairs come from the same `is_compatible()` the create validator uses,
+    so a version offered here is a version that will be accepted — the whole
+    point of T1's single-owner design. A wizard that derived compatibility
+    itself would be the second record for one fact, and this codebase has been
+    burned by that shape repeatedly.
+
+    Declared above `/{name}` on purpose: FastAPI matches in declaration order
+    and `talos-versions` would otherwise be read as a tenant called
+    "talos-versions".
+    """
+    from app.core.talos_catalog import catalog, default_release
+
+    entries = catalog()
+    default = default_release()
+    return {
+        "items": [
+            {
+                "talos": e.talos,
+                "image_url": e.image_url,
+                "sha": e.sha,
+                "k8s_min": e.k8s_min,
+                "k8s_max": e.k8s_max,
+                "default": e.talos == default.talos,
+            }
+            for e in entries
+        ],
+        "default": default.talos,
+    }
+
+
 @router.get("/catalog")
 async def get_addon_catalog(request: Request, user: User = Depends(require_auth)) -> dict[str, Any]:
     """Get addon catalog for tenant wizard."""
@@ -1303,9 +1338,14 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                     k8s, req.name, ns, worker_os=req.worker_os,
                 )
             await ensure_talos_tenant_objects(k8s, req.name, ns, vip=talos_vip)
+            # Resolved here rather than trusted: the wizard renders the pairs
+            # this same function accepts, so a mismatch means one of them has
+            # drifted and the tenant would be built on an image whose kubelet
+            # does not match its control plane.
+            release = resolve_talos_release(req.kubernetes_version, req.talos_version)
             await ensure_talos_golden_image(
                 k8s, req.name, ns,
-                image_url=req.worker_image_url or None,
+                image_url=req.worker_image_url or release.image_url,
                 size=req.worker_image_size,
                 storage_class=req.storage_class or None,
             )
