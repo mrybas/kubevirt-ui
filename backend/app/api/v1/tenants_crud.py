@@ -114,6 +114,8 @@ from app.core.tenant_transit import (
 )
 from app.api.v1.tenants_ntp import ensure_ntp_server, ensure_tenant_ntp_service
 from app.api.v1.tenants_talos import (
+    ensure_golden_clone_rbac,
+    ensure_shared_golden_image,
     resolve_talos_release,
     assert_cabpt_installed,
     ensure_talos_bootstrap_provider,
@@ -1074,9 +1076,13 @@ def _tenant_quota(req: Any) -> dict[str, str]:
     # through a scratch PVC of the target size.
     if req.worker_os == "talos":
         from app.api.v1.tenants_capi import _worker_root_size
-        from app.api.v1.tenants_talos import DEFAULT_TALOS_GOLDEN_SIZE
 
-        storage += (parse_quantity(DEFAULT_TALOS_GOLDEN_SIZE) or 0)
+        # The root clones, and only those. The golden image used to be
+        # imported into this namespace and was counted here for that reason;
+        # T2 moved it to a shared namespace, so counting it now reserves 20Gi
+        # against a tenant for something that is not in its namespace. Same
+        # defect as a96df69 — a quota that does not describe the namespace it
+        # governs — with the sign reversed.
         storage += surge * (parse_quantity(_worker_root_size(req)) or 0)
     return {
         "cpu": f"{cpu:g}",
@@ -1350,11 +1356,18 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             # drifted and the tenant would be built on an image whose kubelet
             # does not match its control plane.
             release = resolve_talos_release(req.kubernetes_version, req.talos_version)
-            await ensure_talos_golden_image(
-                k8s, req.name, ns,
-                image_url=req.worker_image_url or release.image_url,
+            # One golden per Talos version for the whole cluster, in a shared
+            # namespace. Two tenants of the same version import once; a tenant
+            # of another version gets its own alongside, with no conflict,
+            # because the version is the name.
+            # The clone is performed by KubeVirt as the tenant namespace's
+            # default ServiceAccount, not by us — so the permission has to be
+            # granted to that subject, in the namespace holding the golden.
+            await ensure_golden_clone_rbac(k8s, ns)
+            await ensure_shared_golden_image(
+                k8s, release.talos,
+                req.worker_image_url or release.image_url,
                 size=req.worker_image_size,
-                storage_class=req.storage_class or None,
             )
 
         # 3. Create CAPI resources + Ingress.

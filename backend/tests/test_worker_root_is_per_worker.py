@@ -33,8 +33,11 @@ from app.models.tenant import TenantCreateRequest
 
 
 def _req(**kw) -> TenantCreateRequest:
+    # A pair the catalogue accepts. These tests predate T1 and used the model
+    # default v1.30.1, which Talos 1.13.8 does not support — the request they
+    # built is one the product now refuses outright, and rightly.
     base = dict(name="t9", display_name="t9", folder="f", environment="e",
-                worker_os="talos")
+                worker_os="talos", kubernetes_version="v1.32.1")
     base.update(kw)
     return TenantCreateRequest(**base)
 
@@ -48,12 +51,18 @@ class TestTheRootDiskIsNoLongerShared:
         assert vol["dataVolume"]["name"] != talos_golden_pvc_name(req)
         assert vol["dataVolume"]["name"] == WORKER_ROOT_TEMPLATE
 
-    def test_the_template_clones_the_golden_image(self) -> None:
+    def test_the_template_clones_the_shared_golden_image(self) -> None:
+        """T2 moved the golden out of the tenant namespace: one image per Talos
+        version for the whole cluster, cloned across the boundary."""
+        from app.api.v1.tenants_talos import golden_name, golden_namespace
+
         [tpl] = _build_worker_data_volume_templates(_req())
 
         assert tpl["spec"]["source"] == {
-            "pvc": {"name": "t9-talos-golden", "namespace": "tenant-t9"},
+            "pvc": {"name": golden_name("1.13.8"),
+                    "namespace": golden_namespace()},
         }
+        assert golden_namespace() != "tenant-t9"
 
     def test_the_volume_reference_matches_the_template_name(self) -> None:
         """CAPK renames both together; if they disagree here they disagree
@@ -164,13 +173,17 @@ class TestTheQuotaCountsTheDisksTheTenantProvisionsForItself:
     is a broken build — and it presents as a storage problem.
     """
 
-    def test_talos_storage_covers_golden_and_the_roots(self) -> None:
+    def test_talos_storage_covers_the_roots(self) -> None:
+        """The golden was counted here while it was imported into the tenant
+        namespace. T2 moved it to a shared one, so reserving 20Gi for it now
+        would charge a tenant for something that is not in its namespace —
+        a96df69's defect with the sign reversed."""
         from app.api.v1.tenants_crud import _tenant_quota
 
         q = _tenant_quota(_req(worker_count=2, worker_disk="20Gi"))
 
-        # data 3x20 + golden 20 + roots 3x20  (surge = workers + 1)
-        assert int(q["storage"]) == (3 * 20 + 20 + 3 * 20) * 2**30
+        # data 3x20 + roots 3x20  (surge = workers + 1), no golden
+        assert int(q["storage"]) == (3 * 20 + 3 * 20) * 2**30
 
     def test_cloud_init_is_unchanged(self) -> None:
         """They boot a containerDisk — no DataVolume, nothing to count."""
@@ -198,4 +211,4 @@ class TestTheQuotaCountsTheDisksTheTenantProvisionsForItself:
 
         q = _tenant_quota(_req(worker_count=1, worker_disk="40Gi"))
 
-        assert int(q["storage"]) == (2 * 40 + 20 + 2 * 40) * 2**30
+        assert int(q["storage"]) == (2 * 40 + 2 * 40) * 2**30

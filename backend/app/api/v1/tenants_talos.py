@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import secrets
 import string
 from typing import Any, Literal
@@ -876,6 +877,245 @@ def resolve_talos_release(k8s_version: str, talos_version: str | None):
             ),
         )
     return release
+
+
+# One golden image per Talos version, for the whole cluster.
+#
+# It used to be one per tenant: the same bytes imported over HTTP again for
+# every tenant created, and — before T3 — written into by the worker that
+# mounted it. The version is the only thing that distinguishes two golden
+# images, so it is the name, and the name is what makes the singleton hold:
+# two tenants created at the same moment both try to create
+# `talos-golden-1-13-8`, etcd admits one, and the other joins it.
+GOLDEN_NAMESPACE_ENV = "TENANTS_GOLDEN_NAMESPACE"
+DEFAULT_GOLDEN_NAMESPACE = "kubevirt-ui-system"
+
+
+def golden_namespace() -> str:
+    return os.getenv(GOLDEN_NAMESPACE_ENV) or DEFAULT_GOLDEN_NAMESPACE
+
+
+def golden_storage_class() -> str | None:
+    """StorageClass for the golden image.
+
+    Meant for an erasure-coded pool: this is read-only reference data cloned
+    many times, which is what EC is for, while the clones themselves live on
+    replica. The lab has no EC class today (`ceph-block` is replicated), so
+    that half is intent rather than something measured here — the setting
+    exists so a deployment that has one can point at it without a code change.
+    """
+    return os.getenv("TENANTS_GOLDEN_STORAGE_CLASS") or None
+
+
+def golden_name(talos_version: str) -> str:
+    """Deterministic, and deliberately the catalogue key.
+
+    T1 keyed its catalogue on the Talos version; this is the same string with
+    dots flattened for DNS-1123. Catalogue and image naming join at one
+    identifier instead of agreeing by convention.
+    """
+    return f"talos-golden-{talos_version.lstrip('v').replace('.', '-')}"
+
+
+def build_shared_golden_dv(
+    talos_version: str, image_url: str, size: str, storage_class: str | None,
+) -> dict[str, Any]:
+    """The one DataVolume every tenant of this Talos version clones from."""
+    storage: dict[str, Any] = {"resources": {"requests": {"storage": size}}}
+    if storage_class:
+        storage["storageClassName"] = storage_class
+    return {
+        "apiVersion": "cdi.kubevirt.io/v1beta1",
+        "kind": "DataVolume",
+        "metadata": {
+            "name": golden_name(talos_version),
+            "namespace": golden_namespace(),
+            "labels": {
+                **MANAGED_LABEL,
+                "kubevirt-ui.io/talos-golden": "true",
+                "kubevirt-ui.io/talos-version": talos_version,
+            },
+        },
+        "spec": {"source": {"http": {"url": image_url}}, "storage": storage},
+    }
+
+
+async def ensure_shared_golden_image(
+    k8s, talos_version: str, image_url: str, *,
+    size: str = DEFAULT_TALOS_GOLDEN_SIZE,
+    wait_seconds: float = 20.0,
+) -> str:
+    """Create the golden for this version, or join the one already being made.
+
+    `create` is the compare-and-swap: etcd admits exactly one object for a
+    name, so two tenants created in the same second cannot both start an
+    import. The loser does not retry and does not create anything of its own —
+    it waits, briefly, for the winner's import.
+
+    The wait is bounded and not fatal. CDI's clone waits for its source
+    anyway, so a golden still importing delays the first worker's disk rather
+    than failing the tenant; blocking tenant creation for the length of a
+    20Gi HTTP pull would be worse than the thing it guards against.
+
+    A golden in Terminating is refused outright rather than raced: recreating
+    an object whose finalizers are still running produces either a stuck
+    create or a second import that the finalizer then deletes.
+    """
+    from fastapi import HTTPException
+
+    name = golden_name(talos_version)
+    ns = golden_namespace()
+    body = build_shared_golden_dv(
+        talos_version, image_url, size, golden_storage_class(),
+    )
+
+    try:
+        await k8s.custom_api.create_namespaced_custom_object(
+            group="cdi.kubevirt.io", version="v1beta1", namespace=ns,
+            plural="datavolumes", body=body,
+        )
+        logger.info("Importing the shared Talos golden %s from %s", name, image_url)
+        return name
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+    existing = None
+    try:
+        existing = await k8s.custom_api.get_namespaced_custom_object(
+            group="cdi.kubevirt.io", version="v1beta1", namespace=ns,
+            plural="datavolumes", name=name,
+        )
+    except ApiException:
+        pass
+
+    if existing and (existing.get("metadata") or {}).get("deletionTimestamp"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"The shared Talos {talos_version} image ({ns}/{name}) is being "
+                "deleted. Creating a tenant on it now would either block on its "
+                "finalizers or start an import that the deletion then removes. "
+                "Retry once it is gone."
+            ),
+        )
+
+    phase = ((existing or {}).get("status") or {}).get("phase")
+    if phase == "Succeeded":
+        return name
+
+    logger.info("Shared Talos golden %s already exists (phase=%s); joining it",
+                name, phase)
+    await _wait_for_golden(k8s, name, ns, wait_seconds)
+    return name
+
+
+GOLDEN_CLONER_ROLE = "talos-golden-cloner"
+
+
+def build_golden_cloner_role() -> dict[str, Any]:
+    """Permission to clone the shared golden, in the namespace that holds it.
+
+    `datavolumes/source` grants nothing by itself: CDI's webhook checks that
+    whoever creates a cross-namespace clone may `create` it in the **source**
+    namespace, and refuses otherwise.
+    """
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "Role",
+        "metadata": {
+            "name": GOLDEN_CLONER_ROLE,
+            "namespace": golden_namespace(),
+            "labels": dict(MANAGED_LABEL),
+        },
+        "rules": [{
+            "apiGroups": ["cdi.kubevirt.io"],
+            "resources": ["datavolumes/source"],
+            "verbs": ["create"],
+        }],
+    }
+
+
+def build_golden_cloner_binding(tenant_namespace: str) -> dict[str, Any]:
+    """Bind that permission to the identity that actually performs the clone.
+
+    Not our backend. The worker's root disk is a `dataVolumeTemplate` on the
+    VirtualMachine, so KubeVirt creates it — and CDI evaluates the **tenant
+    namespace's default ServiceAccount**, which is what the cluster said in as
+    many words:
+
+        not authorized to create DataVolume: User
+        system:serviceaccount:tenant-ga:default has insufficient permissions
+        in clone source namespace kubevirt-ui-system
+
+    Granting the backend `datavolumes/source` was necessary and not
+    sufficient; there are two subjects on this path and they are different.
+    """
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "RoleBinding",
+        "metadata": {
+            "name": f"{GOLDEN_CLONER_ROLE}-{tenant_namespace}",
+            "namespace": golden_namespace(),
+            "labels": dict(MANAGED_LABEL),
+        },
+        "roleRef": {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "Role",
+            "name": GOLDEN_CLONER_ROLE,
+        },
+        "subjects": [{
+            "kind": "ServiceAccount",
+            "name": "default",
+            "namespace": tenant_namespace,
+        }],
+    }
+
+
+async def ensure_golden_clone_rbac(k8s, tenant_namespace: str) -> None:
+    """Let this tenant's VMs clone the shared golden. Idempotent."""
+    from kubernetes_asyncio.client import RbacAuthorizationV1Api
+
+    rbac = RbacAuthorizationV1Api(k8s._api_client)
+    ns = golden_namespace()
+    for body, api in (
+        (build_golden_cloner_role(), "role"),
+        (build_golden_cloner_binding(tenant_namespace), "binding"),
+    ):
+        try:
+            if api == "role":
+                await rbac.create_namespaced_role(namespace=ns, body=body)
+            else:
+                await rbac.create_namespaced_role_binding(namespace=ns, body=body)
+        except ApiException as e:
+            if e.status != 409:
+                logger.error(
+                    "Could not grant %s the right to clone the shared golden "
+                    "(%s): its workers will fail with 'insufficient permissions "
+                    "in clone source namespace'. %s", tenant_namespace, api, e,
+                )
+
+
+async def _wait_for_golden(k8s, name: str, ns: str, seconds: float) -> None:
+    import asyncio
+
+    deadline = seconds
+    while deadline > 0:
+        await asyncio.sleep(2.0)
+        deadline -= 2.0
+        try:
+            dv = await k8s.custom_api.get_namespaced_custom_object(
+                group="cdi.kubevirt.io", version="v1beta1", namespace=ns,
+                plural="datavolumes", name=name,
+            )
+        except ApiException:
+            return
+        if ((dv.get("status") or {}).get("phase")) == "Succeeded":
+            return
+    logger.info(
+        "Shared Talos golden %s is still importing; the first worker's clone "
+        "will wait for it", name,
+    )
 
 
 def build_talos_golden_dv(

@@ -235,6 +235,9 @@ class TestTheHardcodeIsGone:
 
         src = Path("app/api/v1/tenants_crud.py").read_text()
         body = src[src.index("resolve_talos_release(req.kubernetes_version"):]
-        body = body[:body.index(")", body.index("ensure_talos_golden_image"))]
+        body = body[:body.index(")", body.index("ensure_shared_golden_image"))]
 
+        # T2 made the import shared, so the resolved release now supplies both
+        # halves of the identity: which version to import, and from where.
         assert "release.image_url" in body
+        assert "release.talos" in body

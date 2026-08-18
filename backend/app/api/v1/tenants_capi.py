@@ -53,6 +53,7 @@ from app.api.v1.tenants_cp_vip import (
 )
 from app.api.v1.tenants_ntp import NTP_PORT, worker_time_servers
 from app.api.v1.tenants_talos import (
+    resolve_talos_release,
     TALOS_TRUSTD_PORT,
     build_talos_config_template,
     read_talos_secrets,
@@ -662,6 +663,10 @@ def _build_worker_data_volume_templates(req: TenantCreateRequest) -> list[dict[s
     if req.storage_class:
         storage["storageClassName"] = req.storage_class
 
+    from app.api.v1.tenants_talos import golden_name, golden_namespace
+
+    release = resolve_talos_release(req.kubernetes_version, req.talos_version)
+
     return [{
         "metadata": {
             "name": WORKER_ROOT_TEMPLATE,
@@ -672,10 +677,15 @@ def _build_worker_data_volume_templates(req: TenantCreateRequest) -> list[dict[s
             },
         },
         "spec": {
+            # The shared golden, not a per-tenant copy. Crossing the
+            # namespace boundary is what CDI gates on `datavolumes/source`
+            # (measured: without it the webhook refuses the clone), and it is
+            # the whole point of T2 — one import per Talos version instead of
+            # one per tenant.
             "source": {
                 "pvc": {
-                    "name": talos_golden_pvc_name(req),
-                    "namespace": _tenant_ns(req.name),
+                    "name": golden_name(release.talos),
+                    "namespace": golden_namespace(),
                 },
             },
             "storage": storage,
