@@ -453,18 +453,32 @@ async def recreate_snat_rule(
     })
 
 
-def build_transit_acls(eip: str, vip: str, ports: list[int]) -> list[dict[str, Any]]:
-    """Let one tenant's EIP reach the control-plane VIP on its own ports only."""
+def build_transit_acls(
+    eip: str, vip: str, ports: list[int], udp_ports: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Let one tenant's EIP reach the control-plane VIP on its own ports only.
+
+    UDP is listed separately rather than inferred, because the one UDP port
+    here is load-bearing in a way that is easy to miss: NTP. Talos will not
+    start the kubelet until the clock is synchronised, and a guard that
+    allowed only the TCP ports would drop the time request and present as a
+    node that never joins — the same symptom, and the same wasted afternoon,
+    that T22 exists to stop.
+    """
     acls: list[dict[str, Any]] = []
-    for port in ports:
-        if not port:
-            continue
-        acls.append({
-            "action": "allow-related",
-            "direction": "from-lport",
-            "priority": TRANSIT_ALLOW_PRIORITY,
-            "match": f"ip4.src == {eip} && ip4.dst == {vip} && tcp.dst == {port}",
-        })
+    for proto, plist in (("tcp", ports), ("udp", udp_ports or [])):
+        for port in plist:
+            if not port:
+                continue
+            acls.append({
+                "action": "allow-related",
+                "direction": "from-lport",
+                "priority": TRANSIT_ALLOW_PRIORITY,
+                "match": (
+                    f"ip4.src == {eip} && ip4.dst == {vip} "
+                    f"&& {proto}.dst == {port}"
+                ),
+            })
     return acls
 
 
@@ -499,6 +513,7 @@ async def _live_transit_addresses(k8s, transit_subnet: str) -> set[str] | None:
 
 async def ensure_transit_acls(
     k8s, transit_subnet: str, eip: str, vip: str, ports: list[int],
+    udp_ports: list[int] | None = None,
 ) -> None:
     """This tenant's allows, plus the deny they are exceptions to.
 
@@ -514,7 +529,7 @@ async def ensure_transit_acls(
     belongs to somebody else. Measured on the lab: an allow for 10.199.1.9
     survived while .9 sat free in `cp-transit`'s available range.
     """
-    wanted = build_transit_acls(eip, vip, ports)
+    wanted = build_transit_acls(eip, vip, ports, udp_ports)
     if not wanted:
         return
 

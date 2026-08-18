@@ -510,6 +510,7 @@ def build_talos_worker_config(
     kubernetes_version: str = "",
     own_vip: str | None = None,
     nameservers: list[str] | None = None,
+    time_servers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Talos machine config for a worker node.
 
@@ -550,6 +551,15 @@ def build_talos_worker_config(
                 # resolv.conf; Talos has no cloud-init, so it goes here.
                 **({"nameservers": nameservers} if nameservers else {}),
             },
+            # T22. Talos will not start the kubelet until the clock is
+            # synchronised, and it says so in a way that reads as a network
+            # fault: "waiting for time sync", nothing naming the clock. With
+            # the default public pool that makes joining a soft dependency of
+            # the internet plane — the one property B3 exists to remove. The
+            # tenant's own VIP is first in the list and is reachable before
+            # any gateway exists; the public servers stay behind it for the
+            # deployments where egress is never in question.
+            **({"time": {"servers": time_servers}} if time_servers else {}),
             "features": {"kubePrism": {"enabled": False}},
             "kubelet": {
                 # Without rotation the kubelet's client certificate expires

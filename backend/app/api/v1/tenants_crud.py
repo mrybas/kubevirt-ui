@@ -112,6 +112,7 @@ from app.core.tenant_transit import (
     remove_tenant_transit,
     transit_subnet_name,
 )
+from app.api.v1.tenants_ntp import ensure_ntp_server, ensure_tenant_ntp_service
 from app.api.v1.tenants_talos import (
     resolve_talos_release,
     assert_cabpt_installed,
@@ -1338,6 +1339,12 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                     k8s, req.name, ns, worker_os=req.worker_os,
                 )
             await ensure_talos_tenant_objects(k8s, req.name, ns, vip=talos_vip)
+            # Time on the transit plane. Best-effort by design: without it the
+            # public fallbacks still work wherever egress does, and failing the
+            # whole create over the clock would be worse than the symptom.
+            await ensure_ntp_server(k8s)
+            if talos_vip:
+                await ensure_tenant_ntp_service(k8s, req.name, ns, talos_vip)
             # Resolved here rather than trusted: the wizard renders the pairs
             # this same function accepts, so a mismatch means one of them has
             # drifted and the tenant would be built on an image whose kubelet

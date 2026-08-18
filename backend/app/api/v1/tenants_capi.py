@@ -51,6 +51,7 @@ from app.api.v1.tenants_cp_vip import (
     cp_metallb_pool,
     per_tenant_vip_enabled,
 )
+from app.api.v1.tenants_ntp import NTP_PORT, worker_time_servers
 from app.api.v1.tenants_talos import (
     TALOS_TRUSTD_PORT,
     build_talos_config_template,
@@ -1401,6 +1402,7 @@ async def tenant_vpc_name(k8s, tenant_name: str) -> str:
 
 async def _wire_tenant_to_transit(
     k8s, tenant_name: str, vpc_name: str, vip: str, ports: list[int],
+    udp_ports: list[int] | None = None,
 ) -> None:
     """Build the tenant's path to the shared control-plane VIP.
 
@@ -1424,7 +1426,7 @@ async def _wire_tenant_to_transit(
             k8s, tenant_name, vpc_name, f"{vpc_name}-default", transit,
         )
         if eip:
-            await ensure_transit_acls(k8s, transit, eip, vip, ports)
+            await ensure_transit_acls(k8s, transit, eip, vip, ports, udp_ports)
         else:
             logger.info(
                 "Tenant %r: transit EIP has no address yet; ACLs deferred to the "
@@ -1875,10 +1877,16 @@ async def _create_capi_resources(
         # Talos also needs trustd's fixed :50001 through the same guard, or the
         # worker's CSR never reaches a signer and the node never appears.
         transit_ports = [api_port, konn_port]
+        transit_udp_ports: list[int] = []
         if own_vip and req.worker_os == "talos":
             transit_ports.append(TENANT_TRUSTD_PORT)
+            # T22. The clock is on the join path: Talos holds the kubelet on
+            # "waiting for time sync", and a guard that passed only the TCP
+            # ports would drop the time request. The failure is a node that
+            # never appears, with nothing naming the clock.
+            transit_udp_ports.append(NTP_PORT)
         await _wire_tenant_to_transit(
-            k8s, req.name, req.vpc_name, vip, transit_ports,
+            k8s, req.name, req.vpc_name, vip, transit_ports, transit_udp_ports,
         )
     else:
         # 3-default. Wait for the Kamaji TCP Service ClusterIP, then PATCH
@@ -1939,6 +1947,10 @@ async def _create_capi_resources(
                     # trustd. The *.svc name is unreachable from a VPC.
                     own_vip=vip if own_vip else None,
                     nameservers=_talos_worker_nameservers(req),
+                    # The transit address first: a worker that cannot get the
+                    # time cannot start its kubelet, and reaching a public
+                    # pool needs the egress this join must not depend on.
+                    time_servers=worker_time_servers(vip if own_vip else None),
                 ),
                 default_flow_style=False, sort_keys=False,
             )
