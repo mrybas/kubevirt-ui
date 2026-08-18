@@ -252,14 +252,60 @@ class TestSignerImage:
 
 
 class TestClusterSingletons:
-    def test_bootstrap_provider_is_the_thin_capi_operator_cr(self) -> None:
-        # The only cluster-wide object Talos support needs: it asks
-        # capi-operator to install CABPT. Everything else is per-tenant.
-        from app.api.v1.tenants_talos import build_bootstrap_provider
+    """T9 moved the one cluster-wide object out of here.
 
-        cr = build_bootstrap_provider()
-        assert cr["kind"] == "BootstrapProvider"
-        assert cr["metadata"]["name"] == "talos"
+    The UI used to create the `BootstrapProvider` itself, on whichever tenant
+    happened to be created first, with an empty spec — so capi-operator
+    installed whatever CABPT release was newest that day, and two clusters
+    built a week apart ran different versions with nothing recording which.
+    It is pinned in the `capi-providers` component now and arrives with the
+    cluster; this side only checks and refuses.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_missing_provider_is_refused_not_installed(self) -> None:
+        from app.api.v1.tenants_talos import assert_cabpt_installed
+        from fastapi import HTTPException
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(
+            side_effect=ApiException(status=404))
+        k8s.custom_api.list_namespaced_custom_object = AsyncMock(
+            side_effect=ApiException(status=404))
+        k8s.custom_api.create_namespaced_custom_object = AsyncMock()
+
+        with pytest.raises(HTTPException) as e:
+            await assert_cabpt_installed(k8s)
+
+        assert e.value.status_code == 409
+        k8s.custom_api.create_namespaced_custom_object.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_says_where_the_provider_comes_from(self) -> None:
+        """"Missing" alone sends the reader looking for a CRD to install by
+        hand, which is the step this task exists to delete."""
+        from app.api.v1.tenants_talos import assert_cabpt_installed
+        from fastapi import HTTPException
+
+        k8s = MagicMock()
+        k8s.custom_api.list_cluster_custom_object = AsyncMock(
+            side_effect=ApiException(status=404))
+        k8s.custom_api.list_namespaced_custom_object = AsyncMock(
+            side_effect=ApiException(status=404))
+
+        with pytest.raises(HTTPException) as e:
+            await assert_cabpt_installed(k8s)
+
+        assert "capi-providers" in e.value.detail
+        assert "cloud-init" in e.value.detail   # and what still works meanwhile
+
+    def test_nothing_here_builds_a_bootstrap_provider_any_more(self) -> None:
+        """Guards against the convenience coming back: creating it from a
+        request is exactly how it ended up unpinned."""
+        from app.api.v1 import tenants_talos
+
+        assert not hasattr(tenants_talos, "build_bootstrap_provider")
+        assert not hasattr(tenants_talos, "ensure_talos_bootstrap_provider")
 
 
 class TestGoldenImageSourceGuard:
@@ -317,69 +363,6 @@ class TestGoldenImageSourceGuard:
         assert url.startswith("https://")
         assert url.endswith(".raw.xz")
 
-
-class TestBootstrapProviderNamespace:
-    """capi-operator's namespace is a deployment choice, not a constant. This
-    cluster runs it under `o0-capi` with its kubeadm provider alongside;
-    creating the Talos provider in a hardcoded `capi-talos-bootstrap-system`
-    404s, and Talos support then reports itself "unavailable" while a healthy
-    operator sits next door."""
-
-    def _k8s(self, providers=None, deployments=None):
-        from unittest.mock import AsyncMock, MagicMock
-
-        k8s = MagicMock()
-        k8s.custom_api.list_cluster_custom_object = AsyncMock(
-            return_value={"items": providers if providers is not None else []},
-        )
-        deps = MagicMock()
-        deps.items = deployments or []
-        k8s.apps_api.list_deployment_for_all_namespaces = AsyncMock(return_value=deps)
-        return k8s
-
-    def _deployment(self, name, namespace):
-        from unittest.mock import MagicMock
-
-        dep = MagicMock()
-        dep.metadata.name = name
-        dep.metadata.namespace = namespace
-        return dep
-
-    @pytest.mark.asyncio
-    async def test_follows_the_namespace_of_an_existing_provider(self) -> None:
-        from app.api.v1.tenants_talos import find_capi_operator_namespace
-
-        k8s = self._k8s(providers=[{"metadata": {"name": "kubeadm", "namespace": "o0-capi"}}])
-
-        assert await find_capi_operator_namespace(k8s) == "o0-capi"
-
-    @pytest.mark.asyncio
-    async def test_falls_back_to_the_operator_deployment(self) -> None:
-        from app.api.v1.tenants_talos import find_capi_operator_namespace
-
-        k8s = self._k8s(
-            providers=[],
-            deployments=[self._deployment("capi-operator-cluster-api-operator", "o0-capi")],
-        )
-
-        assert await find_capi_operator_namespace(k8s) == "o0-capi"
-
-    @pytest.mark.asyncio
-    async def test_falls_back_to_the_upstream_default_when_nothing_is_found(self) -> None:
-        from app.api.v1.tenants_talos import (
-            TALOS_PROVIDER_FALLBACK_NS,
-            find_capi_operator_namespace,
-        )
-
-        assert await find_capi_operator_namespace(self._k8s()) == TALOS_PROVIDER_FALLBACK_NS
-
-    def test_the_manifest_is_built_for_the_namespace_it_is_created_in(self) -> None:
-        from app.api.v1.tenants_talos import build_bootstrap_provider
-
-        body = build_bootstrap_provider("o0-capi")
-
-        assert body["metadata"]["namespace"] == "o0-capi"
-        assert body["metadata"]["name"] == "talos"
 
 
 class TestSignerReachesTheControlPlane:

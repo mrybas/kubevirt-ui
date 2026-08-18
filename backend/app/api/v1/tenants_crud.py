@@ -123,7 +123,6 @@ from app.api.v1.tenants_talos import (
     ensure_shared_golden_image,
     resolve_talos_release,
     assert_cabpt_installed,
-    ensure_talos_bootstrap_provider,
     ensure_talos_golden_image,
     ensure_talos_tenant_objects,
     validate_worker_binding,
@@ -1380,7 +1379,12 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
         #     created with the rest of the CAPI objects, since it is just
         #     another per-tenant ingress alongside the apiserver's.
         if req.worker_os == "talos":
-            await ensure_talos_bootstrap_provider(k8s)
+            # No BootstrapProvider is created here any more (T9). Installing
+            # CABPT belongs to the cluster's bootstrap, pinned, not to
+            # whichever tenant happens to be created first — that version was
+            # whatever the operator found newest that day. `assert_cabpt_installed`
+            # above has already refused the request if it is absent.
+            #
             # A VPC tenant with its own VIP needs that address inside the
             # signer certificate: the worker dials <vip>:50001 by address and
             # sends no SNI, so a DNS-only certificate fails the handshake
