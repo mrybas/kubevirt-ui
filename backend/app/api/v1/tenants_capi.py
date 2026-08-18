@@ -473,6 +473,28 @@ def _build_kubevirt_cluster_cr(
     }
 
 
+# How long a worker may be NotReady before it is replaced.
+#
+# Derived, not chosen. A Talos worker rebooted through the UI came back in
+# about **3 minutes** (VMI recreated, node rejoined, tenant Ready 2/2 —
+# measured on t3fix). The previous 5m left ninety seconds of margin, and the
+# MHC did fire `DetectedUnhealthy` during that reboot: it started its clock
+# and only failed to remediate because the node beat it. A slower boot — a
+# larger image, a busy node, a loaded Ceph — crosses that line, and the
+# operation that crosses it is an ordinary reboot.
+#
+# Three times the measured return is the rule, so the number moves when the
+# measurement does instead of being re-guessed. The cost is stated rather
+# than hidden: a genuinely dead worker is now detected ~5 minutes later. That
+# trade is deliberate for persistent nodes — a false replacement re-clones a
+# 20Gi root and churns the node's identity, which is dearer than waiting.
+#
+# `nodeStartupTimeout` is left at 20m: it governs a node that has never
+# joined, was verified sufficient, and is not what this is about.
+WORKER_RETURN_TIME_OBSERVED = 3          # minutes, measured on t3fix
+WORKER_UNHEALTHY_TIMEOUT = f"{WORKER_RETURN_TIME_OBSERVED * 3}m"
+
+
 def _build_machine_health_check_cr(req: Any) -> dict[str, Any]:
     """Replace a worker whose node stops being Ready.
 
@@ -509,8 +531,8 @@ def _build_machine_health_check_cr(req: Any) -> dict[str, Any]:
                 "cluster.x-k8s.io/deployment-name": f"{req.name}-workers",
             }},
             "unhealthyConditions": [
-                {"type": "Ready", "status": "False", "timeout": "5m"},
-                {"type": "Ready", "status": "Unknown", "timeout": "5m"},
+                {"type": "Ready", "status": "False", "timeout": WORKER_UNHEALTHY_TIMEOUT},
+                {"type": "Ready", "status": "Unknown", "timeout": WORKER_UNHEALTHY_TIMEOUT},
             ],
         },
     }
