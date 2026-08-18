@@ -108,6 +108,36 @@ distinguishes "nothing is listening for you" from "something refused you".
 
 ---
 
+## `kubectl auth can-i` says no and the action plainly works
+
+Subresources need the flag, not a slash:
+
+```
+kubectl auth can-i create datavolumes --subresource=source -n <ns> --as=<subject>   # yes
+kubectl auth can-i create datavolumes/source          -n <ns> --as=<subject>   # no
+```
+
+The second form answers **no** for a subject that holds the permission. It is
+the more natural thing to type, it produces a confident wrong answer, and
+nothing about the output suggests the query was malformed.
+
+Which is worse than having no check at all: a tool that lies in the direction
+of "you lack this" sends the diagnosis toward RBAC when RBAC is fine. When the
+datapath and the check disagree, the datapath wins — a DataVolume that cloned
+successfully is proof of permission no `can-i` can overrule.
+
+Cross-namespace clones have **two** subjects, and they are asked about
+separately:
+
+| what creates the DataVolume | subject CDI evaluates |
+|---|---|
+| the backend, directly | the backend's ServiceAccount |
+| KubeVirt, from a VM's `dataVolumeTemplate` | the **VM namespace's** `default` SA |
+
+Granting one and not the other looks like a permission that is handled.
+
+---
+
 ## Before measuring anything, prove the change arrived
 
 A pod whose Deployment you just edited may still be the previous ReplicaSet.
