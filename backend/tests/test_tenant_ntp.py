@@ -111,6 +111,18 @@ class TestPublishingItOnTheTenantVip:
 
         assert (port["port"], port["protocol"]) == (NTP_PORT, "UDP")
 
+    def test_it_lives_beside_the_pods_it_selects(self) -> None:
+        """A Service selects only pods in its own namespace. Published in the
+        tenant namespace it had no endpoints at all — an address that answered
+        nothing, which is indistinguishable from a server refusing to reply and
+        sent the first diagnosis of this into chronyd's configuration."""
+        from app.api.v1.tenants_ntp import NTP_NAMESPACE
+
+        svc = build_tenant_ntp_service("t8", "tenant-t8", vip="10.199.0.101")
+
+        assert svc["metadata"]["namespace"] == NTP_NAMESPACE
+        assert svc["spec"]["selector"] == {"app": NTP_APP}
+
     def test_it_shares_the_control_plane_address(self) -> None:
         """A second address per tenant would be an allocation nobody asked
         for; MetalLB allows the sharing because the ports cannot collide."""
@@ -172,6 +184,32 @@ class TestTheServerItself:
         assert caps["drop"] == ["ALL"]
         assert "SYS_TIME" not in caps["add"]
         assert c["securityContext"]["allowPrivilegeEscalation"] is False
+
+    def test_it_clears_a_stale_pid_file_before_starting(self) -> None:
+        """chronyd is pid 1 here, so it writes "1" into its pid file, and
+        `/run/chrony` is an emptyDir that survives a container restart. The
+        next start reads pid 1, finds it alive — it is chronyd itself — and
+        dies with "Another chronyd may already be running (pid=1)" forever.
+        One crash made the pod permanently unstartable, and the rollout sat in
+        CrashLoopBackOff while an older ReplicaSet kept serving the image's own
+        configuration."""
+        cmd = " ".join(
+            build_chrony_deployment()["spec"]["template"]["spec"]["containers"][0]["command"]
+        )
+
+        assert "rm -f /run/chrony/chronyd.pid" in cmd
+        assert cmd.index("rm -f") < cmd.index("chronyd -d")
+
+    def test_it_is_started_without_clock_control(self) -> None:
+        """`-x` is what "serves a clock, never sets one" means to chronyd.
+        Without it it calls adjtimex at startup and dies — CAP_SYS_TIME not
+        present — and the alternative would be letting a pod set the node's
+        time."""
+        cmd = " ".join(
+            build_chrony_deployment()["spec"]["template"]["spec"]["containers"][0]["command"]
+        )
+
+        assert " -x " in f" {cmd} "
 
     def test_it_declares_itself_a_local_reference(self) -> None:
         """Measured the hard way: without `local stratum`, chronyd refuses to

@@ -161,7 +161,36 @@ def build_chrony_deployment() -> dict[str, Any]:
                                 ],
                             },
                         },
-                        "command": ["chronyd", "-d", "-f", "/etc/chrony/chrony.conf"],
+                        # The pid file has to be cleared before start, and the
+                        # reason is a trap worth naming: chronyd *is* pid 1 in
+                        # this container, so it writes "1" into its pid file.
+                        # `/run/chrony` is an emptyDir and survives a container
+                        # restart, so the next chronyd reads a stale pid of 1,
+                        # checks whether that process is alive — it always is,
+                        # it is chronyd itself — and dies with
+                        #
+                        #   Fatal error : Another chronyd may already be
+                        #   running (pid=1)
+                        #
+                        # forever. One crash makes the pod permanently
+                        # unstartable, which is how a rollout can sit in
+                        # CrashLoopBackOff while an older ReplicaSet keeps
+                        # serving the image's own configuration.
+                        "command": [
+                            "sh", "-c",
+                            "rm -f /run/chrony/chronyd.pid; "
+                            # -x is what "serves a clock, never sets one"
+                            # actually means to chronyd. Without it it tries to
+                            # discipline the system clock at startup and dies:
+                            #
+                            #   CAP_SYS_TIME not present
+                            #   Fatal error : adjtimex(0x8001) failed
+                            #
+                            # The alternative would be handing it CAP_SYS_TIME,
+                            # i.e. letting a pod set the node's time — which is
+                            # the opposite of the intent.
+                            "exec chronyd -d -x -f /etc/chrony/chrony.conf",
+                        ],
                         "volumeMounts": [
                             {"name": "run", "mountPath": "/run/chrony"},
                             {"name": "state", "mountPath": "/var/lib/chrony"},
@@ -208,6 +237,12 @@ def build_tenant_ntp_service(tenant: str, namespace: str, *, vip: str) -> dict[s
     `allow-shared-ip` **and** no port collision — 123/udp does not meet
     6443/8132/50001, so the pair is legal.
 
+    It lives in **chrony's** namespace, not the tenant's. A Service selects
+    only pods beside it, so the tenant-namespace version had no endpoints at
+    all: it existed, it had an address, and every query timed out. That looked
+    exactly like a server refusing to answer, and is why the first diagnosis
+    of this went to chronyd's configuration instead of here.
+
     `externalTrafficPolicy: Cluster` deliberately: chrony does not run on
     every node, and Local would black-hole the request from any node that has
     no replica.
@@ -217,7 +252,7 @@ def build_tenant_ntp_service(tenant: str, namespace: str, *, vip: str) -> dict[s
         "kind": "Service",
         "metadata": {
             "name": f"{tenant}-ntp",
-            "namespace": namespace,
+            "namespace": NTP_NAMESPACE,
             "labels": {
                 "kubevirt-ui.io/tenant": tenant,
                 "kubevirt-ui.io/managed": "true",
@@ -280,10 +315,12 @@ async def ensure_ntp_server(k8s) -> None:
 
 
 async def ensure_tenant_ntp_service(k8s, tenant: str, namespace: str, vip: str) -> None:
-    """Publish UDP/123 on this tenant's VIP."""
+    """Publish UDP/123 on this tenant's VIP, beside the pods that serve it."""
     body = build_tenant_ntp_service(tenant, namespace, vip=vip)
     try:
-        await k8s.core_api.create_namespaced_service(namespace=namespace, body=body)
+        await k8s.core_api.create_namespaced_service(
+            namespace=NTP_NAMESPACE, body=body,
+        )
         logger.info("Published NTP for %s on %s:123/udp", tenant, vip)
     except ApiException as e:
         if e.status != 409:
