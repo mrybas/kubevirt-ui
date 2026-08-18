@@ -11,8 +11,13 @@ before changing anything.
 
 | protocol | peers | what it carries |
 |---|---|---|
-| `b3test` | the announcer nodes, AS 65030 | one `/22` per routed VPC, next hop = that VPC's own router leg |
+| `tenants` | the announcer nodes, AS 65030 | one `/22` per routed VPC, next hop = that VPC's own router leg |
 | `vpcgw` | VpcEgressGateway pods, AS 65010 | the hub tenants' prefixes, next hop = a gateway pod |
+
+The protocol was called `b3test` while B3 was an experiment; it is the
+production return path now and is named `tenants`. Session instances still
+appear as `b31`, `b32` — those come from `dynamic name "b3"`, not from the
+protocol name.
 
 Both are **dynamic**: a `neighbor range` accepts sessions rather than naming
 peers, and BIRD creates an instance per peer (`b31`, `vpc10`, …).
@@ -64,7 +69,7 @@ ip route show | grep '^10.200'          # what the kernel actually installed
 journalctl -u bird --since -10min       # "Bad peer AS", range collisions
 ```
 
-A healthy stand: `b3test` and `vpcgw` `Passive`, one `b3N` per announcer node,
+A healthy stand: `tenants` and `vpcgw` `Passive`, one `b3N` per announcer node,
 one `vpcN` per live gateway pod, and nothing else.
 
 ## Changing the peer range
@@ -98,21 +103,47 @@ Redundancy of the *announcement*, not of the path: every announcer advertises
 the same prefix with the same next hop, so there is nothing to load-balance.
 It exists so one node's reboot does not remove a tenant's return path.
 
-## Known hardening gaps (not yet applied)
+## The firewall rules do not say what is allowed
 
-Decisions, not chores — each one can lock somebody out:
+Zone `public` carries six source-scoped BGP rich rules **and** a blanket
+`179/tcp` in `ports`. The blanket port wins: it admits BGP from anywhere, so
+the rich rules constrain nothing. That alone would only be untidy. The trap is
+the other half — measured with `ss -tnp | grep :179`, the four live sessions
+come from
 
-* `rule family="ipv4" source address="192.168.1.0/24" accept` in zone `public`
-  is a blanket accept for a whole network, unscoped by service. Everything
-  else in that zone is BGP-only. Narrow it or confirm it is the admin network
-  and meant to be that wide.
-* `10.198.160.0/20` is allowed BGP twice — once as `service name="bgp"` and
-  once as `port 179/tcp`. Harmless, and a reader has to check both to know
-  what is permitted.
-* The masquerade and notrack rules are firewalld **direct** rules. They work
-  (they are in `nat` and `raw`), but they do not appear in
-  `firewall-cmd --list-all` — someone auditing the border will not see them.
-  Policy objects are visible; direct rules are not.
+    10.198.160.3, 10.198.160.4    the announcer nodes
+    10.199.4.6,   10.199.4.7      the VPC gateway legs (vpc1, vpc2)
+
+and the second pair was matched by **no rich rule at all**. So a reader who
+trusted the rich rules as the policy and removed the redundant-looking
+`179/tcp` would have dropped both VPC gateway sessions — the return path for
+every VPC that peers through `vpcgw` — while the rule list still looked
+deliberate.
+
+Applied since: the duplicate `10.198.160.0/20 port 179/tcp` rule (already
+covered by the `service name="bgp"` rule for the same source) is gone, and
+`10.199.4.0/24 service name="bgp"` is added. Neither changes what passes today;
+together they make the rich rules describe the sessions that actually exist.
+
+Verify before trusting the list, always against the sessions rather than the
+rules:
+
+    ss -tnp | grep ':179'                       # who is really peering
+    firewall-cmd --zone=public --list-rich-rules # who is nominally allowed
+
+### Decisions left open — each can lock somebody out
+
+* Remove `179/tcp` from `ports`, making the rich rules load-bearing. Safe as
+  of the measurement above, and only as long as it is re-taken first.
+* `rule family="ipv4" source address="192.168.1.0/24" accept` is a blanket
+  accept for a whole network, unscoped by service, where everything else in the
+  zone is BGP-only. Narrow it, or confirm it is the admin network and meant to
+  be that wide.
+* Masquerade and notrack are firewalld **direct** rules. They are permanent
+  (checked — a `--reload` will not drop them), but they never appear in
+  `firewall-cmd --list-all`, so an audit of the border does not see the NAT
+  that the whole tenant range depends on. Policy objects are visible; direct
+  rules are not.
 
 ## Tenant↔tenant
 
