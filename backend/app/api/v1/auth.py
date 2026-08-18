@@ -246,7 +246,6 @@ async def _ensure_service_account(
     sa_name: str,
     username: str,
     groups: list[str],
-    api_server_url: str = "https://kubernetes.default.svc",
     email: str = "",
 ) -> str:
     """Create ServiceAccount + ClusterRoleBinding for user, return a bound token."""
@@ -428,10 +427,29 @@ async def _ensure_service_account(
         AuthenticationV1TokenRequest,
         V1TokenRequestSpec,
     )
+    # No `audiences`, deliberately.
+    #
+    # Asking for one means guessing what the apiserver's `--api-audiences` is,
+    # and this guessed the in-cluster address — so every kubeconfig the CLI
+    # Access page handed out was rejected the moment it was used:
+    #
+    #     the server has asked for the client to provide credentials
+    #
+    # with a token that was perfectly valid and simply addressed to someone
+    # else. Measured against this cluster, whose issuer is the external URL:
+    #
+    #     audience https://10.96.0.1:443  ->  401
+    #     no audience                     ->  200
+    #
+    # Omitting the field makes the apiserver stamp its own default audience,
+    # which is the one it validates against by definition. There is nothing
+    # left to keep in step.
+    # An empty list, not a missing field: the client model rejects `None`
+    # ("Invalid value for `audiences`, must not be `None`"), and an empty list
+    # is what tells the apiserver to stamp its own default.
     token_request = AuthenticationV1TokenRequest(
         spec=V1TokenRequestSpec(
-            audiences=[api_server_url],
-            expiration_seconds=SA_TOKEN_EXPIRATION,
+            audiences=[], expiration_seconds=SA_TOKEN_EXPIRATION,
         ),
     )
     result = await core_api.create_namespaced_service_account_token(
@@ -457,9 +475,10 @@ async def get_kubeconfig(
 
     k8s_client = request.app.state.k8s_client
 
-    # In-cluster URL — used as the TokenRequest audience (the apiserver
-    # validates tokens against its own self-identity, not the external URL)
-    # and as a sanity-check / fallback comparison.
+    # In-cluster URL — a sanity-check and fallback for the external one. It is
+    # NOT the token audience: this comment used to claim the apiserver
+    # validates against its in-cluster self-identity, and that belief is what
+    # produced kubeconfigs nobody could use.
     k8s_config = k8s_client._api_client.configuration
     internal_server = k8s_config.host
 
@@ -511,10 +530,6 @@ async def get_kubeconfig(
         sa_token = await _ensure_service_account(
             k8s_client, sa_name, username, user.groups,
             email=user.email or "",
-            # Audience MUST match the apiserver's self-identity (in-cluster
-            # URL) — using the external URL here would produce tokens the
-            # apiserver rejects with "audiences not accepted".
-            api_server_url=internal_server,
         )
 
         # Set default namespace for non-admin users
