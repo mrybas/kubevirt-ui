@@ -35,6 +35,7 @@ import {
   useDeleteTenant,
   useScaleTenant,
   useTenantKubeconfig,
+  useTenantTalosconfig,
   useAddonCatalog,
   useEnableAddon,
   useDisableAddon,
@@ -160,6 +161,8 @@ export default function TenantDetail() {
   const deleteMutation = useDeleteTenant();
   const scaleMutation = useScaleTenant();
   const deleteImageMutation = useDeleteTenantImage(name || '');
+  const { refetch: fetchTalosconfig, isFetching: talosconfigLoading } =
+    useTenantTalosconfig(name);
   const { refetch: fetchAdminKc, isFetching: adminKcLoading } = useTenantKubeconfig(name, 'admin');
   const { refetch: fetchOidcKc, isFetching: oidcKcLoading } = useTenantKubeconfig(name, 'oidc');
   const enableAddon = useEnableAddon(name || '');
@@ -219,6 +222,20 @@ export default function TenantDetail() {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }
+  };
+
+  // T5. Each click mints a fresh short-lived certificate; there is nothing to
+  // cache and nothing to refetch on focus.
+  const handleDownloadTalosconfig = async () => {
+    const { data } = await fetchTalosconfig();
+    if (!data?.talosconfig) return;
+    const blob = new Blob([data.talosconfig], { type: 'text/yaml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${name}-talosconfig.yaml`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   const handleDeleteImage = (imageName: string) => {
@@ -592,6 +609,41 @@ export default function TenantDetail() {
           </div>
         </div>
       </div>
+
+      {/* T5. Talos nodes speak their own API and nothing else does — before
+          this the only way to ask one anything was an SSH crutch, which is why
+          the T22 diagnosis had to go through the guest console. Only rendered
+          for Talos tenants: a cloud-init node runs no apid, and a file that
+          connects to nothing is worse than an absent button. */}
+      {tenant.worker_os === 'talos' && (
+        <div className="card">
+          <div className="card-body">
+            <h2 className="text-lg font-semibold text-surface-100 flex items-center gap-2 mb-2">
+              <Terminal className="h-5 w-5 text-primary-400" />
+              talosctl access
+            </h2>
+            <p className="text-sm text-surface-400 mb-3">
+              An <span className="font-mono">os:admin</span> credential for this
+              tenant's machines, valid for 24 hours. It reaches the nodes on
+              their own network — from inside the VPC — not through the
+              Kubernetes API.
+            </p>
+            <button
+              onClick={handleDownloadTalosconfig}
+              disabled={talosconfigLoading}
+              className="btn-secondary text-sm"
+            >
+              <Download className="h-4 w-4" />
+              {talosconfigLoading ? 'Issuing…' : 'Download talosconfig'}
+            </button>
+            <p className="text-xs text-surface-500 mt-2">
+              Then: <span className="font-mono">
+                talosctl --talosconfig {name}-talosconfig.yaml time
+              </span> — the first thing to check when a node never joins.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Addons */}
       <div className="card">

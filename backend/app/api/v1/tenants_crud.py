@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException, StorageV1Api
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_admin, require_auth
 from app.core.errors import k8s_error_to_http
 from app.core.groups import (
     ENV_ENVIRONMENT_LABEL,
@@ -113,6 +113,11 @@ from app.core.tenant_transit import (
     transit_subnet_name,
 )
 from app.api.v1.tenants_ntp import ensure_ntp_server, ensure_tenant_ntp_service
+from app.api.v1.tenants_talosconfig import (
+    DEFAULT_TTL_HOURS,
+    build_talosconfig,
+    issue_client_certificate,
+)
 from app.api.v1.tenants_talos import (
     ensure_golden_clone_rbac,
     ensure_shared_golden_image,
@@ -413,6 +418,24 @@ async def _enrich_with_control_plane(k8s, tenant: TenantResponse) -> TenantRespo
     # version, which is a different number during an upgrade).
     if not tenant.kubernetes_version:
         tenant.kubernetes_version = kcp_spec.get("version", "")
+    return tenant
+
+
+async def _enrich_with_worker_os(k8s, tenant: TenantResponse) -> TenantResponse:
+    """Whether these workers are Talos, read from what they boot.
+
+    Not from an annotation: `kubevirt-ui.io/worker-type` says vm vs bare metal,
+    which is a different question, and nothing records the OS. The root volume
+    does — a DataVolume means Talos clones a root per worker, a containerDisk
+    means cloud-init — and it is the same fact the scale preflight reads, so
+    the page and the quota cannot disagree about what a tenant is.
+
+    The UI needs it to decide whether `talosctl` is even a thing here: a
+    cloud-init node runs no apid, and offering a credential that connects to
+    nothing is worse than offering none.
+    """
+    shape = await _current_worker_shape(k8s, tenant.namespace, f"{tenant.name}-workers")
+    tenant.worker_os = shape.get("worker_os", "")
     return tenant
 
 
@@ -1592,6 +1615,7 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
     tenant = await _enrich_with_workers(k8s, tenant)
     tenant = await _enrich_with_control_plane(k8s, tenant)
     tenant = await _enrich_with_cp_address(k8s, tenant)
+    tenant = await _enrich_with_worker_os(k8s, tenant)
     tenant = await _enrich_with_folder_env(k8s, tenant)
     tenant = await _enrich_with_transit_snat(k8s, tenant)
     return apply_capacity_to_status(tenant)
@@ -1981,6 +2005,92 @@ async def reconcile_tenant_storage(
                  "re-run once the tenant is up."
         ),
     }
+
+
+@router.get("/{name}/talosconfig")
+async def get_tenant_talosconfig(
+    request: Request, name: str, user: User = Depends(require_admin),
+) -> dict[str, Any]:
+    """A talosconfig for this tenant's nodes, valid for a day.
+
+    Admin-only, and short-lived: it is an `os:admin` credential for every
+    machine in the tenant, which is more than the tenant's own kubeconfig
+    grants. Talos has no revocation worth the name, so the expiry is the
+    control.
+
+    Refused for a cloud-init tenant rather than returned empty — those nodes
+    run no Talos API, and a file that connects to nothing is worse than a
+    message saying why.
+    """
+    k8s = request.app.state.k8s_client
+    ns = _tenant_ns(name)
+
+    nodes = await _talos_node_addresses(k8s, ns)
+    if not nodes:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Tenant {name!r} has no running Talos machine to talk to. "
+                "talosctl speaks to each node's apid on :50000; there is "
+                "nothing to point it at yet."
+            ),
+        )
+
+    try:
+        secret = await k8s.core_api.read_namespaced_secret(
+            name=f"{name}-talos-ca", namespace=ns,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Tenant {name!r} has no Talos CA ({name}-talos-ca). Only "
+                    "Talos tenants have one — a cloud-init tenant's nodes run "
+                    "no Talos API to connect to."
+                ),
+            ) from e
+        raise k8s_error_to_http(e, "reading the Talos CA")
+
+    ca_pem, crt_pem, key_pem = issue_client_certificate(
+        secret.data or {}, common_name=f"{user.username or 'admin'}@{name}",
+    )
+    return {
+        "tenant": name,
+        "nodes": nodes,
+        "expires_hours": DEFAULT_TTL_HOURS,
+        "talosconfig": build_talosconfig(
+            name, nodes=nodes, ca_pem=ca_pem, crt_pem=crt_pem, key_pem=key_pem,
+        ),
+    }
+
+
+async def _talos_node_addresses(k8s, ns: str) -> list[str]:
+    """Addresses of this tenant's running machines.
+
+    From the VirtualMachineInstances rather than from CAPI: a Machine keeps its
+    `addresses` after the VM is gone, and a talosconfig pointing at an address
+    nobody answers on looks like a broken credential rather than a stopped
+    node.
+    """
+    try:
+        vmis = await k8s.custom_api.list_namespaced_custom_object(
+            group="kubevirt.io", version="v1", namespace=ns,
+            plural="virtualmachineinstances",
+        )
+    except ApiException:
+        return []
+
+    out: list[str] = []
+    for vmi in vmis.get("items", []):
+        if ((vmi.get("status") or {}).get("phase")) != "Running":
+            continue
+        for iface in ((vmi.get("status") or {}).get("interfaces") or []):
+            ip = iface.get("ipAddress")
+            if ip:
+                out.append(ip)
+                break
+    return sorted(out)
 
 
 @router.get("/{name}/kubeconfig", response_model=TenantKubeconfigResponse)

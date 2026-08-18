@@ -18,6 +18,7 @@ import { MemoryRouter } from 'react-router-dom';
 
 import TenantDetail from '../TenantDetail';
 
+let workerOs: 'talos' | 'cloud-init' = 'talos';
 let cp: any = {
   address: '10.199.0.101',
   api_port: 6443,
@@ -36,13 +37,17 @@ const baseTenant = () => ({
   control_plane_ready: true, pod_cidr: '', service_cidr: '',
   enable_oidc: false, conditions: [], addons: [],
   control_plane_address: cp,
+  worker_os: workerOs,
 });
 
 vi.mock('@/hooks/useTenants', () => ({
-  useTenant: () => ({ data: { ...baseTenant(), control_plane_address: cp }, isLoading: false, refetch: vi.fn() }),
+  useTenant: () => ({ data: { ...baseTenant(), control_plane_address: cp, worker_os: workerOs }, isLoading: false, refetch: vi.fn() }),
   useDeleteTenant: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useScaleTenant: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useTenantKubeconfig: () => ({ data: null, isLoading: false }),
+  // T5: the page offers a talosconfig for Talos tenants. Manual-fetch only,
+  // so an unclicked mock is enough here.
+  useTenantTalosconfig: () => ({ refetch: vi.fn(), isFetching: false }),
   useAddonCatalog: () => ({ data: { components: [] } }),
   useEnableAddon: () => ({ mutateAsync: vi.fn(), isPending: false }),
   useDisableAddon: () => ({ mutateAsync: vi.fn(), isPending: false }),
@@ -102,5 +107,44 @@ describe('the control-plane address on the tenant page', () => {
     renderPage();
 
     expect(screen.getByText(/no address of its own/i)).toBeInTheDocument();
+  });
+});
+
+describe('the talosctl card', () => {
+  it('is offered for a Talos tenant', () => {
+    // Restore a normal control-plane address; the OS is what gates the card.
+    cp = { address: '10.199.0.101', api_port: 6443, konnectivity_port: 8132,
+           trustd_port: 50001, shared_with: [], source: 'service' };
+    workerOs = 'talos';
+    renderPage();
+
+    expect(screen.getByText(/talosctl access/i)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /download talosconfig/i }))
+      .toBeInTheDocument();
+  });
+
+  it('is absent for a cloud-init tenant', () => {
+    // Those nodes run no apid at all — a credential that connects to nothing
+    // is worse than no button.
+    workerOs = 'cloud-init';
+    renderPage();
+
+    expect(screen.queryByText(/talosctl access/i)).not.toBeInTheDocument();
+  });
+
+  it('names the first command worth running', () => {
+    // "check the clock before the network" is the first troubleshooting entry,
+    // and this is where someone stands when they need it.
+    workerOs = 'talos';
+    renderPage();
+
+    expect(screen.getByText(/talosctl --talosconfig .* time/)).toBeInTheDocument();
+  });
+
+  it('says the credential expires', () => {
+    workerOs = 'talos';
+    renderPage();
+
+    expect(screen.getByText(/24 hours/i)).toBeInTheDocument();
   });
 });

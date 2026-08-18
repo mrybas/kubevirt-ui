@@ -4,6 +4,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
+  getTenantTalosconfig,
   listTalosVersions,
   listTenants,
   getTenant,
@@ -89,6 +90,17 @@ export function useTenantKubeconfig(name: string | undefined, type: 'admin' | 'o
     queryKey: ['tenants', name, 'kubeconfig', type],
     queryFn: () => getTenantKubeconfig(name!, type),
     enabled: false, // manual fetch only
+  });
+}
+
+export function useTenantTalosconfig(name: string | undefined) {
+  return useQuery({
+    queryKey: ['tenants', name, 'talosconfig'],
+    queryFn: () => getTenantTalosconfig(name!),
+    // Manual: each fetch mints a new certificate, so it must not happen on a
+    // page render or a window focus.
+    enabled: false,
+    gcTime: 0,
   });
 }
 

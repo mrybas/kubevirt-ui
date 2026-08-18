@@ -12,6 +12,7 @@ import type {
   TenantStorageReconcileResponse,
   TenantStorageStatus,
   TalosVersionsResponse,
+  TenantTalosconfigResponse,
 } from '@/types/tenant';
 import type { GoldenImageListResponse } from '@/types/template';
 
@@ -115,4 +116,14 @@ export async function listTalosVersions(
     ? `?kubernetes_version=${encodeURIComponent(kubernetesVersion)}`
     : '';
   return apiRequest<TalosVersionsResponse>(`/tenants/talos-versions${q}`);
+}
+
+/** A short-lived `os:admin` talosconfig for this tenant's nodes.
+ *
+ *  Admin-only and expiring by itself: Talos has no revocation worth relying
+ *  on, so the credential's lifetime is the control. Closes R1 — before this
+ *  the only way to ask a node anything was an SSH crutch, and the T22
+ *  diagnosis had to go through the guest console instead. */
+export async function getTenantTalosconfig(name: string): Promise<TenantTalosconfigResponse> {
+  return apiRequest<TenantTalosconfigResponse>(`/tenants/${name}/talosconfig`);
 }

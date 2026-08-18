@@ -132,6 +132,9 @@ export interface Tenant {
   control_plane_ready_replicas?: number;
   control_plane_ready: boolean;
   worker_type: string;
+  /** cloud-init or talos — read from the root volume the workers boot;
+   *  only a Talos tenant has an API for talosctl to reach. */
+  worker_os?: 'cloud-init' | 'talos';
   worker_count: number;
   workers_ready: number;
   worker_vcpu: number;
@@ -234,4 +237,13 @@ export interface TalosVersionsResponse {
   /** How many the filter removed — said out loud rather than silently absent. */
   hidden: number;
   default: string;
+}
+
+export interface TenantTalosconfigResponse {
+  tenant: string;
+  /** Node addresses talosctl will speak to — apid on :50000, not the tenant's
+   *  Kubernetes control plane, which is Kamaji pods and has no Talos API. */
+  nodes: string[];
+  expires_hours: number;
+  talosconfig: string;
 }

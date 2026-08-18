@@ -360,6 +360,9 @@ class TenantResponse(BaseModel):
     control_plane_ready_replicas: int = 0
     control_plane_ready: bool = False
     worker_type: str = "vm"
+    # cloud-init or talos, read from the root volume rather than remembered:
+    # only a Talos tenant has a Talos API to point talosctl at.
+    worker_os: str = ""
     worker_count: int = 0
     workers_ready: int = 0
     worker_vcpu: int = 0
