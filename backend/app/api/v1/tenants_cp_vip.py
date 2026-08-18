@@ -39,6 +39,8 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import logging
+
+from app.api.v1.tenants_ntp import cp_sharing_key
 import os
 from typing import Any
 
@@ -168,9 +170,19 @@ def build_cp_lb_service(
 ) -> dict[str, Any]:
     """The tenant's own LoadBalancer, with no address of its own yet.
 
-    Deliberately no `loadBalancerIPs` and no `allow-shared-ip`: MetalLB picks
-    the address from `pool`, and nothing is shared, so no port may collide
-    with another tenant's.
+    No `loadBalancerIPs`: MetalLB picks the address from `pool`.
+
+    It does carry `allow-shared-ip`, and the key is scoped to this tenant. The
+    address is shared with exactly one Service — the tenant's own NTP on
+    123/udp (T22), which cannot collide with 6443/8132/50001. Sharing across
+    *tenants* remains impossible, because the key contains the tenant name.
+
+    Both sides must declare it. Annotating only the NTP Service left it at
+    `<pending>` with
+
+        can't change sharing key ... address also in use by <t>-cp-lb
+
+    and a worker that could not get the time.
 
     `service.cilium.io/type: ClusterIP` opts the address out of Cilium's LB
     BPF DNAT (same fix as the ingress Services) so in-VPC pod traffic is not
@@ -189,6 +201,7 @@ def build_cp_lb_service(
             "annotations": {
                 "service.cilium.io/type": "ClusterIP",
                 "metallb.universe.tf/address-pool": pool,
+                "metallb.universe.tf/allow-shared-ip": cp_sharing_key(tenant),
             },
         },
         "spec": {

@@ -145,7 +145,13 @@ class TestScalingResizesTheQuota:
         block = block[:block.index("\n\n\n")]
         assert "kubevirtmachinetemplates" in block
         assert "kamajicontrolplanes" in block
-        assert "dataVolumeTemplates" in block
+        # The disk used to be read from `dataVolumeTemplates`, which on a
+        # Talos tenant is the *root clone*, not the data disk `worker_disk`
+        # means — and once the quota started counting the root separately that
+        # charged it twice. It reads the `data` emptyDisk now, and the root
+        # volume tells it which worker OS this is.
+        assert "emptyDisk" in block
+        assert "worker_os" in block
 
     async def test_writing_the_quota_replaces_an_existing_one(self) -> None:
         from unittest.mock import AsyncMock, MagicMock

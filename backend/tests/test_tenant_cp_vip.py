@@ -64,18 +64,24 @@ def _k8s(assigned: str | None = "10.199.0.101", *, create_conflict: bool = False
 
 
 class TestTheServiceAsksForNoAddress:
-    def test_no_pinned_ip_and_no_shared_ip_key(self) -> None:
-        """Pinning would make us the second allocator over MetalLB's pool."""
-        svc = build_cp_lb_service(
-            TENANT, NS, ports=tenant_cp_ports("cloud-init"), pool="cp-transit-pool",
-        )
+    def test_no_pinned_ip_and_a_sharing_key_scoped_to_this_tenant(self) -> None:
+        """The key used to be absent, and the docstring said "nothing is
+        shared". T22 shares this address with exactly one Service — the
+        tenant's own NTP on 123/udp, which cannot collide with the control
+        plane's ports. Both sides must declare the same key or MetalLB refuses
+        the second Service and it never gets an address.
+
+        Sharing across *tenants* is still impossible: the key contains the
+        tenant name.
+        """
+        svc = build_cp_lb_service("t8", "tenant-t8",
+                                  ports=[("api", 6443)], pool="cp")
         ann = svc["metadata"]["annotations"]
 
         assert "metallb.universe.tf/loadBalancerIPs" not in ann
-        assert "metallb.universe.tf/allow-shared-ip" not in ann, (
-            "nothing is shared any more — sharing is what forced port demux"
-        )
-        assert ann["metallb.universe.tf/address-pool"] == "cp-transit-pool"
+        assert ann["metallb.universe.tf/allow-shared-ip"] == "t8-cp"
+        assert "t8" in ann["metallb.universe.tf/allow-shared-ip"]
+
 
     def test_cilium_lb_bypass_is_kept(self) -> None:
         """Without it, in-VPC pod traffic is DNAT'd before kube-ovn routing."""

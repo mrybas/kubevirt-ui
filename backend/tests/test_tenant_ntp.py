@@ -159,14 +159,29 @@ class TestTheServerItself:
         assert spec["template"]["spec"]["topologySpreadConstraints"][0][
             "topologyKey"] == "kubernetes.io/hostname"
 
-    def test_it_does_not_ask_for_privileges_it_does_not_need(self) -> None:
-        """It serves the clock it is given; it never steps one."""
+    def test_it_never_asks_to_step_the_clock(self) -> None:
+        """The claim worth guarding. The rest of the set was measured, not
+        chosen: with `drop: ALL` and NET_BIND_SERVICE alone the pod
+        crash-looped on `chown: /var/lib/chrony: Operation not permitted`,
+        because chronyd's entrypoint takes ownership of its own directories
+        and then drops privileges itself. SYS_TIME is the one that would let
+        it change the host's time, and it is absent."""
         c = build_chrony_deployment()["spec"]["template"]["spec"]["containers"][0]
         caps = c["securityContext"]["capabilities"]
 
         assert caps["drop"] == ["ALL"]
-        assert caps["add"] == ["NET_BIND_SERVICE"]
+        assert "SYS_TIME" not in caps["add"]
         assert c["securityContext"]["allowPrivilegeEscalation"] is False
+
+    def test_it_declares_itself_a_local_reference(self) -> None:
+        """Measured the hard way: without `local stratum`, chronyd refuses to
+        answer at all until it considers itself synchronised — so the pod runs,
+        reports Ready, and every query times out. There is no upstream here by
+        design; the node's clock is the source."""
+        from app.api.v1.tenants_ntp import CHRONY_CONF
+
+        assert "local stratum" in CHRONY_CONF
+        assert "allow all" in CHRONY_CONF
 
 
 class TestFailureIsNotFatalToTheTenant:
@@ -179,6 +194,7 @@ class TestFailureIsNotFatalToTheTenant:
         from app.api.v1.tenants_ntp import ensure_ntp_server
 
         k8s = MagicMock()
+        k8s.core_api.create_namespaced_config_map = AsyncMock()
         k8s.apps_api.create_namespaced_deployment = AsyncMock(
             side_effect=ApiException(status=409))
 
@@ -195,6 +211,7 @@ class TestFailureIsNotFatalToTheTenant:
         from app.api.v1.tenants_ntp import ensure_ntp_server
 
         k8s = MagicMock()
+        k8s.core_api.create_namespaced_config_map = AsyncMock()
         k8s.apps_api.create_namespaced_deployment = AsyncMock(
             side_effect=ApiException(status=403))
 

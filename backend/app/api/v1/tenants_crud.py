@@ -1748,6 +1748,7 @@ async def _plan_tenant_quota(k8s, name: str, ns: str, scale: Any) -> dict[str, s
         worker_memory=scale.worker_memory or shape["memory"],
         worker_disk=shape["disk"],
         control_plane_replicas=shape["cp_replicas"],
+        worker_os=shape["worker_os"],
     ))
 
     folder = ""
@@ -1777,6 +1778,13 @@ async def _current_worker_shape(k8s, ns: str, md_name: str) -> dict[str, Any]:
     """
     shape: dict[str, Any] = {
         "vcpu": 2, "memory": "2Gi", "disk": "20Gi", "cp_replicas": 1,
+        # Read from the datapath, not from an annotation: the root volume says
+        # what this tenant is. A DataVolume means Talos clones a root per
+        # worker; a containerDisk means cloud-init. `_tenant_quota` needs it,
+        # and a shim that omitted it turned every scale into a 500 —
+        # AttributeError: 'SimpleNamespace' object has no attribute 'worker_os'
+        # — which the page swallowed silently.
+        "worker_os": "cloud-init",
     }
     try:
         md = await k8s.custom_api.get_namespaced_custom_object(
@@ -1797,14 +1805,19 @@ async def _current_worker_shape(k8s, ns: str, md_name: str) -> dict[str, Any]:
         domain = vm.get("template", {}).get("spec", {}).get("domain", {})
         shape["vcpu"] = domain.get("cpu", {}).get("cores") or shape["vcpu"]
         shape["memory"] = domain.get("memory", {}).get("guest") or shape["memory"]
-        for dvt in vm.get("dataVolumeTemplates") or []:
-            size = (
-                ((dvt.get("spec") or {}).get("storage") or {})
-                .get("resources", {}).get("requests", {}).get("storage")
-            )
-            if size:
-                shape["disk"] = size
-                break
+
+        volumes = vm.get("template", {}).get("spec", {}).get("volumes") or []
+        root = next((v for v in volumes if v.get("name") == "root"), {})
+        if "dataVolume" in root:
+            shape["worker_os"] = "talos"
+
+        # `worker_disk` is the *data* disk. Taking it from the DataVolume
+        # template read the root clone instead, and since the quota now counts
+        # the root separately that would have charged it twice.
+        data = next((v for v in volumes if v.get("name") == "data"), {})
+        capacity = (data.get("emptyDisk") or {}).get("capacity")
+        if capacity:
+            shape["disk"] = capacity
     except Exception as e:
         logger.warning(f"Could not read worker shape in {ns}: {e}")
 
