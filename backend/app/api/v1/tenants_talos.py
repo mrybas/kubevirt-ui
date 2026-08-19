@@ -35,6 +35,8 @@ import secrets
 import string
 from typing import Any, Literal
 
+import yaml
+
 from kubernetes_asyncio.client import ApiException
 
 logger = logging.getLogger(__name__)
@@ -651,6 +653,45 @@ async def read_tenant_k8s_ca_cert(k8s, tenant: str, namespace: str) -> str:
         return ""
 
     return (secret.data or {}).get("ca.crt", "")
+
+
+async def await_tenant_k8s_ca_cert(
+    k8s, tenant: str, namespace: str, attempts: int = 60, delay: float = 2.0,
+) -> str:
+    """The Kubernetes CA, waited for rather than sampled.
+
+    Kamaji mints `<tenant>-ca` while this flow is still assembling the worker
+    config, and the two used to race. Measured on 2026-08-19:
+
+        09:41:30.063  read <tenant>-ca -> 404, branch silently skipped
+        09:41:30      TalosConfigTemplate written without cluster.ca
+        09:41:31      Kamaji created the secret
+
+    One second late, and permanently so: the template is immutable, nothing
+    re-renders it, and Talos then fails every boot with
+
+        secrets.KubeletController: missing accepted Kubernetes CAs
+
+    at twelve seconds in — before any network, so it reads like a mystery
+    rather than a race. Reproduced deterministically on a second tenant two
+    hours later.
+
+    Waiting is the fix rather than retrying the write, because the write is
+    what cannot be taken back.
+    """
+    import asyncio
+
+    for _ in range(attempts):
+        cert = await read_tenant_k8s_ca_cert(k8s, tenant, namespace)
+        if cert:
+            return cert
+        await asyncio.sleep(delay)
+
+    logger.error(
+        f"Kubernetes CA for tenant {tenant!r} never appeared in "
+        f"{namespace}/{tenant}-ca after {attempts * delay:.0f}s"
+    )
+    return ""
 
 
 async def read_talos_ca_cert(k8s, tenant: str, namespace: str) -> str:
@@ -1293,3 +1334,115 @@ def validate_worker_binding(binding: WorkerBinding) -> None:
             "every guest sees itself as 10.0.2.2 and registers under that "
             "address, so only the first node can ever join."
         )
+
+
+async def ensure_worker_bootstrap_ca(k8s) -> None:
+    """Repair worker bootstrap templates that carry no Kubernetes CA.
+
+    The wait in `await_tenant_k8s_ca_cert` makes the race unlikely; this makes
+    losing it survivable. Both are needed, and only this one covers a tenant
+    created before the wait existed.
+
+    A TalosConfigTemplate is immutable, so repair means a *new* template and
+    a MachineDeployment repointed at it — the same two moves that fixed the
+    UAT tenants by hand. CAPI then rolls the workers itself.
+
+    Deliberately narrow: only templates this product manages, only the
+    missing-`cluster.ca` case, and only when the CA is actually available to
+    write. Anything else is left alone.
+    """
+    try:
+        namespaces = await k8s.core_api.list_namespace(
+            label_selector="kubevirt-ui.io/tenant",
+        )
+    except ApiException as e:
+        logger.error(f"worker bootstrap reconcile: cannot list tenants: {e}")
+        return
+
+    for ns_obj in namespaces.items or []:
+        ns = ns_obj.metadata.name
+        tenant = (ns_obj.metadata.labels or {}).get("kubevirt-ui.io/tenant")
+        if not tenant:
+            continue
+        try:
+            await _repair_one_worker_bootstrap(k8s, tenant, ns)
+        except Exception as e:  # noqa: BLE001 - one tenant must not stop the rest
+            logger.error(f"worker bootstrap reconcile failed for {tenant!r}: {e}")
+
+
+def _template_lacks_k8s_ca(template: dict[str, Any]) -> bool:
+    """True when the rendered config has no Kubernetes CA under `cluster`.
+
+    `machine.ca` is the Talos CA and is always present; it is the *cluster*
+    branch that `secrets.KubeletController` reads, and its absence is the
+    whole defect.
+    """
+    data = (
+        template.get("spec", {}).get("template", {}).get("spec", {}).get("data")
+    )
+    if not data:
+        return False
+    try:
+        parsed = yaml.safe_load(data) or {}
+    except yaml.YAMLError:
+        return False
+    cluster = parsed.get("cluster") or {}
+    return not (cluster.get("ca") or cluster.get("acceptedCAs"))
+
+
+async def _repair_one_worker_bootstrap(k8s, tenant: str, ns: str) -> None:
+    custom = k8s.custom_api
+    try:
+        template = await custom.get_namespaced_custom_object(
+            group=CABPT_GROUP, version=CABPT_VERSION, namespace=ns,
+            plural=CABPT_PLURAL, name=f"{tenant}-workers",
+        )
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        return  # cloud-init tenant, or nothing built yet
+
+    if not _template_lacks_k8s_ca(template):
+        return
+
+    ca = await read_tenant_k8s_ca_cert(k8s, tenant, ns)
+    if not ca:
+        logger.warning(
+            f"Tenant {tenant!r}: worker template has no Kubernetes CA and the "
+            f"CA secret is still absent — leaving both alone"
+        )
+        return
+
+    data = template["spec"]["template"]["spec"]["data"]
+    config = yaml.safe_load(data)
+    config.setdefault("cluster", {})["ca"] = {"crt": ca}
+    config["cluster"]["acceptedCAs"] = [{"crt": ca}]
+
+    # A new object rather than a patch: the CRD refuses spec changes, which is
+    # why the defect was permanent in the first place.
+    repaired_name = f"{tenant}-workers-ca"
+    body = build_talos_config_template(
+        tenant, ns, yaml.safe_dump(config, default_flow_style=False, sort_keys=False),
+    )
+    body["metadata"]["name"] = repaired_name
+    try:
+        await custom.create_namespaced_custom_object(
+            group=CABPT_GROUP, version=CABPT_VERSION, namespace=ns,
+            plural=CABPT_PLURAL, body=body,
+        )
+    except ApiException as e:
+        if e.status != 409:
+            raise
+
+    await custom.patch_namespaced_custom_object(
+        group="cluster.x-k8s.io", version="v1beta1", namespace=ns,
+        plural="machinedeployments", name=f"{tenant}-workers",
+        body={"spec": {"template": {"spec": {"bootstrap": {
+            "configRef": {"name": repaired_name},
+        }}}}},
+        _content_type="application/merge-patch+json",
+    )
+    logger.info(
+        f"Tenant {tenant!r}: worker bootstrap template had no Kubernetes CA; "
+        f"wrote {repaired_name} and repointed the MachineDeployment"
+    )

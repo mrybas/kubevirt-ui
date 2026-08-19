@@ -20,6 +20,8 @@ from app.models.tenant import AddonCatalog, AddonComponent
 
 from app.core.b3_announce import ensure_announcements
 
+from app.api.v1.tenants_talos import ensure_worker_bootstrap_ca
+
 logger = logging.getLogger(__name__)
 
 # Constants (same as tenants.py)
@@ -306,6 +308,15 @@ async def _reconcile_once(k8s: K8sClient) -> None:
         await ensure_announcements(k8s)
     except Exception as e:  # noqa: BLE001 - one subsystem must not stop another
         logger.error(f"B3 announcement reconcile failed: {e}")
+
+    # A worker bootstrap template written without the Kubernetes CA is a
+    # tenant whose kubelet can never start, and the template is immutable —
+    # nothing else in the product can repair it. Same guard as above: this
+    # must not be blocked by, or block, anything else in the pass.
+    try:
+        await ensure_worker_bootstrap_ca(k8s)
+    except Exception as e:  # noqa: BLE001 - one subsystem must not stop another
+        logger.error(f"worker bootstrap reconcile failed: {e}")
 
     # Load catalog
     catalog = await _get_addon_catalog(k8s)
