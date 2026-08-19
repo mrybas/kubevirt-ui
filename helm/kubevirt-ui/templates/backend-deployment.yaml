@@ -102,6 +102,11 @@ spec:
             - name: KUBE_API_EXTERNAL_URL
               value: {{ .Values.auth.kubeconfig.externalApiUrl | quote }}
             {{- end }}
+            {{- /* B3 routed egress: same value the Role in rbac.yaml is created
+                   from, so the grant and the write can never name different
+                   namespaces. */}}
+            - name: B3_FRR_NAMESPACE
+              value: {{ .Values.b3.frrNamespace | quote }}
             {{- /* External LDAP — Phase 2 group autocomplete for folder Access tab */ -}}
             {{- with .Values.auth.ldap }}
             {{- if .url }}

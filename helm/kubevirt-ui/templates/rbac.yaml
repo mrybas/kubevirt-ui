@@ -591,4 +591,48 @@ subjects:
     name: {{ include "kubevirt-ui.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+
+---
+# -----------------------------------------------------------------------
+# B3 routed egress: the FRRConfiguration that announces tenant VPC prefixes
+# -----------------------------------------------------------------------
+# Namespaced on purpose. The backend writes exactly one object here —
+# `kubevirt-ui-b3` in the namespace frr-k8s runs in — so a cluster-wide
+# grant over every FRRConfiguration would be far more than it needs.
+#
+# No `delete`: tearing the last VPC down rewrites this object to zero
+# prefixes rather than removing it, which is how the announcement is
+# withdrawn. Measured in UAT 2026-08-19.
+#
+# Without this Role the write 403s in a loop while the page still reports
+# the prefixes as handed to FRR — the generator works, only the write is
+# refused, and the tenant silently has no egress.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-b3
+  namespace: {{ .Values.b3.frrNamespace }}
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["frrk8s.metallb.io"]
+    resources: ["frrconfigurations"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "kubevirt-ui.fullname" . }}-b3
+  namespace: {{ .Values.b3.frrNamespace }}
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "kubevirt-ui.fullname" . }}-b3
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubevirt-ui.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
 {{- end }}

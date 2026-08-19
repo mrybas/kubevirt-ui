@@ -123,25 +123,40 @@ REQUIRED: list[tuple[str, str, str, str]] = [
 ]
 
 
-def _cluster_role_rules() -> list[dict]:
-    """Rules of the cluster-wide ClusterRole, with Helm directives stripped.
+def _chart_documents() -> list[dict]:
+    """Every document the template renders, with Helm directives stripped.
 
-    The template is plain YAML apart from a handful of `{{ }}` lines, none of
-    which sit inside the rules themselves — so dropping them and parsing the
-    first document is enough, and avoids needing helm in the test image.
+    The template is plain YAML apart from `{{ }}` lines, none of which sit
+    inside the rules themselves — so stripping them is enough, and avoids
+    needing helm in the test image.
+
+    Two kinds of line need different treatment, and conflating them is how
+    this silently parsed only the first document for a while: a line that is
+    *only* a template call (`{{- include "kubevirt-ui.labels" . }}`) leaves a
+    bare scalar where a mapping is expected, so it has to go entirely, while
+    an inline call (`name: {{ ... }}`) just needs a value.
     """
     raw = RBAC_TEMPLATE.read_text()
-    # Drop whole-line Helm directives; keep indentation of everything else.
-    cleaned = "\n".join(
-        line for line in raw.splitlines()
-        if not re.match(r"^\s*\{\{-?\s*(if|else|end|range|with)\b", line)
-    )
-    # Substitute the remaining inline templating with a placeholder so the
-    # YAML stays parseable (names/labels are not what this test checks).
-    cleaned = re.sub(r"\{\{-?.*?-?\}\}", "placeholder", cleaned)
+    kept: list[str] = []
+    for line in raw.splitlines():
+        if re.match(r"^\s*\{\{-?\s*(if|else|end|range|with)\b", line):
+            continue
+        substituted = re.sub(r"\{\{-?.*?-?\}\}", "placeholder", line)
+        if substituted.strip() == "placeholder":
+            # Whole-line call: it would render a block, not a scalar.
+            continue
+        kept.append(substituted)
 
-    for doc in yaml.safe_load_all(cleaned):
-        if isinstance(doc, dict) and doc.get("kind") == "ClusterRole":
+    return [
+        doc for doc in yaml.safe_load_all("\n".join(kept))
+        if isinstance(doc, dict)
+    ]
+
+
+def _cluster_role_rules() -> list[dict]:
+    """Rules of the cluster-wide ClusterRole."""
+    for doc in _chart_documents():
+        if doc.get("kind") == "ClusterRole":
             return doc.get("rules") or []
     raise AssertionError("No ClusterRole found in rbac.yaml")
 
@@ -302,4 +317,97 @@ def test_managed_cluster_roles_are_writable(
         f"{constant} = {name!r} is replaced by the backend but is not in the "
         f"ClusterRole write allowlist in helm/kubevirt-ui/templates/rbac.yaml "
         f"(resourceNames of the clusterroles update/patch/delete rule)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Namespaced grants
+# ---------------------------------------------------------------------------
+# The list above only sees the cluster-wide ClusterRole. A permission granted
+# by a namespaced Role is invisible to it — which is how the B3 announcement
+# shipped with no grant at all: nobody could add a row that would have caught
+# it, because the row had nowhere to live.
+#
+# Rows here are permissions the backend needs in a namespace that is NOT the
+# release namespace, named by a value.
+
+# (api group, resource, verb, who needs it)
+REQUIRED_NAMESPACED: list[tuple[str, str, str, str]] = [
+    ("frrk8s.metallb.io", "frrconfigurations", "get", "b3_announce.apply"),
+    ("frrk8s.metallb.io", "frrconfigurations", "list", "bgp.get_b3_state"),
+    ("frrk8s.metallb.io", "frrconfigurations", "create", "b3_announce.apply"),
+    ("frrk8s.metallb.io", "frrconfigurations", "patch", "b3_announce.apply"),
+]
+
+
+def _role_rules() -> list[dict]:
+    """Rules of every namespaced Role the chart renders."""
+    rules: list[dict] = []
+    for doc in _chart_documents():
+        if doc.get("kind") == "Role":
+            rules.extend(doc.get("rules") or [])
+    return rules
+
+
+@pytest.fixture(scope="module")
+def namespaced_rules() -> list[dict]:
+    return _role_rules()
+
+
+@pytest.mark.parametrize(
+    "group,resource,verb,caller",
+    REQUIRED_NAMESPACED,
+    ids=[f"{g}/{r}:{v}" for g, r, v, _ in REQUIRED_NAMESPACED],
+)
+def test_chart_grants_namespaced_permission(
+    namespaced_rules: list[dict], group: str, resource: str, verb: str,
+    caller: str,
+) -> None:
+    assert _granted(namespaced_rules, group, resource, verb), (
+        f"{caller} calls {verb} on {group}/{resource}, but no Role in the "
+        f"chart grants it. The write 403s in a loop on a live cluster while "
+        f"the UI still reports the announcement as handed to FRR. Add the "
+        f"verb to the -b3 Role in helm/kubevirt-ui/templates/rbac.yaml."
+    )
+
+
+def test_the_b3_role_does_not_ask_for_delete(namespaced_rules) -> None:
+    # Withdrawing an announcement rewrites the object to zero prefixes; the
+    # object itself is never removed (measured when every VPC was torn down
+    # in UAT 2026-08-19). Asking for delete would widen the grant for a call
+    # that does not exist.
+    for rule in namespaced_rules:
+        if "frrconfigurations" in (rule.get("resources") or []):
+            assert "delete" not in (rule.get("verbs") or []), (
+                "the B3 Role asks for delete, but withdrawing an announcement "
+                "rewrites the FRRConfiguration to zero prefixes rather than "
+                "deleting it — drop the verb or prove the call exists"
+            )
+
+
+def test_the_b3_role_and_the_backend_env_name_one_namespace() -> None:
+    """A Role in one namespace and a write to another grant nothing.
+
+    Both must come from `.Values.b3.frrNamespace`. This is the invariant that
+    a hand-kept second copy would break silently: RBAC would look correct on
+    review and still 403 in production.
+    """
+    rbac = RBAC_TEMPLATE.read_text()
+    deployment = (RBAC_TEMPLATE.parent / "backend-deployment.yaml").read_text()
+
+    assert "namespace: {{ .Values.b3.frrNamespace }}" in rbac, (
+        "the B3 Role must take its namespace from .Values.b3.frrNamespace"
+    )
+    assert "B3_FRR_NAMESPACE" in deployment, (
+        "the backend must be told which namespace to write into"
+    )
+    env_line = next(
+        line for line in deployment.splitlines()
+        if "B3_FRR_NAMESPACE" in line
+    )
+    idx = deployment.splitlines().index(env_line)
+    value_line = deployment.splitlines()[idx + 1]
+    assert ".Values.b3.frrNamespace" in value_line, (
+        f"B3_FRR_NAMESPACE is set from {value_line.strip()!r} instead of "
+        ".Values.b3.frrNamespace — the grant and the write can now drift"
     )

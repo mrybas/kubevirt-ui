@@ -238,6 +238,18 @@ rbac:
   createRoles: true
 
 # =========================================================================
+# B3 routed egress — BGP announcements for tenant VPC prefixes
+# =========================================================================
+# Each VPC is announced to the upstream router with its own leg as next hop;
+# no gateway pods sit in the path. The announcement is one FRRConfiguration
+# that frr-k8s picks up, written into the namespace where frr-k8s runs.
+b3:
+  # -- Namespace frr-k8s runs in. ONE fact: it names both the Role the
+  # backend needs and the B3_FRR_NAMESPACE it reads — a Role created
+  # somewhere other than where the object is written grants nothing.
+  frrNamespace: "o0-metallb"
+
+# =========================================================================
 # Network Policy
 # =========================================================================
 networkPolicy:
