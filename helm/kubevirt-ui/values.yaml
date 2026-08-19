@@ -73,6 +73,63 @@ backend:
     TENANTS_VPCDNS_FORWARD_DNS: ""
     # VPC DNS VIP within service CIDR (default: <service-cidr>.200)
     TENANTS_VPCDNS_VIP: ""
+    # Ingress class for the tenant apiserver route. Empty → cluster default.
+    TENANTS_INGRESS_CLASS: ""
+    # Address the tenant ingress answers on. Empty → discovered from the
+    # ingress controller's Service.
+    TENANTS_INGRESS_IP: ""
+    # Traefik entrypoint carrying the tenant apiserver (default: websecure).
+    TENANTS_TRAEFIK_ENTRYPOINT: ""
+    # Management range allowed to reach tenant control planes. Empty → no
+    # restriction is programmed.
+    TENANTS_MGMT_CIDR: ""
+    # Storage class the Talos golden image is imported into. Empty → cluster
+    # default. The image is shared, so this is not per-tenant.
+    TENANTS_GOLDEN_STORAGE_CLASS: ""
+    # Namespace holding the shared Talos golden image (default:
+    # kubevirt-ui-system). One image serves every tenant, so it does not live
+    # in a tenant namespace.
+    TENANTS_GOLDEN_NAMESPACE: ""
+    # JSON overriding the offered Talos releases and the Kubernetes range each
+    # supports. Empty → the built-in catalogue. A malformed value falls back to
+    # the built-in and logs loudly, because the operator who wrote it would
+    # otherwise just see their new version fail to appear.
+    TENANTS_TALOS_CATALOG: ""
+    # Give every tenant its own control-plane VIP instead of sharing one and
+    # demultiplexing by port (default: true).
+    TENANTS_CP_PER_TENANT_VIP: ""
+    # Namespace MetalLB runs in (default: o0-metallb).
+    TENANTS_CP_METALLB_NAMESPACE: ""
+    # NTP served to tenants that have no egress yet — a worker whose clock is
+    # wrong cannot start its kubelet, and reaching a public pool needs the
+    # egress the join must not depend on.
+    TENANTS_NTP_NAMESPACE: ""
+    TENANTS_NTP_FALLBACK: ""
+    TENANTS_CHRONY_IMAGE: ""
+
+    # -- B3 routed egress: each VPC is announced upstream with its own leg as
+    # next hop, no gateway pods in the path. Declared here even though every
+    # value is empty, because a knob nobody knows about is a feature that
+    # silently does nothing: with B3_BGP_PEER unset the announcements are
+    # simply never generated, and a whole stand shipped that way without a
+    # single error anywhere (UAT 2026-08-19, finding A4).
+    #
+    # Unset B3_BGP_PEER or B3_VPC_GATEWAY → B3 is off.
+    B3_BGP_PEER: ""
+    B3_VPC_GATEWAY: ""
+    # This cluster's ASN and the upstream router's (defaults: 65030 / 65000).
+    B3_LOCAL_ASN: ""
+    B3_PEER_ASN: ""
+    # Namespace frr-k8s runs in. Also names the Role that lets the backend
+    # write its FRRConfiguration — one fact, two readers; see
+    # `kubevirt-ui.b3FrrNamespace` in _helpers.tpl. Empty → b3.frrNamespace.
+    B3_FRR_NAMESPACE: ""
+    # kube-ovn subnet the VPC legs live on (default: external).
+    B3_EXTERNAL_SUBNET: ""
+    # How many nodes announce, and which. The explicit list wins; without it
+    # the first N Ready nodes are chosen.
+    B3_ANNOUNCE_NODES: ""
+    B3_ANNOUNCE_NODE_LIST: ""
     # Default: registry.k8s.io/kas-network-proxy/proxy-server
     TENANTS_KONNECTIVITY_PROXY_IMAGE: ""
     # Default: registry.k8s.io/kas-network-proxy/proxy-agent

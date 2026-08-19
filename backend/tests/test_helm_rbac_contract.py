@@ -388,26 +388,36 @@ def test_the_b3_role_does_not_ask_for_delete(namespaced_rules) -> None:
 def test_the_b3_role_and_the_backend_env_name_one_namespace() -> None:
     """A Role in one namespace and a write to another grant nothing.
 
-    Both must come from `.Values.b3.frrNamespace`. This is the invariant that
-    a hand-kept second copy would break silently: RBAC would look correct on
-    review and still 403 in production.
+    Both must resolve through `kubevirt-ui.b3FrrNamespace`. A second copy of
+    the value would break this silently: RBAC would look correct on review
+    and still 403 in production. The helper also keeps the env from being
+    emitted twice when a site sets it through `backend.env`, which Kubernetes
+    resolves by taking the last entry — quietly.
     """
     rbac = RBAC_TEMPLATE.read_text()
     deployment = (RBAC_TEMPLATE.parent / "backend-deployment.yaml").read_text()
+    helper = 'include "kubevirt-ui.b3FrrNamespace"'
 
-    assert "namespace: {{ .Values.b3.frrNamespace }}" in rbac, (
-        "the B3 Role must take its namespace from .Values.b3.frrNamespace"
+    assert helper in rbac, (
+        "the B3 Role must take its namespace from the shared helper, not from "
+        "a value read directly — the two readers would drift"
     )
-    assert "B3_FRR_NAMESPACE" in deployment, (
-        "the backend must be told which namespace to write into"
+    assert helper in deployment, (
+        "B3_FRR_NAMESPACE must come from the same helper the Role does"
     )
-    env_line = next(
-        line for line in deployment.splitlines()
-        if "B3_FRR_NAMESPACE" in line
+
+    lines = deployment.splitlines()
+    # The name line, not the `if` guard that also mentions the variable.
+    idx = next(
+        i for i, line in enumerate(lines)
+        if line.strip() == "- name: B3_FRR_NAMESPACE"
     )
-    idx = deployment.splitlines().index(env_line)
-    value_line = deployment.splitlines()[idx + 1]
-    assert ".Values.b3.frrNamespace" in value_line, (
-        f"B3_FRR_NAMESPACE is set from {value_line.strip()!r} instead of "
-        ".Values.b3.frrNamespace — the grant and the write can now drift"
+    assert helper in lines[idx + 1], (
+        f"B3_FRR_NAMESPACE is set from {lines[idx + 1].strip()!r} rather than "
+        f"the helper — the grant and the write can now name different "
+        f"namespaces"
+    )
+    assert "if not (and .Values.backend.env" in deployment, (
+        "the env must be skipped when backend.env already carries it, or the "
+        "container gets two entries of the same name"
     )

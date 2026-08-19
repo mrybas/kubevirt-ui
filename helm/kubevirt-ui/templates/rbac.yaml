@@ -611,7 +611,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "kubevirt-ui.fullname" . }}-b3
-  namespace: {{ .Values.b3.frrNamespace }}
+  namespace: {{ include "kubevirt-ui.b3FrrNamespace" . }}
   labels:
     {{- include "kubevirt-ui.labels" . | nindent 4 }}
 rules:
@@ -624,7 +624,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "kubevirt-ui.fullname" . }}-b3
-  namespace: {{ .Values.b3.frrNamespace }}
+  namespace: {{ include "kubevirt-ui.b3FrrNamespace" . }}
   labels:
     {{- include "kubevirt-ui.labels" . | nindent 4 }}
 roleRef:

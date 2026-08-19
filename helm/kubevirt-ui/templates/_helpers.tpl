@@ -85,3 +85,22 @@ LLDAP secret name (supports existingSecret)
 {{ include "kubevirt-ui.fullname" . }}-lldap
 {{- end -}}
 {{- end }}
+
+{{/*
+The namespace frr-k8s runs in — one fact, two readers.
+
+It names the Role that lets the backend write its FRRConfiguration and the
+B3_FRR_NAMESPACE the backend reads to decide where to write it. A Role in one
+namespace and a write to another grants nothing while looking correct on
+review, so both come from here.
+
+`backend.env` wins because that is where a site already sets it; `b3.frrNamespace`
+is the chart's own default, and matches the fallback compiled into the backend.
+*/}}
+{{- define "kubevirt-ui.b3FrrNamespace" -}}
+{{- $fromEnv := "" -}}
+{{- if .Values.backend.env -}}
+{{- $fromEnv = (.Values.backend.env.B3_FRR_NAMESPACE | default "") -}}
+{{- end -}}
+{{- $fromEnv | default .Values.b3.frrNamespace | default "o0-metallb" -}}
+{{- end -}}
