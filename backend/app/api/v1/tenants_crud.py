@@ -417,12 +417,19 @@ async def _rollout_stall(
     if updated >= desired:
         return None
 
-    stale = desired - updated
+    # A rollout in progress looks exactly like a stalled one from the
+    # replica counts alone — measured on an acceptance run, where a healthy
+    # vCPU change reported itself as stalled for the two minutes it took.
+    # Only something actively refusing the replacement makes it a stall, so
+    # if nothing can be named, nothing is said.
     reason = await _blocked_pod_reason(k8s, namespace)
-    detail = f" — {reason}" if reason else ""
+    if not reason:
+        return None
+
+    stale = desired - updated
     return (
         f"worker rollout stalled: {stale} of {desired} still on the old "
-        f"template{detail}"
+        f"template — {reason}"
     )
 
 
@@ -435,14 +442,20 @@ async def _blocked_pod_reason(k8s, namespace: str) -> str | None:
     try:
         events = await k8s.core_api.list_namespaced_event(
             namespace=namespace,
-            field_selector="reason=FailedCreate",
-            limit=20,
+            # FailedCreate is the quota case; FailedScheduling is the same
+            # story told by the scheduler when the pod exists but nothing
+            # can hold it.
+            field_selector="reason!=Started",
+            limit=50,
         )
     except ApiException as e:
         logger.debug(f"could not read events in {namespace}: {e}")
         return None
 
+    blocking = {"FailedCreate", "FailedScheduling"}
     for event in reversed(events.items or []):
+        if getattr(event, "reason", None) not in blocking:
+            continue
         message = event.message or ""
         if "exceeded quota" in message:
             # The quota name and the shortfall are the actionable part; the

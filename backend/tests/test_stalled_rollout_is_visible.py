@@ -21,14 +21,17 @@ from app.api.v1.tenants_crud import _rollout_stall, apply_capacity_to_status
 from app.models.tenant import TenantResponse
 
 
-def _k8s(events: list[str] | None = None, explode: bool = False):
+def _k8s(events: list[tuple[str, str]] | None = None, explode: bool = False):
+    """`events` is (reason, message) — the reason is what makes one blocking."""
     k8s = MagicMock()
 
     async def _list_events(**kw):
         if explode:
             raise RuntimeError("events should not have been read")
         return SimpleNamespace(
-            items=[SimpleNamespace(message=m) for m in (events or [])],
+            items=[
+                SimpleNamespace(reason=r, message=m) for r, m in (events or [])
+            ],
         )
 
     k8s.core_api.list_namespaced_event = _list_events
@@ -38,7 +41,8 @@ def _k8s(events: list[str] | None = None, explode: bool = False):
 @pytest.mark.asyncio
 async def test_a_stalled_rollout_names_the_quota() -> None:
     stall = await _rollout_stall(
-        _k8s(['pods "virt-launcher-x" is forbidden: exceeded quota: t-quota']),
+        _k8s([("FailedCreate",
+               'pods "virt-launcher-x" is forbidden: exceeded quota: t-quota')]),
         "tenant-t1",
         {"replicas": 2},
         {"replicas": 3, "readyReplicas": 2, "updatedReplicas": 0},
@@ -72,8 +76,43 @@ async def test_an_unreconciled_deployment_is_not_called_stalled() -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_unreadable_event_list_still_reports_the_stall() -> None:
-    # The reason is a nicety; the stall itself is the finding.
+async def test_a_rollout_that_is_merely_in_progress_says_nothing() -> None:
+    """The counts alone cannot tell "stalled" from "working".
+
+    Measured on the acceptance run: a healthy vCPU change through the UI
+    reported itself as stalled for the two minutes it took to roll, because
+    `updatedReplicas < replicas` is true throughout a perfectly good rollout.
+    Crying wolf on every routine change is how a real stall stops being
+    noticed, so nothing is said unless something can be named.
+    """
+    stall = await _rollout_stall(
+        _k8s([("SuccessfulCreate", "created pod virt-launcher-x")]),
+        "tenant-t1",
+        {"replicas": 2},
+        {"replicas": 3, "readyReplicas": 2, "updatedReplicas": 1},
+    )
+
+    assert stall is None
+
+
+@pytest.mark.asyncio
+async def test_the_scheduler_refusing_counts_too() -> None:
+    # Quota is one way a replacement never lands; a node that cannot hold it
+    # is another, and it arrives as FailedScheduling instead.
+    stall = await _rollout_stall(
+        _k8s([("FailedScheduling", "0/6 nodes are available: insufficient memory")]),
+        "tenant-t1",
+        {"replicas": 2},
+        {"replicas": 3, "updatedReplicas": 0},
+    )
+
+    assert stall is not None and "insufficient memory" in stall
+
+
+@pytest.mark.asyncio
+async def test_unreadable_events_stay_quiet() -> None:
+    # Without the events there is no reason to give, and "stalled, cause
+    # unknown" on a rollout that is simply slow is worse than silence.
     k8s = MagicMock()
 
     async def _boom(**kw):
@@ -81,11 +120,10 @@ async def test_an_unreadable_event_list_still_reports_the_stall() -> None:
         raise ApiException(status=403)
 
     k8s.core_api.list_namespaced_event = _boom
-    stall = await _rollout_stall(
-        k8s, "tenant-t1", {"replicas": 2},
-        {"replicas": 3, "updatedReplicas": 1},
-    )
-    assert stall is not None and "1 of 2" in stall
+
+    assert await _rollout_stall(
+        k8s, "tenant-t1", {"replicas": 2}, {"replicas": 3, "updatedReplicas": 1},
+    ) is None
 
 
 def test_the_tenant_stops_reading_ready() -> None:
