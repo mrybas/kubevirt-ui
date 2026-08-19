@@ -22,20 +22,51 @@ from app.models.tenant import TenantResponse
 
 
 def _k8s(events: list[tuple[str, str]] | None = None, explode: bool = False):
-    """`events` is (reason, message) — the reason is what makes one blocking."""
+    """`events` is (reason, message).
+
+    The fake honours `field_selector=reason=...` because the real API does,
+    and the version of this code that ignored it shipped: a namespace with
+    664 events returned an unsorted page of 50 holding none of the ones being
+    looked for, so a live stall went unreported while the scheduler refused
+    the pod every few seconds. A fake that hands back everything regardless
+    of the filter cannot see that.
+    """
     k8s = MagicMock()
 
-    async def _list_events(**kw):
+    async def _list_events(namespace, field_selector=None, limit=None, **kw):
         if explode:
             raise RuntimeError("events should not have been read")
-        return SimpleNamespace(
-            items=[
-                SimpleNamespace(reason=r, message=m) for r, m in (events or [])
-            ],
-        )
+        wanted = (field_selector or "").removeprefix("reason=")
+        items = [
+            SimpleNamespace(reason=r, message=m, last_timestamp=i)
+            for i, (r, m) in enumerate(events or [])
+            if not wanted or r == wanted
+        ]
+        return SimpleNamespace(items=items[:limit or len(items)])
 
     k8s.core_api.list_namespaced_event = _list_events
     return k8s
+
+
+@pytest.mark.asyncio
+async def test_the_reason_is_found_in_a_namespace_full_of_noise() -> None:
+    """The failure measured live, and the only one that mattered.
+
+    A tenant namespace accumulates hundreds of routine events. Asking for a
+    page of them and hoping the interesting one is inside is not a filter —
+    it is a lottery, and it lost.
+    """
+    noise = [("SuccessfulCreate", f"created pod {i}") for i in range(300)]
+    blocking = [("FailedScheduling", "0/6 nodes are available: 3 Insufficient memory")]
+
+    stall = await _rollout_stall(
+        _k8s(noise + blocking + noise),
+        "tenant-t1",
+        {"replicas": 2},
+        {"replicas": 3, "updatedReplicas": 0},
+    )
+
+    assert stall is not None and "Insufficient memory" in stall
 
 
 @pytest.mark.asyncio

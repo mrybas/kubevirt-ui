@@ -436,34 +436,43 @@ async def _rollout_stall(
 async def _blocked_pod_reason(k8s, namespace: str) -> str | None:
     """The event behind a replacement that never got a pod.
 
+    Filtered server-side, one reason at a time. The list API returns events in
+    no useful order and a busy tenant namespace holds hundreds of them — an
+    unsorted page of 50 contained not one of the events being looked for when
+    this was measured live, so the stall went unreported while the scheduler
+    was refusing the pod every few seconds. `reason=` is the only filter that
+    makes the page relevant rather than merely small.
+
     Only read when a rollout is already known to be stuck, so the cost lands
     on the rare path rather than on every row of the tenant list.
     """
-    try:
-        events = await k8s.core_api.list_namespaced_event(
-            namespace=namespace,
-            # FailedCreate is the quota case; FailedScheduling is the same
-            # story told by the scheduler when the pod exists but nothing
-            # can hold it.
-            field_selector="reason!=Started",
-            limit=50,
-        )
-    except ApiException as e:
-        logger.debug(f"could not read events in {namespace}: {e}")
+    newest = None
+    newest_at = None
+    for reason in ("FailedCreate", "FailedScheduling"):
+        try:
+            events = await k8s.core_api.list_namespaced_event(
+                namespace=namespace,
+                field_selector=f"reason={reason}",
+                limit=20,
+            )
+        except ApiException as e:
+            logger.debug(f"could not read {reason} events in {namespace}: {e}")
+            continue
+
+        for event in events.items or []:
+            at = getattr(event, "last_timestamp", None)
+            if newest_at is None or (at is not None and at > newest_at):
+                newest, newest_at = event, at
+
+    if newest is None:
         return None
 
-    blocking = {"FailedCreate", "FailedScheduling"}
-    for event in reversed(events.items or []):
-        if getattr(event, "reason", None) not in blocking:
-            continue
-        message = event.message or ""
-        if "exceeded quota" in message:
-            # The quota name and the shortfall are the actionable part; the
-            # pod name changes on every retry and only adds noise.
-            return "namespace quota has no room for the replacement pod"
-        if message:
-            return message.split(":")[-1].strip()[:120]
-    return None
+    message = newest.message or ""
+    if "exceeded quota" in message:
+        # The quota name and the shortfall are the actionable part; the pod
+        # name changes on every retry and only adds noise.
+        return "namespace quota has no room for the replacement pod"
+    return message.split(":", 1)[-1].strip()[:120] or None
 
 
 async def _enrich_with_workers(
