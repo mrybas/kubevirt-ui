@@ -342,6 +342,12 @@ class TenantResponse(BaseModel):
     # Why the status is not Ready, when the reason is something the list view
     # would otherwise hide (no workers joined, an addon wedged).
     status_detail: str | None = None
+    # Set when the worker MachineDeployment is mid-rollout and not finishing:
+    # the replacement Machine exists but its pod cannot be created, so the old
+    # workers stay healthy and the tenant reads Ready while nothing is being
+    # replaced. Measured cause on this stand: the namespace quota had no room
+    # for the surge pod. Surfaced through `status_detail`.
+    rollout_stalled: str | None = None
     # Set when something else holds this VPC's SNAT slot on a non-transit
     # network — the tenant's control-plane path cannot be built until it is
     # released. Surfaced through `status_detail`.

@@ -141,6 +141,63 @@ logger = logging.getLogger(__name__)
 # namespace's quota alongside the workers.
 _CP_CPU = 0.5
 _CP_MEMORY = 1024 ** 3
+# KubeVirt does not run a VM on its declared memory: virt-launcher asks for
+# the guest's memory plus its own overhead. Sizing a quota slot at the
+# declared memory is what deadlocked a worker rollout in UAT 2026-08-19 —
+# quota 8Gi, two workers and the control plane using 5.79Gi, the replacement
+# pod asking 2.273Gi against 2.21Gi free. Short by 0.06Gi, forever, because a
+# rollout that cannot start never finishes.
+#
+# The terms below mirror KubeVirt's own `GetMemoryOverhead`
+# (virt-controller/services/renderresources.go) rather than a curve fitted to
+# this cluster: a fit silently misses whatever the sample did not exercise,
+# and drifts on a version bump with nothing to point at. Naming the parts
+# makes a bump a diff instead of a mystery.
+_VIRT_LAUNCHER_MONITOR_OVERHEAD = 25 * 1024 ** 2
+_VIRT_LAUNCHER_OVERHEAD = 100 * 1024 ** 2
+_VIRTLOGD_OVERHEAD = 20 * 1024 ** 2
+_VIRTQEMUD_OVERHEAD = 35 * 1024 ** 2
+_QEMU_OVERHEAD = 30 * 1024 ** 2
+_IOTHREAD_OVERHEAD = 8 * 1024 ** 2
+_VIDEO_RAM_OVERHEAD = 32 * 1024 ** 2
+_PER_VCPU_OVERHEAD = 8 * 1024 ** 2
+# Page tables are the term that makes this a formula rather than a constant:
+# they scale with guest memory, so a reserve chosen from a 2Gi worker starves
+# a 256Gi one — and only the largest tenants, the ones least likely to be
+# tested, would ever hit it.
+_PAGETABLE_DIVISOR = 512
+
+# Over-reserving costs a slightly higher folder ceiling; under-reserving
+# reproduces the stall. The margin also absorbs the components a future
+# KubeVirt adds before anyone reconciles the list above.
+_OVERHEAD_MARGIN = 1.25
+
+# What this deliberately does NOT account for: hugepages, dedicated CPU
+# placement, VFIO/GPU passthrough, SEV, downward metrics. Worker VMs set none
+# of them — `test_worker_vms_stay_within_the_reserved_shape` fails if that
+# ever stops being true, because each would add its own term.
+
+
+def _vmi_memory_overhead(memory: int, vcpu: int) -> int:
+    """What virt-launcher asks for beyond the guest's own memory.
+
+    Checked against what the pods really requested on this stand:
+
+        2Gi  / 2 vCPU  ->  2.273Gi   overhead 280Mi
+        8Gi  / 4 vCPU  ->  8.301Gi   overhead 308Mi
+       32Gi  / 8 vCPU  -> 32.379Gi   overhead 388Mi
+    """
+    fixed = (
+        _VIRT_LAUNCHER_MONITOR_OVERHEAD
+        + _VIRT_LAUNCHER_OVERHEAD
+        + _VIRTLOGD_OVERHEAD
+        + _VIRTQEMUD_OVERHEAD
+        + _QEMU_OVERHEAD
+        + _IOTHREAD_OVERHEAD
+        + _VIDEO_RAM_OVERHEAD
+    )
+    raw = fixed + memory // _PAGETABLE_DIVISOR + _PER_VCPU_OVERHEAD * vcpu
+    return int(raw * _OVERHEAD_MARGIN)
 
 
 
@@ -321,12 +378,79 @@ def apply_capacity_to_status(tenant: TenantResponse) -> TenantResponse:
     if tenant.transit_conflict:
         reasons.append(tenant.transit_conflict)
 
+    # A stalled rollout keeps every existing worker healthy, so none of the
+    # checks above notice it. Without this the tenant reads Ready while the
+    # change the operator asked for is going nowhere.
+    if tenant.rollout_stalled:
+        reasons.append(tenant.rollout_stalled)
+
     if not reasons:
         return tenant
 
     tenant.status = "Degraded"
     tenant.status_detail = "; ".join(reasons)
     return tenant
+
+
+async def _rollout_stall(
+    k8s, namespace: str, md_spec: dict, md_status: dict,
+) -> str | None:
+    """Why a worker rollout is not finishing, if it is not finishing.
+
+    A rollout that cannot start looks exactly like a healthy cluster: the old
+    workers are untouched and Ready, `readyReplicas` equals `replicas`, and
+    the replacement sits as a Machine with no pod. Measured in UAT
+    2026-08-19 — a vCPU change through the UI's own Apply button hung this
+    way for good, and the tenant went on reporting Ready 2/2.
+
+    `updatedReplicas` is the number already on the current template, so it is
+    the one field that tells old from new.
+    """
+    desired = md_spec.get("replicas") or 0
+    # Absent is not zero: a MachineDeployment that has not been reconciled yet
+    # carries no `updatedReplicas` at all, and reading that as "none updated"
+    # reports every fresh tenant as stalled.
+    if not desired or "updatedReplicas" not in md_status:
+        return None
+
+    updated = md_status.get("updatedReplicas") or 0
+    if updated >= desired:
+        return None
+
+    stale = desired - updated
+    reason = await _blocked_pod_reason(k8s, namespace)
+    detail = f" — {reason}" if reason else ""
+    return (
+        f"worker rollout stalled: {stale} of {desired} still on the old "
+        f"template{detail}"
+    )
+
+
+async def _blocked_pod_reason(k8s, namespace: str) -> str | None:
+    """The event behind a replacement that never got a pod.
+
+    Only read when a rollout is already known to be stuck, so the cost lands
+    on the rare path rather than on every row of the tenant list.
+    """
+    try:
+        events = await k8s.core_api.list_namespaced_event(
+            namespace=namespace,
+            field_selector="reason=FailedCreate",
+            limit=20,
+        )
+    except ApiException as e:
+        logger.debug(f"could not read events in {namespace}: {e}")
+        return None
+
+    for event in reversed(events.items or []):
+        message = event.message or ""
+        if "exceeded quota" in message:
+            # The quota name and the shortfall are the actionable part; the
+            # pod name changes on every retry and only adds noise.
+            return "namespace quota has no room for the replacement pod"
+        if message:
+            return message.split(":")[-1].strip()[:120]
+    return None
 
 
 async def _enrich_with_workers(
@@ -346,6 +470,9 @@ async def _enrich_with_workers(
             tenant.worker_count = md_spec.get("replicas", 0)
             tenant.workers_ready = await _healthy_worker_count(
                 k8s, tenant.namespace, md_status.get("readyReplicas", 0),
+            )
+            tenant.rollout_stalled = await _rollout_stall(
+                k8s, tenant.namespace, md_spec, md_status,
             )
 
             # Extract VM spec from infrastructure template
@@ -1103,8 +1230,12 @@ def _tenant_quota(req: Any) -> dict[str, str]:
     # is what lets a rolling worker resize proceed.
     surge = req.worker_count + 1
     cpu = surge * req.worker_vcpu + req.control_plane_replicas * _CP_CPU
+    worker_memory = int(parse_quantity(req.worker_memory) or 0)
     memory = (
-        surge * (parse_quantity(req.worker_memory) or 0)
+        surge * (
+            worker_memory
+            + _vmi_memory_overhead(worker_memory, req.worker_vcpu)
+        )
         + req.control_plane_replicas * _CP_MEMORY
     )
     storage = surge * (parse_quantity(req.worker_disk) or 0)

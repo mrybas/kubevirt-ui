@@ -35,9 +35,18 @@ class TestTenantQuota:
         # Replacing a worker overlaps with it: sized to exactly the worker
         # count, the quota refused every replacement and a tenant whose
         # worker died could never get a new one.
+        #
+        # Memory counts the launcher, not the guest: KubeVirt runs a 2Gi
+        # worker in a pod that requests 2.4Gi, so a slot sized at 2Gi is a
+        # slot the replacement cannot occupy (UAT 2026-08-19 deadlock).
+        from app.api.v1.tenants_crud import _vmi_memory_overhead
+
+        two_gi = 2 * 1024 ** 3
         q = _tenant_quota(_req(worker_count=3, control_plane_replicas=0))
         assert q["cpu"] == "8"                              # (3+1) x 2 vCPU
-        assert int(q["memory"]) == 4 * 2 * 1024 ** 3
+        assert int(q["memory"]) == 4 * (
+            two_gi + _vmi_memory_overhead(two_gi, 2)
+        )
         assert int(q["storage"]) == 4 * 20 * 1024 ** 3
 
     def test_a_single_worker_tenant_can_replace_its_only_worker(self) -> None:
