@@ -2228,6 +2228,25 @@ async def _talos_node_addresses(k8s, ns: str) -> list[str]:
     return sorted(out)
 
 
+def _kubeconfig_with_external_server(kubeconfig_yaml: str, host: str) -> str:
+    """Point a tenant kubeconfig at the address a workstation can reach.
+
+    Kamaji writes its Secret against the in-cluster address — on this stand a
+    private VIP, unreachable from anywhere an operator sits. The hostname in
+    `certSANs` is the one that resolves publicly and is valid in the
+    apiserver certificate, so the swap keeps TLS verifiable rather than
+    trading it for `insecure-skip-tls-verify`.
+
+    Extracted from the route so it can be tested: the rewrite was correct and
+    entirely unguarded, and a kubeconfig that hands back the internal address
+    fails only on someone else's machine, long after the change that caused it.
+    """
+    parsed = yaml.safe_load(kubeconfig_yaml)
+    for cluster in parsed.get("clusters", []):
+        cluster.setdefault("cluster", {})["server"] = f"https://{host}"
+    return yaml.dump(parsed, default_flow_style=False)
+
+
 @router.get("/{name}/kubeconfig", response_model=TenantKubeconfigResponse)
 async def get_tenant_kubeconfig(
     request: Request,
@@ -2277,14 +2296,11 @@ async def get_tenant_kubeconfig(
                 status_code=404, detail="Kubeconfig data not found in secret"
             )
 
-        kubeconfig_str = base64.b64decode(raw).decode("utf-8")
-        # Replace internal server URL with external ingress endpoint
-        admin_kc = yaml.safe_load(kubeconfig_str)
-        external_server = f"https://{_endpoint_host(name)}"
-        for cluster in admin_kc.get("clusters", []):
-            cluster.setdefault("cluster", {})["server"] = external_server
-        kubeconfig_str = yaml.dump(admin_kc, default_flow_style=False)
-        return TenantKubeconfigResponse(kubeconfig=kubeconfig_str)
+        return TenantKubeconfigResponse(
+            kubeconfig=_kubeconfig_with_external_server(
+                base64.b64decode(raw).decode("utf-8"), _endpoint_host(name),
+            ),
+        )
 
     # type == "oidc"
     if not OIDC_ISSUER:
