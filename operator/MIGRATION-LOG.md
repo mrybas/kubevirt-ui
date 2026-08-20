@@ -1779,3 +1779,76 @@ Three mutation runs in this slice reported the wrong result because the test
 binary was built from a file the container had not seen yet — the bind mount
 lags a write by a second or two. A mutation is now confirmed *inside* the
 container before its result is believed.
+
+### Live: the address, and the invariant proved by making it fire
+
+```
+tenant adr1  MetalLB gave 10.199.0.102 from cp-transit-pool
+             sharing key adr1-cp, AddressAssigned=True(Assigned)
+             status.controlPlaneVIP = 10.199.0.102
+```
+
+The first read of that last line was **empty while the condition said
+Assigned** — the live CRD predated the field, so the API server pruned it. The
+condition and the value it describes disagreed, and only the value was wrong.
+Applying the CRD fixed it. It is the same class as everything else in this log:
+the change had not reached the object being measured.
+
+Then the invariant, made to fire rather than assumed: the operator was pointed
+at `ovn-default`, whose excludeIps are `10.16.0.1` and cover nothing in
+`10.199.0.0/24`. A new tenant was refused —
+
+```
+PoolOverlapsSubnet: MetalLB pool "cp-transit-pool" has ranges outside the
+excludeIps of subnet "ovn-default": 10.199.0.100-10.199.0.119. …
+services "adr2-cp-lb" not found
+```
+
+— refused, with no Service asked for, and the setting put back afterwards. A
+check that has never been seen to say no is not a check.
+
+The two live tenants kept their addresses and their NTP Services on them
+(10.199.0.100 and .101, each shared between cp-lb and ntp).
+
+## M12c (fourth slice) — the CSR signer's PKI
+
+A Talos worker asks trustd for a certificate instead of presenting a token, so
+this chain is the difference between a node that joins and a VM that looks
+perfectly healthy while the cluster has never heard of it.
+
+Four objects, and the shapes are the product's: a selfSigned Issuer, a ten-year
+Ed25519 CA (rotating it means re-provisioning every node), an Issuer from that
+CA, and the signer's own certificate for a year.
+
+**It waits for the address.** The old rule was DNS names only, for a good
+reason: an IP SAN could only be added once the address existed, which meant
+patching the certificate afterwards — and the signer reads its certificate once
+at startup and never watches the file. Per-tenant addresses remove the ordering
+problem, so the SAN is issued with the certificate. It is also required: a
+worker dials `<vip>:50001` by address, sends no SNI, and a DNS-only certificate
+fails the handshake before trustd is asked anything.
+
+### Ready means the certificate answers, not that a file exists
+
+The first version reported Issued when the secret existed, and a reviewer was
+right to call it the wrong object to measure. Two ways it lies, both reporting a
+working signer while the handshake fails: a tenant that predates per-tenant
+addresses already has a `<t>-talos-signer` secret with a DNS-only certificate,
+and adding `ipAddresses` to the Certificate leaves the old secret in place until
+cert-manager re-issues. A signer started in that window reads its file once and
+never sees the replacement.
+
+So `tls.crt` is parsed and the VIP must be among the IP SANs, with both DNS
+names present. The tests build real certificates for each case — names only, a
+foreign address, one name missing, and finally the right one — so the refusals
+are the check working rather than a condition that never turns true. Mutating
+the check to accept everything turns the first case red.
+
+### Waiting for what nobody wakes us for
+
+Two things here are not watched: cert-manager writing the signer's secret, and
+the image controller finishing an import. Watching either means caching every
+Secret and every ManagedImage in the cluster to notice one object apiece, so the
+tenant requeues every ten seconds while something is pending and stops as soon
+as it is not. The PKI test found this the honest way: it assigned the secret and
+waited twenty seconds for a condition that had nothing to wake it.

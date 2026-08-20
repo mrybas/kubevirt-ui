@@ -111,6 +111,18 @@ rules:
   verbs:
   - create
 - apiGroups:
+  - cert-manager.io
+  resources:
+  - certificates
+  - issuers
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - clone.kubevirt.io
   resources:
   - virtualmachineclones

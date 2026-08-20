@@ -182,6 +182,13 @@ const (
 	// from the control-plane endpoint and dials :50001 there. That port cannot
 	// be moved, so two tenants cannot share a listener for it.
 	ConditionAddressAssigned = "AddressAssigned"
+
+	// ConditionPKIReady is the CSR signer's certificate chain.
+	//
+	// A Talos worker asks trustd for a certificate instead of presenting a
+	// token, so without this nothing signs its CSR and the node never appears
+	// — while the VM looks perfectly healthy.
+	ConditionPKIReady = "PKIReady"
 )
 
 // TenantReservation is what this tenant asks of its folder.

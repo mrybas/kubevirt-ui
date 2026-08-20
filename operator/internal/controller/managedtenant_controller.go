@@ -22,6 +22,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -43,6 +44,10 @@ import (
 
 const (
 	tenantControllerName = "managedtenant"
+
+	// pendingRequeue is how often a tenant comes back to look at the two things
+	// nobody wakes it for: the signer's secret and the shared image's import.
+	pendingRequeue = 10 * time.Second
 
 	// tenantCatalogEnv is where a deployment states its Talos releases — the
 	// same variable the endpoint and the webhook read, so all three answer with
@@ -89,6 +94,8 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes/source,verbs=create
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=metallb.io,resources=ipaddresspools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cert-manager.io,resources=issuers;certificates,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeovn.io,resources=subnets,verbs=get;list;watch
 
 // Reconcile brings the tenant's namespace into line with the declaration.
@@ -210,6 +217,29 @@ func (r *ManagedTenantReconciler) Reconcile(
 	apimeta.SetStatusCondition(&obj.Status.Conditions,
 		addressCondition(addressReady, addressMessage))
 
+	// Two of the things below are waited for rather than watched: cert-manager
+	// writes the signer's secret, and the image controller finishes an import.
+	// Watching either would mean caching every Secret and every ManagedImage in
+	// the cluster to notice one object apiece, so the tenant comes back and
+	// looks instead. It stops as soon as they are ready.
+	pending := false
+
+	// After the address, which the signer's certificate carries as an IP SAN.
+	pkiReady, pkiReason, pkiMessage, err := r.reconcilePKI(
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			pkiCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if pkiMessage != "" || obj.Spec.Workers.OS == "talos" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			pkiCondition(pkiReady, pkiReason, pkiMessage))
+		pending = pending || !pkiReady
+	}
+
 	// After the namespace, because the clone grant names it as its subject.
 	goldenReady, goldenMessage, err := r.reconcileGolden(ctx, obj, namespace, release)
 	if err != nil {
@@ -222,6 +252,7 @@ func (r *ManagedTenantReconciler) Reconcile(
 	if goldenMessage != "" || obj.Spec.Workers.OS == "talos" {
 		apimeta.SetStatusCondition(&obj.Status.Conditions,
 			goldenCondition(goldenReady, goldenMessage))
+		pending = pending || !goldenReady
 	}
 
 	r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady, true, "Ready",
@@ -244,7 +275,11 @@ func (r *ManagedTenantReconciler) Reconcile(
 	}
 
 	obj.Status.ObservedGeneration = obj.Generation
-	return ctrl.Result{}, kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+	result := ctrl.Result{}
+	if pending {
+		result.RequeueAfter = pendingRequeue
+	}
+	return result, kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
 }
 
 // resolveRelease answers which Talos release this tenant builds from, or why

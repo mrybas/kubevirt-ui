@@ -243,7 +243,12 @@ func (r *ManagedTenantReconciler) poolOverlapsSubnet(
 // is absent, this deployment may not read it, or the CRD is not installed.
 func unreadable(err error) bool {
 	return apierrors.IsNotFound(err) || apierrors.IsForbidden(err) ||
-		apimeta.IsNoMatchError(err)
+		apimetaIsNoMatch(err)
+}
+
+// apimetaIsNoMatch is "this cluster has never heard of that kind".
+func apimetaIsNoMatch(err error) bool {
+	return apimeta.IsNoMatchError(err)
 }
 
 // reader is the uncached client when one was wired, the cached one otherwise.
