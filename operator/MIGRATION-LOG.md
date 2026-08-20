@@ -2249,3 +2249,35 @@ M12e, and confirmed absent rather than assumed.
 The rest is additive metadata — a `kubevirt-ui.io/tenant` label on objects the
 product leaves unlabelled — and the ingress certSAN, which is empty because the
 operator has no ingress domain configured yet.
+
+### The one the diff could not have found
+
+With every difference closed, the tenant still would not come up: six
+control-plane containers crash-looping, the apiserver dying on `error creating
+leases`. Nothing in any message named a network. The cause was three layers
+down, in kine:
+
+```
+failed to connect to host=kamaji-postgres-rw.o0-cnpg.svc:
+lookup … on 10.96.0.10:53: i/o timeout
+```
+
+and the pod's own address gave it away: `10.200.16.29`, inside the tenant's VPC.
+
+**The namespace was pinned to the VPC subnet, and that was mine** — from the
+namespace slice, with a comment explaining the reasoning: kube-ovn claims a new
+namespace for the cluster overlay, so pin it to the tenant's network or pods
+born there land on 10.16/16. Exactly backwards. The control plane lives in that
+namespace too, and from inside a VPC it can reach neither the datastore, nor the
+ingress, nor anything else the platform runs. Only the worker *launcher pods*
+belong in the VPC, and they get there by the annotation on their own template —
+which is what the product does, and which I had already ported correctly one
+file over.
+
+A test asserted the wrong behaviour, in the same words as the comment. It now
+asserts the opposite, with the crash it prevents written into it.
+
+No test could have caught this: envtest has no CNI, so a pod there has no
+address at all, and the diff could not either — it compares what is declared,
+and both declarations were the same shape. It took a control plane that would
+not start.

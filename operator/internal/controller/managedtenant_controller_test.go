@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
+	"github.com/mrybas/kubevirt-ui/operator/internal/tenant"
 )
 
 func mustTenant(t *testing.T, obj *platformv1alpha1.ManagedTenant) *platformv1alpha1.ManagedTenant {
@@ -275,23 +276,39 @@ func TestAnotherWritersQuotaIsNotMadeWorse(t *testing.T) {
 	})
 }
 
-// TestATenantPointedAtANetworkLandsOnIt. kube-ovn default-claims a new
-// namespace to the cluster overlay the moment it sees one, so the annotation
-// has to be on the object as it is created — otherwise pods born here get
-// 10.16/16 even though the tenant is attached to a VPC.
-func TestATenantPointedAtANetworkLandsOnIt(t *testing.T) {
+// TestTheTenantNamespaceStaysOnTheClusterOverlay.
+//
+// The opposite of what this test used to assert, and the stand is what settled
+// it. Stamping the tenant's VPC subnet on the namespace puts the *control
+// plane* in the VPC as well, where it cannot resolve the datastore:
+//
+//	failed to connect to host=kamaji-postgres-rw.o0-cnpg.svc:
+//	lookup … on 10.96.0.10:53: i/o timeout
+//
+// kine then never opens its socket, the apiserver dies on "error creating
+// leases", and six containers crash-loop with nothing in any message naming the
+// network. Only the worker launcher pods belong in the VPC, and they get there
+// by the annotation on their own template.
+func TestTheTenantNamespaceStaysOnTheClusterOverlay(t *testing.T) {
 	obj := plainTenant("tnet")
 	obj.Spec.Network = "uat-net-x"
 	mustTenant(t, obj)
 
-	eventually(t, "the logical switch annotation", func() error {
+	eventually(t, "the namespace", func() error {
 		ns := &corev1.Namespace{}
-		if err := k8sClient.Get(testCtx, types.NamespacedName{Name: "tenant-tnet"}, ns); err != nil {
-			return err
-		}
-		if got := ns.Annotations["ovn.kubernetes.io/logical_switch"]; got != "uat-net-x-default" {
-			return fmt.Errorf("annotation = %q", got)
-		}
-		return nil
+		return k8sClient.Get(testCtx, types.NamespacedName{Name: "tenant-tnet"}, ns)
 	})
+	ns := &corev1.Namespace{}
+	if err := k8sReader.Get(testCtx, types.NamespacedName{Name: "tenant-tnet"}, ns); err != nil {
+		t.Fatalf("reading the namespace: %v", err)
+	}
+	if got, found := ns.Annotations["ovn.kubernetes.io/logical_switch"]; found {
+		t.Errorf("the namespace was pinned to %q, which takes the control "+
+			"plane into the VPC with it", got)
+	}
+
+	// And the workers still cross into it, by their own template.
+	if got := tenant.LogicalSwitchOf(obj); got != "uat-net-x-default" {
+		t.Errorf("the worker switch is %q", got)
+	}
 }

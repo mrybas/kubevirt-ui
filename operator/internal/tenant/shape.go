@@ -57,7 +57,11 @@ func NamespaceLabels(obj *platformv1alpha1.ManagedTenant) map[string]string {
 	return labels
 }
 
-// LogicalSwitchOf is the subnet a namespace's pods default to, or "".
+// LogicalSwitchOf is the tenant's VPC subnet, or "".
+//
+// For the worker launcher pods, which cross into it. Deliberately not for the
+// namespace: the control plane lives there too and has to reach the datastore,
+// the ingress and the rest of the platform, none of which a VPC can see.
 func LogicalSwitchOf(obj *platformv1alpha1.ManagedTenant) string {
 	if obj.Spec.Network == "" {
 		return ""

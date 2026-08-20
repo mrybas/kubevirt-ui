@@ -392,16 +392,21 @@ func (r *ManagedTenantReconciler) ensureNamespace(
 		for key, value := range tenant.NamespaceLabels(obj) {
 			live.Labels[key] = value
 		}
-		// The logical switch is stamped before the namespace exists, and that
-		// is deliberate: kube-ovn-controller default-claims a new namespace to
-		// the cluster overlay the moment it sees one, so a pod born here would
-		// land on 10.16/16 even though the tenant is attached to a VPC.
-		if switchName := tenant.LogicalSwitchOf(obj); switchName != "" {
-			if live.Annotations == nil {
-				live.Annotations = map[string]string{}
-			}
-			live.Annotations["ovn.kubernetes.io/logical_switch"] = switchName
-		}
+		// **No logical switch on the namespace.** An earlier version stamped
+		// the tenant's VPC subnet here, reasoning that a pod born in this
+		// namespace should land in the tenant's network. Exactly backwards, and
+		// the stand said so: the control plane lands there too, and from inside
+		// a VPC it cannot resolve the datastore —
+		//
+		//   failed to connect to host=kamaji-postgres-rw.o0-cnpg.svc:
+		//   lookup ... on 10.96.0.10:53: i/o timeout
+		//
+		// — so kine never opens its socket, the apiserver dies on "error
+		// creating leases", and six containers crash-loop with nothing naming
+		// the network. The namespace stays on the cluster overlay, where the
+		// control plane can reach Postgres, the ingress and the rest of the
+		// platform; it is the worker *launcher pods* that cross into the VPC,
+		// by the annotation on their own template.
 		return nil
 	})
 	if err != nil {
