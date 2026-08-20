@@ -93,6 +93,47 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # -----------------------------------------------------------------------
+  # The operator's custom resources
+  # -----------------------------------------------------------------------
+  # Needed only when an OPERATOR_*_ENABLED flag is on, but granted regardless:
+  # the flags are set on the Deployment and a role that has to be widened at the
+  # same moment a flag is flipped turns a reversible switch into a two-step
+  # migration.
+  #
+  # This block was missing entirely while four of those paths were already
+  # written, and no test or lab run could see it: the development backend talks
+  # to the cluster through an admin kubeconfig, so every RBAC-gated path passes
+  # by construction. It surfaced only when the deployed backend was asked to
+  # read a ManagedUnderlay and answered 403.
+  #
+  # The verbs are not maintained by hand. tests/test_backend_rbac_covers_the_
+  # operator_paths.py derives them from the call sites and fails if this drifts.
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedvms
+    verbs: ["get", "list", "create", "patch", "delete"]
+
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedvmoperations
+    verbs: ["create"]
+
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedvmtemplates
+    verbs: ["list", "create", "delete"]
+
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedimages
+    verbs: ["get", "create", "delete"]
+
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedunderlays
+    verbs: ["get", "create", "patch"]
+
+  # -----------------------------------------------------------------------
   # Core resources
   # -----------------------------------------------------------------------
   # Namespaces — full CRUD for project/environment management

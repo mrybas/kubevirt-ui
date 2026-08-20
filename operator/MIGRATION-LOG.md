@@ -837,6 +837,42 @@ rather than left implicit.
   Stated in the type doc, the values comment and the cutover script header. The
   rollback path pauses; it never deletes.
 
+### A third defect, found by the advisor pushing back on the rollout order
+
+The paused-status fix was committed *after* the cluster backend had been rolled
+to `dev-a3eaa55`, and the later deploys only moved the operator tag. So the live
+backend was still the stale-status build while the branch was fixed. Rolled to
+`dev-77bb000`, digest checked on the running pod, and verified behaviourally on
+that pod against the real CRs: `external` paused -> ready=False with the frozen
+-status message, `cp-transit` unpaused -> ready=True, then the annotation removed
+and the same pod flipped to ready=True. Same pod, one annotation, both answers.
+
+Doing that verification turned up something considerably worse.
+
+**The chart granted the backend nothing on `platform.kubevirt-ui.io`** — not for
+underlays, and not for the four operator paths written before this one. The
+deployed pod answered 403 reading a ManagedUnderlay. Nothing could see it: the
+development backend reaches the cluster through an admin kubeconfig, so every
+RBAC-gated path passes in the lab by construction.
+
+There was already a contract test for exactly this class (`test_helm_rbac_
+contract.py`, written after three shipped features 403'd at once) with a
+hand-kept `REQUIRED` list and a "add a row when you add a call" convention.
+Nobody added the rows. So the fix is in that file rather than beside it:
+
+- the fifteen operator rows, and
+- `test_every_operator_call_site_is_listed`, which reads the
+  `*_custom_object(plural=...)` call sites out of the source — literals and
+  module constants — and fails when `REQUIRED` falls behind them.
+
+Both ends now fail on their own: deleting the chart rule fails
+`test_chart_grants_permission[...managedunderlays:patch]`, deleting the REQUIRED
+row fails the new scan, and a scan that matched nothing fails its own guard.
+
+Applied to the stand: the backend SA can now get/create/patch managedunderlays,
+and deliberately **not** delete one — given the cascade, the backend has no
+business being able to.
+
 ### Left open
 
 - `status.labelHeals` is per-underlay, so on a shared node the first underlay to
