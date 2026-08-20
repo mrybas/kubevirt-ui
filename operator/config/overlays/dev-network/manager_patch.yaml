@@ -32,3 +32,10 @@ spec:
             # be a coin toss.
             - name: ENABLE_WEBHOOKS
               value: "false"
+            # Named so it can be refused: a tenant's workers reach their
+            # control plane over this leg, and the tenant controller attaches
+            # it. Without the name here, this controller would happily withdraw
+            # it when a declaration stops mentioning it — two writers with
+            # opposite intentions on the one path that must not flap.
+            - name: TENANTS_CP_TRANSIT_SUBNET
+              value: cp-transit

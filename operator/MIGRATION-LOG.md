@@ -2614,3 +2614,39 @@ Both directions are tested, and mutating the hold away turns the second red with
 writing the test: a declaration naming an egress subnet it no longer attaches
 contradicts itself, and the controller already refuses it — the test was wrong,
 not the code.
+
+### Live: detached through the declaration, and the one leg that would not go
+
+Yesterday's A/B needed a hand edit of the Vpc because the CR could only attach.
+Done properly now, with a live tenant behind the network:
+
+```
+declared: attachments []  egressSubnet ""
+before:   extra ["cp-transit","external"]   default route via 10.199.4.254
+after:    extra ["cp-transit"]              no static routes
+          lrp cmp-net-external   gone
+          lrp cmp-net-cp-transit 10.199.1.23   still there
+```
+
+The egress leg went with its route and its router port. The control-plane leg
+stayed, because a tenant declares this network — and the tenant behind it did
+not notice: 2/2 workers, `TransitReady=Wired` throughout. The legs were put back
+afterwards and the two product tenants were untouched the whole time.
+
+That is the refusal doing its job in the only way that counts: the declaration
+asked for both legs to go, and one of them is not the declaration's to remove.
+
+### And the harness, checked on all three of its cases
+
+The RBAC harness was proved on one gap; the other two are the ones that actually
+cost live runs, so they were run too — through `hack/mutate.sh`, which is the
+point of having it:
+
+```
+role.yaml less `datavolumes/source`        -> controller package FAILs
+role.yaml less rbac `create`               -> "clone grant … not found"
+role.yaml less `secrets` create            -> the live error, in the suite
+```
+
+All three now fail here instead of on a cluster. The direct-call tests did not
+need a restricted client after all: the manager-driven ones reach those paths.

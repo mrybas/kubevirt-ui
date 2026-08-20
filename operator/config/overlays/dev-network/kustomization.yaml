@@ -37,4 +37,4 @@ patches:
 images:
 - name: controller
   newName: ghcr.io/mrybas/kubevirt-ui/operator
-  newTag: dev-49e2de1
+  newTag: dev-fea7e11
