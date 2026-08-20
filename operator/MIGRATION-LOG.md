@@ -1004,3 +1004,72 @@ Two hypotheses were tested and are wrong, which is worth as much as the finding:
   the broken and the working case explains neither.
 
 Rule for the live cycles from here: **never reuse a network name.**
+
+## M10a (second slice) — VPC DNS, and the route that kept going missing
+
+The network gets its own resolver, and — the part worth the work — the
+service-network route on that resolver's pod template is applied on a watch
+rather than once at create time.
+
+A VpcDns pod's secondary interface gets exactly one route into the cluster
+overlay, written by kube-ovn and not configurable, so the cluster resolver's
+ClusterIP is unreachable: the packet takes the pod's default route out into the
+tenant network and dies. Routing the whole service network is what removed the
+need to pin resolver *pod* addresses in the Corefile — and pinned pod addresses
+is how VPC DNS once went silent after a CoreDNS restart while the VpcDns object
+reported ACTIVE with both pods Running.
+
+The old path could only try once: kube-ovn creates that Deployment *after* the
+VpcDns object, so at create time there is nothing to annotate. The code said the
+route would go on "at the next reconcile", and the only next reconcile was a
+person calling an endpoint.
+
+### Facts read, not configured
+
+| fact | source |
+|---|---|
+| resolver address | `vpc-dns-config`.`coredns-vip` — the ConfigMap that already configures kube-ovn's own VpcDns controller |
+| overlay gateway | `Subnet/ovn-default`.`spec.gateway` |
+| service network | kubeadm ConfigMap, else the apiserver's `--service-cluster-ip-range` |
+
+Measured on this stand: no kubeadm ConfigMap (Talos), and
+`--service-cluster-ip-range=10.96.0.0/12` on the apiserver pods.
+
+The last one can genuinely be unavailable — a managed control plane exposes
+neither — so there are two ways to state it instead: `--service-cidr` on the
+operator (a cluster fact belongs on the operator, not repeated per network) and
+`spec.serviceCIDR` on one network. With none of the three, DNSReady goes false
+naming all of them, rather than leaving DNS quietly unrouted. The lookup uses
+the uncached reader: asked once per process, against an alternative of an
+informer over every Pod and ConfigMap in kube-system.
+
+### Mutations
+
+Three, all of which fail the tests:
+
+1. accept any existing annotation instead of the right one — the dangerous
+   shape, because a route that is present and wrong satisfies every presence
+   check while the packets still go nowhere;
+2. drop the "managed control plane" half of the refusal;
+3. disable the Deployment watch — fails at the first step, because then nothing
+   applies the route at all. That one is the proof that the watch is doing the
+   work.
+
+### Live
+
+`opnet2` (a new name — see the rule above): DNSReady true in 6 s,
+`status.dnsServer 10.96.0.200` resolved from the ConfigMap,
+`status.serviceRoute 10.96.0.0/12 via 10.16.0.1`, all three conditions true.
+Operator permissions checked on the stand with `auth can-i` as its own service
+account: list pods in kube-system, get configmaps, patch deployments, create
+vpc-dnses — all yes.
+
+### Housekeeping, from an audit of this session's commits
+
+Every commit so far used `git add -A`. Auditing the file lists found one thing
+that should not have shipped: `config/samples/lab-underlays.yaml` was written
+with the repo root as the working directory when `operator/config/samples/` was
+meant, creating a stray top-level `config/` directory. Moved. Six other files
+carried whitespace-only `gofmt` changes swept in after `make test` ran
+`go fmt ./...` — checked, harmless, left alone. Paths are named explicitly from
+here.
