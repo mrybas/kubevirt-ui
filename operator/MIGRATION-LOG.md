@@ -386,3 +386,54 @@ product's own lister returns for managed namespaces, and a deliberately created
 standalone `DataVolume` carrying `managed=true` but no `disk-type` is not
 offered. The Talos golden now falls out on its own merits rather than by the
 namespace rule, which stays as a second guard.
+
+---
+
+## M8 (first slice) — lifecycle operations: restore and migrate
+
+Operations are objects with their own state, because the two things they
+replace were sequences of sleeps inside an HTTP handler and died with it.
+
+### Research first, and it changed the design twice
+
+Measured against KubeVirt v1.9 and CDI v1.66 on the stand, before writing
+anything:
+
+- `VirtualMachineInstanceMigration.spec.addedNodeSelector` exists. It restricts
+  where *this migration* may land without touching the machine. So the old
+  defect — a nodeSelector welded onto the VM that nothing removes — is not
+  fixed by adding a cleanup step; the mechanism that caused it is simply not
+  used.
+- `VirtualMachineRestore.spec.targetReadinessPolicy: StopTarget` exists. KubeVirt
+  stops the target itself, which deletes the entire stop-and-poll dance from our
+  side. What is left is the part it does not do: remembering whether the machine
+  had been running, and putting it back — the exact part the old code kept in a
+  local variable.
+
+### Live, on one machine
+
+| Check | Result |
+|---|---|
+| Migrate as an operation | worker-3 → worker-1 in 20s; `addedNodeSelector` on the migration object; **VM nodeSelector empty** |
+| The same machine through the **old** endpoint | welded to `kubernetes.io/hostname: kubevirt-lab-worker-2`, and nothing removes it |
+| Restore as an operation, **operator killed mid-flight** (`--grace-period=0 --force`) | after the restart the operation finished by itself: `Succeeded — restored op-target from op-snap`, `spec.running` put back to `true`, the machine started again |
+| The VM controller during an operation | yields; `status.operationInProgress` names it, and is *derived* from unfinished operations rather than written by the other controller, so the status keeps one writer |
+| Migrate through the UI endpoint, after rewiring | creates an operation; machine never pinned |
+
+The kill test is the whole point of the type. In the path it replaces, the same
+kill left the machine stopped for good, because the only record that it had been
+running was a variable in a process that no longer existed.
+
+`hack/unpin-migrated-vms.sh` frees machines the old path pinned — planning by
+default, because a nodeSelector is also how a person places a machine
+deliberately and nothing here can tell the two apart.
+
+### Still owed on M8
+
+Recreate and disk-snapshot rollback; the declarative disk model
+(`spec.disks` plus the one-VM rule in admission); the delete cascade for
+schedules and Velero objects; NIC detach leaving `networks[]` litter. And
+before clone is rewritten: measure upstream `VirtualMachineClone`, which has its
+own state machine and volume-naming policy — porting the current rename-map,
+which copies attached PVCs verbatim and so points a clone at the source's disks,
+would be rebuilding a defect in a new language.
