@@ -1,0 +1,162 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    cert-manager.io/inject-ca-from: o0-capi/cabpt-serving-cert
+    controller-gen.kubebuilder.io/version: v0.17.0
+  labels:
+    cluster.x-k8s.io/provider: bootstrap-talos
+    cluster.x-k8s.io/v1alpha3: v1alpha3
+    cluster.x-k8s.io/v1alpha4: v1alpha3
+    cluster.x-k8s.io/v1beta1: v1alpha3
+    clusterctl.cluster.x-k8s.io: ""
+  name: talosconfigtemplates.bootstrap.cluster.x-k8s.io
+spec:
+  conversion:
+    strategy: Webhook
+    webhook:
+      clientConfig:
+        caBundle: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURFakNDQWZxZ0F3SUJBZ0lVZGtoWEVjbHlTUmh3UkJRWGNtMmZMSVVvUXVnd0RRWUpLb1pJaHZjTkFRRUwKQlFBd0FEQWVGdzB5TmpBNE1Ua3lNek00TXpCYUZ3MHlOakV4TVRjeU16TTRNekJhTUFBd2dnRWlNQTBHQ1NxRwpTSWIzRFFFQkFRVUFBNElCRHdBd2dnRUtBb0lCQVFEREFvV3h3OUI1TjNKcTg1eTNBNzlhZmlqNHpoVko0KzhiCkNkM3d4VU9EQ25XTHBVdGlwTHBZT2drRUQ3NFhBeC9FNVVCejhOVnBqaUpVeWUrRW9BWHlCbWdNT2VROG9EVmwKdnh1Ykx6N3NGQzU5MlcrbkFWMjV6YXZ3S05DdkZ1OGIzUG5jWmE3VDV4UkU0V3BKWGJhZ2Z6Tm9FTmVTYUhlNwpJTHZ4UkpmS1NkNVNlc0F3aFNiakZocUsyZUcyOXBhS0dPVkJDaWlmMFZnQ3VBMm14VUhoYlp4NmlGSXdnekZVCkhOTERBYkZFdWk0a2dVeW5MMitWUFdEQUZNRmY4WUFQanNXQXpucGxNZlVMUmhBZDBtS2JDcUtHdjFLYkI1RS8KSmNuWW5CTlN3S3FIdFdOTlJxdHhhcUV1eHBPR2ErMDZiOFJZYStjd3FVSzgxRjRLR2YxekFnTUJBQUdqZ1lNdwpnWUF3RGdZRFZSMFBBUUgvQkFRREFnV2dNQXdHQTFVZEV3RUIvd1FDTUFBd1lBWURWUjBSQVFIL0JGWXdWSUloClkyRmljSFF0ZDJWaWFHOXZheTF6WlhKMmFXTmxMbTh3TFdOaGNHa3VjM1pqZ2k5allXSndkQzEzWldKb2IyOXIKTFhObGNuWnBZMlV1YnpBdFkyRndhUzV6ZG1NdVkyeDFjM1JsY2k1c2IyTmhiREFOQmdrcWhraUc5dzBCQVFzRgpBQU9DQVFFQUwycGNuMHJ6RExINkNzSjhiVCtQSUt2L25mSUh2bkRTZm5FS2s3WWRIRlBiL1VvVTg5MFlaWmxNCm5aOGtFaXY1YVc1OVR5YXM3blBLVy8xNjlaektoOXIrRWJRNlFNeFNvbGxMRWVxbVRTK05qa2NYWGptWG0xMEkKb1h4TE1vMVp4RjA0WlBTVDJwRnljQlFMTFh3cW51L0pKci9HWC9xVWZiR2RrU1A3eU5HOUdzWFFEV3doeXd0bgp1MlNlSFZZRERmWDhRdFBNKzJUdVVwV3V2V0p2blY1V3RXN1hDRTFNRGFoSU5Bb1UvcFVPVnZtZCthTFZadFcyClU2bk1MNFord0xhZEVxWXQ1bEl4OW14WU9Rb0xTU2RYZ2RHQkFqdlA5MGFGaFNNaGJYVTJTcHZNK1U4c0Q2WU4KY1hKRXBYNm9tcXhhK21VZjJFcXcvSTU1N3B6SjRBPT0KLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=
+        service:
+          name: cabpt-webhook-service
+          namespace: o0-capi
+          path: /convert
+          port: 443
+      conversionReviewVersions:
+        - v1
+        - v1beta1
+  group: bootstrap.cluster.x-k8s.io
+  names:
+    categories:
+      - cluster-api
+    kind: TalosConfigTemplate
+    listKind: TalosConfigTemplateList
+    plural: talosconfigtemplates
+    singular: talosconfigtemplate
+  scope: Namespaced
+  versions:
+    - name: v1alpha2
+      schema:
+        openAPIV3Schema:
+          description: TalosConfigTemplate is the Schema for the talosconfigtemplates API
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: TalosConfigTemplateSpec defines the desired state of TalosConfigTemplate
+              properties:
+                template:
+                  description: TalosConfigTemplateResource defines the Template structure
+                  properties:
+                    spec:
+                      description: TalosConfigSpec defines the desired state of TalosConfig
+                      properties:
+                        data:
+                          type: string
+                        generateType:
+                          type: string
+                      required:
+                        - generateType
+                      type: object
+                  type: object
+              required:
+                - template
+              type: object
+          type: object
+      served: true
+      storage: false
+    - name: v1alpha3
+      schema:
+        openAPIV3Schema:
+          description: TalosConfigTemplate is the Schema for the talosconfigtemplates API
+          properties:
+            apiVersion:
+              description: |-
+                APIVersion defines the versioned schema of this representation of an object.
+                Servers should convert recognized schemas to the latest internal value, and
+                may reject unrecognized values.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+              type: string
+            kind:
+              description: |-
+                Kind is a string value representing the REST resource this object represents.
+                Servers may infer this from the endpoint the client submits requests to.
+                Cannot be updated.
+                In CamelCase.
+                More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: TalosConfigTemplateSpec defines the desired state of TalosConfigTemplate
+              properties:
+                template:
+                  description: TalosConfigTemplateResource defines the Template structure
+                  properties:
+                    spec:
+                      description: TalosConfigSpec defines the desired state of TalosConfig
+                      properties:
+                        configPatches:
+                          items:
+                            properties:
+                              op:
+                                type: string
+                              path:
+                                type: string
+                              value:
+                                x-kubernetes-preserve-unknown-fields: true
+                            required:
+                              - op
+                              - path
+                            type: object
+                          type: array
+                        data:
+                          type: string
+                        generateType:
+                          type: string
+                        hostname:
+                          description: Set hostname in the machine configuration to some value.
+                          properties:
+                            source:
+                              description: |-
+                                Source of the hostname.
+
+                                Allowed values:
+                                "MachineName" (use linked Machine's Name).
+                                "InfrastructureName" (use linked Machine's infrastructure's name).
+                              type: string
+                          type: object
+                        strategicPatches:
+                          description: Talos Linux machine configuration strategic merge patch list.
+                          items:
+                            type: string
+                          type: array
+                        talosVersion:
+                          type: string
+                      required:
+                        - generateType
+                      type: object
+                  type: object
+              required:
+                - template
+              type: object
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}

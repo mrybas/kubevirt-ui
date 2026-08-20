@@ -82,6 +82,15 @@ rules:
   - patch
   - watch
 - apiGroups:
+  - bootstrap.cluster.x-k8s.io
+  resources:
+  - talosconfigtemplates
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
   - cdi.kubevirt.io
   resources:
   - datasources
@@ -103,6 +112,16 @@ rules:
   - delete
   - get
   - list
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinedeployments
+  verbs:
+  - get
+  - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - frrk8s.metallb.io
