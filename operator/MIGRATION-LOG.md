@@ -1568,3 +1568,38 @@ original intact
 
 And the two live tenants were untouched: `uat-t1-workers` and `uat-t2-workers`
 still the only templates in their namespaces, both carrying their CA.
+
+Attribution, since both writers make the identical two moves and the order alone
+would not settle who made them: the operator logged the repair and left a
+`WorkerBootstrapRepaired` event on the namespace, and the backend log has no
+mention of `brkprobe`, `worker bootstrap` or `workers-ca` in that window.
+
+### Two defects the live log showed and the tests did not
+
+The same log said **"wrote a replacement and repointed the MachineDeployment"
+twice, in the same second**. The original template is immutable, so it stays
+broken for the tenant's whole life and every wake finds it broken again — the
+announcement was firing on finding the defect rather than on fixing it, which
+turns one real repair into a warning nobody can pick out from the noise.
+
+Reporting only actual writes was half of it. The other half was subtler and is
+the same rule as everywhere else in this migration: **whether a write changed
+anything is the server's answer, not the caller's intent.** The read comes from
+a cache, and right after a repair that cache is a version behind — the
+comparison says the workers still point at the broken template, the patch says
+what they already say, the API server does nothing, and a controller trusting
+its own intent announces a repair that never happened. The check is now the
+resource version before and after the patch. envtest reproduced the double
+announcement exactly, before and after the first fix, which is how the second
+one was found at all.
+
+The second defect: a namespace being torn down refuses new content, so the
+repair could only fail — and it failed loudly, once per backoff, for as long as
+termination took. Eleven `Reconciler error` lines in six seconds on the stand.
+It now leaves a dying namespace alone; the workers are going away with it.
+
+Both tests were mutated to check they were not vacuous. The announcement test
+had to be rewritten first: the version that broke the MachineDeployment pointer
+by hand and watched a private recorder was racing the running manager for who
+would fix it, and losing that race is indistinguishable from silence. It counts
+the manager's own events now, aggregation included.

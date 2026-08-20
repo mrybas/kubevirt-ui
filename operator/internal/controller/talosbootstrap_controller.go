@@ -100,6 +100,13 @@ func (r *TalosBootstrapReconciler) Reconcile(
 	if tenant == "" {
 		return ctrl.Result{}, nil
 	}
+	if namespace.DeletionTimestamp != nil {
+		// A namespace being torn down refuses new content, so the repair can
+		// only fail — and it failed loudly, once per backoff, for as long as
+		// termination took. Nothing here is worth saving: the workers are
+		// going away with it.
+		return ctrl.Result{}, nil
+	}
 
 	template := &unstructured.Unstructured{}
 	template.SetGroupVersionKind(talosConfigTemplateGVK)
@@ -141,11 +148,20 @@ func (r *TalosBootstrapReconciler) Reconcile(
 	}
 
 	repaired := tenant + repairedSuffix
-	if err := r.writeRepairedTemplate(ctx, template, config, repaired, ca); err != nil {
+	wrote, err := r.writeRepairedTemplate(ctx, template, config, repaired, ca)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.repointDeployment(ctx, req.Name, tenant, repaired); err != nil {
+	repointed, err := r.repointDeployment(ctx, req.Name, tenant, repaired)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if !wrote && !repointed {
+		// The steady state after a repair, and it lasts forever: the original
+		// template is immutable, so it stays broken and every wake finds it
+		// broken again. Saying so again each time would turn one real repair
+		// into an endless warning nobody can distinguish from a new one.
+		return ctrl.Result{}, nil
 	}
 
 	logger.Info("the worker bootstrap template had no Kubernetes CA; wrote a "+
@@ -204,10 +220,13 @@ func (r *TalosBootstrapReconciler) tenantCA(
 }
 
 // writeRepairedTemplate creates the replacement, leaving the original alone.
+//
+// The bool is whether it wrote: an already-existing replacement is the normal
+// case after the first pass, not a write.
 func (r *TalosBootstrapReconciler) writeRepairedTemplate(
 	ctx context.Context, original *unstructured.Unstructured,
 	config map[string]any, name, ca string,
-) error {
+) (bool, error) {
 	cluster, _ := config["cluster"].(map[string]any)
 	if cluster == nil {
 		cluster = map[string]any{}
@@ -218,7 +237,7 @@ func (r *TalosBootstrapReconciler) writeRepairedTemplate(
 
 	rendered, err := yaml.Marshal(config)
 	if err != nil {
-		return fmt.Errorf("rendering the repaired config: %w", err)
+		return false, fmt.Errorf("rendering the repaired config: %w", err)
 	}
 
 	repaired := &unstructured.Unstructured{Object: map[string]any{}}
@@ -238,10 +257,10 @@ func (r *TalosBootstrapReconciler) writeRepairedTemplate(
 	}
 	if err := unstructured.SetNestedField(
 		spec, string(rendered), "template", "spec", "data"); err != nil {
-		return err
+		return false, err
 	}
 	if err := unstructured.SetNestedMap(repaired.Object, spec, "spec"); err != nil {
-		return err
+		return false, err
 	}
 
 	if err := r.Create(ctx, repaired); err != nil {
@@ -249,46 +268,56 @@ func (r *TalosBootstrapReconciler) writeRepairedTemplate(
 			// Written by an earlier pass, or by the backend loop while both are
 			// running. Either way the MachineDeployment still has to point at
 			// it, so this is not a reason to stop.
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("creating %s: %w", name, err)
+		return false, fmt.Errorf("creating %s: %w", name, err)
 	}
 	kube.CountWrite(r.Scheme, repaired, bootstrapControllerName, "created")
-	return nil
+	return true, nil
 }
 
 // repointDeployment sends the workers at the repaired template. CAPI rolls them
 // itself from there.
 func (r *TalosBootstrapReconciler) repointDeployment(
 	ctx context.Context, namespace, tenant, template string,
-) error {
+) (bool, error) {
 	deployment := &unstructured.Unstructured{}
 	deployment.SetGroupVersionKind(machineDeploymentGVK)
 	if err := r.Get(ctx, types.NamespacedName{
 		Namespace: namespace, Name: tenant + "-workers",
 	}, deployment); err != nil {
 		if apierrors.IsNotFound(err) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("reading the MachineDeployment: %w", err)
+		return false, fmt.Errorf("reading the MachineDeployment: %w", err)
 	}
 
 	current, _, _ := unstructured.NestedString(deployment.Object,
 		"spec", "template", "spec", "bootstrap", "configRef", "name")
 	if current == template {
-		return nil
+		return false, nil
 	}
 
 	patched := deployment.DeepCopy()
 	if err := unstructured.SetNestedField(patched.Object, template,
 		"spec", "template", "spec", "bootstrap", "configRef", "name"); err != nil {
-		return err
+		return false, err
 	}
 	if err := r.Patch(ctx, patched, client.MergeFrom(deployment)); err != nil {
-		return fmt.Errorf("repointing the MachineDeployment: %w", err)
+		return false, fmt.Errorf("repointing the MachineDeployment: %w", err)
+	}
+	// Whether this changed anything is the server's answer, not ours. The read
+	// above comes from a cache, and right after a repair that cache is a
+	// version behind: the comparison says the workers still point at the broken
+	// template, the patch says the same thing they already say, and the API
+	// server does nothing — while a controller that trusted its own intent
+	// announced a second repair that never happened. Measured: two identical
+	// warnings a second apart, both on the stand and in envtest.
+	if patched.GetResourceVersion() == deployment.GetResourceVersion() {
+		return false, nil
 	}
 	kube.CountWrite(r.Scheme, patched, bootstrapControllerName, "updated")
-	return nil
+	return true, nil
 }
 
 func (r *TalosBootstrapReconciler) event(
