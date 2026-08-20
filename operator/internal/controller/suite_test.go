@@ -117,6 +117,14 @@ func runSuite(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("wiring announcement controller: %w", err)
 	}
 
+	if err := (&ManagedNetworkReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("managednetwork"),
+	}).SetupWithManager(mgr); err != nil {
+		return 0, fmt.Errorf("wiring network controller: %w", err)
+	}
+
 	if err := (&ManagedUnderlayReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),

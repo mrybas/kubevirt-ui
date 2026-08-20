@@ -117,7 +117,6 @@ rules:
   - kubeovn.io
   resources:
   - ovn-eips
-  - vpcs
   verbs:
   - get
   - list
@@ -128,6 +127,7 @@ rules:
   - provider-networks
   - subnets
   - vlans
+  - vpcs
   verbs:
   - create
   - delete
@@ -171,6 +171,7 @@ rules:
   resources:
   - announcementpolicies
   - managedimages
+  - managednetworks
   - managedunderlays
   - managedvmoperations
   - managedvms
@@ -188,6 +189,7 @@ rules:
   resources:
   - announcementpolicies/status
   - managedimages/status
+  - managednetworks/status
   - managedunderlays/status
   - managedvmoperations/status
   - managedvms/status

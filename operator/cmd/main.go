@@ -268,6 +268,14 @@ func main() {
 			setupLog.Error(err, "Failed to create controller", "controller", "announcementpolicy")
 			os.Exit(1)
 		}
+		if err := (&controller.ManagedNetworkReconciler{
+			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
+			Recorder: mgr.GetEventRecorderFor("managednetwork"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "managednetwork")
+			os.Exit(1)
+		}
 		if err := (&controller.ManagedUnderlayReconciler{
 			Client:   mgr.GetClient(),
 			Scheme:   mgr.GetScheme(),
