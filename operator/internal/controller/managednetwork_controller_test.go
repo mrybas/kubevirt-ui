@@ -1414,3 +1414,129 @@ func TestAnUnacceptedDeclarationOpensNothing(t *testing.T) {
 		return nil
 	})
 }
+
+// TestTheAllowOutlivesTheRoutes is the deletion ordering.
+//
+// The obvious reading of "this peering is being deleted, stop allowing it"
+// takes the allow off the moment the object is marked, while the finalizer is
+// still pulling the routes off the routers — for as long as that takes, the
+// traffic is routed at a prefix that now drops it. The same black hole,
+// arrived at from the other end.
+func TestTheAllowOutlivesTheRoutes(t *testing.T) {
+	for _, spec := range []struct{ name, cidr string }{
+		{"netlast-a", "10.200.192.0/22"},
+		{"netlast-b", "10.200.196.0/22"},
+	} {
+		mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+			ObjectMeta: metav1.ObjectMeta{Name: spec.name},
+			Spec: platformv1alpha1.ManagedNetworkSpec{
+				CIDR: spec.cidr, DeletionPolicy: "Delete",
+			},
+		})
+	}
+
+	link := &platformv1alpha1.ManagedNetworkPeering{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "netlast-a-netlast-b",
+			// Ours, so the object stays while its own teardown is watched.
+			Finalizers: []string{"test.kubevirt-ui.io/hold"},
+		},
+		Spec: platformv1alpha1.ManagedNetworkPeeringSpec{
+			Networks: []string{"netlast-a", "netlast-b"},
+		},
+	}
+	if err := k8sClient.Create(testCtx, link); err != nil {
+		t.Fatalf("declaring: %v", err)
+	}
+	t.Cleanup(func() {
+		current := &platformv1alpha1.ManagedNetworkPeering{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Name: "netlast-a-netlast-b",
+		}, current); err == nil {
+			current.Finalizers = nil
+			_ = k8sClient.Update(testCtx, current)
+		}
+	})
+
+	allowed := func() (bool, error) {
+		rules, err := readLiveACLs("netlast-a-default")
+		if err != nil {
+			return false, err
+		}
+		return acl.Evaluate(rules,
+			netip.MustParseAddr("10.200.196.9"), "to-lport") == acl.Allowed, nil
+	}
+
+	eventually(t, "the prefix to open", func() error {
+		open, err := allowed()
+		if err != nil {
+			return err
+		}
+		if !open {
+			return fmt.Errorf("still shut")
+		}
+		return nil
+	})
+
+	if err := k8sClient.Delete(testCtx, link); err != nil {
+		t.Fatalf("deleting: %v", err)
+	}
+
+	// The cached read lags the delete by a beat; the interesting window starts
+	// once the mark is visible.
+	eventually(t, "the deletion to be visible", func() error {
+		out := &platformv1alpha1.ManagedNetworkPeering{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Name: "netlast-a-netlast-b",
+		}, out); err != nil {
+			return err
+		}
+		if out.DeletionTimestamp.IsZero() {
+			return fmt.Errorf("not marked yet")
+		}
+		return nil
+	})
+
+	// Marked for deletion and held. The routes may or may not be off yet; what
+	// must not happen is the allow going first.
+	consistently(t, "the allow outliving the marked object", 5*time.Second, func() error {
+		out := &platformv1alpha1.ManagedNetworkPeering{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Name: "netlast-a-netlast-b",
+		}, out); err != nil {
+			return fmt.Errorf("the object went while it was still held: %w", err)
+		}
+		open, err := allowed()
+		if err != nil {
+			return err
+		}
+		if !open {
+			return fmt.Errorf("the allow came off while the object was still " +
+				"being torn down — the routes would be pointing at a drop")
+		}
+		return nil
+	})
+
+	// Let it finish, and the allow follows.
+	current := &platformv1alpha1.ManagedNetworkPeering{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Name: "netlast-a-netlast-b",
+	}, current); err != nil {
+		t.Fatalf("reading the held object: %v", err)
+	}
+	current.Finalizers = nil
+	if err := k8sClient.Update(testCtx, current); err != nil {
+		t.Fatalf("releasing: %v", err)
+	}
+
+	eventually(t, "the allow to follow the object", func() error {
+		open, err := allowed()
+		if err != nil {
+			return err
+		}
+		if open {
+			return fmt.Errorf("still open after the peering is gone")
+		}
+		return nil
+	})
+}

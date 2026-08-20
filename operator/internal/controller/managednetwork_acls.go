@@ -322,15 +322,18 @@ func (r *ManagedNetworkReconciler) peerCIDRs(ctx context.Context, vpc string) ([
 		return nil, fmt.Errorf("listing declared peerings: %w", err)
 	}
 	for i := range declared.Items {
-		if !declared.Items[i].DeletionTimestamp.IsZero() {
-			// On its way out. Keeping the allow alive here would mean the
-			// routes come off while the hole stays open.
-			//
-			// The finalizer is what makes the order right: it holds the object
-			// until the routes are gone, so the allow outlives them by exactly
-			// as long as that takes and not a moment longer.
-			continue
-		}
+		// A peering being deleted still counts, and that is the ordering.
+		//
+		// The obvious reading — it is going, so stop allowing — takes the allow
+		// off the moment the object is *marked*, while the finalizer is still
+		// pulling the routes off the routers. That is allow-first,
+		// routes-second: for as long as the teardown takes, the traffic is
+		// routed at a prefix that now drops it. Exactly the black hole this
+		// design spends its effort avoiding, arrived at from the other end.
+		//
+		// Counting it until the object is actually gone gives the right order
+		// for free: the finalizer holds it until the routes are off, and only
+		// then does the allow follow.
 		// Only what the peering controller has accepted. A declaration is
 		// something anybody who can create an object can write; trusting the
 		// spec here would let a CR naming two networks open an allow between
