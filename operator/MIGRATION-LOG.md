@@ -317,3 +317,45 @@ eight seconds after a restart, before the watchdog had run at all — an unset
 Prometheus gauge reads exactly like one set to zero, so it looked like proof and
 was not. There is now a `guard_last_check_timestamp_seconds` alongside it, so
 "broken" and "nobody has looked yet" are distinguishable.
+
+---
+
+## M3 — ManagedVMTemplate (done)
+
+Templates were JSON values under user-chosen keys in one cluster-wide ConfigMap,
+rewritten whole on every change. Now each is an object, named per namespace by
+the API server, referencing a ManagedImage by a name that can be written before
+either object exists.
+
+The controller creates nothing — a template is data — and reports the one thing
+nobody could see before: whether the image it points at is there. Deliberately
+*not* whether that image is ready; that is the image's own status, and two
+objects answering one question is how they come to disagree.
+
+Reading covers both stores during the migration, with a resource shadowing a
+legacy entry of the same name. Writing follows the flag
+(`OPERATOR_TEMPLATE_ENABLED`); deleting follows the object, because the flag
+says where new templates go, not where the old ones live. A bare name that
+exists in two namespaces is reported, not guessed.
+
+### Migration order, learned by breaking it
+
+Running the template migration first turned a working template into a broken
+one: `uat-ubuntu-small` migrated cleanly and immediately reported
+`ImageFound: False`, because the image it names was still only a DataVolume.
+Images have to be adopted first, and `hack/migrate-templates.sh` now refuses a
+template whose image is not managed yet, naming the script to run.
+
+`hack/adopt-images.sh` takes ownership of disks that already exist rather than
+recreating them. Verified on the stand: two adopted images reported `Ready`
+immediately, no import, no new disk, and the migrated template flipped to
+`ImageFound: True`.
+
+Its first version had a defect worth recording, because it is the same shape as
+several in this codebase's history: it identified golden disks by the *absence*
+of our `vm-disk` label — a convention, not a fact — and offered to adopt four
+tenant worker root disks as golden images, since the tenant machinery writes no
+such label. It now selects on the absence of a `VirtualMachine` ownerReference,
+which KubeVirt writes itself and which states what a disk is for. The platform's
+own namespace is skipped: the Talos golden there is owned by the tenant path as
+a deterministic singleton, and adopting it would give it a second owner.
