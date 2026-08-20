@@ -16,9 +16,14 @@ from app.core.operator import (
     OWNER_KIND_LABEL,
     OWNER_NAME_LABEL,
     image_path_enabled,
+    template_path_enabled,
 )
 from app.core.naming import DISPLAY_NAME_ANNOTATION, SLUG_LABEL, sanitize_display_name
 from app.models.template import (
+    TemplateCloudInit,
+    TemplateCompute,
+    TemplateConsole,
+    TemplateDisk,
     VMTemplate,
     VMTemplateCreate,
     VMTemplateListResponse,
@@ -87,6 +92,102 @@ async def _resolve_folder_ancestors(k8s_client, folder_name: str) -> list[str]:
 # =============================================================================
 
 
+# ---------------------------------------------------------------------------
+# Templates as custom resources
+# ---------------------------------------------------------------------------
+
+
+def _template_from_cr(cr: dict[str, Any]) -> VMTemplate:
+    """Present a ManagedVMTemplate in the shape the UI already reads.
+
+    The image namespace is taken from status when the controller has resolved
+    it, and from the spec otherwise, so a template is usable before its first
+    reconcile rather than appearing to point nowhere.
+    """
+    meta = cr.get("metadata", {}) or {}
+    spec = cr.get("spec", {}) or {}
+    status = cr.get("status", {}) or {}
+    image = spec.get("imageRef", {}) or {}
+    compute = spec.get("compute", {}) or {}
+    disk = spec.get("rootDisk", {}) or {}
+    console = spec.get("console") or {}
+    cloud_init = spec.get("cloudInit") or None
+
+    return VMTemplate(
+        name=meta.get("name", ""),
+        display_name=spec.get("displayName") or meta.get("name", ""),
+        description=spec.get("description"),
+        category=spec.get("category", "linux"),
+        os_type=spec.get("osType", "linux"),
+        golden_image_name=image.get("name", ""),
+        golden_image_namespace=(
+            status.get("imageNamespace")
+            or image.get("namespace")
+            or meta.get("namespace", "")
+        ),
+        compute=TemplateCompute(
+            cpu_cores=compute.get("cores", 2),
+            cpu_sockets=compute.get("sockets", 1),
+            cpu_threads=compute.get("threads", 1),
+            memory=compute.get("memory", "4Gi"),
+        ),
+        disk=TemplateDisk(size=disk.get("size", "20Gi")),
+        cloud_init=(
+            TemplateCloudInit(user_data=cloud_init.get("userData"))
+            if cloud_init else None
+        ),
+        console=TemplateConsole(
+            vnc_enabled=console.get("vnc", True),
+            serial_console_enabled=console.get("serial", False),
+        ),
+        created=meta.get("creationTimestamp"),
+        labels=meta.get("labels", {}) or {},
+        annotations=meta.get("annotations", {}) or {},
+    )
+
+
+async def _list_template_crs(custom_api: Any) -> list[dict[str, Any]]:
+    """Every ManagedVMTemplate on the cluster, or none if the CRD is absent."""
+    try:
+        result = await custom_api.list_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION, plural="managedvmtemplates",
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return []
+        raise
+    return result.get("items", []) or []
+
+
+async def _find_template_cr(
+    custom_api: Any, name: str, namespace: str | None = None,
+) -> dict[str, Any] | None:
+    """The ManagedVMTemplate with this name, if there is exactly one.
+
+    Names are unique per namespace, not per cluster, so a name alone can be
+    ambiguous. Rather than picking one, an ambiguous name is reported — the
+    old store's collision behaviour was to answer 409 naming a template the
+    user could not see, and guessing is not an improvement on that.
+    """
+    matches = [
+        cr for cr in await _list_template_crs(custom_api)
+        if cr.get("metadata", {}).get("name") == name
+        and (namespace is None or cr.get("metadata", {}).get("namespace") == namespace)
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        where = ", ".join(sorted(m["metadata"]["namespace"] for m in matches))
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"template {name!r} exists in more than one namespace ({where}); "
+                "name the namespace to say which one"
+            ),
+        )
+    return matches[0]
+
+
 @router.get("", response_model=VMTemplateListResponse)
 async def list_templates(
     request: Request,
@@ -121,8 +222,20 @@ async def list_templates(
             except Exception as e:
                 logger.warning(f"Failed to parse template {name}: {e}")
         
+        # Both stores are read during the migration, so a template written
+        # either way is usable from either path. A resource shadows a legacy
+        # entry of the same name: the migration copies one to the other, and
+        # showing both would be showing the same template twice.
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        for cr in await _list_template_crs(custom_api):
+            converted = _template_from_cr(cr)
+            templates = [t for t in templates if t.name != converted.name]
+            templates.append(converted)
+
         return VMTemplateListResponse(items=templates, total=len(templates))
-    
+
+    except HTTPException:
+        raise
     except ApiException as e:
         logger.error(f"Failed to list templates: {e}")
         raise HTTPException(
@@ -139,6 +252,12 @@ async def get_template(
 ) -> VMTemplate:
     """Get a specific VM template."""
     k8s_client = request.app.state.k8s_client
+
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    existing = await _find_template_cr(custom_api, name)
+    if existing is not None:
+        return _template_from_cr(existing)
+
     
     try:
         cm = await k8s_client.core_api.read_namespaced_config_map(
@@ -171,6 +290,74 @@ async def get_template(
         )
 
 
+async def _create_template_cr(k8s_client: Any, template: VMTemplateCreate) -> VMTemplate:
+    """Write the template as its own object, next to the image it names.
+
+    The namespace is the image's, because that is where the template is usable
+    from and where the picker looks. The old store had no namespace at all —
+    one cluster-wide map keyed by a user-chosen string, which is why a
+    collision could name a template the user was not allowed to see.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    namespace = template.golden_image_namespace
+
+    spec: dict[str, Any] = {
+        "displayName": template.display_name,
+        "imageRef": {"name": template.golden_image_name},
+        "compute": {
+            "cores": template.compute.cpu_cores,
+            "sockets": template.compute.cpu_sockets,
+            "threads": template.compute.cpu_threads,
+            "memory": template.compute.memory,
+        },
+        "rootDisk": {"size": template.disk.size},
+        "category": template.category,
+        "osType": template.os_type,
+    }
+    if template.description:
+        spec["description"] = template.description
+    if template.cloud_init and template.cloud_init.user_data:
+        spec["cloudInit"] = {"userData": template.cloud_init.user_data}
+    spec["console"] = {
+        "vnc": template.console.vnc_enabled,
+        "serial": template.console.serial_console_enabled,
+    }
+
+    body = {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedVMTemplate",
+        "metadata": {"name": template.name, "namespace": namespace},
+        "spec": spec,
+    }
+
+    try:
+        created = await custom_api.create_namespaced_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            namespace=namespace, plural="managedvmtemplates", body=body,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Template creation is routed to the operator "
+                    "(OPERATOR_TEMPLATE_ENABLED), but the ManagedVMTemplate CRD is "
+                    "not installed in this cluster"
+                ),
+            )
+        if e.status == 409:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Template {template.name!r} already exists in {namespace}",
+            )
+        raise HTTPException(
+            status_code=e.status or status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create template: {e.reason}",
+        )
+
+    return _template_from_cr(created)
+
+
 @router.post("", response_model=VMTemplate, status_code=status.HTTP_201_CREATED)
 async def create_template(
     template: VMTemplateCreate,
@@ -179,7 +366,10 @@ async def create_template(
 ) -> VMTemplate:
     """Create a new VM template."""
     k8s_client = request.app.state.k8s_client
-    
+
+    if template_path_enabled():
+        return await _create_template_cr(k8s_client, template)
+
     try:
         import json
         from datetime import datetime
@@ -368,9 +558,24 @@ async def delete_template(
     request: Request,
     user: User = Depends(require_auth),
 ) -> None:
-    """Delete a VM template."""
+    """Delete a VM template.
+
+    A template that exists as its own object is deleted as one, whatever the
+    flag says: the flag decides where new templates are written, not where the
+    old ones live.
+    """
     k8s_client = request.app.state.k8s_client
-    
+
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    existing = await _find_template_cr(custom_api, name)
+    if existing is not None:
+        await custom_api.delete_namespaced_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            namespace=existing["metadata"]["namespace"],
+            plural="managedvmtemplates", name=name,
+        )
+        return
+
     try:
         cm = await k8s_client.core_api.read_namespaced_config_map(
             name=TEMPLATE_CONFIGMAP_NAME,

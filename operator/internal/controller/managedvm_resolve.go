@@ -106,7 +106,66 @@ func (r *ManagedVMReconciler) resolveSource(
 	return r.resolveImage(ctx, vm, vm.Spec.ImageRef, in)
 }
 
+// resolveTemplate prefers the custom resource and falls back to the legacy
+// store.
+//
+// Both are read during the migration so that templates written either way are
+// usable from either path — the alternative is two sets of templates that drift
+// and a user who cannot tell which picker they are looking at. The fallback
+// goes away one release after the migration script has run.
 func (r *ManagedVMReconciler) resolveTemplate(
+	ctx context.Context, vm *platformv1alpha1.ManagedVM, in *kubevirt.Input,
+) *blocked {
+	tpl := &platformv1alpha1.ManagedVMTemplate{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: vm.Namespace, Name: vm.Spec.TemplateRef.Name,
+	}, tpl)
+	if err == nil {
+		return r.applyTemplateResource(ctx, vm, tpl, in)
+	}
+	if !apierrors.IsNotFound(err) {
+		return &blocked{Reason: "TemplateUnreadable", Message: err.Error()}
+	}
+	return r.resolveLegacyTemplate(ctx, vm, in)
+}
+
+// applyTemplateResource fills the defaults from a ManagedVMTemplate and
+// resolves the image it names.
+func (r *ManagedVMReconciler) applyTemplateResource(
+	ctx context.Context,
+	vm *platformv1alpha1.ManagedVM,
+	tpl *platformv1alpha1.ManagedVMTemplate,
+	in *kubevirt.Input,
+) *blocked {
+	in.TemplateName = tpl.Name
+	in.Cores = tpl.Spec.Compute.Cores
+	in.Sockets = tpl.Spec.Compute.Sockets
+	in.Threads = tpl.Spec.Compute.Threads
+	in.Memory = tpl.Spec.Compute.Memory
+	in.DiskSize = tpl.Spec.RootDisk.Size
+	if tpl.Spec.CloudInit != nil {
+		in.CloudInitUserData = tpl.Spec.CloudInit.UserData
+	}
+	in.VNC, in.Serial = true, false
+	if c := tpl.Spec.Console; c != nil {
+		if c.VNC != nil {
+			in.VNC = *c.VNC
+		}
+		if c.Serial != nil {
+			in.Serial = *c.Serial
+		}
+	}
+	// The image goes through the same resolution a direct reference does,
+	// including the readiness gate and the cross-namespace scope check — a
+	// template is a convenience, not a way around either.
+	ref := tpl.Spec.ImageRef
+	if ref.Namespace == "" {
+		ref.Namespace = tpl.Namespace
+	}
+	return r.resolveImage(ctx, vm, &ref, in)
+}
+
+func (r *ManagedVMReconciler) resolveLegacyTemplate(
 	ctx context.Context, vm *platformv1alpha1.ManagedVM, in *kubevirt.Input,
 ) *blocked {
 	cm := &corev1.ConfigMap{}

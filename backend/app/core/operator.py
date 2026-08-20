@@ -43,6 +43,18 @@ def vm_path_enabled() -> bool:
     return _enabled("OPERATOR_VM_ENABLED")
 
 
+def template_path_enabled() -> bool:
+    """True when VM templates are written as ManagedVMTemplate resources.
+
+    Off: templates are JSON blobs under user-chosen keys in one cluster-wide
+    ConfigMap, rewritten whole on every change.
+    On: each template is its own object, unique per namespace by the API
+    server, and its reference to an image is a name that exists before the
+    image does — which is what makes a template writable from a manifest.
+    """
+    return _enabled("OPERATOR_TEMPLATE_ENABLED")
+
+
 # The group the operator's custom resources live in.
 OPERATOR_GROUP = "platform.kubevirt-ui.io"
 OPERATOR_VERSION = "v1alpha1"

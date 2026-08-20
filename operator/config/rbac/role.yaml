@@ -76,6 +76,7 @@ rules:
   resources:
   - managedimages
   - managedvms
+  - managedvmtemplates
   verbs:
   - create
   - delete
@@ -96,6 +97,7 @@ rules:
   resources:
   - managedimages/status
   - managedvms/status
+  - managedvmtemplates/status
   verbs:
   - get
   - patch

@@ -48,6 +48,13 @@ backend:
     # images, deletion and power actions follow ownership rather than the flag,
     # so machines created while it was on keep working after it is turned off.
     OPERATOR_VM_ENABLED: ""
+    # -- Write new VM templates as ManagedVMTemplate resources instead of JSON
+    # blobs in one cluster-wide ConfigMap. Empty/false → the ConfigMap, as
+    # before. Reading always covers both stores, so a template written either
+    # way stays usable; and a template that already exists as a resource is
+    # edited and deleted as one whatever this says — the flag decides where new
+    # ones are written, not where the old ones live.
+    OPERATOR_TEMPLATE_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as

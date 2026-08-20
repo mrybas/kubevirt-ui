@@ -208,6 +208,14 @@ func main() {
 			setupLog.Error(err, "Failed to create controller", "controller", "managedimage")
 			os.Exit(1)
 		}
+		if err := (&controller.ManagedVMTemplateReconciler{
+			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
+			Recorder: mgr.GetEventRecorderFor("managedvmtemplate"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "managedvmtemplate")
+			os.Exit(1)
+		}
 		if err := (&controller.ManagedVMReconciler{
 			Client:           mgr.GetClient(),
 			Scheme:           mgr.GetScheme(),

@@ -105,6 +105,14 @@ func runSuite(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("wiring image controller: %w", err)
 	}
 
+	if err := (&ManagedVMTemplateReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("managedvmtemplate"),
+	}).SetupWithManager(mgr); err != nil {
+		return 0, fmt.Errorf("wiring template controller: %w", err)
+	}
+
 	if err := (&ManagedVMReconciler{
 		Client:           mgr.GetClient(),
 		Scheme:           mgr.GetScheme(),
