@@ -15,6 +15,13 @@ spec:
             - --metrics-bind-address=:8080
             - --metrics-secure=false
             - --domains=network
+            # This site's addressing plan, and the reason the isolation floor is
+            # one rule rather than one per tenant. It matches the backend's
+            # TENANT_SUPERNET because they describe the same thing; the operator
+            # checks every tenant network against it on each pass rather than
+            # trusting it, because a supernet that did not contain the tenants
+            # is a mistake this product has already made.
+            - --tenant-supernet=10.200.0.0/14
           ports:
             - name: metrics
               containerPort: 8080

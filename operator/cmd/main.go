@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -66,6 +67,18 @@ func init() {
 }
 
 // nolint:gocyclo
+// splitList turns a comma-separated flag into a list, dropping the empties a
+// trailing comma leaves behind.
+func splitList(value string) []string {
+	var out []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
 func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
@@ -76,6 +89,8 @@ func main() {
 	var enableHTTP2 bool
 	var domainsFlag string
 	var serviceCIDRFlag string
+	var tenantSupernetFlag string
+	var mgmtCIDRFlag string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -94,6 +109,17 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&tenantSupernetFlag, "tenant-supernet", "",
+		"The aggregate every tenant network is carved from, e.g. 10.200.0.0/14. "+
+			"The isolation floor is scoped to it, so one rule denies every other "+
+			"tenant instead of one rule per tenant. Empty means no isolation is "+
+			"written at all: a drop with nothing to scope it to would take the "+
+			"internet with it.")
+	flag.StringVar(&mgmtCIDRFlag, "mgmt-cidr", "",
+		"Comma-separated prefixes of the management plane, which must not open "+
+			"connections into a tenant. Empty means each node's own address as a "+
+			"/32 — exact, and it cannot over-block. Autodiscovery cannot learn the "+
+			"mask: the API reports node addresses, not the network they sit on.")
 	flag.StringVar(&serviceCIDRFlag, "service-cidr", "",
 		"The cluster's service network, e.g. 10.96.0.0/12. Empty means read it "+
 			"from the cluster: the kubeadm ConfigMap, else the apiserver's own "+
@@ -279,8 +305,10 @@ func main() {
 			Client:      mgr.GetClient(),
 			Scheme:      mgr.GetScheme(),
 			Recorder:    mgr.GetEventRecorderFor("managednetwork"),
-			APIReader:   mgr.GetAPIReader(),
-			ServiceCIDR: serviceCIDRFlag,
+			APIReader:      mgr.GetAPIReader(),
+			ServiceCIDR:    serviceCIDRFlag,
+			TenantSupernet: tenantSupernetFlag,
+			MgmtCIDRs:      splitList(mgmtCIDRFlag),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "managednetwork")
 			os.Exit(1)
