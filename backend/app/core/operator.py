@@ -58,11 +58,12 @@ def template_path_enabled() -> bool:
 def announce_path_enabled() -> bool:
     """True when the operator owns the BGP announcements.
 
-    This one is not a routing choice, it is an ownership switch, and it has to
-    move in the same change as the operator's policy leaving dry-run. frr-k8s
-    merges every FRRConfiguration in its namespace into the node's FRR, so two
-    writers of that object are not two opinions — they are two `router bgp`
-    blocks fighting over one session.
+    This is an ownership switch, and there is no atomic step for it: this flag
+    lives on a Deployment and the operator's dry-run lives on a custom resource.
+    Only one order is safe — this flag on first, which takes the number of
+    writers from one to none while the existing configuration stays exactly as
+    it is, and then the operator out of dry-run. Backwards there are two, and
+    frr-k8s merges every FRRConfiguration in its namespace into one FRR.
 
     The handover is provable before it happens: the operator publishes what it
     would write while this is off, and the two are compared byte for byte.

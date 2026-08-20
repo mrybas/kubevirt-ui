@@ -660,10 +660,26 @@ operator: ["kubevirt-lab-worker-1","kubevirt-lab-worker-2"]
 Four prefixes, each with its own router leg as the next hop, and the same two
 workers carrying them.
 
-**The cutover is one change and is not taken here**, because it touches live BGP
-on the stand: set `OPERATOR_ANNOUNCE_ENABLED` on the backend and `dryRun: false`
-on the policy together. The flag and its test exist; the loop steps aside
-completely rather than both writing and hoping they agree.
+**The cutover is two phases, in one safe order, and is not taken here** because
+it touches live BGP on the stand. There is no atomic step available: the writer
+flag lives on a Deployment and dry-run lives on a custom resource, so it is two
+API calls and two rollouts.
+
+| phase | change | writers |
+|---|---|---|
+| 1 | `OPERATOR_ANNOUNCE_ENABLED` on the backend | 1 → **0** |
+| 2 | `dryRun: false` on the policy | 0 → 1 |
+
+A window with no writer is harmless: the FRRConfiguration stays exactly as it
+is, frr-k8s keeps applying it, and the dataplane does not move. A window with
+two is two `router bgp` blocks over one session. Rollback is the same order
+backwards, for the same reason.
+
+`hack/announce-cutover.sh` walks it and **refuses the wrong order** — asked to
+take the object over while the backend is still writing, it declines and prints
+the phase-1 command. It will not flip the backend itself: that is a change to a
+released deployment. Its `status` also prints the byte-for-byte comparison, so
+the decision is made on evidence rather than on this document.
 
 ### Why "shadow" was the wrong idea, corrected before it shipped
 

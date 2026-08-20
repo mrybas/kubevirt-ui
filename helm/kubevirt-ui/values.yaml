@@ -60,12 +60,16 @@ backend:
     # AnnouncementPolicy takes it over. Empty/false → the backend keeps writing
     # it, as before.
     #
-    # This one is an ownership switch, not a routing choice, and it moves in the
-    # same change as the policy leaving dryRun. frr-k8s merges every
-    # FRRConfiguration in its namespace into the node's FRR, so two writers of
-    # that object are two `router bgp` blocks over one session. Compare the
-    # policy's status.renderedConfiguration against the live object first — when
-    # they match byte for byte, the switch is a no-op.
+    # This is an ownership switch, not a routing choice, and there is no atomic
+    # step for it: this flag lives on a Deployment and the operator's dryRun
+    # lives on a custom resource, so the switch is two API calls. Only one order
+    # is safe — this flag ON first (writers 1 -> 0, the existing configuration
+    # stays and the dataplane does not change), then dryRun off (0 -> 1).
+    # Backwards leaves two writers, and frr-k8s merges every FRRConfiguration in
+    # its namespace into one FRR: two `router bgp` blocks over one session.
+    #
+    # hack/announce-cutover.sh walks it, refuses the wrong order, and compares
+    # what the operator would write against the live object first.
     OPERATOR_ANNOUNCE_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
