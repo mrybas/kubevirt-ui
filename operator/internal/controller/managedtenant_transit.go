@@ -22,6 +22,8 @@ import (
 	"sort"
 	"strings"
 
+	corev1 "k8s.io/api/core/v1"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -32,6 +34,7 @@ import (
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 	"github.com/mrybas/kubevirt-ui/operator/internal/kube"
+	"github.com/mrybas/kubevirt-ui/operator/internal/tenant"
 	"github.com/mrybas/kubevirt-ui/operator/internal/transit"
 )
 
@@ -488,7 +491,7 @@ func (r *ManagedTenantReconciler) ensureTransitACLs(
 	live, known := r.liveTransitAddresses(ctx, subnetName)
 	if known {
 		// Ours may not be observable yet.
-		live[address] = struct{}{}
+		live[address] = obj.Name
 	}
 
 	subnet := &unstructured.Unstructured{}
@@ -517,7 +520,22 @@ func (r *ManagedTenantReconciler) ensureTransitACLs(
 		//
 		// Withholding leaves the plane exactly as open as it already is, which
 		// is not a regression, and names what is missing.
-		unprotected = addressesWithoutAllow(acls, live, known)
+		// Whoever else is on this plane without a permission gets one written
+		// for them first, from what their own Service says. The baseline can
+		// then go in without taking them down; anything that cannot be
+		// attributed keeps it withheld.
+		if missing := addressesWithoutAllow(acls, live, known); len(missing) > 0 {
+			var backfilled []transit.Rule
+			backfilled, unprotected = r.backfillAllows(ctx, missing, live)
+			for _, rule := range backfilled {
+				candidate := ruleToMap(rule)
+				if !hasRule(acls, candidate) {
+					acls = append(acls, candidate)
+				}
+			}
+		} else {
+			unprotected = nil
+		}
 		if len(unprotected) == 0 && !hasDeny(acls) {
 			excludes, _, _ := unstructured.NestedStringSlice(subnet.Object, "spec", "excludeIps")
 			acls = append(acls, ruleToMap(transit.Deny(transitCIDR, excludes)))
@@ -532,7 +550,7 @@ func (r *ManagedTenantReconciler) ensureTransitACLs(
 
 // addressesWithoutAllow is who is on the plane with no permission written for
 // them — the tenants a baseline deny would silence.
-func addressesWithoutAllow(acls []any, live map[string]struct{}, known bool) []string {
+func addressesWithoutAllow(acls []any, live map[string]string, known bool) []string {
 	if !known {
 		// Cannot tell who is here, so cannot promise the baseline is safe.
 		return []string{"<the addresses on this plane could not be read>"}
@@ -567,7 +585,7 @@ func addressesWithoutAllow(acls []any, live map[string]struct{}, known bool) []s
 // `known` is whether the live set could be read at all. When it could not,
 // nothing is dropped: deleting a permit on a guess is how a working tenant
 // loses its control plane, and the rules can wait for a pass that can see.
-func pruneStaleAllows(existing []any, live map[string]struct{}, known bool) []any {
+func pruneStaleAllows(existing []any, live map[string]string, known bool) []any {
 	var out []any
 	for _, raw := range existing {
 		rule, _ := raw.(map[string]any)
@@ -601,13 +619,14 @@ func pruneStaleAllows(existing []any, live map[string]struct{}, known bool) []an
 // gone — the address it names having quietly become a router leg.
 func (r *ManagedTenantReconciler) liveTransitAddresses(
 	ctx context.Context, subnetName string,
-) (map[string]struct{}, bool) {
+) (map[string]string, bool) {
 	eips := &unstructured.UnstructuredList{}
 	eips.SetGroupVersionKind(ovnEipGVK.GroupVersion().WithKind("OvnEipList"))
 	if err := r.reader().List(ctx, eips); err != nil {
 		return nil, false
 	}
-	live := map[string]struct{}{}
+	// address -> the tenant it belongs to, "" when it cannot be attributed.
+	live := map[string]string{}
 	for i := range eips.Items {
 		item := &eips.Items[i]
 		if external, _, _ := unstructured.NestedString(item.Object, "spec", "externalSubnet"); external != subnetName {
@@ -617,10 +636,20 @@ func (r *ManagedTenantReconciler) liveTransitAddresses(
 			continue
 		}
 		if addr, _, _ := unstructured.NestedString(item.Object, "status", "v4Ip"); addr != "" {
-			live[addr] = struct{}{}
+			live[addr] = tenantOfEIP(item)
 		}
 	}
 	return live, true
+}
+
+// tenantOfEIP is whose address this is, from the label if it carries one and
+// from the name this operator and the product both use otherwise. Empty when
+// neither says.
+func tenantOfEIP(eip *unstructured.Unstructured) string {
+	if name := eip.GetLabels()["kubevirt-ui.io/tenant"]; name != "" {
+		return name
+	}
+	return strings.TrimPrefix(eip.GetName(), "cpt-eip-")
 }
 
 func hasDeny(acls []any) bool {
@@ -675,4 +704,77 @@ func transitCondition(ready bool, reason, message string) metav1.Condition {
 		Reason:  reason,
 		Message: message,
 	}
+}
+
+// backfillAllows writes the permissions of tenants that are on the plane
+// without one — so the baseline can go in without silencing them.
+//
+// Attributed, never guessed. The address names its tenant (by label, or by the
+// name both writers use), and everything else is read off that tenant's own
+// control-plane Service: the address it answers on, and the ports it publishes.
+// A Talos tenant's Service carries trustd, a cloud-init one's does not, and the
+// clock is there if its time Service exists. Nothing is inferred from a shape
+// this operator believes the tenant ought to have.
+//
+// What cannot be attributed is left alone and reported. Writing a permission
+// for an address whose owner cannot be identified is how a plane ends up with
+// rules nobody can account for.
+func (r *ManagedTenantReconciler) backfillAllows(
+	ctx context.Context, missing []string, live map[string]string,
+) (rules []transit.Rule, unattributable []string) {
+	for _, address := range missing {
+		tenantName := live[address]
+		if tenantName == "" {
+			unattributable = append(unattributable, address)
+			continue
+		}
+		vip, tcp, ok := r.controlPlaneShapeOf(ctx, tenantName)
+		if !ok {
+			unattributable = append(unattributable, address)
+			continue
+		}
+		var udp []int
+		if r.servesTime(ctx, tenantName) {
+			udp = append(udp, ntpPort)
+		}
+		rules = append(rules, transit.Allows(address, vip, tcp, udp)...)
+	}
+	return rules, unattributable
+}
+
+// controlPlaneShapeOf reads a tenant's address and ports off the Service it
+// answers on, rather than deciding what they ought to be.
+func (r *ManagedTenantReconciler) controlPlaneShapeOf(
+	ctx context.Context, tenantName string,
+) (vip string, tcp []int, ok bool) {
+	service := &corev1.Service{}
+	if err := r.reader().Get(ctx, types.NamespacedName{
+		Namespace: tenant.NamespaceOf(tenantName), Name: tenantName + "-cp-lb",
+	}, service); err != nil {
+		return "", nil, false
+	}
+	for _, ingress := range service.Status.LoadBalancer.Ingress {
+		if ingress.IP != "" {
+			vip = ingress.IP
+			break
+		}
+	}
+	if vip == "" {
+		return "", nil, false
+	}
+	for _, port := range service.Spec.Ports {
+		if port.Protocol == corev1.ProtocolUDP {
+			continue
+		}
+		tcp = append(tcp, int(port.Port))
+	}
+	return vip, tcp, len(tcp) > 0
+}
+
+func (r *ManagedTenantReconciler) servesTime(ctx context.Context, tenantName string) bool {
+	service := &corev1.Service{}
+	err := r.reader().Get(ctx, types.NamespacedName{
+		Namespace: ntpNamespace(), Name: tenantName + "-ntp",
+	}, service)
+	return err == nil
 }

@@ -5,6 +5,9 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
@@ -241,7 +244,7 @@ func TestAStaleAllowIsDroppedAndAGuessIsNot(t *testing.T) {
 		map[string]any{"priority": int64(transit.AllowPriority), "action": "allow-related",
 			"match": "ip4.src == 10.199.1.9 && ip4.dst == 10.199.0.102 && tcp.dst == 6443"},
 	}
-	live := map[string]struct{}{"10.199.1.4": {}}
+	live := map[string]string{"10.199.1.4": "somebody"}
 
 	kept := pruneStaleAllows(rules, live, true)
 	if len(kept) != 2 {
@@ -271,7 +274,7 @@ func TestAStaleAllowIsDroppedAndAGuessIsNot(t *testing.T) {
 		t.Errorf("kept %d rules on a guess, want all three", len(got))
 	}
 	// And the deny is never a candidate, whatever the live set says.
-	if got := pruneStaleAllows(rules, map[string]struct{}{}, true); len(got) != 1 {
+	if got := pruneStaleAllows(rules, map[string]string{}, true); len(got) != 1 {
 		t.Errorf("kept %d, want the deny alone", len(got))
 	}
 }
@@ -430,6 +433,8 @@ func TestTheBaselineIsWithheldWhileItWouldSilenceSomebody(t *testing.T) {
 	// tenants holding nat addresses inside the allocatable range, and not one
 	// ACL on the subnet.
 	mustTransitSubnet(t, "transit-g")
+	// Unattributable on purpose: no tenant of that name has a control-plane
+	// Service, so nothing can be written for them without guessing.
 	mustEIP(t, "cpt-eip-stranger-a", "transit-g", "10.199.1.40")
 	mustEIP(t, "cpt-eip-stranger-b", "transit-g", "10.199.1.42")
 	mustEIP(t, "cpt-eip-trg", "transit-g", "10.199.1.41")
@@ -464,7 +469,7 @@ func TestTheBaselineIsWithheldWhileItWouldSilenceSomebody(t *testing.T) {
 		t.Errorf("acls = %d, want this tenant's four allows", len(acls))
 	}
 
-	// Cover both strangers and the baseline can go in.
+	// Cover both strangers by hand and the baseline can go in.
 	strangerAllows := append(
 		transit.Allows("10.199.1.40", "10.199.0.105", []int{6443}, nil),
 		transit.Allows("10.199.1.42", "10.199.0.106", []int{6443}, nil)...)
@@ -530,5 +535,96 @@ func TestARouterPortIsNotATenantAddress(t *testing.T) {
 	}
 	if _, found := addresses["10.199.1.50"]; found {
 		t.Error("a router port was counted as a tenant address")
+	}
+}
+
+// TestAStrangerWithAServiceIsWrittenForRatherThanWaitedOn.
+//
+// The plane on this stand is open, and it stays open until every address on it
+// has a permission — which, with tenants the product created, means the
+// operator writes theirs. Attributed, never guessed: the address names its
+// tenant, and the address it answers on and the ports it publishes are read off
+// that tenant's own Service. A Talos tenant's Service carries trustd; a
+// cloud-init one's does not.
+func TestAStrangerWithAServiceIsWrittenForRatherThanWaitedOn(t *testing.T) {
+	mustTransitSubnet(t, "transit-i")
+	mustNamespace(t, "tenant-elder", "")
+
+	// The tenant the product built: a control-plane Service with its own ports,
+	// and a time Service beside it.
+	elder := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "tenant-elder", Name: "elder-cp-lb",
+	}}
+	elder.Spec.Type = corev1.ServiceTypeLoadBalancer
+	elder.Spec.Ports = []corev1.ServicePort{
+		{Name: "api", Port: 6443, Protocol: corev1.ProtocolTCP},
+		{Name: "konn", Port: 8132, Protocol: corev1.ProtocolTCP},
+		{Name: "trustd", Port: 50001, Protocol: corev1.ProtocolTCP},
+	}
+	if err := k8sClient.Create(testCtx, elder); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating the elder's Service: %v", err)
+	}
+	live := &corev1.Service{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-elder", Name: "elder-cp-lb"}, live); err != nil {
+		t.Fatalf("reading it back: %v", err)
+	}
+	live.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: "10.199.0.201"}}
+	if err := k8sClient.Status().Update(testCtx, live); err != nil {
+		t.Fatalf("assigning its address: %v", err)
+	}
+	ntp := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "kubevirt-ui-system", Name: "elder-ntp",
+	}}
+	ntp.Spec.Ports = []corev1.ServicePort{
+		{Name: "ntp", Port: 123, Protocol: corev1.ProtocolUDP},
+	}
+	if err := k8sClient.Create(testCtx, ntp); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating the elder's time Service: %v", err)
+	}
+
+	mustEIP(t, "cpt-eip-elder", "transit-i", "10.199.1.60")
+	mustEIP(t, "cpt-eip-tri", "transit-i", "10.199.1.61")
+
+	obj := vpcTalosTenant("tri")
+	obj.Spec.Network = "net-tri"
+	unprotected, err := transitReconciler("transit-i").ensureTransitACLs(
+		testCtx, obj, "transit-i", "10.199.0.0/22", "10.199.1.61", "10.199.0.202")
+	if err != nil {
+		t.Fatalf("ensureTransitACLs: %v", err)
+	}
+	if len(unprotected) != 0 {
+		t.Fatalf("unprotected = %v — the elder could be attributed", unprotected)
+	}
+
+	subnet := &unstructured.Unstructured{}
+	subnet.SetGroupVersionKind(ovnSubnetGVK)
+	if err := k8sReader.Get(testCtx, types.NamespacedName{Name: "transit-i"}, subnet); err != nil {
+		t.Fatalf("reading the subnet: %v", err)
+	}
+	acls, _, _ := unstructured.NestedSlice(subnet.Object, "spec", "acls")
+	if !hasDeny(acls) {
+		t.Error("the baseline is still withheld with everybody covered")
+	}
+
+	matches := map[string]bool{}
+	for _, raw := range acls {
+		rule, _ := raw.(map[string]any)
+		matches[fmt.Sprint(rule["match"])] = true
+	}
+	// Its own ports and its own address, read from its Service — including the
+	// clock, because its time Service is there.
+	for _, want := range []string{
+		"ip4.src == 10.199.1.60 && ip4.dst == 10.199.0.201 && tcp.dst == 6443",
+		"ip4.src == 10.199.1.60 && ip4.dst == 10.199.0.201 && tcp.dst == 50001",
+		"ip4.src == 10.199.1.60 && ip4.dst == 10.199.0.201 && udp.dst == 123",
+	} {
+		if !matches[want] {
+			t.Errorf("missing %q", want)
+		}
+	}
+	// And nothing was invented for it: no port its Service does not publish.
+	if matches["ip4.src == 10.199.1.60 && ip4.dst == 10.199.0.201 && tcp.dst == 6444"] {
+		t.Error("it wrote a port the tenant's Service does not carry")
 	}
 }

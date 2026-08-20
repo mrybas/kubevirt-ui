@@ -2419,3 +2419,42 @@ when the live set cannot be read at all nothing is pruned.
 The fixture is modelled on the live plane: two foreign `nat` addresses, empty
 ACLs. Mutating the withholding away turns it red with "it wrote the baseline and
 took the stranger's control plane with it".
+
+### The plane is open, and who closes it
+
+Stated plainly because it is the current state of a production-shaped stand:
+**`cp-transit` carries no ACLs at all.** Anything on that subnet can reach
+anything else on it. Two live tenants hold addresses there and neither has a
+permission written for it, so the baseline cannot go in without taking them
+down, and this operator withholds it rather than choosing for somebody.
+
+The user's decision: the operator writes the missing permissions for the
+tenants it can **attribute**, and keeps withholding for anything it cannot.
+
+Attributed, never guessed. The address names its tenant — by label, or by the
+`cpt-eip-<tenant>` name both writers use — and everything else is read off that
+tenant's own control-plane Service: the address it answers on, and the ports it
+publishes. A Talos tenant's Service carries trustd and a cloud-init one's does
+not; the clock is added when the tenant's time Service exists. Nothing comes
+from a shape this operator believes a tenant ought to have, which is the same
+rule as reading announce-eligibility off the datapath rather than off a label.
+
+What that gives is convergence rather than a one-off: as tenants come under the
+operator the unattributable set empties, and the plane closes by itself on the
+pass where it can be closed safely. The alternative — writing the two rules by
+hand — leaves the next foreign address to reopen it with nobody watching.
+
+### What is *not* on this plane yet, and should not be pretended
+
+`6444` — the host API a tenant's CSI talks to — appears **nowhere in the
+reference**: not in its transit ports, not anywhere in the backend. Measured on
+the stand instead of assumed: the tenant's CSI driver runs inside the tenant
+cluster and its kubeconfig points at `https://10.198.175.250:6443`, the Talos
+VIP on **mgmt**. The guard only pushes `10.199.0.0/22` out the transit leg, so
+that traffic takes the default route to the border.
+
+So today the storage control path *does* depend on the gateway — which is
+exactly what putting it on this plane is meant to fix, and it is target design
+(the lab plan's T13: a private per-VPC URL, `VIP:6444` with `tls-server-name`),
+not something to port. Named here so the gap is a decision rather than a
+discovery.
