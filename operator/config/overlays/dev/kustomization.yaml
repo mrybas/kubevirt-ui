@@ -79,4 +79,4 @@ replacements:
 images:
 - name: controller
   newName: ghcr.io/mrybas/kubevirt-ui/operator
-  newTag: dev-83f2808
+  newTag: dev-49e2de1

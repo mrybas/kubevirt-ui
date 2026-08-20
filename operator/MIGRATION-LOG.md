@@ -1318,3 +1318,63 @@ Same silent signature as the earlier two: the delete is processed once, the pod
 addresses are released, and the controller never mentions the subnet again. No
 `not found logical router` in the log this time either. The mechanism inside
 kube-ovn is still not established; what is established is one way to provoke it.
+
+## M13a — deliberately deferred, with the reason
+
+The plan puts `ManagedEgressGateway` next. Checked before starting, and it is
+the wrong next thing:
+
+- there is no egress gateway on the stand — no `VpcEgressGateway`, no `egw-*`
+  VPC, no transit allocator ConfigMap — so there is nothing to compare a port
+  against, and this migration's whole method is comparison;
+- the reference UAT run does not exercise it. Its egress is routed: "Ізольований
+  VPC із маршрутизованим egress випускає назовні". The gateway phase, C10, is
+  marked blocked and was not run;
+- routed egress is what M10a already builds, through `externalPlane`.
+
+So M13a would port a hub that nothing on this stand uses, cannot be checked
+against anything working, and is superseded by a path already migrated. Recorded
+rather than skipped quietly; the two repairs it names — the GET-time heals and
+the un-forced VEG rollout — stay worth doing if the hub survives.
+
+## M12a — ManagedTenant, the catalogue and the reservation
+
+### Ports whose numbers came from the product
+
+The quota test's expected values were read off the running backend for four
+requests, not derived here. A port that agrees with my reading of the formula
+and disagrees with the formula would pass a test written the other way. It
+matched first try, all three quantities, all four cases.
+
+The refusal strings are byte-identical to `resolve_talos_release`:
+
+```
+Talos 1.13.8 does not support Kubernetes v1.30.1 (it takes 1.31-1.36). Compatible pairs: Talos 1.13.8 -> Kubernetes 1.31-1.36.
+Talos 9.9.9 is not in this deployment's catalogue. Offered: 1.13.8.
+```
+
+### The mutation that took three tries
+
+The version window is compared as numbers, and the obvious test does not prove
+it. With the built-in 1.31–1.36 window a string comparison gives the *same*
+answers, including for the "1.9" case the Python comment warns about — the upper
+bound rejects it either way. Two mutations passed before I found the shape that
+distinguishes them: a **wide** window. With 1.9–1.31, "1.28" sorts below "1.9"
+as text, so a textual check refuses a version squarely inside. That case is now
+in the test, and the mutation fails on three of its six probes.
+
+### Live
+
+| check | result |
+|---|---|
+| incompatible pair via `kubectl apply` | denied by admission, with the product's sentence verbatim |
+| unknown release | denied, naming what is offered |
+| compatible pair | created |
+| every minor the catalogue offers (1.31–1.36) | accepted |
+| the minors either side (1.30, 1.37) | refused |
+
+The wizard's own endpoint could not be queried on the harness — tenants are
+disabled there — and it was left that way deliberately: enabling them would
+start the tenant reconciler against the two live UAT tenants, which is another
+writer this migration does not need. The comparison was made against the module
+the endpoint calls.
