@@ -72,6 +72,17 @@ spec:
                   external plane cannot reach.
                 minLength: 1
                 type: string
+              configurationName:
+                default: kubevirt-ui-b3
+                description: |-
+                  ConfigurationName is the FRRConfiguration to write.
+
+                  Configurable so a handover can be proved before it happens: point a new
+                  controller at a second name, compare what it renders against what the
+                  current writer produces, and only then take the real object over. Two
+                  writers of one BGP configuration is an outage with extra steps, so the
+                  swap has to be a single step with evidence behind it.
+                type: string
               externalSubnet:
                 default: external
                 description: |-

@@ -58,6 +58,17 @@ type AnnouncementPolicySpec struct {
 	// +optional
 	TargetNamespace string `json:"targetNamespace,omitempty"`
 
+	// ConfigurationName is the FRRConfiguration to write.
+	//
+	// Configurable so a handover can be proved before it happens: point a new
+	// controller at a second name, compare what it renders against what the
+	// current writer produces, and only then take the real object over. Two
+	// writers of one BGP configuration is an outage with extra steps, so the
+	// swap has to be a single step with evidence behind it.
+	// +kubebuilder:default=kubevirt-ui-b3
+	// +optional
+	ConfigurationName string `json:"configurationName,omitempty"`
+
 	// Replicas is how many nodes carry the announcement.
 	//
 	// Redundancy of the announcement, not of the path: every node advertises

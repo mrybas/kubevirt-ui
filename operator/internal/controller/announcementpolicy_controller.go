@@ -45,10 +45,10 @@ import (
 const (
 	announceControllerName = "announcementpolicy"
 
-	// frrConfigName is the object frr-k8s reads. One per cluster, owned by the
-	// policy, and the single writer of it — two writers of one BGP
+	// defaultFRRConfigName is the object frr-k8s reads. One per cluster, owned
+	// by the policy, and the single writer of it — two writers of one BGP
 	// configuration is an outage with extra steps.
-	frrConfigName = "kubevirt-ui-b3"
+	defaultFRRConfigName = "kubevirt-ui-b3"
 )
 
 var (
@@ -319,6 +319,7 @@ func (r *AnnouncementPolicyReconciler) writeConfiguration(
 	if namespace == "" {
 		namespace = "metallb-system"
 	}
+	name := configurationNameOf(policy)
 
 	nodeValues := make([]any, 0, len(nodes))
 	for _, n := range nodes {
@@ -342,24 +343,24 @@ func (r *AnnouncementPolicyReconciler) writeConfiguration(
 
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(frrConfigGVK)
-	err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: frrConfigName}, existing)
+	err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, existing)
 	switch {
 	case apierrors.IsNotFound(err):
 		created := &unstructured.Unstructured{}
 		created.SetGroupVersionKind(frrConfigGVK)
-		created.SetName(frrConfigName)
+		created.SetName(name)
 		created.SetNamespace(namespace)
 		created.SetLabels(map[string]string{"kubevirt-ui.io/managed": "true"})
 		if err := unstructured.SetNestedMap(created.Object, desiredSpec, "spec"); err != nil {
 			return fmt.Errorf("rendering the configuration: %w", err)
 		}
 		if err := r.Create(ctx, created); err != nil {
-			return fmt.Errorf("creating %s/%s: %w", namespace, frrConfigName, err)
+			return fmt.Errorf("creating %s/%s: %w", namespace, name, err)
 		}
 		kube.CountWrite(r.Scheme, created, announceControllerName, "created")
 		return nil
 	case err != nil:
-		return fmt.Errorf("reading %s/%s: %w", namespace, frrConfigName, err)
+		return fmt.Errorf("reading %s/%s: %w", namespace, name, err)
 	}
 
 	current, _, _ := unstructured.NestedMap(existing.Object, "spec")
@@ -371,7 +372,7 @@ func (r *AnnouncementPolicyReconciler) writeConfiguration(
 		return fmt.Errorf("rendering the configuration: %w", err)
 	}
 	if err := r.Update(ctx, patched); err != nil {
-		return fmt.Errorf("updating %s/%s: %w", namespace, frrConfigName, err)
+		return fmt.Errorf("updating %s/%s: %w", namespace, name, err)
 	}
 	kube.CountWrite(r.Scheme, patched, announceControllerName, "updated")
 	return nil
@@ -410,6 +411,14 @@ func (r *AnnouncementPolicyReconciler) reloadFailures(
 		}
 	}
 	return failures, nil
+}
+
+// configurationNameOf is the object this policy owns.
+func configurationNameOf(policy *platformv1alpha1.AnnouncementPolicy) string {
+	if policy.Spec.ConfigurationName != "" {
+		return policy.Spec.ConfigurationName
+	}
+	return defaultFRRConfigName
 }
 
 func toAnnouncedPrefixes(in []announce.Announcement) []platformv1alpha1.AnnouncedPrefix {

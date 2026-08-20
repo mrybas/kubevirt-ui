@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+spec:
+  template:
+    spec:
+      serviceAccountName: controller-manager
+      containers:
+        - name: manager
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+            - --metrics-secure=false
+            - --domains=network
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # No admission here: the webhook configuration points at the vm
+            # deployment's service, and a second server answering for it would
+            # be a coin toss.
+            - name: ENABLE_WEBHOOKS
+              value: "false"

@@ -1,0 +1,29 @@
+# The network domain, as its own deployment.
+#
+# Same image, different --domains, and therefore a different leader-election
+# lease: a crash in the network controllers must not stop VM reconciliation, and
+# each half's service account carries only the rights its own half needs.
+#
+# It deliberately does not include the CRDs, the webhooks or the certificate —
+# those belong to the vm overlay, which is applied first. Two deployments
+# installing one webhook configuration would fight over it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kubevirt-ui-operator-dev
+namePrefix: kubevirt-ui-operator-network-
+
+resources:
+  - ../../manager
+  - rbac.yaml
+
+patches:
+  - path: manager_patch.yaml
+    target:
+      kind: Deployment
+      name: controller-manager
+
+images:
+  - name: controller
+    newName: ghcr.io/mrybas/kubevirt-ui/operator
+    newTag: dev-latest

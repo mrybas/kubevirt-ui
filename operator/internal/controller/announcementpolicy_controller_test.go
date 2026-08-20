@@ -123,7 +123,7 @@ func frrConfig(t *testing.T, namespace string) *unstructured.Unstructured {
 	cfg := &unstructured.Unstructured{}
 	cfg.SetGroupVersionKind(frrConfigGVK)
 	if err := k8sClient.Get(testCtx, types.NamespacedName{
-		Namespace: namespace, Name: frrConfigName,
+		Namespace: namespace, Name: defaultFRRConfigName,
 	}, cfg); err != nil {
 		t.Fatalf("reading the generated configuration: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestAnUnchangedClusterProducesNoWrites(t *testing.T) {
 	eventually(t, "the configuration to be written once", func() error {
 		cfg := &unstructured.Unstructured{}
 		cfg.SetGroupVersionKind(frrConfigGVK)
-		return k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: frrConfigName}, cfg)
+		return k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: defaultFRRConfigName}, cfg)
 	})
 	time.Sleep(2 * time.Second)
 
