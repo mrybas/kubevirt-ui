@@ -33,12 +33,20 @@ spec:
             #     provisioning and from replacing an unhealthy worker;
             #   * the UI backend, which still writes VMs directly until its
             #     create path moves onto ManagedVM. It comes off this list in
-            #     the same change that moves it.
+            #     the same change that moves it;
+            #   * virt-controller, which creates the target of a
+            #     VirtualMachineClone. Found by measurement, not by thinking
+            #     hard: with the guard deployed and this entry missing, cloning
+            #     was refused outright. An allowlist assembled from memory will
+            #     always be missing one, which is why refusals are logged — the
+            #     next missing identity should arrive as a log line rather than
+            #     as a mystery.
             - name: OPERATOR_RAW_VM_ALLOWED_SUBJECTS
               value: >-
                 system:serviceaccount:kubevirt-ui-operator-dev:kubevirt-ui-operator-controller-manager,
                 system:serviceaccount:o0-capi:capk-manager,
-                system:serviceaccount:kubevirt-ui-system:kubevirt-ui
+                system:serviceaccount:kubevirt-ui-system:kubevirt-ui,
+                system:serviceaccount:o0-kubevirt:kubevirt-controller
             - name: KUBE_OVN_NAMESPACE
               value: o0-kube-ovn
             # The guard fails open, so something has to notice when it is not

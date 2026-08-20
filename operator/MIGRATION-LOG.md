@@ -472,3 +472,53 @@ ownerReference now — the cluster's own garbage collector, no controller, no
 finalizer, and it still works when nothing of ours is running. Not blocking, so
 a machine never waits on its schedules; not set across namespaces, where the
 collector would read it as a missing owner and delete the schedule at once.
+
+### The disk race, and why admission was not enough
+
+Admission refuses a disk another machine already declares — but admission is a
+preflight. Two requests racing each read a world in which the other has not
+landed, both pass, and both attach. Two machines writing one filesystem corrupt
+it, and neither finds out.
+
+So the decision is made on the disk itself. The controller **claims** before it
+attaches: a compare-and-set on the holder label, carrying the resourceVersion it
+read, so the API server rejects the second writer rather than luck deciding. The
+claim is pinned to the object, not to its name — a second label records the
+machine's UID, because a name is reusable and a claim must not transfer to
+whatever is called that next.
+
+Releasing is refused unless it comes from the holder. That was a real bug on the
+way here: the release path checked the name only when *taking* a label, not when
+clearing one, so a machine that had merely listed a disk could free somebody
+else's on its way out — producing exactly the double attachment the claim
+exists to prevent.
+
+Three tests, none of which need the webhook (it is deliberately absent from the
+suite, which is the situation being tested):
+
+- two machines racing for one disk: exactly one attaches, the other reports
+  `DiskHeldByAnotherMachine` naming the holder, and **stays** refused rather
+  than taking it a moment later;
+- a machine that never held a disk cannot free it by being deleted;
+- a release arriving *after* the disk has been claimed by another object leaves
+  that claim alone — the case where comparing names would have been wrong.
+
+### And a guard defect found by the clone research
+
+`VirtualMachineClone` is installed here (v1beta1, with `volumeNamePolicy`, new
+MAC addresses and SMBios serial), so clone should delegate to it rather than
+port the hand-rolled rename-map — which copies attached claims verbatim and so
+points a clone at the *source's* disks.
+
+Measuring that turned up something more urgent: the guard **was refusing the
+clone controller**. `system:serviceaccount:o0-kubevirt:kubevirt-controller`
+creates the target of a clone and was not on the allowlist, so cloning was
+broken by a guard added two slices earlier. Fixed, and the lesson recorded in
+the allowlist's own comment: a list assembled from memory will always be missing
+one, which is why refusals are logged — the next missing identity should arrive
+as a log line rather than as a mystery.
+
+Also worth writing down, because it wasted a measurement: the first attempt to
+deploy that fix ran `kubectl apply … >/dev/null 2>&1`, so the apply's failure
+was invisible and the "still refused" reading looked like a code problem. Prove
+the change arrived — and do not silence the command that would tell you.

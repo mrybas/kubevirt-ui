@@ -20,6 +20,10 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
+
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
@@ -33,6 +37,15 @@ import (
 // attachedToLabel records which machine holds a persistent disk. The disks page
 // reads it, and the attach path used it as a cache in front of a full scan.
 const attachedToLabel = "kubevirt-ui.io/attached-to"
+
+// attachedToUIDLabel records *which* machine of that name holds it.
+//
+// A name is what people read, and it is what the disks page shows, so the label
+// above keeps carrying one. But a name is reusable: delete a machine and create
+// another with the same name and the claim would transfer silently. The UID
+// pins the claim to one object, which is what lets a release be refused unless
+// it comes from the holder itself.
+const attachedToUIDLabel = "platform.kubevirt-ui.io/attached-to-uid"
 
 // reservedVolumes are the machine's own, rendered at create and never managed
 // as attachments.
@@ -76,11 +89,26 @@ func (r *ManagedVMReconciler) syncDisks(
 	var (
 		toAttach []platformv1alpha1.DiskAttachment
 		toDetach []string
+		refused  []string
 	)
 	for name, disk := range desired {
-		if _, ok := present[name]; !ok {
-			toAttach = append(toAttach, disk)
+		if _, ok := present[name]; ok {
+			continue
 		}
+		// Claim before attaching, never after. Admission refuses a disk another
+		// machine already declares, but admission is a preflight: two requests
+		// racing each read a world in which the other has not landed yet, and
+		// both pass. The claim is a compare-and-set on the disk itself, so at
+		// most one of them can win it, whichever order they arrive in.
+		holder, err := r.claimDisk(ctx, vm.Namespace, disk.Claim, vm.Name, string(vm.UID))
+		if err != nil {
+			return err
+		}
+		if holder != "" {
+			refused = append(refused, fmt.Sprintf("%s (held by %s)", disk.Claim, holder))
+			continue
+		}
+		toAttach = append(toAttach, disk)
 	}
 	for name := range previously {
 		if _, stillWanted := desired[name]; stillWanted {
@@ -97,6 +125,9 @@ func (r *ManagedVMReconciler) syncDisks(
 		}
 	}
 
+	sort.Strings(refused)
+	setDiskCondition(vm, refused)
+
 	// Record what is attached now, from the object rather than from intent: if
 	// a write failed, the next pass should see that it failed.
 	attached := make([]string, 0, len(desired))
@@ -111,7 +142,74 @@ func (r *ManagedVMReconciler) syncDisks(
 	sort.Strings(attached)
 	vm.Status.AttachedDisks = attached
 
-	return r.syncAttachedLabels(ctx, vm, desired, previously)
+	return r.releaseDetached(ctx, vm, desired, previously)
+}
+
+// claimDisk takes ownership of a disk, or reports who holds it.
+//
+// The label is the claim, and the write that sets it is a compare-and-set: the
+// object carries the resourceVersion it was read at, so a second writer racing
+// for the same disk is rejected by the API server rather than by luck. A
+// conflict is returned as an error so the pass retries against a fresh read and
+// sees whoever won.
+func (r *ManagedVMReconciler) claimDisk(
+	ctx context.Context, namespace, claim, holder, holderUID string,
+) (string, error) {
+	dv := &cdiv1.DataVolume{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: claim}, dv); err != nil {
+		if apierrors.IsNotFound(err) {
+			// A plain claim rather than a DataVolume: there is nothing to write
+			// the holder on, and nothing this controller can arbitrate.
+			return "", nil
+		}
+		return "", fmt.Errorf("reading disk %s/%s: %w", namespace, claim, err)
+	}
+
+	current := dv.Labels[attachedToLabel]
+	currentUID := dv.Labels[attachedToUIDLabel]
+	switch {
+	case current == "":
+		// Unclaimed.
+	case current == holder && (currentUID == "" || currentUID == holderUID):
+		// Ours already; adopt an entry left by an older release that recorded
+		// no UID.
+		if currentUID == holderUID {
+			return "", nil
+		}
+	default:
+		return current, nil
+	}
+
+	patched := dv.DeepCopy()
+	if patched.Labels == nil {
+		patched.Labels = map[string]string{}
+	}
+	patched.Labels[attachedToLabel] = holder
+	patched.Labels[attachedToUIDLabel] = holderUID
+	if err := r.Update(ctx, patched); err != nil {
+		if apierrors.IsConflict(err) {
+			return "", fmt.Errorf("lost the race for disk %s/%s: %w", namespace, claim, err)
+		}
+		return "", fmt.Errorf("claiming disk %s/%s: %w", namespace, claim, err)
+	}
+	kube.CountWrite(r.Scheme, patched, vmControllerName, "updated")
+	return "", nil
+}
+
+func setDiskCondition(vm *platformv1alpha1.ManagedVM, refused []string) {
+	cond := metav1.Condition{
+		Type:               platformv1alpha1.ConditionDisksAttached,
+		Status:             metav1.ConditionTrue,
+		Reason:             "Attached",
+		Message:            "every declared disk is attached",
+		ObservedGeneration: vm.Generation,
+	}
+	if len(refused) > 0 {
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = "DiskHeldByAnotherMachine"
+		cond.Message = "not attached: " + strings.Join(refused, ", ")
+	}
+	apimeta.SetStatusCondition(&vm.Status.Conditions, cond)
 }
 
 func (r *ManagedVMReconciler) applyDiskChanges(
@@ -178,22 +276,16 @@ func (r *ManagedVMReconciler) applyDiskChanges(
 	return nil
 }
 
-// syncAttachedLabels keeps the disks page honest about who holds what.
+// releaseDetached drops the holder label from disks that are no longer wanted.
 //
-// The label is a cache in front of a full scan, and a stale one is why a disk
-// belonging to a deleted machine could never be attached to anything again: the
-// attach path checked the label before it scanned.
-func (r *ManagedVMReconciler) syncAttachedLabels(
+// A stale holder is why a disk belonging to a deleted machine could never be
+// attached to anything again: the attach path reads the label before it scans.
+func (r *ManagedVMReconciler) releaseDetached(
 	ctx context.Context,
 	vm *platformv1alpha1.ManagedVM,
 	desired map[string]platformv1alpha1.DiskAttachment,
 	previously map[string]struct{},
 ) error {
-	for _, disk := range desired {
-		if err := r.setAttachedTo(ctx, vm.Namespace, disk.Claim, vm.Name); err != nil {
-			return err
-		}
-	}
 	for name := range previously {
 		if _, stillWanted := desired[name]; stillWanted {
 			continue
@@ -201,15 +293,22 @@ func (r *ManagedVMReconciler) syncAttachedLabels(
 		// The recorded entry is the volume name; for the label it is the claim
 		// that matters, and the two are the same unless someone chose
 		// otherwise. Release by whichever name is there.
-		if err := r.setAttachedTo(ctx, vm.Namespace, name, ""); err != nil {
+		if err := r.releaseDisk(ctx, vm.Namespace, name, vm.Name, string(vm.UID)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (r *ManagedVMReconciler) setAttachedTo(
-	ctx context.Context, namespace, claim, holder string,
+// releaseDisk drops the holder labels, but only on behalf of the machine that
+// holds them.
+//
+// A release that does not check would let one machine free another's disk
+// simply by having once listed it — and the disk would then be attached twice,
+// which is the exact outcome the claim exists to prevent. The UID is what makes
+// the check exact: a name can be reused, an object cannot.
+func (r *ManagedVMReconciler) releaseDisk(
+	ctx context.Context, namespace, claim, holder, holderUID string,
 ) error {
 	dv := &cdiv1.DataVolume{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: namespace, Name: claim}, dv); err != nil {
@@ -221,27 +320,24 @@ func (r *ManagedVMReconciler) setAttachedTo(
 		return fmt.Errorf("reading disk %s/%s: %w", namespace, claim, err)
 	}
 
-	current := dv.Labels[attachedToLabel]
-	if current == holder {
+	current, currentUID := dv.Labels[attachedToLabel], dv.Labels[attachedToUIDLabel]
+	if current == "" {
 		return nil
 	}
-	// Do not take a label that names another machine: whoever holds it is
-	// either right, or a stale entry this controller is not the one to judge.
-	if holder != "" && current != "" && current != holder {
+	if current != holder {
+		return nil
+	}
+	// Same name, different object: the claim belongs to a machine that replaced
+	// this one, and freeing it would hand its disk to somebody else.
+	if currentUID != "" && holderUID != "" && currentUID != holderUID {
 		return nil
 	}
 
 	patched := dv.DeepCopy()
-	if patched.Labels == nil {
-		patched.Labels = map[string]string{}
-	}
-	if holder == "" {
-		delete(patched.Labels, attachedToLabel)
-	} else {
-		patched.Labels[attachedToLabel] = holder
-	}
+	delete(patched.Labels, attachedToLabel)
+	delete(patched.Labels, attachedToUIDLabel)
 	if err := r.Update(ctx, patched); err != nil {
-		return fmt.Errorf("recording the holder of %s/%s: %w", namespace, claim, err)
+		return fmt.Errorf("releasing disk %s/%s: %w", namespace, claim, err)
 	}
 	kube.CountWrite(r.Scheme, patched, vmControllerName, "updated")
 	return nil
@@ -272,7 +368,7 @@ func (r *ManagedVMReconciler) releaseDisks(
 		seen[name] = struct{}{}
 	}
 	for claim := range seen {
-		if err := r.setAttachedTo(ctx, vm.Namespace, claim, ""); err != nil {
+		if err := r.releaseDisk(ctx, vm.Namespace, claim, vm.Name, string(vm.UID)); err != nil {
 			return err
 		}
 	}

@@ -1023,3 +1023,242 @@ func TestDeletingAMachineReleasesItsDisks(t *testing.T) {
 		return nil
 	})
 }
+
+// Admission refuses a disk another machine already declares, but admission is a
+// preflight: two requests racing each read a world in which the other has not
+// landed, and both pass. The claim on the disk itself is what decides. Here the
+// webhook is not running at all, which is precisely the situation to test.
+func TestTwoMachinesRacingForOneDiskLeaveExactlyOneHolder(t *testing.T) {
+	ns := "vm-disk-race"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+	mustDataVolume(t, ns, "contested")
+
+	for _, name := range []string{"racer-a", "racer-b"} {
+		vm := newManagedVM(ns, name, "ubuntu")
+		vm.Spec.Disks = []platformv1alpha1.DiskAttachment{{Claim: "contested"}}
+		if err := k8sClient.Create(testCtx, vm); err != nil {
+			t.Fatalf("creating %s: %v", name, err)
+		}
+	}
+
+	eventually(t, "both machines to be rendered", func() error {
+		for _, name := range []string{"racer-a", "racer-b"} {
+			if _, err := getKubeVirtVM(ns, name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	eventually(t, "exactly one of them to hold the disk", func() error {
+		holders := 0
+		var loser string
+		for _, name := range []string{"racer-a", "racer-b"} {
+			kvm, err := getKubeVirtVM(ns, name)
+			if err != nil {
+				return err
+			}
+			attached := false
+			for _, v := range kvm.Spec.Template.Spec.Volumes {
+				if v.Name == "contested" {
+					attached = true
+				}
+			}
+			if attached {
+				holders++
+			} else {
+				loser = name
+			}
+		}
+		if holders != 1 {
+			return fmt.Errorf("%d machines have the disk attached; exactly one may", holders)
+		}
+
+		// And the one that lost says so, naming who has it.
+		got := getVM(t, ns, loser)
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, platformv1alpha1.ConditionDisksAttached)
+		if cond == nil || cond.Status != metav1.ConditionFalse {
+			return fmt.Errorf("the machine without the disk does not say so: %+v", cond)
+		}
+		if !strings.Contains(cond.Message, "contested") || !strings.Contains(cond.Message, "held by") {
+			return fmt.Errorf("the refusal does not name the holder: %q", cond.Message)
+		}
+		return nil
+	})
+
+	// The label names the winner, pinned to that object rather than to its
+	// name, and only one machine ever wrote it.
+	dv := &cdiv1.DataVolume{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "contested"}, dv); err != nil {
+		t.Fatalf("reading the contested disk: %v", err)
+	}
+	holder := dv.Labels[attachedToLabel]
+	if holder != "racer-a" && holder != "racer-b" {
+		t.Fatalf("attached-to = %q, want one of the two racers", holder)
+	}
+	winner := getVM(t, ns, holder)
+	if dv.Labels[attachedToUIDLabel] != string(winner.UID) {
+		t.Fatalf("the claim is not pinned to the winning object: %q vs %q",
+			dv.Labels[attachedToUIDLabel], winner.UID)
+	}
+
+	// The loser stays refused rather than eventually taking the disk: a race
+	// that resolves and then un-resolves is worse than one that never did.
+	loser := "racer-a"
+	if holder == "racer-a" {
+		loser = "racer-b"
+	}
+	consistently(t, "the loser to stay out", 6*time.Second, func() error {
+		kvm, err := getKubeVirtVM(ns, loser)
+		if err != nil {
+			return err
+		}
+		for _, v := range kvm.Spec.Template.Spec.Volumes {
+			if v.Name == "contested" {
+				return fmt.Errorf("the machine that lost the race took the disk anyway")
+			}
+		}
+		fresh := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "contested"}, fresh); err != nil {
+			return err
+		}
+		if fresh.Labels[attachedToLabel] != holder {
+			return fmt.Errorf("the holder changed to %q", fresh.Labels[attachedToLabel])
+		}
+		return nil
+	})
+}
+
+// A machine must not be able to free a disk it does not hold — a release that
+// skips the check hands somebody else's disk away, which is the very outcome
+// the claim exists to prevent.
+func TestOnlyTheHolderCanReleaseADisk(t *testing.T) {
+	ns := "vm-disk-release-guard"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+	mustDataVolume(t, ns, "held-tight")
+
+	holder := newManagedVM(ns, "holder", "ubuntu")
+	holder.Spec.Disks = []platformv1alpha1.DiskAttachment{{Claim: "held-tight"}}
+	if err := k8sClient.Create(testCtx, holder); err != nil {
+		t.Fatalf("creating holder: %v", err)
+	}
+	eventually(t, "the disk to be held", func() error {
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "held-tight"}, dv); err != nil {
+			return err
+		}
+		if dv.Labels[attachedToLabel] != "holder" {
+			return fmt.Errorf("attached-to = %q", dv.Labels[attachedToLabel])
+		}
+		return nil
+	})
+
+	// Another machine lists the disk, is refused, and is then deleted. Its
+	// cleanup must not free a disk it never had.
+	other := newManagedVM(ns, "bystander", "ubuntu")
+	other.Spec.Disks = []platformv1alpha1.DiskAttachment{{Claim: "held-tight"}}
+	if err := k8sClient.Create(testCtx, other); err != nil {
+		t.Fatalf("creating bystander: %v", err)
+	}
+	eventually(t, "the bystander to be refused", func() error {
+		got := getVM(t, ns, "bystander")
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, platformv1alpha1.ConditionDisksAttached)
+		if cond == nil || cond.Status != metav1.ConditionFalse {
+			return fmt.Errorf("condition = %+v", cond)
+		}
+		return nil
+	})
+	if err := k8sClient.Delete(testCtx, getVM(t, ns, "bystander")); err != nil {
+		t.Fatalf("deleting bystander: %v", err)
+	}
+
+	eventually(t, "the bystander to be gone", func() error {
+		got := &platformv1alpha1.ManagedVM{}
+		err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "bystander"}, got)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("still present")
+	})
+
+	dv := &cdiv1.DataVolume{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "held-tight"}, dv); err != nil {
+		t.Fatalf("reading the disk: %v", err)
+	}
+	if dv.Labels[attachedToLabel] != "holder" {
+		t.Fatalf("a machine that never held the disk released it: attached-to = %q",
+			dv.Labels[attachedToLabel])
+	}
+}
+
+// The dangerous ordering: a machine's release runs late, after the disk has
+// already been claimed by somebody else. Comparing names alone would free the
+// new holder's disk; the UID is what makes the check exact.
+func TestALateReleaseDoesNotFreeSomebodyElsesClaim(t *testing.T) {
+	ns := "vm-disk-late-release"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+	mustDataVolume(t, ns, "passed-on")
+
+	first := newManagedVM(ns, "first-owner", "ubuntu")
+	first.Spec.Disks = []platformv1alpha1.DiskAttachment{{Claim: "passed-on"}}
+	if err := k8sClient.Create(testCtx, first); err != nil {
+		t.Fatalf("creating the first owner: %v", err)
+	}
+	eventually(t, "the first owner to hold the disk", func() error {
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "passed-on"}, dv); err != nil {
+			return err
+		}
+		if dv.Labels[attachedToLabel] != "first-owner" {
+			return fmt.Errorf("attached-to = %q", dv.Labels[attachedToLabel])
+		}
+		return nil
+	})
+
+	// Somebody else takes the disk — the same name reused, or simply the next
+	// machine along. Either way the claim now belongs to a different object.
+	const newOwnerUID = "99999999-8888-7777-6666-555555555555"
+	eventually(t, "the disk to be re-claimed by another object", func() error {
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "passed-on"}, dv); err != nil {
+			return err
+		}
+		dv.Labels[attachedToLabel] = "first-owner"
+		dv.Labels[attachedToUIDLabel] = newOwnerUID
+		return k8sClient.Update(testCtx, dv)
+	})
+
+	// Now the original machine goes away, and its cleanup runs late.
+	if err := k8sClient.Delete(testCtx, getVM(t, ns, "first-owner")); err != nil {
+		t.Fatalf("deleting the first owner: %v", err)
+	}
+	eventually(t, "the first owner to be gone", func() error {
+		got := &platformv1alpha1.ManagedVM{}
+		err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "first-owner"}, got)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("still held by finalizers %v", got.Finalizers)
+	})
+
+	dv := &cdiv1.DataVolume{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "passed-on"}, dv); err != nil {
+		t.Fatalf("reading the disk: %v", err)
+	}
+	if dv.Labels[attachedToUIDLabel] != newOwnerUID {
+		t.Fatalf("a late release freed a claim that had moved on: uid = %q, want %q",
+			dv.Labels[attachedToUIDLabel], newOwnerUID)
+	}
+	if dv.Labels[attachedToLabel] == "" {
+		t.Fatal("a late release cleared the holder entirely")
+	}
+}

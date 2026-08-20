@@ -264,6 +264,9 @@ const (
 	ConditionProvisioned = "Provisioned"
 	// ConditionImageReady reports the state of the image this VM clones from.
 	ConditionImageReady = "ImageReady"
+	// ConditionDisksAttached is false when a declared disk could not be
+	// attached, and names what is holding it.
+	ConditionDisksAttached = "DisksAttached"
 )
 
 // ManagedVMStatus is the derived state, kept deliberately small.
