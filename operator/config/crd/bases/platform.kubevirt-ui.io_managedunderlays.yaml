@@ -1,0 +1,310 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: managedunderlays.platform.kubevirt-ui.io
+spec:
+  group: platform.kubevirt-ui.io
+  names:
+    kind: ManagedUnderlay
+    listKind: ManagedUnderlayList
+    plural: managedunderlays
+    shortNames:
+    - mul
+    singular: managedunderlay
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.interface
+      name: Interface
+      type: string
+    - jsonPath: .spec.subnetName
+      name: Subnet
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="FabricReady")].status
+      name: Fabric
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="NodesLabelled")].status
+      name: Nodes
+      type: string
+    - jsonPath: .status.labelHeals
+      name: Heals
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ManagedUnderlay is the physical path out of the cluster.
+
+          Its children carry ownerReferences, unlike a ManagedVM's. The reasoning is
+          the opposite one: a VM must survive its CR being rolled back, because the
+          workload is the point and the record of it is not. Here the objects *are*
+          the record — a ProviderNetwork with no ManagedUnderlay behind it is fabric
+          nobody is keeping up.
+
+          The consequence is worth stating plainly: deleting this object takes the
+          external subnet with it, and every egress gateway attached to it. That is
+          not a subtle blast radius, but it is the honest one, and it is the same as
+          deleting the Subnet by hand — which is exactly what used to happen, with no
+          object anywhere saying what the four pieces had to do with each other.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ManagedUnderlaySpec describes the physical path out of the cluster that VPC
+              egress gateways attach to: a NIC, a VLAN, and an external subnet reachable
+              through a network-attachment-definition.
+            properties:
+              ciliumImage:
+                default: quay.io/cilium/cilium:v1.20.0
+                type: string
+              ciliumNamespace:
+                description: CiliumNamespace is where that DaemonSet goes. Empty means
+                  find it.
+                type: string
+              ciliumSourceIPExempt:
+                description: |-
+                  CiliumSourceIPExempt deploys the DaemonSet that clears source-IP
+                  verification on VPC gateway endpoints. Unset means decide by looking at
+                  the cluster, which is the only answer that has ever been right: the
+                  form's default of "no" was wrong on the one cluster it was asked about.
+
+                  Per-endpoint on purpose. The global `enable-source-ip-verification:
+                  false` fixes it in one line and disables anti-spoofing for every pod in
+                  the cluster — a bad trade when tenant worker VMs are root-accessible to
+                  their tenants.
+                type: boolean
+              excludeIPs:
+                description: ExcludeIPs are ranges of ExternalCIDR kube-ovn must not
+                  allocate from.
+                items:
+                  type: string
+                type: array
+              excludeNodes:
+                description: |-
+                  ExcludeNodes are nodes without the dedicated NIC — typically the control
+                  plane.
+                items:
+                  type: string
+                type: array
+              externalCIDR:
+                description: ExternalCIDR is the segment on the other side of that
+                  NIC.
+                minLength: 1
+                type: string
+              externalGateway:
+                description: ExternalGateway is the upstream address on that segment.
+                minLength: 1
+                type: string
+              interface:
+                description: |-
+                  Interface is the dedicated NIC for the provider network, e.g. `eth1`.
+
+                  It must not be the node's management interface. kube-ovn enslaves the NIC
+                  into the OVS bridge and migrates its address there, which on Talos does
+                  not hold: the node loses its address and stays NotReady until it is
+                  rebooted.
+                minLength: 1
+                type: string
+              kubeOVNNamespace:
+                description: |-
+                  KubeOVNNamespace is where the NAD and the link watcher go. Empty means
+                  find it — the namespace running kube-ovn's own CNI DaemonSet.
+                type: string
+              linkWatcher:
+                default: true
+                description: |-
+                  LinkWatcher deploys the DaemonSet that keeps every provider NIC
+                  administratively up.
+
+                  A workaround, and labelled as one. kube-ovn raises the provider NIC once
+                  at bridge init and never rechecks it; on Talos it drops back DOWN minutes
+                  later. A down provider NIC is the most misleading failure in this stack:
+                  OVS lists the port, the bridge mapping is right, pods get addresses, and
+                  every frame is swallowed.
+                type: boolean
+              linkWatcherImage:
+                description: |-
+                  LinkWatcherImage overrides the image. Empty reuses the image kube-ovn's
+                  own CNI DaemonSet runs — already pulled on exactly the nodes the watcher
+                  runs on, and it carries iproute2 because kube-ovn uses it. A named public
+                  image is a dependency that can rot: one such default stopped serving a
+                  layer and the watcher sat in ImagePullBackOff, desired 3 ready 0, which
+                  reads as a healthy DaemonSet in every summary that counts objects.
+                type: string
+              providerNetworkName:
+                default: external
+                type: string
+              subnetName:
+                default: ext-sub
+                type: string
+              vlanID:
+                default: 0
+                description: |-
+                  VLANID is the tag, 0 for untagged.
+
+                  Tagged frames do not always survive an overlay underneath — measured on
+                  an OpenNebula VXLAN lab, where two pods on different workers could not
+                  ARP each other while untagged frames between the same NICs were fine.
+                format: int32
+                maximum: 4094
+                minimum: 0
+                type: integer
+              vlanName:
+                default: vlan-external
+                type: string
+            required:
+            - externalCIDR
+            - externalGateway
+            - interface
+            type: object
+          status:
+            description: ManagedUnderlayStatus is what the fabric actually looks like.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              daemonSets:
+                description: DaemonSets is the state of the workarounds.
+                items:
+                  description: |-
+                    UnderlayDaemonSetStatus is whether a DaemonSet is doing anything, as opposed
+                    to whether it exists.
+                  properties:
+                    desired:
+                      format: int32
+                      type: integer
+                    detail:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    ready:
+                      format: int32
+                      type: integer
+                    state:
+                      description: State is one of running, scheduled-nowhere, not-starting,
+                        absent, skipped.
+                      type: string
+                  required:
+                  - name
+                  - state
+                  type: object
+                type: array
+              labelHeals:
+                description: |-
+                  LabelHeals counts how many times this controller has had to put the
+                  gateway label back. It is not expected to be zero: on the lab the label
+                  was found sitting at an explicit `false` on all three workers with
+                  nothing in managedFields claiming it. A number that keeps climbing means
+                  something else is still writing it, and is worth chasing; the fabric
+                  stays up either way.
+                format: int64
+                type: integer
+              labelledNodes:
+                description: LabelledNodes carry `ovn.kubernetes.io/external-gw=true`.
+                items:
+                  type: string
+                type: array
+              observedGeneration:
+                format: int64
+                type: integer
+              provider:
+                description: |-
+                  Provider is the `<nad>.<namespace>.ovn` string tying the subnet to its
+                  NAD, published because kube-ovn compares it character for character and
+                  says so only in a refusal.
+                type: string
+              readyNodes:
+                description: |-
+                  ReadyNodes are the nodes whose OVS bridge for this provider network came
+                  up — kube-ovn's own answer to "does this NIC exist here".
+                items:
+                  type: string
+                type: array
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

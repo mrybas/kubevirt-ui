@@ -24,7 +24,7 @@ import "testing"
 // like a slug bug.
 func TestSlugMatchesTheBackendExamples(t *testing.T) {
 	cases := map[string]string{
-		"Ubuntu 24.04 Server": "ubuntu-24-04-server",
+		"Ubuntu 24.04 Server":  "ubuntu-24-04-server",
 		"My   Weird---Name!!!": "my-weird-name",
 		"":                     "unnamed",
 		"!!!":                  "unnamed",

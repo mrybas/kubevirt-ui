@@ -9,7 +9,6 @@ rules:
   resources:
   - configmaps
   - namespaces
-  - nodes
   verbs:
   - get
   - list
@@ -21,6 +20,16 @@ rules:
   verbs:
   - create
   - patch
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - ""
   resources:
@@ -37,6 +46,18 @@ rules:
   verbs:
   - get
   - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - cdi.kubevirt.io
@@ -81,14 +102,39 @@ rules:
   - list
   - watch
 - apiGroups:
+  - k8s.cni.cncf.io
+  resources:
+  - network-attachment-definitions
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - kubeovn.io
   resources:
   - ovn-eips
-  - subnets
   - vpcs
   verbs:
   - get
   - list
+  - watch
+- apiGroups:
+  - kubeovn.io
+  resources:
+  - provider-networks
+  - subnets
+  - vlans
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - kubevirt.io
@@ -125,6 +171,7 @@ rules:
   resources:
   - announcementpolicies
   - managedimages
+  - managedunderlays
   - managedvmoperations
   - managedvms
   - managedvmtemplates
@@ -141,6 +188,7 @@ rules:
   resources:
   - announcementpolicies/status
   - managedimages/status
+  - managedunderlays/status
   - managedvmoperations/status
   - managedvms/status
   - managedvmtemplates/status

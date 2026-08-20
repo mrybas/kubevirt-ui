@@ -35,8 +35,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	kubevirtv1 "kubevirt.io/api/core/v1"
 	clonev1beta1 "kubevirt.io/api/clone/v1beta1"
+	kubevirtv1 "kubevirt.io/api/core/v1"
 	snapshotv1beta1 "kubevirt.io/api/snapshot/v1beta1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
@@ -266,6 +266,14 @@ func main() {
 			Recorder: mgr.GetEventRecorderFor("announcementpolicy"),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "announcementpolicy")
+			os.Exit(1)
+		}
+		if err := (&controller.ManagedUnderlayReconciler{
+			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
+			Recorder: mgr.GetEventRecorderFor("managedunderlay"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "managedunderlay")
 			os.Exit(1)
 		}
 	}
