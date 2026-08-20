@@ -952,3 +952,25 @@ And the reason that got noticed at all: the normalisation `sed` failed on the
 slashes in a CIDR, wrote two empty files, and `diff` called them identical. A
 comparison that passes on empty inputs is not a comparison. Byte counts are now
 printed alongside every diff in this log's live checks.
+
+### Dataplane proof, not just object proof
+
+`opnet1-default` has a real logical switch in OVN
+(`ovn-nbctl ls-list` → `4787eab0… (opnet1-default)`), alongside the UI-built
+`uat-net-vm-default`. The CR conditions alone would not have shown this: the
+subnet that turned out to have **no** logical switch also reported
+`Ready=True, reason=ResetLogicalSwitchAclSuccess`.
+
+### A trap of my own making, worth the rule
+
+Deleting a test network and immediately recreating it under the same name left
+the second one with no logical switch at all (`not found logical switch
+"uinet1-default"`, logged while the VpcDns pod tried to attach), and its Subnet
+then sat in Terminating forever on kube-ovn's finalizer — the UI's honest 409
+says "retry in a moment", and the moment never came. Deleting the Vpc did not
+release it either; I tested that rather than assuming, and the hypothesis was
+wrong.
+
+Rule for the live cycles from here: **never reuse a network name**. The first
+delete is still in flight when the second create lands, and the two collide
+somewhere below the CRs where nothing reports it.
