@@ -522,3 +522,30 @@ Also worth writing down, because it wasted a measurement: the first attempt to
 deploy that fix ran `kubectl apply … >/dev/null 2>&1`, so the apply's failure
 was invisible and the "still refused" reading looked like a code problem. Prove
 the change arrived — and do not silence the command that would tell you.
+
+#### Proving the claim is a compare-and-set, not a hope
+
+"Exactly one machine ends up with the disk" is not the same claim as "the write
+is atomic": with one worker per controller the reconciles are serialised, so the
+loser usually loses on the *read*, and a test that only checks the outcome would
+pass just as well if the write were last-writer-wins.
+
+So the conflict branch is forced. A test client hands one claimant a snapshot
+taken before the other's claim landed, which puts a stale resourceVersion on its
+write. It must come back as a lost race, and the disk must still name the first
+holder with the first holder's UID.
+
+The test was then checked for being vacuous by breaking the production code, and
+two attempts were **inconclusive** before one worked — worth recording, because
+each looked like a valid mutation:
+
+- clearing `resourceVersion` before the update: rejected outright by the API
+  server (`must be specified for an update`), so it never became a
+  last-writer-wins write at all;
+- switching to `client.Merge`: still carries the resourceVersion in the patch
+  body, so the API server still treats it as a precondition;
+- a labels-only raw merge patch, which carries no version: this one **made the
+  test fail** with "a stale claimant succeeded; the write is not version-checked".
+
+Only the third mutation proves anything. A comment on the update in
+`claimDisk` now records why it is an Update and not a patch.

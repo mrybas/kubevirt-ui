@@ -17,8 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1260,5 +1263,227 @@ func TestALateReleaseDoesNotFreeSomebodyElsesClaim(t *testing.T) {
 	}
 	if dv.Labels[attachedToLabel] == "" {
 		t.Fatal("a late release cleared the holder entirely")
+	}
+}
+
+// The previous test shows exactly one machine ends up with the disk, but it
+// would pass just as well with a plain read-then-write, because the reconciles
+// are serialised and the second one simply reads a label that is already there.
+// What follows tests the property that makes the outcome safe when they are not
+// serialised: the claim write is version-checked, so a writer holding a stale
+// read cannot overwrite a claim made in the meantime.
+func TestTheClaimWriteIsVersionCheckedNotLastWriterWins(t *testing.T) {
+	ns := "vm-claim-cas"
+	mustNamespace(t, ns, "opdev")
+	mustDataVolume(t, ns, "cas-disk")
+
+	// Reads go through the manager's cache, which trails a create.
+	stale := &cdiv1.DataVolume{}
+	eventually(t, "the disk to be visible", func() error {
+		return k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "cas-disk"}, stale)
+	})
+
+	// Somebody else claims it after that read.
+	winner := stale.DeepCopy()
+	winner.Labels[attachedToLabel] = "machine-b"
+	winner.Labels[attachedToUIDLabel] = "bbbbbbbb-0000-0000-0000-000000000000"
+	if err := k8sClient.Update(testCtx, winner); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+
+	// The holder of the stale read now tries to claim the same disk. Its object
+	// still carries the resourceVersion from before, which is what the API
+	// server checks.
+	stale.Labels[attachedToLabel] = "machine-a"
+	stale.Labels[attachedToUIDLabel] = "aaaaaaaa-0000-0000-0000-000000000000"
+	err := k8sClient.Update(testCtx, stale)
+	if err == nil {
+		t.Fatal("a stale write took the claim; the write is last-writer-wins, not compare-and-set")
+	}
+	if !apierrors.IsConflict(err) {
+		t.Fatalf("expected a conflict, got %v", err)
+	}
+
+	eventually(t, "the first claim to stand", func() error {
+		after := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "cas-disk"}, after); err != nil {
+			return err
+		}
+		if after.Labels[attachedToLabel] != "machine-b" {
+			return fmt.Errorf("holder = %q, want the machine that got there first",
+				after.Labels[attachedToLabel])
+		}
+		return nil
+	})
+}
+
+// And the same thing with real contention: N callers going for one disk at the
+// same moment, exactly one of which may come away with it.
+//
+// This drives claimDisk directly rather than through Reconcile, because
+// contention is the property under test and the controller runs one worker per
+// object — the end-to-end outcome is covered by the racing-machines test above.
+func TestConcurrentClaimsProduceExactlyOneWinner(t *testing.T) {
+	ns := "vm-claim-concurrent"
+	mustNamespace(t, ns, "opdev")
+
+	reconciler := &ManagedVMReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+
+	for round := range 5 {
+		disk := fmt.Sprintf("hot-disk-%d", round)
+		mustDataVolume(t, ns, disk)
+		// The cache has to know about the disk before the claimants read it,
+		// or they all miss it and none of them claims anything.
+		eventually(t, "the disk to be visible", func() error {
+			dv := &cdiv1.DataVolume{}
+			return k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: disk}, dv)
+		})
+
+		const claimants = 2
+		start := make(chan struct{})
+		results := make(chan struct {
+			holder string
+			err    error
+		}, claimants)
+
+		var wg sync.WaitGroup
+		for i := range claimants {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				holder, err := reconciler.claimDisk(
+					testCtx, ns, disk,
+					fmt.Sprintf("claimant-%d", i),
+					fmt.Sprintf("%08d-0000-0000-0000-000000000000", i),
+				)
+				results <- struct {
+					holder string
+					err    error
+				}{holder, err}
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+		close(results)
+
+		won := 0
+		for res := range results {
+			switch {
+			case res.err != nil:
+				// Lost on a conflict: the API server refused the stale write.
+				if !contains(res.err.Error(), "lost the race") {
+					t.Fatalf("round %d: unexpected error %v", round, res.err)
+				}
+			case res.holder != "":
+				// Lost on a read: somebody already held it.
+			default:
+				won++
+			}
+		}
+		if won != 1 {
+			t.Fatalf("round %d: %d claimants believe they hold the disk; exactly one may", round, won)
+		}
+
+		eventually(t, fmt.Sprintf("round %d: the winner's claim to be visible", round), func() error {
+			dv := &cdiv1.DataVolume{}
+			if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: disk}, dv); err != nil {
+				return err
+			}
+			if dv.Labels[attachedToLabel] == "" {
+				return fmt.Errorf("a winner was reported but the disk has no holder yet")
+			}
+			return nil
+		})
+	}
+}
+
+// staleReader hands out a snapshot taken earlier for one named object, and
+// passes everything else through.
+//
+// It exists to force the case the concurrent test can only hope for: a claimant
+// whose read happened *before* somebody else's claim landed, so its write
+// carries an out-of-date resourceVersion. Without this the loser usually loses
+// on the read, and the compare-and-set branch is never exercised — a test that
+// would pass just as well if the write were last-writer-wins.
+type staleReader struct {
+	client.Client
+	name     string
+	snapshot *cdiv1.DataVolume
+}
+
+func (s staleReader) Get(
+	ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption,
+) error {
+	if dv, ok := obj.(*cdiv1.DataVolume); ok && key.Name == s.name {
+		s.snapshot.DeepCopyInto(dv)
+		return nil
+	}
+	return s.Client.Get(ctx, key, obj, opts...)
+}
+
+// The claim must be decided by the API server's version check, not by whoever
+// writes last.
+func TestAClaimantWithAStaleReadLosesOnConflict(t *testing.T) {
+	ns := "vm-claim-forced"
+	mustNamespace(t, ns, "opdev")
+	mustDataVolume(t, ns, "forced-disk")
+
+	snapshot := &cdiv1.DataVolume{}
+	eventually(t, "the disk to be visible", func() error {
+		return k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "forced-disk"}, snapshot)
+	})
+
+	winner := &ManagedVMReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	holder, err := winner.claimDisk(testCtx, ns, "forced-disk", "machine-b",
+		"bbbbbbbb-0000-0000-0000-000000000000")
+	if err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	if holder != "" {
+		t.Fatalf("the disk was already held by %q before the test started", holder)
+	}
+
+	// Now a claimant that read the disk before that claim landed. Its write
+	// carries the old resourceVersion, which is the whole question.
+	loser := &ManagedVMReconciler{
+		Client: staleReader{Client: k8sClient, name: "forced-disk", snapshot: snapshot},
+		Scheme: k8sClient.Scheme(),
+	}
+	holder, err = loser.claimDisk(testCtx, ns, "forced-disk", "machine-a",
+		"aaaaaaaa-0000-0000-0000-000000000000")
+	if err == nil {
+		t.Fatalf("a stale claimant succeeded (holder=%q); the write is not version-checked", holder)
+	}
+	if !contains(err.Error(), "lost the race") {
+		t.Fatalf("expected the conflict to be reported as a lost race, got %v", err)
+	}
+	if !apierrors.IsConflict(errors.Unwrap(err)) {
+		t.Fatalf("expected a conflict underneath, got %v", errors.Unwrap(err))
+	}
+
+	// And the disk still belongs to whoever got there first.
+	eventually(t, "the first claim to stand", func() error {
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "forced-disk"}, dv); err != nil {
+			return err
+		}
+		if dv.Labels[attachedToLabel] != "machine-b" {
+			return fmt.Errorf("holder = %q", dv.Labels[attachedToLabel])
+		}
+		if dv.Labels[attachedToUIDLabel] != "bbbbbbbb-0000-0000-0000-000000000000" {
+			return fmt.Errorf("holder uid = %q", dv.Labels[attachedToUIDLabel])
+		}
+		return nil
+	})
+
+	// The loser, reading afresh, is told who has it rather than taking it.
+	holder, err = winner.claimDisk(testCtx, ns, "forced-disk", "machine-a",
+		"aaaaaaaa-0000-0000-0000-000000000000")
+	if err != nil {
+		t.Fatalf("re-reading claimant: %v", err)
+	}
+	if holder != "machine-b" {
+		t.Fatalf("holder reported as %q, want machine-b", holder)
 	}
 }

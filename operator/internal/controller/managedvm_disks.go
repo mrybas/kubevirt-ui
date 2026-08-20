@@ -24,9 +24,9 @@ import (
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
@@ -186,6 +186,11 @@ func (r *ManagedVMReconciler) claimDisk(
 	}
 	patched.Labels[attachedToLabel] = holder
 	patched.Labels[attachedToUIDLabel] = holderUID
+	// Update rather than a patch, deliberately: it carries the resourceVersion
+	// the object was read at, so the API server rejects a claimant whose read
+	// predates somebody else's claim. A labels-only patch would carry no
+	// version and the last writer would simply win — checked by mutating this
+	// line and watching the stale-read test fail.
 	if err := r.Update(ctx, patched); err != nil {
 		if apierrors.IsConflict(err) {
 			return "", fmt.Errorf("lost the race for disk %s/%s: %w", namespace, claim, err)
