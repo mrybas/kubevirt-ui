@@ -2492,10 +2492,17 @@ the VPC:
 ```
 own VIP    10.199.0.104:6443   open
 own VIP    10.199.0.104:8132   open
+own VIP    10.199.0.104:123u   open, and answered — receive time stamp 21:29:10
 other VIP  10.199.0.100:6443   closed   <- the deny is in force
+other VIP  10.199.0.100:123u   no reply
 own VIP    10.199.0.104:9999   closed   <- only the ports it was given
 internet   1.1.1.1:443         closed   <- there is no gateway path at all
 ```
+
+The clock is in the table on purpose: it is the port the old guard dropped,
+and its absence presents as a node that never joins with nothing naming the
+time. Asked for with an NTP query rather than a port scan, so what is recorded
+is a server answering, not a port state guessed from silence.
 
 The third line is the one that proves the source: the deny only matches traffic
 from `10.199.1.0/24`, so a refusal on the neighbour's VIP means the packets are
