@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 )
@@ -20,6 +21,16 @@ import (
 func cpService(tenantName string) (*corev1.Service, error) {
 	service := &corev1.Service{}
 	err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-" + tenantName, Name: tenantName + "-cp-lb",
+	}, service)
+	return service, err
+}
+
+// uncachedCPService is the same read straight from the API server, for the
+// assertions that turn on a Service not being there.
+func uncachedCPService(tenantName string) (*corev1.Service, error) {
+	service := &corev1.Service{}
+	err := k8sReader.Get(testCtx, types.NamespacedName{
 		Namespace: "tenant-" + tenantName, Name: tenantName + "-cp-lb",
 	}, service)
 	return service, err
@@ -37,9 +48,16 @@ func mustCPService(t *testing.T, tenantName string) *corev1.Service {
 // assignAddress is MetalLB's part, which envtest has nobody to play.
 func assignAddress(t *testing.T, tenantName, ip string) {
 	t.Helper()
-	service := mustCPService(t, tenantName)
-	service.Status.LoadBalancer.Ingress = []corev1.LoadBalancerIngress{{IP: ip}}
-	if err := k8sClient.Status().Update(testCtx, service); err != nil {
+	// Patched rather than read-then-updated: this client reads from a cache,
+	// and a read-modify-write against an object the controller is also touching
+	// loses the race often enough to make a test flake.
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "tenant-" + tenantName, Name: tenantName + "-cp-lb",
+	}}
+	patch := []byte(fmt.Sprintf(
+		`{"status":{"loadBalancer":{"ingress":[{"ip":%q}]}}}`, ip))
+	if err := k8sClient.Status().Patch(testCtx, service,
+		client.RawPatch(types.MergePatchType, patch)); err != nil {
 		t.Fatalf("assigning %s to %s: %v", ip, tenantName, err)
 	}
 }
@@ -181,8 +199,10 @@ func TestAPoolTheSubnetDoesNotExcludeIsRefusedBeforeAnAddressIsHandedOut(t *test
 		t.Errorf("reason = %q", got)
 	}
 
+	// Straight to the API server: a cached read cannot tell "was not created"
+	// from "has not arrived", and here the first of those is the whole claim.
 	service := &corev1.Service{}
-	err = k8sClient.Get(testCtx, types.NamespacedName{
+	err = k8sReader.Get(testCtx, types.NamespacedName{
 		Namespace: "tenant-tadx", Name: "tadx-cp-lb",
 	}, service)
 	if err == nil {
@@ -198,7 +218,7 @@ func TestAPoolTheSubnetDoesNotExcludeIsRefusedBeforeAnAddressIsHandedOut(t *test
 	if _, _, _, _, err := reconciler.reconcileAddress(testCtx, obj, "tenant-tadx"); err != nil {
 		t.Fatalf("reconcileAddress against a well-excluded pool: %v", err)
 	}
-	if err := k8sClient.Get(testCtx, types.NamespacedName{
+	if err := k8sReader.Get(testCtx, types.NamespacedName{
 		Namespace: "tenant-tadx", Name: "tadx-cp-lb",
 	}, service); err != nil {
 		t.Fatalf("the Service was not asked for even with the pool excluded: %v", err)
@@ -276,7 +296,7 @@ func TestATenantOnTheDefaultOverlayAsksForNoAddress(t *testing.T) {
 		return nil
 	})
 
-	if _, err := cpService("tadd"); err == nil {
+	if _, err := uncachedCPService("tadd"); err == nil {
 		t.Error("an address was asked for on the default overlay")
 	} else if !apierrors.IsNotFound(err) {
 		t.Fatalf("reading the Service: %v", err)
@@ -294,7 +314,7 @@ func TestATenantOnTheDefaultOverlayAsksForNoAddress(t *testing.T) {
 	// And no time Service either: on the default overlay a worker reaches the
 	// public servers the same way it reaches everything else.
 	service := &corev1.Service{}
-	err := k8sClient.Get(testCtx, types.NamespacedName{
+	err := k8sReader.Get(testCtx, types.NamespacedName{
 		Namespace: "kubevirt-ui-system", Name: "tadd-ntp",
 	}, service)
 	if err == nil {

@@ -137,8 +137,31 @@ rules:
 - apiGroups:
   - cluster.x-k8s.io
   resources:
+  - clusters
+  - machinehealthchecks
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
   - machinedeployments
   verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - controlplane.cluster.x-k8s.io
+  resources:
+  - kamajicontrolplanes
+  verbs:
+  - create
   - get
   - list
   - patch
@@ -170,6 +193,18 @@ rules:
   verbs:
   - get
   - list
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - kubevirtclusters
+  - kubevirtmachinetemplates
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - k8s.cni.cncf.io

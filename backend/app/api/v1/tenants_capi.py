@@ -387,7 +387,6 @@ def _build_kamaji_cp_cr(
     if req.worker_os == "talos":
         talos_add = talos_control_plane_additions(
             req.name, _tenant_ns(req.name), _talos_signer_image(),
-            shared_vip=advertise_vip is not None,
         )
         # KamajiControlPlane names these `extraContainers`/`extraVolumes`;
         # TenantControlPlane calls the same things `additionalContainers`/
@@ -401,8 +400,6 @@ def _build_kamaji_cp_cr(
         spec["network"]["certSANs"] = [
             *spec["network"]["certSANs"], *talos_add["certSANs"],
         ]
-        if "additionalPorts" in talos_add:
-            spec["network"]["additionalPorts"] = talos_add["additionalPorts"]
     # VPC (advertiseAddress) model: advertise the shared CP VIP so
     # cluster-info points workers at <vip>:<apiServerPort> (reachable from
     # the isolated VPC). serviceType stays ClusterIP. Default overlay omits

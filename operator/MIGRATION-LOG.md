@@ -1952,10 +1952,24 @@ PKIReady=True on that tenant is worth its own line: cert-manager issued the
 signer certificate, and the SAN check — the VIP among the IP addresses, both DNS
 names present — passed against a real certificate rather than a hand-built one.
 
-Open, and recorded rather than smoothed over: one full run of the controller
-suite failed while this slice was being finished, and the output was not kept —
-three runs since have passed. If it is real it will show in CI, where the suite
-runs on every push; if it does, the run that catches it will name it.
+### The flake, caught and named
+
+Rather than leaving it to CI: eight runs in a row with the output kept, stopping
+at the first red. Run 4 was it —
+
+```
+managedtenant_address_test.go:204: the Service was not asked for even with the
+pool excluded: Service "tadx-cp-lb" not found
+```
+
+— a race in my own test, not in the product. It read a Service it had just
+caused to be created through the *cached* client, whose informer had not caught
+up. The dangerous half is the assertion beside it: "no Service was created" read
+the same way, so a cache one beat behind would have made the safety check pass
+for the wrong reason. Both now read straight from the API server, through a
+reader added to the suite for exactly this — and the helper that fakes MetalLB
+patches the status instead of reading-and-updating it, which is the same race
+one object over.
 
 ### Correction: only a tenant in a VPC needs an address of its own
 
@@ -1978,3 +1992,59 @@ from the same fact and all of them had to move together:
   cert-manager refuses a certificate with an empty `ipAddresses`, so the whole
   chain would fail to issue. Readiness follows — with no address, only the names
   are checked, because only the names are dialled.
+
+## M12d (first slice) — the control plane, declared
+
+Three objects: the CAPI `Cluster`, the `KubevirtCluster` that CAPK reads, and
+the `KamajiControlPlane` that actually runs an apiserver. Declared, not built —
+Kamaji creates the pods and CAPI wires them together; what this owns is the
+description they act on.
+
+Plus the tenant's machine secrets, which the PKI slice missed: the signer
+sidecar mounts `<t>-talos-secrets` for the token a worker authenticates with.
+Written **once**, create-if-absent, never through `Ensure` — rotating the token
+means a new worker cannot authenticate while the existing ones stop being issued
+certificates, which presents as a broken signer rather than a changed secret.
+
+### Where a worker is told to join
+
+Two models, decided by whether the tenant has a network of its own.
+
+In a VPC: its own address, and `apiServerPort` on the Cluster so cluster-info
+advertises `<vip>:6443`. The endpoint used to be the external ingress name here,
+on the assumption that cluster-info already carried the address — it cannot,
+because CAPI copies this field into the worker's discovery endpoint and the
+worker must fetch cluster-info before it can learn anything from it. So the
+worker dialled a name its VPC could neither resolve nor route to, and three lab
+runs read that as "CAPK will not bootstrap".
+
+On the default overlay: the Kamaji Service's ClusterIP, natively routable there
+and absent when the Cluster is first written. The product polled for it inside
+the creating request and patched the field afterwards; here the tenant says what
+it is waiting for and comes back.
+
+### A field that does not exist
+
+The product writes `network.additionalPorts` on the KamajiControlPlane to
+publish trustd. **KamajiControlPlane has no such field.** Its schema is
+advertiseAddress, certSANs, dnsServiceIPs, gateway, ingress, loadBalancerConfig,
+serviceAddress, serviceAnnotations, serviceLabels, serviceType — and the API
+server prunes anything else without a word. Read off the CRD, then confirmed on
+both live tenants: their `network` carries exactly advertiseAddress, certSANs
+and serviceType.
+
+It never mattered, because trustd is published by the tenant's own Services —
+the LoadBalancer on its address and the ClusterIP beside it — which is where
+workers actually reach it. But four tests asserted the port was configured, and
+all four passed by reading the dictionary the code had just built rather than
+anything a cluster kept. That is the same disease as the constant-grepping test
+in T1, one layer up: they protected a write that did nothing.
+
+Removed from the operator before it was copied, and removed from the backend in
+the same change, along with the `shared_vip` parameter that existed only to
+decide it. What replaces the four: one test asserting that `spec.network`
+contains nothing outside the schema, which is the property rather than the
+literal.
+
+This is also the first thing found by reading a foreign CRD instead of the code
+that writes to it — worth repeating for the other three kinds in this phase.

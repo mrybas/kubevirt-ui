@@ -51,6 +51,12 @@ var (
 	testEnv   *envtest.Environment
 	cfg       *rest.Config
 	k8sClient client.Client
+	// k8sReader goes straight to the API server. For assertions about a thing
+	// NOT existing, and for reads of something just written: the cached client
+	// answers from an informer that may not have caught up, which makes
+	// "absent" and "not yet delivered" the same answer — and the dangerous
+	// direction of that is a safety test passing because it looked too early.
+	k8sReader client.Reader
 	testCtx   context.Context
 	stopMgr   context.CancelFunc
 )
@@ -210,6 +216,7 @@ func runSuite(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("cache did not sync")
 	}
 	k8sClient = mgr.GetClient()
+	k8sReader = mgr.GetAPIReader()
 
 	// The controllers read cluster-wide configuration from this namespace, so
 	// it has to exist before any of them run.

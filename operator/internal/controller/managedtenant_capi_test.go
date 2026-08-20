@@ -1,0 +1,350 @@
+package controller
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+
+	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
+)
+
+func capiObject(gvk schema.GroupVersionKind, namespace, name string) (*unstructured.Unstructured, error) {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: namespace, Name: name,
+	}, obj)
+	return obj, err
+}
+
+// TestAVPCTenantJoinsOnItsOwnAddress.
+//
+// The endpoint used to be the external ingress name, on the assumption that
+// cluster-info already carried the address. It cannot: CAPI copies this field
+// into the worker's discovery endpoint, and the worker has to fetch
+// cluster-info before it can learn anything from it. So the worker dialled a
+// name its VPC could neither resolve nor route to, and three lab runs read that
+// as "CAPK will not bootstrap".
+func TestAVPCTenantJoinsOnItsOwnAddress(t *testing.T) {
+	mustTenant(t, vpcTalosTenant("tcp1"))
+	eventually(t, "the request for an address", func() error {
+		_, err := cpService("tcp1")
+		return err
+	})
+	assignAddress(t, "tcp1", "10.199.0.111")
+
+	eventually(t, "the Cluster", func() error {
+		cluster, err := capiObject(clusterGVK, "tenant-tcp1", "tcp1")
+		if err != nil {
+			return err
+		}
+		host, _, _ := unstructured.NestedString(cluster.Object,
+			"spec", "controlPlaneEndpoint", "host")
+		port, _, _ := unstructured.NestedInt64(cluster.Object,
+			"spec", "controlPlaneEndpoint", "port")
+		if host != "10.199.0.111" || port != 6443 {
+			return fmt.Errorf("endpoint = %s:%d", host, port)
+		}
+		apiPort, found, _ := unstructured.NestedInt64(cluster.Object,
+			"spec", "clusterNetwork", "apiServerPort")
+		if !found || apiPort != 6443 {
+			return fmt.Errorf("apiServerPort = %d (found=%v) — it is what the "+
+				"apiserver listens on and what cluster-info advertises",
+				apiPort, found)
+		}
+		return nil
+	})
+
+	// The control plane advertises the same address, or cluster-info sends the
+	// worker somewhere it cannot reach.
+	cp, err := capiObject(kamajiControlPlaneGVK, "tenant-tcp1", "tcp1")
+	if err != nil {
+		t.Fatalf("reading the control plane: %v", err)
+	}
+	if advertise, _, _ := unstructured.NestedString(cp.Object,
+		"spec", "network", "advertiseAddress"); advertise != "10.199.0.111" {
+		t.Errorf("advertiseAddress = %q", advertise)
+	}
+	// And the port a Talos worker actually dials is published by the tenant's
+	// own Service, not by the control plane object.
+	//
+	// The product writes `network.additionalPorts` for this, and the field does
+	// not exist: KamajiControlPlane's schema has no such property, so the API
+	// server prunes it without a word. Both live tenants carry exactly
+	// advertiseAddress, certSANs and serviceType. It never mattered because the
+	// Services publish 50001 — but a write that looks like configuration and is
+	// not should not be copied into the operator.
+	if _, found, _ := unstructured.NestedSlice(cp.Object,
+		"spec", "network", "additionalPorts"); found {
+		t.Error("it wrote a field the schema does not have, which the API " +
+			"server drops in silence")
+	}
+	service := mustCPService(t, "tcp1")
+	published := map[string]int32{}
+	for _, port := range service.Spec.Ports {
+		published[port.Name] = port.Port
+	}
+	if published["trustd"] != 50001 {
+		t.Errorf("the tenant's own Service publishes %v — a Talos worker dials "+
+			"trustd on 50001 of the host it was given, and the port is not "+
+			"configurable", published)
+	}
+}
+
+// TestADefaultOverlayTenantJoinsOnTheClusterIP.
+//
+// There the Kamaji Service's address is natively routable, and it does not
+// exist when the Cluster is first written — so the tenant says what it is
+// waiting for instead of writing an endpoint it has invented.
+func TestADefaultOverlayTenantJoinsOnTheClusterIP(t *testing.T) {
+	mustTenant(t, plainTenant("tcp2"))
+
+	eventually(t, "the tenant to name what is missing", func() error {
+		condition := tenantCondition(getTenant(t, "tcp2"),
+			platformv1alpha1.ConditionControlPlaneReady)
+		if condition == nil {
+			return fmt.Errorf("no condition")
+		}
+		if condition.Reason != "WaitingForControlPlaneService" {
+			return fmt.Errorf("reason = %q (%s)", condition.Reason, condition.Message)
+		}
+		return nil
+	})
+	if _, err := capiObject(clusterGVK, "tenant-tcp2", "tcp2"); err == nil {
+		t.Error("a Cluster was written with an endpoint nobody has yet")
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("reading the Cluster: %v", err)
+	}
+
+	// Kamaji's part.
+	service := &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "tenant-tcp2", Name: "tcp2",
+	}}
+	service.Spec.Ports = []corev1.ServicePort{{Name: "kube-apiserver", Port: 6443}}
+	if err := k8sClient.Create(testCtx, service); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating the control-plane Service: %v", err)
+	}
+
+	eventually(t, "the endpoint to follow it", func() error {
+		cluster, err := capiObject(clusterGVK, "tenant-tcp2", "tcp2")
+		if err != nil {
+			return err
+		}
+		host, _, _ := unstructured.NestedString(cluster.Object,
+			"spec", "controlPlaneEndpoint", "host")
+		if host == "" || host != service.Spec.ClusterIP {
+			return fmt.Errorf("endpoint host = %q, ClusterIP = %q",
+				host, service.Spec.ClusterIP)
+		}
+		// No apiServerPort on the default overlay: the port is Kamaji's default
+		// and writing one here would change what the apiserver listens on.
+		if _, found, _ := unstructured.NestedInt64(cluster.Object,
+			"spec", "clusterNetwork", "apiServerPort"); found {
+			return fmt.Errorf("apiServerPort was set on the default overlay")
+		}
+		return nil
+	})
+
+	cp, err := capiObject(kamajiControlPlaneGVK, "tenant-tcp2", "tcp2")
+	if err != nil {
+		t.Fatalf("reading the control plane: %v", err)
+	}
+	if _, found, _ := unstructured.NestedString(cp.Object,
+		"spec", "network", "advertiseAddress"); found {
+		t.Error("it advertised an address on the default overlay, where the " +
+			"ClusterIP is what workers use")
+	}
+}
+
+// TestTheSignerRunsBesideTheApiserverUnderTheNameKamajiReads.
+//
+// KamajiControlPlane calls these `extraContainers`/`extraVolumes`.
+// TenantControlPlane calls the same things `additionalContainers`/
+// `additionalVolumes`, and writing those names here is not an error anyone
+// reports: unknown fields are pruned silently, the object applies, the tenant
+// comes up Ready — and the signer is simply not there, while the worker waits
+// for a certificate nothing will ever issue.
+func TestTheSignerRunsBesideTheApiserverUnderTheNameKamajiReads(t *testing.T) {
+	mustTenant(t, vpcTalosTenant("tcp3"))
+	eventually(t, "the request for an address", func() error {
+		_, err := cpService("tcp3")
+		return err
+	})
+	assignAddress(t, "tcp3", "10.199.0.112")
+
+	eventually(t, "the control plane", func() error {
+		_, err := capiObject(kamajiControlPlaneGVK, "tenant-tcp3", "tcp3")
+		return err
+	})
+	cp, err := capiObject(kamajiControlPlaneGVK, "tenant-tcp3", "tcp3")
+	if err != nil {
+		t.Fatalf("reading the control plane: %v", err)
+	}
+
+	// Read back from the API server, so a field it pruned is a field that is
+	// not there — which is the whole failure this guards.
+	containers, found, _ := unstructured.NestedSlice(cp.Object,
+		"spec", "deployment", "extraContainers")
+	if !found || len(containers) != 1 {
+		t.Fatalf("extraContainers = %v (found=%v)", containers, found)
+	}
+	container, _ := containers[0].(map[string]any)
+	if container["name"] != "talos-csr-signer" {
+		t.Errorf("container = %v", container["name"])
+	}
+	args := fmt.Sprint(container["args"])
+	for _, flag := range []string{"--port=50001", "--ca-key-path"} {
+		if !strings.Contains(args, flag) {
+			t.Errorf("args = %s, missing %s — the CA key is what signs the CSR, "+
+				"so mounting only the certificate leaves it able to issue nothing",
+				args, flag)
+		}
+	}
+	volumes, found, _ := unstructured.NestedSlice(cp.Object,
+		"spec", "deployment", "extraVolumes")
+	if !found || len(volumes) != 2 {
+		t.Errorf("extraVolumes = %v", volumes)
+	}
+
+	// And the names the worker dials are in the certificate the apiserver
+	// presents, or the join fails TLS before trustd is reached at all.
+	sans, _, _ := unstructured.NestedStringSlice(cp.Object, "spec", "network", "certSANs")
+	want := "tcp3-talos.tenant-tcp3.svc"
+	if !strings.Contains(strings.Join(sans, ","), want) {
+		t.Errorf("certSANs = %v, missing %s", sans, want)
+	}
+}
+
+// TestTheMachineSecretsAreWrittenOnceAndNeverAgain.
+//
+// Every worker is derived from these values. Rotating the token means a new
+// worker cannot authenticate to the signer while the existing ones stop being
+// issued certificates — which presents as a broken signer rather than as a
+// changed secret.
+func TestTheMachineSecretsAreWrittenOnceAndNeverAgain(t *testing.T) {
+	mustTenant(t, vpcTalosTenant("tcp4"))
+
+	eventually(t, "the machine secrets", func() error {
+		secret := &corev1.Secret{}
+		return k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "tenant-tcp4", Name: "tcp4-talos-secrets",
+		}, secret)
+	})
+	first := &corev1.Secret{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-tcp4", Name: "tcp4-talos-secrets",
+	}, first); err != nil {
+		t.Fatalf("reading the secrets: %v", err)
+	}
+	for _, key := range []string{"machine.token", "cluster.id", "cluster.secret"} {
+		if len(first.Data[key]) == 0 {
+			t.Errorf("%s is empty", key)
+		}
+	}
+	// kubeadm format: six characters, a dot, sixteen.
+	token := string(first.Data["machine.token"])
+	if parts := strings.Split(token, "."); len(parts) != 2 ||
+		len(parts[0]) != 6 || len(parts[1]) != 16 {
+		t.Errorf("machine.token = %q", token)
+	}
+
+	// Wake it repeatedly; the values must not move.
+	for poke := 1; poke <= 3; poke++ {
+		assignAddress(t, "tcp4", fmt.Sprintf("10.199.0.11%d", poke+2))
+	}
+	consistently(t, "the secrets to stay as they were", 5*time.Second, func() error {
+		live := &corev1.Secret{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "tenant-tcp4", Name: "tcp4-talos-secrets",
+		}, live); err != nil {
+			return err
+		}
+		if string(live.Data["machine.token"]) != token {
+			return fmt.Errorf("the token was rotated under a running tenant")
+		}
+		if live.ResourceVersion != first.ResourceVersion {
+			return fmt.Errorf("the secret was rewritten: %s -> %s",
+				first.ResourceVersion, live.ResourceVersion)
+		}
+		return nil
+	})
+}
+
+// TestTheControlPlaneConditionFollowsCAPIRatherThanOurOwnWrite.
+//
+// Writing a KamajiControlPlane always succeeds. Whether an apiserver came up
+// behind it is a different question, and the only one a worker cares about — so
+// the condition is read from the Cluster's own status, and it has to arrive
+// through the manager rather than on a resync twelve hours later.
+func TestTheControlPlaneConditionFollowsCAPIRatherThanOurOwnWrite(t *testing.T) {
+	mustTenant(t, vpcTenant("tcp5"))
+	eventually(t, "the request for an address", func() error {
+		_, err := cpService("tcp5")
+		return err
+	})
+	assignAddress(t, "tcp5", "10.199.0.118")
+
+	eventually(t, "the tenant to report it as provisioning", func() error {
+		condition := tenantCondition(getTenant(t, "tcp5"),
+			platformv1alpha1.ConditionControlPlaneReady)
+		if condition == nil {
+			return fmt.Errorf("no condition")
+		}
+		if condition.Status != metav1.ConditionFalse || condition.Reason != "Provisioning" {
+			return fmt.Errorf("condition = %+v", condition)
+		}
+		return nil
+	})
+
+	// CAPI's part.
+	cluster, err := capiObject(clusterGVK, "tenant-tcp5", "tcp5")
+	if err != nil {
+		t.Fatalf("reading the Cluster: %v", err)
+	}
+	if err := unstructured.SetNestedField(cluster.Object, true,
+		"status", "controlPlaneReady"); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8sClient.Status().Update(testCtx, cluster); err != nil {
+		t.Fatalf("marking the control plane ready: %v", err)
+	}
+
+	eventually(t, "the tenant to notice", func() error {
+		condition := tenantCondition(getTenant(t, "tcp5"),
+			platformv1alpha1.ConditionControlPlaneReady)
+		if condition == nil || condition.Status != metav1.ConditionTrue {
+			return fmt.Errorf("condition = %+v", condition)
+		}
+		return nil
+	})
+
+	// And back again: nothing requeues a tenant that is already ready, so the
+	// falling edge is the watch's alone.
+	cluster, err = capiObject(clusterGVK, "tenant-tcp5", "tcp5")
+	if err != nil {
+		t.Fatalf("reading the Cluster: %v", err)
+	}
+	if err := unstructured.SetNestedField(cluster.Object, false,
+		"status", "controlPlaneReady"); err != nil {
+		t.Fatal(err)
+	}
+	if err := k8sClient.Status().Update(testCtx, cluster); err != nil {
+		t.Fatalf("marking the control plane down: %v", err)
+	}
+	eventually(t, "the tenant to stop claiming it is ready", func() error {
+		condition := tenantCondition(getTenant(t, "tcp5"),
+			platformv1alpha1.ConditionControlPlaneReady)
+		if condition == nil || condition.Status != metav1.ConditionFalse {
+			return fmt.Errorf("condition = %+v", condition)
+		}
+		return nil
+	})
+}

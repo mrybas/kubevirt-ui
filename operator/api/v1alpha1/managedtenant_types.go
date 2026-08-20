@@ -197,6 +197,15 @@ const (
 	// worker in an isolated VPC that cannot reach an NTP server does not join —
 	// and the symptom is a VM that boots, stays up, and never becomes a node.
 	ConditionTimeServed = "TimeServed"
+
+	// ConditionControlPlaneReady is CAPI's own answer about the control plane
+	// this tenant declared — not whether the declaration was written.
+	//
+	// The two are worth keeping apart. Writing a KamajiControlPlane always
+	// succeeds; whether an apiserver came up behind it, and whether anything
+	// can reach the endpoint the workers were given, is a different question
+	// and the only one a worker cares about.
+	ConditionControlPlaneReady = "ControlPlaneReady"
 )
 
 // TenantReservation is what this tenant asks of its folder.

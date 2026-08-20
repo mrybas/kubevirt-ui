@@ -466,31 +466,29 @@ def talos_control_plane_additions(
     tenant: str,
     namespace: str,
     signer_image: str,
-    *,
-    shared_vip: bool,
 ) -> dict[str, Any]:
     """Fragments to merge into the KamajiControlPlane spec.
 
-    `service.additionalPorts` carries 50001 only when each tenant has its own
-    VIP. On a shared VIP it must NOT go there: MetalLB refuses identical ports
-    on one shared address, so the router fronts a per-tenant ClusterIP service
-    instead.
+    There is deliberately no port here any more. This used to return an
+    `additionalPorts` entry for trustd, and `KamajiControlPlane.spec.network`
+    **has no such field**: its schema is advertiseAddress, certSANs,
+    dnsServiceIPs, gateway, ingress, loadBalancerConfig, serviceAddress,
+    serviceAnnotations, serviceLabels, serviceType — and nothing else, so the
+    API server pruned it in silence. Confirmed on two live tenants, whose
+    network carries exactly advertiseAddress, certSANs and serviceType.
+
+    It never mattered because trustd is published by the tenant's own Services
+    — the LoadBalancer on its address and the ClusterIP beside it — which is
+    where workers actually reach it. But a write that reads like configuration
+    and does nothing is worse than no write, and four tests were guarding it.
     """
-    additions: dict[str, Any] = {
+    return {
         "additionalContainers": [build_signer_sidecar(tenant, signer_image)],
         "additionalVolumes": build_signer_volume(tenant),
         # The apiserver certificate must answer to the same names the worker
         # dials, or the join fails TLS before trustd is ever reached.
         "certSANs": signer_dns_names(tenant, namespace),
     }
-    if not shared_vip:
-        additions["additionalPorts"] = [{
-            "name": "trustd",
-            "port": TALOS_TRUSTD_PORT,
-            "targetPort": TALOS_TRUSTD_PORT,
-            "protocol": "TCP",
-        }]
-    return additions
 
 
 # ---------------------------------------------------------------------------

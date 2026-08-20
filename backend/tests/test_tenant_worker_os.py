@@ -104,16 +104,33 @@ class TestTalosControlPlane:
         talos = _build_kamaji_cp_cr(_req(worker_os="talos"))["spec"]["network"]["certSANs"]
         assert set(plain) <= set(talos)
 
-    def test_own_vip_publishes_port_50001(self) -> None:
-        spec = _build_kamaji_cp_cr(_req(worker_os="talos"))["spec"]
-        assert spec["network"]["additionalPorts"][0]["port"] == TALOS_TRUSTD_PORT
+    def test_the_control_plane_carries_no_port_fields_at_all(self) -> None:
+        """It used to publish trustd here, and the field does not exist.
 
-    def test_shared_vip_does_not_publish_the_port(self) -> None:
-        # MetalLB refuses identical ports on one shared address.
-        spec = _build_kamaji_cp_cr(
-            _req(worker_os="talos"), advertise_vip="10.198.190.10",
-        )["spec"]
-        assert "additionalPorts" not in spec["network"]
+        `KamajiControlPlane.spec.network` has advertiseAddress, certSANs,
+        dnsServiceIPs, gateway, ingress, loadBalancerConfig, serviceAddress,
+        serviceAnnotations, serviceLabels and serviceType. Anything else the
+        API server prunes without a word — confirmed on two live tenants,
+        whose network carries exactly three of those.
+
+        Where trustd is actually published is the tenant's own Services, and
+        `tenant_cp_ports` is what decides that.
+        """
+        for spec in (
+            _build_kamaji_cp_cr(_req(worker_os="talos"))["spec"],
+            _build_kamaji_cp_cr(
+                _req(worker_os="talos"), advertise_vip="10.198.190.10",
+            )["spec"],
+        ):
+            unknown = set(spec["network"]) - {
+                "advertiseAddress", "certSANs", "dnsServiceIPs", "gateway",
+                "ingress", "loadBalancerConfig", "serviceAddress",
+                "serviceAnnotations", "serviceLabels", "serviceType",
+            }
+            assert not unknown, (
+                f"written into spec.network and dropped by the API server: "
+                f"{sorted(unknown)}"
+            )
 
 
 class TestRequestValidation:
