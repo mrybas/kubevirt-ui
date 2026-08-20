@@ -240,6 +240,13 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              controlPlaneVIP:
+                description: |-
+                  ControlPlaneVIP is the address MetalLB gave this tenant. Published
+                  because everything else is derived from it — the certificate's IP SAN,
+                  the worker's endpoint, where its clock comes from — and a value that
+                  several objects are built from should be visible in one place.
+                type: string
               namespace:
                 description: Namespace the tenant's objects live in.
                 type: string

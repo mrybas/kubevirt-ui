@@ -59,6 +59,21 @@ type ManagedTenantReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+
+	// APIReader reads straight from the API server, for the two occasional
+	// lookups — the MetalLB pool and the transit subnet — that are not worth a
+	// cluster-wide watch apiece.
+	APIReader client.Reader
+
+	// Where tenant addresses come from, and the subnet that must exclude them.
+	// Fields rather than environment reads at the point of use: the value
+	// belongs to the deployment, and a test that has to set a process variable
+	// to exercise one controller sets it for every other one running beside it.
+	// Empty falls back to the environment, so the deployment can keep
+	// configuring it the way the product always has.
+	MetalLBPool      string
+	MetalLBNamespace string
+	TransitSubnet    string
 }
 
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants,verbs=get;list;watch;create;update;patch;delete
@@ -72,6 +87,9 @@ type ManagedTenantReconciler struct {
 // in the lab could show this — envtest and the dev backend both run as admin,
 // where an escalation check never fires.
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes/source,verbs=create
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=metallb.io,resources=ipaddresspools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kubeovn.io,resources=subnets,verbs=get;list;watch
 
 // Reconcile brings the tenant's namespace into line with the declaration.
 func (r *ManagedTenantReconciler) Reconcile(
@@ -174,6 +192,23 @@ func (r *ManagedTenantReconciler) Reconcile(
 	}
 
 	obj.Status.RedundantQuotas = redundant
+
+	// After the namespace, because the Service lives in it.
+	vip, addressReady, addressMessage, err := r.reconcileAddress(ctx, obj, namespace)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			addressCondition(false, err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	// Kept even while pending: an address that has been handed out is not
+	// withdrawn because one read came back empty.
+	if vip != "" {
+		obj.Status.ControlPlaneVIP = vip
+	}
+	apimeta.SetStatusCondition(&obj.Status.Conditions,
+		addressCondition(addressReady, addressMessage))
 
 	// After the namespace, because the clone grant names it as its subject.
 	goldenReady, goldenMessage, err := r.reconcileGolden(ctx, obj, namespace, release)
@@ -423,6 +458,11 @@ func (r *ManagedTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&platformv1alpha1.ManagedTenant{}).
 		Watches(&corev1.ResourceQuota{}, toTenant).
 		Watches(&corev1.LimitRange{}, toTenant).
+		// The address arrives on the Service's status, written by MetalLB long
+		// after this controller asked for it. Without this watch the tenant
+		// would carry "no address yet" until something unrelated woke it —
+		// which, with a ten-hour resync, is indistinguishable from never.
+		Watches(&corev1.Service{}, toTenant).
 		Named(tenantControllerName).
 		Complete(r)
 }

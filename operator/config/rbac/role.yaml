@@ -26,6 +26,7 @@ rules:
   - limitranges
   - namespaces
   - resourcequotas
+  - services
   verbs:
   - create
   - get
@@ -213,6 +214,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - metallb.io
+  resources:
+  - ipaddresspools
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - platform.kubevirt-ui.io

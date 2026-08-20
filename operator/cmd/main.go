@@ -298,9 +298,13 @@ func main() {
 	}
 	if enabled.Has(domains.Tenant) {
 		if err := (&controller.ManagedTenantReconciler{
-			Client:   mgr.GetClient(),
-			Scheme:   mgr.GetScheme(),
-			Recorder: mgr.GetEventRecorderFor("managedtenant"),
+			Client:           mgr.GetClient(),
+			Scheme:           mgr.GetScheme(),
+			Recorder:         mgr.GetEventRecorderFor("managedtenant"),
+			APIReader:        mgr.GetAPIReader(),
+			MetalLBPool:      os.Getenv("TENANTS_CP_METALLB_POOL"),
+			MetalLBNamespace: os.Getenv("TENANTS_CP_METALLB_NAMESPACE"),
+			TransitSubnet:    os.Getenv("TENANTS_CP_TRANSIT_SUBNET"),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "managedtenant")
 			os.Exit(1)

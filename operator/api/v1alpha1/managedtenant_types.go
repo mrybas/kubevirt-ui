@@ -174,6 +174,14 @@ const (
 	// tenant. It is here because "the tenant is stuck" and "a 20Gi image is
 	// still downloading" look identical from the outside otherwise.
 	ConditionGoldenReady = "GoldenReady"
+
+	// ConditionAddressAssigned is the tenant's own address — the one its API
+	// server, konnectivity, trustd and NTP all answer on.
+	//
+	// Its own, and not a shared one, because Talos derives trustd's address
+	// from the control-plane endpoint and dials :50001 there. That port cannot
+	// be moved, so two tenants cannot share a listener for it.
+	ConditionAddressAssigned = "AddressAssigned"
 )
 
 // TenantReservation is what this tenant asks of its folder.
@@ -194,6 +202,13 @@ type ManagedTenantStatus struct {
 	// Namespace the tenant's objects live in.
 	// +optional
 	Namespace string `json:"namespace,omitempty"`
+
+	// ControlPlaneVIP is the address MetalLB gave this tenant. Published
+	// because everything else is derived from it — the certificate's IP SAN,
+	// the worker's endpoint, where its clock comes from — and a value that
+	// several objects are built from should be visible in one place.
+	// +optional
+	ControlPlaneVIP string `json:"controlPlaneVIP,omitempty"`
 
 	// TalosRelease is the release resolved from the catalogue, published
 	// because "the default" is otherwise invisible and it decides which golden

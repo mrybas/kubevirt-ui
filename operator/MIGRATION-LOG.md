@@ -1716,3 +1716,66 @@ Known gap, named rather than fixed here: deleting a ManagedTenant leaves its
 clone grant behind. Tenant teardown does not exist yet — the controller returns
 on a deletionTimestamp and nothing is reclaimed — so this belongs with that
 slice, not this one.
+
+## M12c (third slice) — the tenant's own address
+
+Everything else in this phase is derived from one value: the certificate's IP
+SAN, the worker's control-plane endpoint, where the node gets the time. So the
+address comes first, and it is published in status where the things built from
+it can be seen to agree.
+
+Its own address, not a shared one, because Talos derives trustd's location from
+the control-plane endpoint and dials :50001 there. That port cannot be moved, so
+two tenants cannot share a listener for it — the whole per-tenant VIP model
+follows from a hard-coded port number.
+
+The product asked MetalLB for the address and then waited for the answer inside
+the request that created the tenant, up to a minute, and turned a full pool into
+a timed-out API call. Here the waiting is the ordinary state of a controller:
+pending is a condition with a reason that names the pool and says what to do
+about it (append a range — never resize one in use).
+
+### The watch is load-bearing, and that was measured
+
+The address arrives on the Service's *status*, written by MetalLB long after the
+Service was asked for. Without a watch on Services the tenant carried "no
+address yet" until something unrelated woke it, and with a ten-hour resync that
+is indistinguishable from never. The test failed exactly that way before the
+watch was added — the address was assigned and status stayed empty for the full
+twenty seconds.
+
+### The invariant that has to run before the address exists
+
+kube-ovn allocates router legs and EIPs out of the transit subnet, so any
+MetalLB range the subnet does not exclude is an address both allocators can hand
+out — found, when it is found, as a duplicate-address outage. The check is
+therefore before the Service is created: the damage is done by an address being
+handed out, not by asking for one. Mutating the order so the refusal comes after
+turns the test red with "it asked for an address anyway".
+
+Silent when it cannot read either object. A diagnostic that stops tenants from
+being created because a CRD is missing has stopped being a diagnostic — and the
+MetalLB CRD is now in the suite's schemas, so the check is exercised rather than
+skipped there.
+
+### Configuration by the same names the backend uses
+
+`TENANTS_CP_METALLB_POOL`, `TENANTS_CP_METALLB_NAMESPACE`,
+`TENANTS_CP_TRANSIT_SUBNET` — and the first draft read
+`TENANTS_TRANSIT_SUBNET`, which exists nowhere. Under the deployment's env block
+that reads as an invariant that quietly never runs, and "no complaint" looks
+exactly like "checked and fine". They are fields on the reconciler with an
+environment fallback: the value belongs to the deployment, and a test that has
+to set a process variable to exercise one controller sets it for every other
+controller running beside it.
+
+The tenant Deployment had none of these at all, so the pool would have defaulted
+to `traefik` — the ingress pool, not the transit one. Added to the overlay in
+the same change.
+
+### Method note
+
+Three mutation runs in this slice reported the wrong result because the test
+binary was built from a file the container had not seen yet — the bind mount
+lags a write by a second or two. A mutation is now confirmed *inside* the
+container before its result is believed.

@@ -25,3 +25,15 @@ spec:
             # be a coin toss.
             - name: ENABLE_WEBHOOKS
               value: "false"
+            # The same three names the backend reads, deliberately: two
+            # deployments configured by different variable names for the same
+            # fact drift apart in silence, and the silence looks like a check
+            # that passed.
+            - name: TENANTS_CP_METALLB_POOL
+              value: cp-transit-pool
+            - name: TENANTS_CP_METALLB_NAMESPACE
+              value: o0-metallb
+            # Without this the pool-versus-excludeIps invariant does not run at
+            # all, and "no complaint" reads exactly like "checked and fine".
+            - name: TENANTS_CP_TRANSIT_SUBNET
+              value: cp-transit

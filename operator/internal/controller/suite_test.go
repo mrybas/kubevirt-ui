@@ -140,9 +140,10 @@ func runSuite(m *testing.M) (int, error) {
 	}
 
 	if err := (&ManagedTenantReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorderFor("managedtenant"),
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorderFor("managedtenant"),
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		return 0, fmt.Errorf("wiring tenant controller: %w", err)
 	}
