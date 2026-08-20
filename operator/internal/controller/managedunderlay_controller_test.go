@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -32,7 +33,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
+	"github.com/mrybas/kubevirt-ui/operator/internal/metrics"
 	"github.com/mrybas/kubevirt-ui/operator/internal/underlay"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 func mustUnderlay(t *testing.T, u *platformv1alpha1.ManagedUnderlay) *platformv1alpha1.ManagedUnderlay {
@@ -536,6 +540,87 @@ func TestUnderlayWatcherCoversEveryProviderNIC(t *testing.T) {
 			if owner.Controller != nil && *owner.Controller {
 				return fmt.Errorf("%s claims to be the controller of a shared object", owner.Name)
 			}
+		}
+		return nil
+	})
+}
+
+func underlayDaemonSetWrites() float64 {
+	var sum float64
+	for _, op := range []string{"created", "updated"} {
+		sum += testutil.ToFloat64(
+			metrics.PatchesTotal.WithLabelValues("DaemonSet", underlayControllerName, op))
+	}
+	return sum
+}
+
+// TestUnderlayStopsWritingTheDaemonSet is the write-on-diff rule, on the one
+// object where breaking it is invisible.
+//
+// Assigning the whole pod template rather than merging into it looks equivalent
+// and is not: the API server defaults eight fields no renderer here sets, so a
+// rendered template never equals a stored one and an Update goes out on every
+// pass. The API server re-applies the defaults, the stored object comes back
+// byte-identical, and resourceVersion does not move — so the object looks
+// perfectly stable while being written to forever. On the lab that was 50
+// DaemonSet writes against 2 for every other kind, and nothing but
+// patches_total said so.
+func TestUnderlayStopsWritingTheDaemonSet(t *testing.T) {
+	mustKubeOVNNamespace(t, "kube-ovn-nowrite", "kubeovn/kube-ovn:v1.14.0")
+
+	u := mustUnderlay(t, &platformv1alpha1.ManagedUnderlay{
+		ObjectMeta: metav1.ObjectMeta{Name: "nowrite"},
+		Spec: platformv1alpha1.ManagedUnderlaySpec{
+			Interface:           "eth1",
+			ExternalCIDR:        "10.66.0.0/24",
+			ExternalGateway:     "10.66.0.1",
+			ProviderNetworkName: "nowrite-pn",
+			VLANName:            "nowrite-vlan",
+			SubnetName:          "nowrite-sub",
+			KubeOVNNamespace:    "kube-ovn-nowrite",
+		},
+	})
+
+	eventually(t, "the link watcher to exist", func() error {
+		ds := &appsv1.DaemonSet{}
+		return k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "kube-ovn-nowrite", Name: underlay.LinkWatcherName,
+		}, ds)
+	})
+
+	// Let the first pass settle: the create itself is a write, and so is the
+	// second underlay's ownerReference if one is being added.
+	eventually(t, "the writes to settle", func() error {
+		first := underlayDaemonSetWrites()
+		time.Sleep(500 * time.Millisecond)
+		if underlayDaemonSetWrites() != first {
+			return fmt.Errorf("still settling")
+		}
+		return nil
+	})
+	baseline := underlayDaemonSetWrites()
+
+	// Force reconciles. An annotation change wakes the controller without
+	// changing anything it renders, which is exactly the pass that must write
+	// nothing.
+	for i := 0; i < 5; i++ {
+		current := getUnderlay(t, u.Name)
+		patched := current.DeepCopy()
+		if patched.Annotations == nil {
+			patched.Annotations = map[string]string{}
+		}
+		patched.Annotations["test.kubevirt-ui.io/poke"] = fmt.Sprintf("%d", i)
+		if err := k8sClient.Patch(testCtx, patched, client.MergeFrom(current)); err != nil {
+			t.Fatalf("poking the underlay: %v", err)
+		}
+	}
+
+	consistently(t, "no further DaemonSet writes", 3*time.Second, func() error {
+		if now := underlayDaemonSetWrites(); now != baseline {
+			return fmt.Errorf("writes went from %v to %v with nothing changed; "+
+				"every one of those is a template the API server has to re-default, "+
+				"and one defaulted field away from restarting every watcher pod",
+				baseline, now)
 		}
 		return nil
 	})

@@ -742,3 +742,102 @@ The service check was worth making rather than assuming: the selector labels
 propagate into Service selectors too, and had they not, half the admission
 traffic would have gone to a pod that serves no webhooks — silently, under
 `failurePolicy: Ignore`.
+
+## M13b — ManagedUnderlay
+
+The fabric a VPC egress gateway needs (ProviderNetwork, Vlan, NAD, Subnet) plus
+the gateway node label and the two workaround DaemonSets, moved from
+`vpc_underlay.py` to a controller.
+
+### Why it is a controller
+
+The `ovn.kubernetes.io/external-gw` label was healed by the GET handler. It came
+back when somebody opened the page, and not otherwise. On this lab it sat at an
+explicit `false` on all three workers with nothing in managedFields claiming it;
+the link-watcher DaemonSet selects on it, so it was scheduled nowhere, and
+`kubectl rollout status` reported success because zero desired pods are all
+ready. Two hours later both provider links were down and had taken the transit
+and egress planes with them.
+
+### Adoption on the live stand
+
+Two underlays already existed, applied by hand from the lab's `vpc-bgp/`
+manifests: `cptransit`/eth0.300 and `extnet`/eth0.310. They were written down as
+CRs — every value read back from the live objects — and adopted.
+
+Full before/after diff of the nine objects: **one** difference, the NAD config
+JSON re-serialised (Go sorts keys and omits spaces; Python kept insertion order).
+Same four fields, same values. Everything else, including both DaemonSet pod
+templates and the link-watcher script, was byte-identical — the Go port and the
+Python builder produce the same fabric.
+
+### Ordering, and the blocker that caught me
+
+I turned the operator on while the backend was still a writer. That is the same
+two-writer condition as the announcements, and measuring idempotence does not
+remove it. Corrected by pausing both CRs immediately, then doing it in order:
+
+  phase 1 — `OPERATOR_UNDERLAY_ENABLED=true` on both backends. Writers 1 -> 0.
+  phase 2 — unpause.                                            Writers 0 -> 1.
+
+`hack/underlay-cutover.sh` walks it and refuses phase 2 while any running
+backend pod lacks the flag — asked of the pods, not the Deployment spec.
+Verified: it refused before phase 1 (exit 2) and passed after.
+
+Both backends, because there are two against this cluster: the in-cluster
+Deployment (moved from the released 2026.10.36 to `dev-a3eaa55`) and the local
+compose harness. The script only knows about the first; the second is named here
+rather than left implicit.
+
+### The A/B, on the live cluster
+
+- paused, label set to `false` on worker-3: **90 seconds, nothing happened.**
+  Which is also a faithful reproduction of the original defect — the DaemonSet
+  quietly went to 2/3 and no object said so.
+- active, label removed entirely from worker-2: **restored in 5 seconds**,
+  counted in `status.labelHeals`, DaemonSet never left 3/3. No GET involved.
+
+### Two defects found by running it
+
+1. **A paused underlay read as a healthy one.** GET reported the fabric ready
+   and "3 node(s) carry the provider NIC" while one of them was at `false`,
+   because a paused controller keeps its last verdict and a frozen status looks
+   exactly like a current one. Same shape as the 0/0 DaemonSet. Paused now
+   answers not-ready and names the annotation.
+
+2. **50 invisible writes.** `patches_total` showed 50 DaemonSet updates against
+   2 for every other kind, while `resourceVersion` and `generation` sat
+   perfectly still. Assigning the whole pod template discards the eight fields
+   the API server defaults; the rendered template never equals the stored one,
+   so an Update goes out every pass, the API server re-applies the defaults, and
+   the object comes back byte-identical. Nothing at the object level can see it.
+   Fixed by merging only the fields this controller renders. Guarded by a test
+   that pokes the CR five times and asserts the counter does not move; reverting
+   to the assignment fails it and nothing else.
+
+   Worth keeping as a rule: `resourceVersion` stability is not proof of
+   write-on-diff. The counter is.
+
+### Deliberate design notes
+
+- The heal is add-only. A node dropping out of `readyNodes` is far more often
+  kube-ovn briefly unable to report than the NIC being gone.
+- Only rendered keys are merged into a live spec — kube-ovn writes its own
+  defaults into its own objects (`enableLb`, `gatewayType`, `u2oFeatures`, `vpc`
+  and more were all present on the live subnets and all survived adoption).
+- The two DaemonSets are cluster singletons shared by every underlay, owned
+  non-controller by each one that wants them, and never deleted when a flag goes
+  false. Verified on the stand: both carry two ownerReferences, neither marked
+  controller.
+- Deleting a ManagedUnderlay takes its external Subnet and every gateway on it.
+  Stated in the type doc, the values comment and the cutover script header. The
+  rollback path pauses; it never deletes.
+
+### Left open
+
+- `status.labelHeals` is per-underlay, so on a shared node the first underlay to
+  reconcile takes the credit and the other records nothing. Accurate as "how
+  often did *this* underlay have to fix it", which is what the number is for.
+- The in-cluster backend now runs a branch image. Putting the stand back is
+  `kubectl set image ... backend=ghcr.io/mrybas/kubevirt-ui/backend:2026.10.36`
+  plus `hack/underlay-cutover.sh rollback --apply`, in that order reversed.

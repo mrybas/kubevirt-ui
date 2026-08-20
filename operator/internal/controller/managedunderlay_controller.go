@@ -413,7 +413,7 @@ func (r *ManagedUnderlayReconciler) ensureDaemonSet(
 		if live.Spec.Selector == nil {
 			live.Spec.Selector = want.Spec.Selector
 		}
-		live.Spec.Template = want.Spec.Template
+		mergePodTemplate(&live.Spec.Template, want.Spec.Template)
 		// Non-controller: several underlays legitimately want the same
 		// singleton, and SetControllerReference would refuse the second one.
 		return controllerutil.SetOwnerReference(u, live, r.Scheme)
@@ -423,6 +423,58 @@ func (r *ManagedUnderlayReconciler) ensureDaemonSet(
 			"DaemonSet/%s/%s: %w", want.Namespace, want.Name, err)
 	}
 	return daemonSetState(live), nil
+}
+
+// mergePodTemplate writes the fields this controller renders and leaves the
+// rest of the template alone.
+//
+// Assigning the whole template instead looks equivalent and is not. The API
+// server defaults eight fields on a pod spec that no renderer here sets —
+// imagePullPolicy, terminationMessagePath and Policy, dnsPolicy, restartPolicy,
+// schedulerName, an empty pod securityContext, terminationGracePeriodSeconds —
+// so a rendered template never equals a stored one, CreateOrUpdate sees a
+// difference on every pass, and an Update goes out every time. The API server
+// re-applies the defaults, the stored object comes out byte-identical, and
+// resourceVersion does not move: the object looks perfectly stable while the
+// operator writes to it forever. Measured as 50 DaemonSet writes against 2 for
+// every other kind, visible only in patches_total.
+//
+// It is also one defaulted field away from being a real rewrite loop, and a
+// rewritten DaemonSet template restarts every watcher pod in the cluster.
+func mergePodTemplate(live *corev1.PodTemplateSpec, want corev1.PodTemplateSpec) {
+	if live.Labels == nil {
+		live.Labels = map[string]string{}
+	}
+	for k, v := range want.Labels {
+		live.Labels[k] = v
+	}
+
+	live.Spec.HostNetwork = want.Spec.HostNetwork
+	live.Spec.NodeSelector = want.Spec.NodeSelector
+	live.Spec.Tolerations = want.Spec.Tolerations
+	live.Spec.Volumes = want.Spec.Volumes
+
+	for _, wanted := range want.Spec.Containers {
+		found := false
+		for i := range live.Spec.Containers {
+			if live.Spec.Containers[i].Name != wanted.Name {
+				continue
+			}
+			c := &live.Spec.Containers[i]
+			c.Image = wanted.Image
+			c.Command = wanted.Command
+			c.Args = wanted.Args
+			c.Env = wanted.Env
+			c.VolumeMounts = wanted.VolumeMounts
+			c.Resources = wanted.Resources
+			c.SecurityContext = wanted.SecurityContext
+			found = true
+			break
+		}
+		if !found {
+			live.Spec.Containers = append(live.Spec.Containers, wanted)
+		}
+	}
 }
 
 // daemonSetState reports whether a DaemonSet is doing anything, as opposed to
