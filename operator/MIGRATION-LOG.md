@@ -631,3 +631,69 @@ With this the VM track's own defects are closed. What the plan still lists for
 later — a fully declarative `spec.networks` with hot-plug through it — is a
 feature, not a defect: today's NIC attach remains imperative and now cleans up
 after itself.
+
+---
+
+## M11 — BGP announcements (controller done; cutover is one deliberate step)
+
+The logic is ported as it stands, including the three raw lines that each fail
+silently when missing and the datapath predicate that decides who may be
+advertised. What changes is where it runs: a pass every thirty seconds inside
+the UI backend becomes a controller woken by what it depends on. Its
+configuration becomes an object, because these values are properties of an
+addressing plan and one of them going unset is how the feature once did nothing
+on a whole stand without saying so.
+
+### The comparison, on the live cluster
+
+The stand's backend writes `kubevirt-ui-b3` every thirty seconds, so the
+controller ran in dry-run: everything collected, nodes chosen, configuration
+rendered, **nothing written**.
+
+```
+$ diff backend.conf operator.conf
+IDENTICAL — the handover would be a no-op
+backend:  ["kubevirt-lab-worker-1","kubevirt-lab-worker-2"]
+operator: ["kubevirt-lab-worker-1","kubevirt-lab-worker-2"]
+```
+
+Four prefixes, each with its own router leg as the next hop, and the same two
+workers carrying them.
+
+**The cutover is one change and is not taken here**, because it touches live BGP
+on the stand: set `OPERATOR_ANNOUNCE_ENABLED` on the backend and `dryRun: false`
+on the policy together. The flag and its test exist; the loop steps aside
+completely rather than both writing and hoping they agree.
+
+### Why "shadow" was the wrong idea, corrected before it shipped
+
+The first plan was to point the controller at a second FRRConfiguration name and
+compare. That would not have been a comparison: frr-k8s merges every
+configuration in its namespace into the node's FRR, so the shadow would have
+been applied to the dataplane beside the real one — two `router bgp` blocks over
+one session, on a live stand.
+
+### Running the network domain separately, and what that turned up
+
+Two defects, both invisible from the outside:
+
+1. **Both deployments shared a selector.** The second one inherited the base's
+   `control-plane: controller-manager`, so the two Deployments formally owned
+   each other's pods. The symptom was misleading — `kubectl logs deploy/network…`
+   printed the *VM* controllers, which looked like the `--domains` argument not
+   arriving, when the arguments were right and the selector was wrong.
+2. **The second account could not take its lease.** The process started,
+   reported `Domains enabled: network`, and then retried
+   `cannot get resource leases` forever — running no controllers at all while
+   looking healthy.
+
+Verified after fixing, each separately: selectors differ; pod labels match their
+own selector; both roll out; one lease each with distinct holders; the webhook
+and metrics services still resolve to the **vm** pod only and neither lost its
+endpoint; admission still refuses a raw VM; and each profile starts only its own
+controllers — vm: Image, Template, VM, Operation; network: AnnouncementPolicy.
+
+The service check was worth making rather than assuming: the selector labels
+propagate into Service selectors too, and had they not, half the admission
+traffic would have gone to a pod that serves no webhooks — silently, under
+`failurePolicy: Ignore`.

@@ -10,6 +10,17 @@ kind: Kustomization
 namespace: kubevirt-ui-operator-dev
 # namePrefix comes from ../../default; setting it again here would double it.
 
+# Two deployments of the same image share the base's selector, so without a
+# distinguishing label each one matches the other's pods. Nothing breaks while
+# the replica sets hold their own — their selectors carry a template hash — but
+# `kubectl logs deploy/...` picks whichever pod it likes, and the two
+# deployments are formally fighting over the same set. includeSelectors puts the
+# domain in the selector as well as on the pods.
+labels:
+  - includeSelectors: true
+    pairs:
+      platform.kubevirt-ui.io/domain: vm
+
 resources:
 - ../../default
 
@@ -68,4 +79,4 @@ replacements:
 images:
 - name: controller
   newName: ghcr.io/mrybas/kubevirt-ui/operator
-  newTag: dev-2007723
+  newTag: dev-83f2808

@@ -19,6 +19,7 @@ from app.core.k8s_client import K8sClient
 from app.models.tenant import AddonCatalog, AddonComponent
 
 from app.core.b3_announce import ensure_announcements
+from app.core.operator import announce_path_enabled
 
 from app.api.v1.tenants_talos import ensure_worker_bootstrap_ca
 
@@ -304,10 +305,18 @@ async def _reconcile_once(k8s: K8sClient) -> None:
     # a VPC's return path must not wait on Flux being configured. Failures are
     # logged inside and never abort the pass — an addon reconcile has no
     # business being blocked by BGP, or the reverse.
-    try:
-        await ensure_announcements(k8s)
-    except Exception as e:  # noqa: BLE001 - one subsystem must not stop another
-        logger.error(f"B3 announcement reconcile failed: {e}")
+    # …unless the operator owns them. The FRRConfiguration takes exactly one
+    # writer: frr-k8s merges every configuration in its namespace into the
+    # node's FRR, so a second writer is not a second opinion, it is two
+    # `router bgp` blocks over one session. The switch is one change — this
+    # flag on and the operator's policy out of dry-run together.
+    if announce_path_enabled():
+        logger.debug("B3 announcements are owned by the operator; skipping")
+    else:
+        try:
+            await ensure_announcements(k8s)
+        except Exception as e:  # noqa: BLE001 - one subsystem must not stop another
+            logger.error(f"B3 announcement reconcile failed: {e}")
 
     # A worker bootstrap template written without the Kubernetes CA is a
     # tenant whose kubelet can never start, and the template is immutable —

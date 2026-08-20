@@ -55,6 +55,18 @@ backend:
     # edited and deleted as one whatever this says — the flag decides where new
     # ones are written, not where the old ones live.
     OPERATOR_TEMPLATE_ENABLED: ""
+    # -- Hand the BGP announcements to the operator: the backend's reconcile
+    # loop stops writing the FRRConfiguration and the operator's
+    # AnnouncementPolicy takes it over. Empty/false → the backend keeps writing
+    # it, as before.
+    #
+    # This one is an ownership switch, not a routing choice, and it moves in the
+    # same change as the policy leaving dryRun. frr-k8s merges every
+    # FRRConfiguration in its namespace into the node's FRR, so two writers of
+    # that object are two `router bgp` blocks over one session. Compare the
+    # policy's status.renderedConfiguration against the live object first — when
+    # they match byte for byte, the switch is a no-op.
+    OPERATOR_ANNOUNCE_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as

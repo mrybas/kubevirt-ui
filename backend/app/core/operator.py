@@ -55,6 +55,21 @@ def template_path_enabled() -> bool:
     return _enabled("OPERATOR_TEMPLATE_ENABLED")
 
 
+def announce_path_enabled() -> bool:
+    """True when the operator owns the BGP announcements.
+
+    This one is not a routing choice, it is an ownership switch, and it has to
+    move in the same change as the operator's policy leaving dry-run. frr-k8s
+    merges every FRRConfiguration in its namespace into the node's FRR, so two
+    writers of that object are not two opinions — they are two `router bgp`
+    blocks fighting over one session.
+
+    The handover is provable before it happens: the operator publishes what it
+    would write while this is off, and the two are compared byte for byte.
+    """
+    return _enabled("OPERATOR_ANNOUNCE_ENABLED")
+
+
 # The group the operator's custom resources live in.
 OPERATOR_GROUP = "platform.kubevirt-ui.io"
 OPERATOR_VERSION = "v1alpha1"
