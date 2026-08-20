@@ -861,14 +861,24 @@ func TestDeleteWaitsRatherThanStranding(t *testing.T) {
 	})
 }
 
-func liveACLsOf(t *testing.T, subnet string) []acl.Rule {
-	t.Helper()
+// readLiveACLs returns an error rather than failing: it is called from inside
+// eventually(), where a first miss is the normal case.
+func readLiveACLs(subnet string) ([]acl.Rule, error) {
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(subnetGVK)
 	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: subnet}, obj); err != nil {
+		return nil, err
+	}
+	return readACLs(obj), nil
+}
+
+func liveACLsOf(t *testing.T, subnet string) []acl.Rule {
+	t.Helper()
+	rules, err := readLiveACLs(subnet)
+	if err != nil {
 		t.Fatalf("reading Subnet/%s: %v", subnet, err)
 	}
-	return readACLs(obj)
+	return rules
 }
 
 func aclOwnerOf(t *testing.T, subnet string) string {
@@ -1264,4 +1274,143 @@ func TestTheControllerStandsDownForSomebodyElsesDelete(t *testing.T) {
 	if err := k8sClient.Update(testCtx, held); err != nil {
 		t.Fatalf("releasing the subnet: %v", err)
 	}
+}
+
+// TestADeclaredPeeringOpensThePrefixBeforeAnythingIsRouted.
+//
+// The composer reads the declaration, not the routers. That is what breaks the
+// circle: the peering controller waits for the allow and the allow would
+// otherwise be waiting for the peering entry, so one of the two has to look at
+// the object instead of at the wire.
+func TestADeclaredPeeringOpensThePrefixBeforeAnythingIsRouted(t *testing.T) {
+	for _, spec := range []struct{ name, cidr string }{
+		{"netpeer-a", "10.200.176.0/22"},
+		{"netpeer-b", "10.200.180.0/22"},
+	} {
+		mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+			ObjectMeta: metav1.ObjectMeta{Name: spec.name},
+			Spec: platformv1alpha1.ManagedNetworkSpec{
+				CIDR: spec.cidr, DeletionPolicy: "Delete",
+			},
+		})
+	}
+
+	eventually(t, "both networks closed to each other", func() error {
+		rules, err := readLiveACLs("netpeer-a-default")
+		if err != nil {
+			return err
+		}
+		if len(rules) == 0 {
+			return fmt.Errorf("no rules yet")
+		}
+		if got := acl.Evaluate(rules,
+			netip.MustParseAddr("10.200.180.9"), "to-lport"); got != acl.Dropped {
+			return fmt.Errorf("already open: %s", got)
+		}
+		return nil
+	})
+
+	link := &platformv1alpha1.ManagedNetworkPeering{
+		ObjectMeta: metav1.ObjectMeta{Name: "netpeer-a-netpeer-b"},
+		Spec: platformv1alpha1.ManagedNetworkPeeringSpec{
+			Networks: []string{"netpeer-a", "netpeer-b"},
+		},
+	}
+	if err := k8sClient.Create(testCtx, link); err != nil {
+		t.Fatalf("declaring the peering: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(testCtx, link) })
+
+	eventually(t, "the prefix to open on both sides from the declaration alone", func() error {
+		for _, pair := range [][2]string{
+			{"netpeer-a-default", "10.200.180.9"},
+			{"netpeer-b-default", "10.200.176.9"},
+		} {
+			rules, err := readLiveACLs(pair[0])
+			if err != nil {
+				return err
+			}
+			if got := acl.Evaluate(rules,
+				netip.MustParseAddr(pair[1]), "to-lport"); got != acl.Allowed {
+				return fmt.Errorf("%s still drops %s: %s", pair[0], pair[1], got)
+			}
+		}
+		return nil
+	})
+}
+
+// TestAnUnacceptedDeclarationOpensNothing.
+//
+// The composer opens the prefix from the declaration, and a declaration is
+// something anybody who can create an object can write. If it trusted the spec,
+// naming two networks in a CR would open an allow between them even when the
+// peering is refused and no route is ever laid — a hole in the isolation with
+// nothing going through it, which is the worst of both.
+func TestAnUnacceptedDeclarationOpensNothing(t *testing.T) {
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netguard"},
+		Spec: platformv1alpha1.ManagedNetworkSpec{
+			CIDR: "10.200.184.0/22", DeletionPolicy: "Delete",
+		},
+	})
+
+	// A real network with a real subnet, whose rule list belongs to something
+	// else — so the peering will be refused, and the allow must not appear on
+	// the composed side either.
+	mustPeeredNetwork(t, "netstranger", "10.200.188.0/22")
+	setACLs(t, "netstranger-default", false, []map[string]any{
+		dropFrom("10.200.184.0/22")})
+
+	eventually(t, "the network closed to the stranger", func() error {
+		rules, err := readLiveACLs("netguard-default")
+		if err != nil {
+			return err
+		}
+		if got := acl.Evaluate(rules,
+			netip.MustParseAddr("10.200.188.9"), "to-lport"); got != acl.Dropped {
+			return fmt.Errorf("already open: %s", got)
+		}
+		return nil
+	})
+
+	link := &platformv1alpha1.ManagedNetworkPeering{
+		ObjectMeta: metav1.ObjectMeta{Name: "netguard-stranger"},
+		Spec: platformv1alpha1.ManagedNetworkPeeringSpec{
+			Networks: []string{"netguard", "netstranger"},
+		},
+	}
+	if err := k8sClient.Create(testCtx, link); err != nil {
+		t.Fatalf("declaring: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(testCtx, link) })
+
+	eventually(t, "the refusal", func() error {
+		out := &platformv1alpha1.ManagedNetworkPeering{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Name: "netguard-stranger",
+		}, out); err != nil {
+			return err
+		}
+		cond := apimeta.FindStatusCondition(out.Status.Conditions,
+			platformv1alpha1.ConditionPeeringAccepted)
+		if cond == nil || cond.Status != metav1.ConditionFalse {
+			return fmt.Errorf("Accepted = %v", cond)
+		}
+		if cond.Reason != "IsolationNotOurs" {
+			return fmt.Errorf("reason = %s", cond.Reason)
+		}
+		return nil
+	})
+
+	consistently(t, "the composed side staying shut", 6*time.Second, func() error {
+		rules, err := readLiveACLs("netguard-default")
+		if err != nil {
+			return err
+		}
+		if got := acl.Evaluate(rules,
+			netip.MustParseAddr("10.200.188.9"), "to-lport"); got != acl.Dropped {
+			return fmt.Errorf("an unaccepted declaration opened the prefix: %s", got)
+		}
+		return nil
+	})
 }

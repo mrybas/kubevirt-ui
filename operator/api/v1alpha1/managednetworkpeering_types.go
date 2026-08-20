@@ -60,6 +60,19 @@ type PeeringLeg struct {
 
 // Condition types published by the peering controller.
 const (
+	// ConditionPeeringAccepted is the operator saying this declaration is one it will
+	// act on: both networks exist, both have something to route to, and their
+	// rule lists are either already open or the composer's to open.
+	//
+	// It exists because the composer opens the prefix from the declaration, and
+	// a declaration is something anybody who can create an object can write. If
+	// the composer trusted the spec directly, naming two networks in a CR would
+	// open an allow between them even when the peering is refused and no route
+	// is ever laid — a hole in the isolation with nothing carrying traffic
+	// through it. So the composer honours only what this controller has
+	// accepted, and acceptance is checked before it is granted.
+	ConditionPeeringAccepted = "Accepted"
+
 	// ConditionEstablished is true only when both ends are written. There is no
 	// partial success here worth reporting as success.
 	ConditionEstablished = "Established"
@@ -100,6 +113,7 @@ type ManagedNetworkPeeringStatus struct {
 // +kubebuilder:resource:scope=Cluster,shortName=mnpeer
 // +kubebuilder:printcolumn:name="Networks",type=string,JSONPath=`.spec.networks`
 // +kubebuilder:printcolumn:name="Link",type=string,JSONPath=`.status.linkCIDR`
+// +kubebuilder:printcolumn:name="Accepted",type=string,JSONPath=`.status.conditions[?(@.type=="Accepted")].status`
 // +kubebuilder:printcolumn:name="Established",type=string,JSONPath=`.status.conditions[?(@.type=="Established")].status`
 // +kubebuilder:printcolumn:name="Traffic",type=string,JSONPath=`.status.conditions[?(@.type=="TrafficAllowed")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`

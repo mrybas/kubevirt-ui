@@ -107,6 +107,8 @@ func (r *ManagedNetworkPeeringReconciler) Reconcile(
 		vpc.SetGroupVersionKind(vpcGVK)
 		err := r.Get(ctx, types.NamespacedName{Name: name}, vpc)
 		if apierrors.IsNotFound(err) {
+			r.setAcceptedCondition(link, false, "NoSuchNetwork",
+				fmt.Sprintf("there is no Vpc/%s", name))
 			r.setPeeringCondition(link, false, "NoSuchNetwork",
 				fmt.Sprintf("there is no Vpc/%s to write an end on; nothing was "+
 					"written on the other side either", name))
@@ -118,6 +120,8 @@ func (r *ManagedNetworkPeeringReconciler) Reconcile(
 			return ctrl.Result{}, fmt.Errorf("reading Vpc/%s: %w", name, err)
 		}
 		if !vpc.GetDeletionTimestamp().IsZero() {
+			r.setAcceptedCondition(link, false, "NetworkGoing",
+				fmt.Sprintf("Vpc/%s is being deleted", name))
 			r.setPeeringCondition(link, false, "NetworkGoing",
 				fmt.Sprintf("Vpc/%s is being deleted; a peering onto it would "+
 					"outlive the thing it points at", name))
@@ -134,6 +138,8 @@ func (r *ManagedNetworkPeeringReconciler) Reconcile(
 			return ctrl.Result{}, err
 		}
 		if len(found) == 0 {
+			r.setAcceptedCondition(link, false, "NoSubnets",
+				fmt.Sprintf("%s has no subnet", name))
 			r.setPeeringCondition(link, false, "NoSubnets",
 				fmt.Sprintf("%s has no subnet, so there would be nothing to route "+
 					"to; both networks need one before they can be peered", name))
@@ -142,6 +148,46 @@ func (r *ManagedNetworkPeeringReconciler) Reconcile(
 				kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before)
 		}
 		cidrs[name] = found
+	}
+
+	// Refuse before writing anything if the rules on either side will never let
+	// the traffic through.
+	//
+	// Routing into a drop is worse than not peering: before, the traffic took
+	// the default route out through the gateway and came back; after, it goes
+	// to the link and dies. That is fine for the seconds a composer takes to
+	// lift its own drop, and permanent when the rule list belongs to something
+	// that will never hear about this peering.
+	reason, detail := r.isolationWillNotLift(ctx, a, b, cidrs)
+	if reason == "IsolationNotOurs" || reason == "Unreadable" {
+		// Not accepted, so the composer must not open anything either — an
+		// allow with no route through it is a hole in the isolation and nothing
+		// to show for it. Anything an earlier pass wrote comes off.
+		r.setAcceptedCondition(link, false, reason, detail)
+		r.rollBack(ctx, link)
+		r.setPeeringCondition(link, false, reason, detail)
+		r.setTrafficCondition(link, false, reason, detail)
+		link.Status.ObservedGeneration = link.Generation
+		return ctrl.Result{RequeueAfter: drainRetry},
+			kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before)
+	}
+
+	// Accepted: the composer may now open the prefix. Written before the wait
+	// below, because that wait is *for* the composer to act on this.
+	r.setAcceptedCondition(link, true, "Accepted",
+		fmt.Sprintf("%s and %s both exist, both have something to route to, and "+
+			"their rules are open or composed", a, b))
+	if err := kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before); err != nil {
+		return ctrl.Result{}, err
+	}
+	before = link.DeepCopy()
+
+	if reason != "" {
+		r.setPeeringCondition(link, false, reason, detail)
+		r.setTrafficCondition(link, false, reason, detail)
+		link.Status.ObservedGeneration = link.Generation
+		return ctrl.Result{RequeueAfter: drainRetry},
+			kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before)
 	}
 
 	chosen, err := r.chooseLink(ctx, link)
@@ -431,6 +477,98 @@ func (r *ManagedNetworkPeeringReconciler) subnetCIDRs(
 	return out, nil
 }
 
+// isolationWillNotLift is the precondition, and the reason the routes go in
+// second.
+//
+// Three outcomes. The traffic is already allowed — nothing is isolated, or the
+// prefix is already open — and the routes can go in. The rules are the
+// composer's and have not caught up: wait, because it has the declaration and
+// the allow is on its way, and writing routes first would create the very
+// interval this ordering exists to remove. Or the rules belong to something
+// that will never hear about this peering, and the allow is never coming.
+//
+// Deletion takes the reverse order for free: the finalizer holds the object
+// until the routes are off, and the composer only drops the allow once the
+// object is gone.
+func (r *ManagedNetworkPeeringReconciler) isolationWillNotLift(
+	ctx context.Context, a, b string, cidrs map[string][]string,
+) (reason, detail string) {
+	var stuck, waiting []string
+	for _, pair := range [][2]string{{a, b}, {b, a}} {
+		local, remote := pair[0], pair[1]
+		rules, err := r.aclsOf(ctx, local)
+		if err != nil {
+			return "Unreadable", err.Error()
+		}
+		blocked := false
+		for _, cidr := range cidrs[remote] {
+			source, err := firstAddressOf(cidr)
+			if err != nil {
+				continue
+			}
+			if acl.Evaluate(rules, source, "to-lport") != acl.Allowed {
+				blocked = true
+			}
+		}
+		if !blocked {
+			continue
+		}
+		owned, err := r.aclsAreComposed(ctx, local)
+		if err != nil {
+			return "Unreadable", err.Error()
+		}
+		if owned {
+			waiting = append(waiting, local)
+			continue
+		}
+		stuck = append(stuck, local)
+	}
+	if len(waiting) > 0 && len(stuck) == 0 {
+		// The composer has seen the declaration and has not caught up yet.
+		// Waiting is the whole point: no route is written until the prefix is
+		// open, so there is never an interval where the traffic is routed into
+		// a drop.
+		return "WaitingForIsolation", fmt.Sprintf(
+			"the rules on %s do not let the other side in yet. They are the "+
+				"composer's and it has the declaration, so the allow is coming; "+
+				"nothing is routed until it does",
+			strings.Join(waiting, " and "))
+	}
+	if len(stuck) == 0 {
+		return "", ""
+	}
+	return "IsolationNotOurs", fmt.Sprintf(
+		"the rules on %s drop the other side and that list is not the composer's, "+
+			"so the allow is never coming. Nothing was written: routing into a drop "+
+			"is worse than not peering — the traffic would go to the link and die "+
+			"where it used to take the default route. Describe %s as a "+
+			"ManagedNetwork so its rules are composed, or open the prefix by hand",
+		strings.Join(stuck, " and "), strings.Join(stuck, " and "))
+}
+
+// aclsAreComposed reports whether the composer owns this network's rule lists.
+func (r *ManagedNetworkPeeringReconciler) aclsAreComposed(
+	ctx context.Context, vpc string,
+) (bool, error) {
+	subnets := &unstructured.UnstructuredList{}
+	subnets.SetGroupVersionKind(subnetGVK.GroupVersion().WithKind("SubnetList"))
+	if err := r.List(ctx, subnets); err != nil {
+		return false, fmt.Errorf("listing subnets of %s: %w", vpc, err)
+	}
+	found := false
+	for i := range subnets.Items {
+		owner, _, _ := unstructured.NestedString(subnets.Items[i].Object, "spec", "vpc")
+		if owner != vpc {
+			continue
+		}
+		found = true
+		if subnets.Items[i].GetAnnotations()[aclOwnerAnnotation] != aclOwnerOperator {
+			return false, nil
+		}
+	}
+	return found, nil
+}
+
 // judgeTraffic asks whether a packet would get through, rather than whether
 // something wrote an allow.
 //
@@ -514,6 +652,22 @@ func (r *ManagedNetworkPeeringReconciler) setTrafficCondition(
 	}
 	apimeta.SetStatusCondition(&link.Status.Conditions, metav1.Condition{
 		Type:               platformv1alpha1.ConditionTrafficAllowed,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: link.Generation,
+	})
+}
+
+func (r *ManagedNetworkPeeringReconciler) setAcceptedCondition(
+	link *platformv1alpha1.ManagedNetworkPeering, ok bool, reason, message string,
+) {
+	status := metav1.ConditionTrue
+	if !ok {
+		status = metav1.ConditionFalse
+	}
+	apimeta.SetStatusCondition(&link.Status.Conditions, metav1.Condition{
+		Type:               platformv1alpha1.ConditionPeeringAccepted,
 		Status:             status,
 		Reason:             reason,
 		Message:            message,

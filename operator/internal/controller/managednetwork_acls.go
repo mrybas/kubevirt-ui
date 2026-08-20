@@ -23,6 +23,8 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -296,33 +298,76 @@ func (r *ManagedNetworkReconciler) tenantCIDRs(ctx context.Context) ([]string, e
 	return out, nil
 }
 
-// peerCIDRs are the networks this one is peered with — read from the peerings,
-// which are the truth about who may talk.
+// peerCIDRs are the networks this one is peered with.
 //
-// Deliberately not read back from the ACLs. Deriving the allow list from the
-// list being written makes the rules their own source: a rule that should have
-// gone stays, because it is still there.
+// Read from two places, and the first of them matters more than it looks. A
+// declared peering — a ManagedNetworkPeering naming this network — counts
+// before anything has been written to any router, which is what lets the allow
+// go in *before* the routes. Deriving it only from `Vpc.spec.vpcPeerings` would
+// be circular: the peering controller waits for the allow, and the allow waits
+// for the peering entry.
+//
+// The second is the live entries, because the endpoint still writes peerings
+// this operator has no object for, and a network composed here can be peered
+// from there.
+//
+// Neither is read back from the ACLs. Deriving the allow list from the list
+// being written makes the rules their own source: a rule that should have gone
+// stays, because it is still there.
 func (r *ManagedNetworkReconciler) peerCIDRs(ctx context.Context, vpc string) ([]string, error) {
-	router := &unstructured.Unstructured{}
-	router.SetGroupVersionKind(vpcGVK)
-	if err := r.Get(ctx, types.NamespacedName{Name: vpc}, router); err != nil {
-		return nil, nil
-	}
-	peerings, _, _ := unstructured.NestedSlice(router.Object, "spec", "vpcPeerings")
-	if len(peerings) == 0 {
-		return nil, nil
-	}
-
 	remotes := map[string]bool{}
-	for _, raw := range peerings {
-		entry, ok := raw.(map[string]any)
-		if !ok {
+
+	declared := &platformv1alpha1.ManagedNetworkPeeringList{}
+	if err := r.List(ctx, declared); err != nil {
+		return nil, fmt.Errorf("listing declared peerings: %w", err)
+	}
+	for i := range declared.Items {
+		if !declared.Items[i].DeletionTimestamp.IsZero() {
+			// On its way out. Keeping the allow alive here would mean the
+			// routes come off while the hole stays open.
+			//
+			// The finalizer is what makes the order right: it holds the object
+			// until the routes are gone, so the allow outlives them by exactly
+			// as long as that takes and not a moment longer.
 			continue
 		}
-		if remote, _ := entry["remoteVpc"].(string); remote != "" {
-			remotes[remote] = true
+		// Only what the peering controller has accepted. A declaration is
+		// something anybody who can create an object can write; trusting the
+		// spec here would let a CR naming two networks open an allow between
+		// them even when the peering is refused and no route is ever laid — a
+		// hole in the isolation with nothing going through it.
+		if accepted := apimeta.FindStatusCondition(
+			declared.Items[i].Status.Conditions, platformv1alpha1.ConditionPeeringAccepted,
+		); accepted == nil || accepted.Status != metav1.ConditionTrue {
+			continue
+		}
+		networks := declared.Items[i].Spec.Networks
+		if len(networks) != 2 {
+			continue
+		}
+		switch vpc {
+		case networks[0]:
+			remotes[networks[1]] = true
+		case networks[1]:
+			remotes[networks[0]] = true
 		}
 	}
+
+	router := &unstructured.Unstructured{}
+	router.SetGroupVersionKind(vpcGVK)
+	if err := r.Get(ctx, types.NamespacedName{Name: vpc}, router); err == nil {
+		peerings, _, _ := unstructured.NestedSlice(router.Object, "spec", "vpcPeerings")
+		for _, raw := range peerings {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if remote, _ := entry["remoteVpc"].(string); remote != "" {
+				remotes[remote] = true
+			}
+		}
+	}
+
 	if len(remotes) == 0 {
 		return nil, nil
 	}

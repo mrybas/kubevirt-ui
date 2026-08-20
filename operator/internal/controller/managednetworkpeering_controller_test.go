@@ -358,44 +358,106 @@ func TestRemovingThePeeringRemovesBothEnds(t *testing.T) {
 	})
 }
 
-// TestAPeeringThatRoutesButDropsSaysSo.
+// setACLs writes a rule list, optionally marking it the composer's.
+func setACLs(t *testing.T, subnet string, composed bool, rules []map[string]any) {
+	t.Helper()
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: subnet}, obj); err != nil {
+		t.Fatalf("reading Subnet/%s: %v", subnet, err)
+	}
+	list := make([]any, 0, len(rules))
+	for _, rule := range rules {
+		list = append(list, rule)
+	}
+	if err := unstructured.SetNestedSlice(obj.Object, list, "spec", "acls"); err != nil {
+		t.Fatalf("building the rules: %v", err)
+	}
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	if composed {
+		annotations[aclOwnerAnnotation] = aclOwnerOperator
+	} else {
+		delete(annotations, aclOwnerAnnotation)
+	}
+	obj.SetAnnotations(annotations)
+	if err := k8sClient.Update(testCtx, obj); err != nil {
+		t.Fatalf("writing the rules on %s: %v", subnet, err)
+	}
+}
+
+func dropFrom(cidr string) map[string]any {
+	return map[string]any{
+		"action": "drop", "direction": "to-lport",
+		"match": "ip4.src == " + cidr, "priority": int64(3000),
+	}
+}
+
+func allowFrom(cidr string) map[string]any {
+	return map[string]any{
+		"action": "allow-related", "direction": "to-lport",
+		"match": "ip4.src == " + cidr, "priority": int64(3100),
+	}
+}
+
+// TestAPeeringIsRefusedWhenTheAllowIsNeverComing.
 //
-// This is the failure the product has actually shipped: the link and the routes
-// perfect on both routers, the object reporting Active, and every packet
-// dropped by isolation. Measured again on the stand with this very controller —
-// two networks peered through a CR, both ends written, ping failing in both
-// directions — because the rule lists belonged to something that had not seen
-// the peering.
+// Routing into a drop is worse than not peering. Before, the traffic took the
+// default route out through the gateway and came back; after, it goes to the
+// link and dies. That is acceptable for the seconds a composer needs to lift
+// its own drop, and permanent when the rule list belongs to something that will
+// never hear about this peering.
 //
-// So the verdict is not "did something write an allow" but "would a packet get
-// through", evaluated the way OVN evaluates it.
-func TestAPeeringThatRoutesButDropsSaysSo(t *testing.T) {
+// Measured on the stand exactly that way: two networks peered through a CR,
+// both ends written, the object reporting Established, the normalized diff
+// against a UI-built peering identical — and ping failing in both directions.
+func TestAPeeringIsRefusedWhenTheAllowIsNeverComing(t *testing.T) {
 	mustPeeredNetwork(t, "pj", "10.215.0.0/22")
 	mustPeeredNetwork(t, "pk", "10.215.4.0/22")
-
-	// The isolation floor, as something else would have written it.
-	for _, pair := range [][2]string{{"pj", "10.215.4.0/22"}, {"pk", "10.215.0.0/22"}} {
-		subnet := &unstructured.Unstructured{}
-		subnet.SetGroupVersionKind(subnetGVK)
-		if err := k8sClient.Get(testCtx, types.NamespacedName{
-			Name: pair[0] + "-default",
-		}, subnet); err != nil {
-			t.Fatalf("reading Subnet/%s: %v", pair[0], err)
-		}
-		if err := unstructured.SetNestedSlice(subnet.Object, []any{map[string]any{
-			"action": "drop", "direction": "to-lport",
-			"match": "ip4.src == " + pair[1], "priority": int64(3000),
-		}}, "spec", "acls"); err != nil {
-			t.Fatalf("building the drop: %v", err)
-		}
-		if err := k8sClient.Update(testCtx, subnet); err != nil {
-			t.Fatalf("writing the drop: %v", err)
-		}
-	}
+	// Rule lists written by something else, dropping each other.
+	setACLs(t, "pj-default", false, []map[string]any{dropFrom("10.215.4.0/22")})
+	setACLs(t, "pk-default", false, []map[string]any{dropFrom("10.215.0.0/22")})
 
 	mustPeering(t, "pj-pk", "pj", "pk")
 
-	eventually(t, "established and honest about the traffic", func() error {
+	eventually(t, "the refusal", func() error {
+		link := getPeering(t, "pj-pk")
+		cond := apimeta.FindStatusCondition(link.Status.Conditions,
+			platformv1alpha1.ConditionEstablished)
+		if cond == nil || cond.Status != metav1.ConditionFalse {
+			return fmt.Errorf("Established = %v", cond)
+		}
+		if cond.Reason != "IsolationNotOurs" {
+			return fmt.Errorf("reason = %s", cond.Reason)
+		}
+		for _, phrase := range []string{"pj", "pk", "Nothing was written"} {
+			if !strings.Contains(cond.Message, phrase) {
+				return fmt.Errorf("message does not mention %q: %s", phrase, cond.Message)
+			}
+		}
+		return nil
+	})
+
+	// And nothing was written, which is the claim.
+	consistently(t, "no routes into a drop", 8*time.Second, func() error {
+		for _, vpc := range []string{"pj", "pk"} {
+			if got := peeringEntriesOf(t, vpc); len(got) != 0 {
+				return fmt.Errorf("%s peers with %v", vpc, got)
+			}
+		}
+		return nil
+	})
+
+	// Open the prefixes by hand — one of the two ways out the message names —
+	// and it goes through.
+	setACLs(t, "pj-default", false, []map[string]any{
+		dropFrom("10.215.4.0/22"), allowFrom("10.215.4.0/22")})
+	setACLs(t, "pk-default", false, []map[string]any{
+		dropFrom("10.215.0.0/22"), allowFrom("10.215.0.0/22")})
+
+	eventually(t, "the peering to establish once the traffic can pass", func() error {
 		link := getPeering(t, "pj-pk")
 		established := apimeta.FindStatusCondition(link.Status.Conditions,
 			platformv1alpha1.ConditionEstablished)
@@ -404,51 +466,71 @@ func TestAPeeringThatRoutesButDropsSaysSo(t *testing.T) {
 		if established == nil || established.Status != metav1.ConditionTrue {
 			return fmt.Errorf("Established = %v", established)
 		}
-		if traffic == nil || traffic.Status != metav1.ConditionFalse {
+		if traffic == nil || traffic.Status != metav1.ConditionTrue {
 			return fmt.Errorf("TrafficAllowed = %v", traffic)
 		}
-		if traffic.Reason != "IsolationDrops" {
-			return fmt.Errorf("reason = %s", traffic.Reason)
+		return nil
+	})
+}
+
+// TestNothingIsRoutedUntilThePrefixIsOpen is the ordering.
+//
+// A composer-owned drop lifts itself, so the peering is not refused — but the
+// routes still do not go in until it has. "A few seconds, fail-closed" is a
+// routed black hole with a short life, and it is avoidable: the composer sees
+// the declaration, not the routes, so the allow can come first.
+func TestNothingIsRoutedUntilThePrefixIsOpen(t *testing.T) {
+	mustPeeredNetwork(t, "pl", "10.216.0.0/22")
+	mustPeeredNetwork(t, "pm", "10.216.4.0/22")
+	setACLs(t, "pl-default", true, []map[string]any{dropFrom("10.216.4.0/22")})
+	setACLs(t, "pm-default", true, []map[string]any{dropFrom("10.216.0.0/22")})
+
+	mustPeering(t, "pl-pm", "pl", "pm")
+
+	eventually(t, "the wait to be reported", func() error {
+		cond := apimeta.FindStatusCondition(getPeering(t, "pl-pm").Status.Conditions,
+			platformv1alpha1.ConditionEstablished)
+		if cond == nil || cond.Reason != "WaitingForIsolation" {
+			return fmt.Errorf("condition = %v", cond)
 		}
-		for _, phrase := range []string{"pj", "pk", "still drop"} {
-			if !strings.Contains(traffic.Message, phrase) {
-				return fmt.Errorf("message does not mention %q: %s", phrase, traffic.Message)
+		return nil
+	})
+
+	// And while it waits, nothing is routed. Watched past the retry interval:
+	// writing the legs and taking them off again would be the same interval
+	// with extra steps.
+	consistently(t, "no routes while the prefix is shut", 8*time.Second, func() error {
+		for _, vpc := range []string{"pl", "pm"} {
+			if got := peeringEntriesOf(t, vpc); len(got) != 0 {
+				return fmt.Errorf("%s peers with %v before the allow landed", vpc, got)
 			}
 		}
 		return nil
 	})
 
-	// Lift the drops the way a composer would, and the verdict changes.
-	for _, pair := range [][2]string{{"pj", "10.215.4.0/22"}, {"pk", "10.215.0.0/22"}} {
-		subnet := &unstructured.Unstructured{}
-		subnet.SetGroupVersionKind(subnetGVK)
-		if err := k8sClient.Get(testCtx, types.NamespacedName{
-			Name: pair[0] + "-default",
-		}, subnet); err != nil {
-			t.Fatalf("reading Subnet/%s: %v", pair[0], err)
-		}
-		if err := unstructured.SetNestedSlice(subnet.Object, []any{
-			map[string]any{
-				"action": "drop", "direction": "to-lport",
-				"match": "ip4.src == " + pair[1], "priority": int64(3000),
-			},
-			map[string]any{
-				"action": "allow-related", "direction": "to-lport",
-				"match": "ip4.src == " + pair[1], "priority": int64(3100),
-			},
-		}, "spec", "acls"); err != nil {
-			t.Fatalf("building the allow: %v", err)
-		}
-		if err := k8sClient.Update(testCtx, subnet); err != nil {
-			t.Fatalf("writing the allow: %v", err)
-		}
-	}
+	// The composer lifts its own drop — here by hand, since the composer is the
+	// other controller's job — and only then do the routes appear.
+	setACLs(t, "pl-default", true, []map[string]any{
+		dropFrom("10.216.4.0/22"), allowFrom("10.216.4.0/22")})
+	setACLs(t, "pm-default", true, []map[string]any{
+		dropFrom("10.216.0.0/22"), allowFrom("10.216.0.0/22")})
 
-	eventually(t, "the verdict to change on its own", func() error {
-		traffic := apimeta.FindStatusCondition(getPeering(t, "pj-pk").Status.Conditions,
+	eventually(t, "the routes to follow the allow", func() error {
+		link := getPeering(t, "pl-pm")
+		established := apimeta.FindStatusCondition(link.Status.Conditions,
+			platformv1alpha1.ConditionEstablished)
+		traffic := apimeta.FindStatusCondition(link.Status.Conditions,
 			platformv1alpha1.ConditionTrafficAllowed)
+		if established == nil || established.Status != metav1.ConditionTrue {
+			return fmt.Errorf("Established = %v", established)
+		}
 		if traffic == nil || traffic.Status != metav1.ConditionTrue {
 			return fmt.Errorf("TrafficAllowed = %v", traffic)
+		}
+		for _, vpc := range []string{"pl", "pm"} {
+			if len(peeringEntriesOf(t, vpc)) != 1 {
+				return fmt.Errorf("%s is not routed", vpc)
+			}
 		}
 		return nil
 	})

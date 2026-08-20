@@ -553,6 +553,9 @@ func (r *ManagedNetworkReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(vpcs, toNetworks).
 		Watches(subnets, toNetworks).
 		Watches(vpcDNSes, toNetworks).
+		// A declared peering opens the prefix before anything is routed, which
+		// is what keeps the routes from ever pointing into a drop.
+		Watches(&platformv1alpha1.ManagedNetworkPeering{}, toNetworks).
 		// The whole point of moving the service route here: kube-ovn creates
 		// the VpcDns Deployment after the object, so the route used to be
 		// applied best-effort at create time and then only by a person calling
