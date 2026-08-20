@@ -961,16 +961,46 @@ printed alongside every diff in this log's live checks.
 subnet that turned out to have **no** logical switch also reported
 `Ready=True, reason=ResetLogicalSwitchAclSuccess`.
 
-### A trap of my own making, worth the rule
+### A trap of my own making — the evidence, and what it does not say
 
-Deleting a test network and immediately recreating it under the same name left
-the second one with no logical switch at all (`not found logical switch
-"uinet1-default"`, logged while the VpcDns pod tried to attach), and its Subnet
-then sat in Terminating forever on kube-ovn's finalizer — the UI's honest 409
-says "retry in a moment", and the moment never came. Deleting the Vpc did not
-release it either; I tested that rather than assuming, and the hypothesis was
-wrong.
+Deleting a test network and recreating it under the same name left the second
+one with no logical switch, and its Subnet then sat in Terminating until the
+finalizer was removed by hand. The UI's honest 409 says "retry in a moment", and
+the moment never came.
 
-Rule for the live cycles from here: **never reuse a network name**. The first
-delete is still in flight when the second create lands, and the two collide
-somewhere below the CRs where nothing reports it.
+I first wrote that up as "name reuse" from inference. Pulled the controller logs
+instead. What they actually show, in order:
+
+```
+08:53:18  ipam.go:347   adding new subnet uinet1-default        ← UID f06b1840…
+08:53:19  ipam.go:490   recorded gateway MAC … for subnet uinet1-default
+08:53:19  ipam.go:61    allocate 10.200.20.2 … vpc-dns-uinet1-dns-…   (switch exists)
+08:55:41  ipam.go:355   delete subnet uinet1-default            ← first delete
+08:57:15  pod.go:751    get logical switch uinet1-default …: not found
+                        logical switch "uinet1-default"          ← second incarnation
+09:05:06  ipam.go:355   delete subnet uinet1-default            ← my finalizer removal
+```
+
+and two distinct UIDs for one name:
+
+```
+Name:"uinet1-default", UID:"f06b1840-96dd-4ab1-843b-d2225c49ee3e"
+Name:"uinet1-default", UID:"30d10794-7834-480e-ad56-1cd752eca45b"
+```
+
+So the name was reused across a delete that was still in flight — that part is
+direct. `adding new subnet` appears exactly once, for the first UID: the second
+incarnation never had a logical switch built for it at all. The internal
+mechanism inside kube-ovn is **not** established, and this log does not claim
+one.
+
+Two hypotheses were tested and are wrong, which is worth as much as the finding:
+
+* *"The Vpc is holding it."* Deleted the Vpc directly; the Subnet did not budge.
+* *"The VPC was never standby."* The logs are full of
+  `the vpc 'uinet1' not standby yet, requeuing` — and `opnet1`, the network that
+  worked, hit the same error **twelve times** on its way up. It is normal
+  transient noise at create, not a cause. An error message that appears in both
+  the broken and the working case explains neither.
+
+Rule for the live cycles from here: **never reuse a network name.**
