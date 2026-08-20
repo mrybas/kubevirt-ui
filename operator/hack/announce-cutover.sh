@@ -37,14 +37,41 @@ action="${1:-status}"
 apply=false
 [[ "${2:-}" == "--apply" ]] && apply=true
 
+# backend_writer_on asks the running pods, not the Deployment.
+#
+# A flag set in a spec is an intention; a pod that has not been replaced yet is
+# still writing every thirty seconds. Reading the spec alone would let phase 2
+# start while the old pod was mid-rollout — which is exactly the two-writer
+# window this whole ordering exists to avoid.
+#
+# Any running pod without the flag counts as writing, and a rollout still in
+# progress counts as writing too.
 backend_writer_on() {
-  local value
-  value=$(kubectl get deploy "$BACKEND_DEPLOY" -n "$BACKEND_NS" -o json 2>/dev/null \
-          | jq -r '.spec.template.spec.containers[0].env[]? | select(.name=="OPERATOR_ANNOUNCE_ENABLED") | .value' || true)
-  case "${value,,}" in
-    1|true|yes|on) return 1 ;;   # operator owns them: the backend is not writing
-    *)             return 0 ;;   # unset or false: the backend is still writing
-  esac
+  if ! kubectl rollout status "deploy/$BACKEND_DEPLOY" -n "$BACKEND_NS" --timeout=5s >/dev/null 2>&1; then
+    return 0   # mid-rollout: some old pod is still around, and it writes
+  fi
+
+  local pods pod value any=false
+  pods=$(kubectl get pods -n "$BACKEND_NS" \
+           -l "$(kubectl get deploy "$BACKEND_DEPLOY" -n "$BACKEND_NS" \
+                 -o jsonpath='{range .spec.selector.matchLabels}{"\n"}{end}' >/dev/null 2>&1; \
+                 kubectl get deploy "$BACKEND_DEPLOY" -n "$BACKEND_NS" -o json \
+                 | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')" \
+           --field-selector=status.phase=Running -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)
+
+  for pod in $pods; do
+    any=true
+    value=$(kubectl get pod "$pod" -n "$BACKEND_NS" -o json \
+            | jq -r '.spec.containers[0].env[]? | select(.name=="OPERATOR_ANNOUNCE_ENABLED") | .value' || true)
+    case "${value,,}" in
+      1|true|yes|on) ;;          # this pod has stepped aside
+      *) return 0 ;;             # this one is still writing
+    esac
+  done
+
+  # No running pod at all is not proof of anything, so treat it as writing.
+  $any || return 0
+  return 1
 }
 
 policy_dry_run() {
@@ -115,8 +142,30 @@ MSG
       echo "Nothing changed. Re-run with --apply to take the object over."
       exit 0
     fi
+    t=$(target); ns="${t%/*}"; name="${t#*/}"
+    kubectl get frrconfiguration "$name" -n "$ns" -o jsonpath='{.spec.raw.rawConfig}' > /tmp/announce-before.conf 2>/dev/null || true
+
     kubectl patch announcementpolicy "$POLICY" --type=merge -p '{"spec":{"dryRun":false}}'
-    echo "The operator now owns $(target)."
+    echo "The operator now owns $t. Checking that the dataplane did not move…"
+
+    # Adoption must be a no-op on the wire. Give the controller a moment, then
+    # compare what is actually on the object — the comparison in status was a
+    # prediction, this is the outcome.
+    sleep 10
+    kubectl get frrconfiguration "$name" -n "$ns" -o jsonpath='{.spec.raw.rawConfig}' > /tmp/announce-after.conf 2>/dev/null || true
+    if diff -u /tmp/announce-before.conf /tmp/announce-after.conf; then
+      echo "  unchanged — the handover moved ownership and nothing else."
+    else
+      cat >&2 <<MSG
+
+  ^^^ the live configuration CHANGED on adoption. Roll back now:
+
+      $0 rollback --apply
+
+  and work out the difference before trying again.
+MSG
+      exit 1
+    fi
     ;;
 
   rollback)
@@ -125,8 +174,17 @@ MSG
         echo "Would put the policy back into dryRun. Re-run with --apply."
         exit 0
       fi
+      t=$(target); ns="${t%/*}"; name="${t#*/}"
+      kubectl get frrconfiguration "$name" -n "$ns" -o jsonpath='{.spec.raw.rawConfig}' > /tmp/announce-rollback-before.conf 2>/dev/null || true
+
       kubectl patch announcementpolicy "$POLICY" --type=merge -p '{"spec":{"dryRun":true}}'
-      echo "The operator has stopped writing. Confirm, then give it back to the backend:"
+      sleep 5
+      kubectl get frrconfiguration "$name" -n "$ns" -o jsonpath='{.spec.raw.rawConfig}' > /tmp/announce-rollback-after.conf 2>/dev/null || true
+      if ! diff -q /tmp/announce-rollback-before.conf /tmp/announce-rollback-after.conf >/dev/null; then
+        echo "WARNING: the configuration changed while stepping back; inspect it before continuing." >&2
+      fi
+      echo "The operator has stopped writing, and the object it leaves behind is what frr-k8s keeps applying."
+      echo "Confirm, then give it back to the backend:"
     else
       echo "The operator is already in dryRun. Give the object back to the backend:"
     fi

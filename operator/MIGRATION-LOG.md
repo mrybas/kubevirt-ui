@@ -675,11 +675,32 @@ is, frr-k8s keeps applying it, and the dataplane does not move. A window with
 two is two `router bgp` blocks over one session. Rollback is the same order
 backwards, for the same reason.
 
-`hack/announce-cutover.sh` walks it and **refuses the wrong order** — asked to
-take the object over while the backend is still writing, it declines and prints
-the phase-1 command. It will not flip the backend itself: that is a change to a
-released deployment. Its `status` also prints the byte-for-byte comparison, so
-the decision is made on evidence rather than on this document.
+`hack/announce-cutover.sh` walks it and **refuses the wrong order**. It will not
+flip the backend itself — that is a change to a released deployment — and its
+`status` prints the byte-for-byte comparison, so the decision is made on
+evidence rather than on this document.
+
+#### The procedure was rehearsed, not just written
+
+The whole cycle was run against a stand-in: an FRRConfiguration identical to the
+live one, in a namespace frr-k8s does not watch, with a probe Deployment
+standing in for the backend. Nothing on the real BGP path was touched.
+
+| step | result |
+|---|---|
+| writer flag unset | `backend writer: ON` — phase 2 refused |
+| flag set to `false` | `ON` — refused |
+| flag set, **rollout still in progress** | `ON` — refused. The check reads the *running pods*, not the Deployment: a flag in a spec is an intention, and a pod that has not been replaced is still writing |
+| flag set, rollout complete | `off` — phase 2 allowed |
+| takeover | `unchanged — the handover moved ownership and nothing else` |
+| ownership, behaviourally | the object was tampered with (`router bgp 1`) and the operator put it back |
+| rollback | operator stepped back; `resourceVersion` then held still for twenty seconds — nobody writing |
+
+Two defects in the script itself came out of running it. The first version read
+the flag off the Deployment spec, so it would have let phase 2 start mid-rollout
+— the exact two-writer window the ordering exists to prevent. The second had
+`local` outside a function, so `phase2 --apply` printed its checks and then
+silently did nothing. Neither would have been visible by reading it.
 
 ### Why "shadow" was the wrong idea, corrected before it shipped
 
