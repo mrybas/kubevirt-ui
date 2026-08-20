@@ -1442,3 +1442,72 @@ The last row is the whole change, and everything around it matches.
 The tenant domain runs as its own deployment (`--domains=tenant`), a third
 alongside vm and network, so a crash in one does not stop the others and each
 service account carries only its own rights.
+
+## R-1 — the plan's version did not reproduce, and what did is worse
+
+The plan says a folder member can delete tenant-cluster nodes through inherited
+RoleBindings. Measured first:
+
+```
+delete machines.cluster.x-k8s.io            -> no
+delete machinedeployments.cluster.x-k8s.io  -> no
+delete clusters.cluster.x-k8s.io            -> no
+delete kubevirtmachinetemplates…            -> no
+```
+
+`kubevirt-ui-editor` grants nothing on `cluster.x-k8s.io`. So that claim is not
+true as written.
+
+What the same probe *did* return:
+
+```
+delete virtualmachines.kubevirt.io  -> yes
+get secrets                         -> yes
+```
+
+And then, with the lowest role there is:
+
+```
+kubectl auth can-i get secret/uat-t1-admin-kubeconfig -n tenant-uat-t1 \
+  --as=someone --as-group=kv-poc-transit-viewers
+yes
+```
+
+A folder **viewer** could read the tenant's admin kubeconfig and its cluster CA.
+That is cluster-admin on that tenant, handed to anyone with read access to the
+folder. A member's role grants `*` on secrets, so they could rewrite them too,
+and delete the worker VMs that are the tenant's nodes.
+
+The mechanism, exactly: a tenant namespace carries the folder and environment
+labels — deliberately, so the tenant takes part in folder authorisation — and
+`reconcile_folder_rbac` therefore binds `kubevirt-ui-{admin,editor,viewer}` into
+it. Those roles grant `get,list,watch` and `*` on `secrets` respectively, which
+is right for a project namespace and wrong for one holding another cluster's
+certificates.
+
+### The fix, and why it costs nothing
+
+Three new roles — `kubevirt-ui-tenant-{admin,editor,viewer}` — bound instead
+when the namespace carries `kubevirt-ui.io/tenant`. Read, and no secrets. All
+three are the same, deliberately: everything the product does to a tenant runs
+as the backend behind `require_tenant_access`, which checks the caller's folder
+role, and the kubeconfig download is one of those. Nothing legitimate reads
+those secrets as the user, so nothing breaks.
+
+The namespace label is read rather than the `tenant-` prefix matched: the prefix
+is a convention, and a convention is what an authorisation decision must not
+rest on.
+
+### Measured after
+
+| group | secret/…-admin-kubeconfig | secrets | delete VMs | list machines | list VMs |
+|---|---|---|---|---|---|
+| viewers | no | no | no | yes | yes |
+| members | no | no | no | yes | yes |
+| admins | no | no | no | yes | yes |
+
+And an ordinary project namespace is untouched — `poc-transit-dev` still answers
+`yes` to a viewer reading secrets, which is what those roles were written for.
+
+Applied to the stand: three ClusterRoles created, six RoleBindings repointed
+across the two live tenants.

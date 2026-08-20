@@ -253,3 +253,115 @@ rules:
     resources: ["storageclasses"]
     verbs: ["get", "list", "watch"]
 {{- end }}
+---
+# Roles bound inside a tenant's namespace, instead of the folder ones.
+#
+# A tenant namespace is a folder namespace — it carries the folder and
+# environment labels so the tenant takes part in folder authorisation — and
+# that is what made the folder roles land in it. Measured on a live stand:
+#
+#   kubectl auth can-i get secret/uat-t1-admin-kubeconfig -n tenant-uat-t1 \
+#     --as=someone --as-group=kv-poc-transit-viewers
+#   yes
+#
+# A folder *viewer* — the lowest role there is — could read the tenant's admin
+# kubeconfig and its cluster CA, which is cluster-admin on that tenant handed to
+# anyone with read access to the folder. A member could write and delete them,
+# and delete the worker VMs that are the tenant's nodes.
+#
+# The contents of a tenant namespace are not a user's workloads. They are the
+# machinery of another cluster: its certificates, its datastore config, its
+# CAPI graph. The product's own operations on them go through the backend's
+# service account behind `require_tenant_access`, so nothing legitimate reads
+# these secrets as the user — the kubeconfig download does not.
+#
+# So: read, and no secrets. Same three names so the binding shape is unchanged.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-ui-tenant-viewer
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    kubevirt-ui.io/role: "tenant-viewer"
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances", "virtualmachineinstancemigrations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes", "datasources"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "pods", "pods/log", "events", "services", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["cluster.x-k8s.io", "infrastructure.cluster.x-k8s.io", "controlplane.cluster.x-k8s.io", "bootstrap.cluster.x-k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch"]
+---
+# Member and admin get the same thing here, deliberately.
+#
+# Everything the product does to a tenant — scaling it, rebooting a worker,
+# fetching a kubeconfig, deleting it — goes through the backend under
+# `require_tenant_access`, which checks the caller's folder role. Direct RBAC in
+# this namespace is only what a person gets with kubectl, and there is nothing
+# they should be doing there by hand that the product does not already offer.
+# Deleting a Machine or a worker VM by hand is not an operation; it is an
+# outage.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-ui-tenant-editor
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    kubevirt-ui.io/role: "tenant-editor"
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances", "virtualmachineinstancemigrations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes", "datasources"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "pods", "pods/log", "events", "services", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["cluster.x-k8s.io", "infrastructure.cluster.x-k8s.io", "controlplane.cluster.x-k8s.io", "bootstrap.cluster.x-k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kubevirt-ui-tenant-admin
+  labels:
+    {{- include "kubevirt-ui.labels" . | nindent 4 }}
+    kubevirt-ui.io/role: "tenant-admin"
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances", "virtualmachineinstancemigrations"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes", "datasources"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims", "pods", "pods/log", "events", "services", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["resourcequotas", "limitranges"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["cluster.x-k8s.io", "infrastructure.cluster.x-k8s.io", "controlplane.cluster.x-k8s.io", "bootstrap.cluster.x-k8s.io"]
+    resources: ["*"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get", "list", "watch"]

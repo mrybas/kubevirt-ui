@@ -450,6 +450,43 @@ _RBAC_ROLE_NAMES: list[tuple[str, str, str]] = [
     ("viewer",  RB_NAME_VIEWER,  ROLE_TO_CLUSTERROLE["viewer"]),
 ]
 
+# The same three roles, for a namespace that holds another cluster's machinery.
+TENANT_CLUSTERROLES = {
+    ROLE_TO_CLUSTERROLE["admin"]: "kubevirt-ui-tenant-admin",
+    ROLE_TO_CLUSTERROLE["editor"]: "kubevirt-ui-tenant-editor",
+    ROLE_TO_CLUSTERROLE["viewer"]: "kubevirt-ui-tenant-viewer",
+}
+
+# The label that says a namespace belongs to a tenant cluster.
+TENANT_NS_LABEL = "kubevirt-ui.io/tenant"
+
+
+def _role_for_namespace(cluster_role: str, ns_labels: dict | None) -> str:
+    """The role to bind here, which is not the folder one in a tenant namespace.
+
+    A tenant namespace *is* a folder namespace — it carries the folder and
+    environment labels so the tenant takes part in folder authorisation — and
+    that is exactly what put the folder roles into it. Measured on a live stand:
+
+        kubectl auth can-i get secret/uat-t1-admin-kubeconfig -n tenant-uat-t1 \
+          --as=someone --as-group=kv-poc-transit-viewers
+        yes
+
+    A folder *viewer* could read the tenant's admin kubeconfig and its cluster
+    CA — cluster-admin on that tenant, handed to anyone with read access to the
+    folder. A member, whose role grants `*` on secrets, could also rewrite them,
+    and could delete the worker VMs that are the tenant's nodes.
+
+    What lives in a tenant namespace is not a user's workloads; it is another
+    cluster's certificates, datastore config and CAPI graph. Every product
+    operation on them runs as the backend behind `require_tenant_access`, so
+    nothing legitimate reads those secrets as the user — the kubeconfig download
+    does not.
+    """
+    if (ns_labels or {}).get(TENANT_NS_LABEL):
+        return TENANT_CLUSTERROLES.get(cluster_role, cluster_role)
+    return cluster_role
+
 
 def _collect_subjects(
     folder_meta: dict, env: str, role: str,
@@ -592,7 +629,8 @@ async def reconcile_folder_rbac(
         for role, rb_name, cluster_role in _RBAC_ROLE_NAMES:
             groups = _collect_subjects(folder_meta, env, role)
             await _apply_phase2_rb(
-                rbac_api, rb_name, ns_name, folder, env, cluster_role, groups,
+                rbac_api, rb_name, ns_name, folder, env,
+                _role_for_namespace(cluster_role, ns_obj.metadata.labels), groups,
             )
 
 
@@ -623,10 +661,27 @@ async def reconcile_namespace_rbac(
     not `<folder>-<env>` shaped so `_ns_name` doesn't apply).
     """
     rbac_api = await _get_rbac_api(k8s_client)
+
+    # Read once, before the loop. The tenant label is the fact; the `tenant-`
+    # prefix is only a convention, and a convention is what an authorisation
+    # decision must not rest on.
+    ns_labels: dict = {}
+    try:
+        ns_obj = await k8s_client.core_api.read_namespace(name=namespace)
+        ns_labels = ns_obj.metadata.labels or {}
+    except ApiException as e:
+        logger.warning(
+            "Could not read namespace %r to decide which roles to bind (%s); "
+            "binding the folder roles, which grant read on this namespace's "
+            "secrets. If this is a tenant namespace, that is too much.",
+            namespace, e,
+        )
+
     for role, rb_name, cluster_role in _RBAC_ROLE_NAMES:
         groups = _collect_subjects(folder_meta, env, role)
         await _apply_phase2_rb(
-            rbac_api, rb_name, namespace, folder, env, cluster_role, groups,
+            rbac_api, rb_name, namespace, folder, env,
+            _role_for_namespace(cluster_role, ns_labels), groups,
         )
 
 
