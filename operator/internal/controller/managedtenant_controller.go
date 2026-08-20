@@ -88,6 +88,10 @@ type ManagedTenantReconciler struct {
 	// built has no ManagedNetwork, and refusing to build workers in one would
 	// be this operator insisting the world be its own shape.
 	KubeOVNNamespace string
+
+	// TenantClient opens a client to a tenant's own API server. Replaced in
+	// tests, where there is no second cluster to talk to.
+	TenantClient TenantClientFor
 }
 
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants,verbs=get;list;watch;create;update;patch;delete
@@ -333,6 +337,23 @@ func (r *ManagedTenantReconciler) Reconcile(
 	apimeta.SetStatusCondition(&obj.Status.Conditions,
 		workersCondition(workersReady, workersReason, workersMessage))
 	pending = pending || !workersReady
+
+	// Last, and against a different API server: what goes here can only be
+	// placed once the tenant's own control plane answers.
+	insideReady, insideReason, insideMessage, err := r.reconcileInsideTheTenant(
+		ctx, obj, namespace)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			insideCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if obj.Spec.Workers.OS == "talos" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			insideCondition(insideReady, insideReason, insideMessage))
+		pending = pending || !insideReady
+	}
 
 	// After the namespace, because the clone grant names it as its subject.
 	goldenReady, goldenMessage, err := r.reconcileGolden(ctx, obj, namespace, release)

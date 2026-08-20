@@ -239,6 +239,15 @@ const (
 	// unreachable. It is also where a conflict over the one SNAT slot a subnet
 	// has gets reported, which is not something that heals itself.
 	ConditionTransitReady = "TransitReady"
+
+	// ConditionTenantBootstrapped is what had to be placed *inside* the tenant
+	// once its own API answered.
+	//
+	// Separate because it is the only thing here that talks to a different
+	// cluster, and because its absence has a symptom that names nothing: the
+	// worker's certificate is issued, every component reports healthy, and the
+	// cluster simply has no node.
+	ConditionTenantBootstrapped = "TenantBootstrapped"
 )
 
 // TenantReservation is what this tenant asks of its folder.

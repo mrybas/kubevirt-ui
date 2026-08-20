@@ -2685,3 +2685,41 @@ now a table both suites read, built from the catalogue the stand carries and all
 four addons it offers, including alloy's config substitution and the CSI
 driver's namespace. Removing `disableWait` from the port turns three of the four
 red.
+
+## M12e (second slice) — what has to be placed inside the tenant
+
+One object, against a different API server, and it cannot be written until the
+tenant's own control plane answers — which is why the product does it from a
+timer and why this is a phase of its own rather than part of the create path.
+
+Talos hands a worker one token for two jobs. trustd authenticates the machine
+with it, and the kubelet uses the same value as a kubeadm bootstrap credential —
+and that half needs a `bootstrap-token-<id>` Secret in the **tenant's**
+kube-system, which Kamaji does not create even though it creates the RBAC
+around it.
+
+Its absence names nothing, which is what makes it worth a condition of its own:
+the signer issues the certificate, apid and the kubelet both report healthy, and
+the cluster has no node at all — because the kubelet's TLS bootstrap has nothing
+to authenticate with and never files a CSR.
+
+Three refusals came out of writing it, and each is a different kind:
+
+* a control plane that is not answering yet is **waited for**, not failed — that
+  is what a cold tenant looks like and it fixes itself;
+* a machine token that is not `id.secret` is **refused** — nothing about it
+  improves by coming back, and the tenant does not get dialled for something
+  that cannot be derived;
+* the credential is written **once**. It never rotates, and rewriting it would
+  invalidate what every existing worker holds.
+
+The tenant's API is reached by the in-cluster address out of the admin secret,
+never the external one: those name an ingress host this process has no reason to
+resolve or route to.
+
+Tested against a stand-in for the tenant cluster rather than a second envtest.
+What is under test is which object is placed, where, and when — a real second
+API server would be testing controller-runtime. Removing `auth-extra-groups`
+from the port turns it red: without that group the CSR is filed by somebody the
+auto-approvers do not recognise, which is the same invisible failure one step
+along.
