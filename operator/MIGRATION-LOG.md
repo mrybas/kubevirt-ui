@@ -2281,3 +2281,45 @@ No test could have caught this: envtest has no CNI, so a pod there has no
 address at all, and the diff could not either — it compares what is declared,
 and both declarations were the same shape. It took a control plane that would
 not start.
+
+### Ceasing to write it is not undoing it
+
+The namespace fix stops the operator stamping the annotation; it does not lift
+the stamp from a namespace already carrying one, and such a tenant stays broken
+after the upgrade that fixed the cause. `tenant-cmp2` was rebuilt rather than
+healed — it was disposable — but the reconciler now removes the annotation when
+it finds it, and only when the value is **our** old stamp, the tenant's own VPC
+subnet. `ovn-default` is kube-ovn's own claim and the value a healthy tenant
+namespace carries; taking that away would be the same mistake pointed the other
+way. The test asserts both halves, and mutating the removal turns it red.
+
+### A tenant, end to end, from one custom resource
+
+```
+Accepted  AddressAssigned  PKIReady  TimeServed
+ControlPlaneReady  WorkersReady  GoldenReady  NamespaceReady  QuotaReserved
+                                                       all True
+
+roots     cmp3-workers-…-bwtvh-root  20Gi  ceph-block
+          cmp3-workers-…-tmq7p-root  20Gi  ceph-block
+golden    one DataVolume in the cluster, no new import
+quota     hard 160Gi, used 40Gi — the two roots and nothing phantom
+```
+
+Two workers, each with its own root clone on the tenant's storage class, from
+the golden that already existed.
+
+**What actually held the join up is worth recording precisely**, because it was
+not the graph. The control plane went Ready and both machines reached
+`Provisioned`, and there they sat: no `nodeRef`, seven minutes. The VPC had no
+external plane at all — no transit leg, no default route — so the workers could
+reach neither their own control-plane address nor anything else. One field on
+the network (`externalPlane.attachments`) and the network controller did the
+rest: both attachments, `enableExternal`, and the default route via the border,
+matching the live tenant exactly. **Both workers joined forty seconds later.**
+
+That is a measured answer to a question the next slice was going to ask: the
+join needed the VPC's external plane and **nothing from `_wire_tenant_to_transit`
+at all** — no SNAT rule was created for this tenant and none was missing. What
+that function is still for, on this path, is now an open question with evidence
+attached rather than an assumption to port.

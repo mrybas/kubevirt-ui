@@ -312,3 +312,67 @@ func TestTheTenantNamespaceStaysOnTheClusterOverlay(t *testing.T) {
 		t.Errorf("the worker switch is %q", got)
 	}
 }
+
+// TestANamespaceTheOldVersionPinnedIsHealed.
+//
+// Ceasing to write the annotation does not undo it. A namespace stamped by the
+// version that pinned it to the tenant's VPC keeps the stamp for ever, and its
+// control plane stays unreachable after the upgrade that fixed the cause.
+//
+// Only our own stamp is removed. `ovn-default` is kube-ovn's claim and the
+// value a healthy tenant namespace carries; taking that away would be the same
+// mistake pointed the other way.
+func TestANamespaceTheOldVersionPinnedIsHealed(t *testing.T) {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name: "tenant-theal",
+		Annotations: map[string]string{
+			"ovn.kubernetes.io/logical_switch": "uat-net-h-default",
+			"kubevirt-ui.io/note":              "somebody else's",
+		},
+	}}
+	if err := k8sClient.Create(testCtx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating the namespace: %v", err)
+	}
+
+	obj := plainTenant("theal")
+	obj.Spec.Network = "uat-net-h"
+	mustTenant(t, obj)
+
+	eventually(t, "the stamp to be lifted", func() error {
+		live := &corev1.Namespace{}
+		if err := k8sReader.Get(testCtx, types.NamespacedName{Name: "tenant-theal"}, live); err != nil {
+			return err
+		}
+		if got, found := live.Annotations["ovn.kubernetes.io/logical_switch"]; found {
+			return fmt.Errorf("still pinned to %q", got)
+		}
+		if live.Annotations["kubevirt-ui.io/note"] != "somebody else's" {
+			return fmt.Errorf("it took somebody else's annotation with it: %v",
+				live.Annotations)
+		}
+		return nil
+	})
+
+	// And a namespace carrying kube-ovn's own claim keeps it.
+	other := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{
+		Name:        "tenant-tkeep",
+		Annotations: map[string]string{"ovn.kubernetes.io/logical_switch": "ovn-default"},
+	}}
+	if err := k8sClient.Create(testCtx, other); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating the namespace: %v", err)
+	}
+	keep := plainTenant("tkeep")
+	keep.Spec.Network = "uat-net-h"
+	mustTenant(t, keep)
+
+	consistently(t, "kube-ovn's own claim to survive", 5*time.Second, func() error {
+		live := &corev1.Namespace{}
+		if err := k8sReader.Get(testCtx, types.NamespacedName{Name: "tenant-tkeep"}, live); err != nil {
+			return err
+		}
+		if live.Annotations["ovn.kubernetes.io/logical_switch"] != "ovn-default" {
+			return fmt.Errorf("annotations = %v", live.Annotations)
+		}
+		return nil
+	})
+}

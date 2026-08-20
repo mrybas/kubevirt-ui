@@ -45,6 +45,9 @@ import (
 const (
 	tenantControllerName = "managedtenant"
 
+	// What kube-ovn reads to place a namespace's pods.
+	logicalSwitchAnnotation = "ovn.kubernetes.io/logical_switch"
+
 	// pendingRequeue is how often a tenant comes back to look at the two things
 	// nobody wakes it for: the signer's secret and the shared image's import.
 	pendingRequeue = 10 * time.Second
@@ -407,6 +410,19 @@ func (r *ManagedTenantReconciler) ensureNamespace(
 		// control plane can reach Postgres, the ingress and the rest of the
 		// platform; it is the worker *launcher pods* that cross into the VPC,
 		// by the annotation on their own template.
+		//
+		// Ceasing to write it does not undo it. A namespace stamped by the
+		// version that did keeps the annotation for ever, and its control plane
+		// stays unreachable after the upgrade that fixed the cause — so the
+		// stamp is removed when it is found, and only when it is *our* stamp:
+		// the tenant's own VPC subnet. Anything else there was put there by
+		// somebody else, `ovn-default` included, which is kube-ovn's own claim
+		// and the value a healthy tenant namespace carries.
+		if switchName := tenant.LogicalSwitchOf(obj); switchName != "" {
+			if live.Annotations[logicalSwitchAnnotation] == switchName {
+				delete(live.Annotations, logicalSwitchAnnotation)
+			}
+		}
 		return nil
 	})
 	if err != nil {
