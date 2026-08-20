@@ -38,6 +38,7 @@ rules:
   - kubeovn.io
   resources:
   - subnets
+  - vpcs
   verbs:
   - get
   - list

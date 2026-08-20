@@ -155,3 +155,68 @@ Consequences, all now facts rather than guesses:
   The scope/ancestry check in our webhook is. That moves it from a product
   nicety to the actual access control, and it is why the guard on raw
   `kubevirt.io/VirtualMachine` creation is load-bearing rather than tidy.
+
+---
+
+## M2 — ManagedVM (controller done; admission webhook and raw-VM guard pending)
+
+Live on the stand, `opdev-dev`:
+
+**Apply order is not part of the API.** One file with the VM listed *before* the
+image it clones: the VM reported `ImageNotReady — ManagedImage
+opdev-dev/ubuntu-fresh is Importing; cloning from an unfinished disk produces a
+broken VM`, created nothing, and then provisioned itself the moment the import
+finished. No re-apply, no restart. The root disk cloned through CDI's CSI fast
+path as `opvm-crd-root-1`, and the VM reached `Running: True`.
+
+**The main check of the task — the rendered VirtualMachine against the one the
+old UI produces.** Same template, same cores, memory, disk, network, no SSH key,
+no password, not started. Diff of the two objects, with the generated names
+normalised:
+
+```
+-    kubevirt-ui.io/owner: anonymous@local
+-  generateName: tpl-vm-ui-
++    platform.kubevirt-ui.io/owner-kind: ManagedVM
++    platform.kubevirt-ui.io/owner-name: opvm-tpl2
++    platform.kubevirt-ui.io/owner-uid: f4d0e69a-…
+-          serial: a4e19aae-…   uuid: 727dcab3-…
++          serial: 20eb3036-…   uuid: d06a9319-…
+```
+
+That is the whole diff. Identical: `dataVolumeTemplates` (clone source, storage,
+labels), volumes, disks, interfaces, networks, the cloud-init document and its
+network data, CPU requests and limits, memory, console flags, runStrategy, and
+every `kubevirt-ui.io/*` label the folder views filter on. The four differences
+are the owner annotation (the UI records a person; a stored object has none
+until the UI supplies it), `generateName` versus an explicit name, our ownership
+labels, and the firmware identifiers KubeVirt generates per machine.
+
+Both operator-created VMs appear in the unmodified UI with the right display
+name, CPU, memory and address.
+
+### Defect found by the comparison, and fixed: two answers to "may I use this network"
+
+The wizard offered no networks at all for `opdev-dev`, while the operator had
+happily attached a VM to `uat-net-vm-default`. The wizard was right: that VPC
+carries `kubevirt-ui.io/folder=poc-transit`, and the wizard hides VPCs belonging
+to other folders. The create path never checked, so the rule existed in the
+picker and nowhere else — a VM created by any other route could attach to
+another team's network.
+
+Fixed by porting the rule into `internal/scope`, which is now the only place
+that answers the question, and calling it from the controller: a subnet out of
+scope is refused with both folder names in the message. The same package will
+back the admission webhook, so the picker and the enforcement cannot drift
+again. Also enforced there, from the same measurement: only the primary NIC may
+be a VPC overlay — the create path checked this and the hot-plug path did not.
+
+### Divergences from the old path, deliberate
+
+| # | Old behaviour | New behaviour | Why |
+|---|---|---|---|
+| 1 | A subnet lookup that failed was treated as a VLAN, with the subnet name used as the attachment name | `NetworkNotFound`, named | The old rule turns a typo into a VM wired to an attachment that does not exist; the only symptom is a guest with no address |
+| 2 | The VPC resolver address was derived from the service CIDR (`x.y.z.200`) | Read from the subnet's own DHCP options, falling back to kube-ovn's `vpc-dns-config` | The formula is right on this cluster and a guess on any other |
+| 3 | Supplying user-data silently discarded the initial password | The password is always applied | Two branches of one handler; a password that vanishes because an unrelated field was filled in is a defect |
+| 4 | The `vm-name` label was patched in after create, failure swallowed | Rendered with the object | Backup selection targets that label, so best-effort meant occasionally unselectable VMs |
+| 5 | project/environment labels copied once at create | Reconciled every pass | A VM created before its namespace was labelled stayed invisible to folder views forever |

@@ -77,7 +77,7 @@ func (r *ManagedVMReconciler) kubeOVNNamespaces() []string {
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedvms/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedvms/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch;create;update;patch
-// +kubebuilder:rbac:groups=kubeovn.io,resources=subnets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kubeovn.io,resources=subnets;vpcs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 

@@ -31,6 +31,7 @@ import (
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 	"github.com/mrybas/kubevirt-ui/operator/internal/kubevirt"
 	"github.com/mrybas/kubevirt-ui/operator/internal/naming"
+	"github.com/mrybas/kubevirt-ui/operator/internal/scope"
 )
 
 // blocked is a reason the VM cannot be rendered yet, phrased for a human.
@@ -89,7 +90,10 @@ const (
 	kubeOVNSystemVPCName = "ovn-cluster"
 )
 
-var subnetGVK = schema.GroupVersionKind{Group: "kubeovn.io", Version: "v1", Kind: "Subnet"}
+var (
+	subnetGVK = schema.GroupVersionKind{Group: "kubeovn.io", Version: "v1", Kind: "Subnet"}
+	vpcGVK    = schema.GroupVersionKind{Group: "kubeovn.io", Version: "v1", Kind: "Vpc"}
+)
 
 // resolveSource fills in the image and the compute/disk defaults, from either a
 // template or a direct image reference.
@@ -282,7 +286,20 @@ func (r *ManagedVMReconciler) checkImageScope(
 func (r *ManagedVMReconciler) resolveNetworks(
 	ctx context.Context, vm *platformv1alpha1.ManagedVM, in *kubevirt.Input,
 ) *blocked {
-	for _, nic := range vm.Spec.Networks {
+	if len(vm.Spec.Networks) == 0 {
+		return nil
+	}
+
+	ns := &corev1.Namespace{}
+	if err := r.Get(ctx, types.NamespacedName{Name: vm.Namespace}, ns); err != nil {
+		return &blocked{Reason: "NamespaceUnreadable", Message: err.Error()}
+	}
+	target := scope.Target{
+		Folder:      ns.Labels[naming.FolderLabel],
+		Environment: ns.Labels[naming.EnvironmentLabel],
+	}
+
+	for idx, nic := range vm.Spec.Networks {
 		subnet := &unstructured.Unstructured{}
 		subnet.SetGroupVersionKind(subnetGVK)
 		if err := r.Get(ctx, types.NamespacedName{Name: nic.Subnet}, subnet); err != nil {
@@ -297,15 +314,33 @@ func (r *ManagedVMReconciler) resolveNetworks(
 
 		vlan, _, _ := unstructured.NestedString(subnet.Object, "spec", "vlan")
 		vpc, _, _ := unstructured.NestedString(subnet.Object, "spec", "vpc")
+		isOverlay := vlan == "" && vpc != "" && vpc != kubeOVNSystemVPCName
+
+		// Only the primary NIC may sit on a VPC overlay: a secondary would need
+		// a per-subnet attachment definition wrapping the OVN CNI, which does
+		// not exist. This is checked here as well as at admission, because a
+		// subnet can change from underlay to overlay after the VM was accepted.
+		if isOverlay && idx != 0 {
+			return &blocked{
+				Reason: "VPCMustBePrimary",
+				Message: fmt.Sprintf("subnet %q is a VPC overlay and can only be the first NIC; "+
+					"use a VLAN-backed subnet for additional interfaces", nic.Subnet),
+				Fatal: true,
+			}
+		}
+
+		if res := scope.Check(r.networkScope(ctx, subnet, vpc, vlan, nic.Subnet), target); !res.Allowed {
+			return &blocked{Reason: res.Reason, Message: res.Message, Fatal: true}
+		}
 
 		in.Networks = append(in.Networks, kubevirt.ResolvedNetwork{
 			Subnet:       nic.Subnet,
 			VLAN:         vlan,
-			IsVPCOverlay: vlan == "" && vpc != "" && vpc != kubeOVNSystemVPCName,
+			IsVPCOverlay: isOverlay,
 			StaticIP:     nic.StaticIP,
 		})
 
-		if vlan == "" && vpc != "" && vpc != kubeOVNSystemVPCName && in.VPCDNSVIP == "" {
+		if isOverlay && in.VPCDNSVIP == "" {
 			in.VPCDNSVIP = r.vpcDNSVIP(ctx, subnet)
 		}
 	}
@@ -338,6 +373,40 @@ func (r *ManagedVMReconciler) vpcDNSVIP(ctx context.Context, subnet *unstructure
 	// No VIP found. The guest keeps the cluster resolver, which is what shipped;
 	// the caller records that on the VM rather than pretending it is configured.
 	return ""
+}
+
+// networkScope gathers what the scope rule needs. Folder and environment are
+// read from the VPC, which is where the wizard reads them too — the subnet
+// carries its own copy, and trusting that copy would mean two sources for one
+// fact.
+func (r *ManagedVMReconciler) networkScope(
+	ctx context.Context,
+	subnet *unstructured.Unstructured,
+	vpc, vlan, name string,
+) scope.Network {
+	net := scope.Network{
+		Name:    name,
+		VPC:     vpc,
+		VLAN:    vlan,
+		Purpose: subnet.GetLabels()[scope.PurposeLabel],
+	}
+	if vpc == "" || vpc == kubeOVNSystemVPCName {
+		return net
+	}
+
+	vpcObj := &unstructured.Unstructured{}
+	vpcObj.SetGroupVersionKind(vpcGVK)
+	if err := r.Get(ctx, types.NamespacedName{Name: vpc}, vpcObj); err != nil {
+		// The VPC cannot be read, so its scope is unknown. Treating unknown as
+		// global would hand out another folder's network on a transient error;
+		// the subnet's own labels are the conservative fallback.
+		net.Folder = subnet.GetLabels()[naming.FolderLabel]
+		net.Environment = subnet.GetLabels()[naming.EnvironmentLabel]
+		return net
+	}
+	net.Folder = vpcObj.GetLabels()[naming.FolderLabel]
+	net.Environment = vpcObj.GetLabels()[naming.EnvironmentLabel]
+	return net
 }
 
 func orUnknown(s string) string {

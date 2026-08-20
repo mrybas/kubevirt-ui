@@ -613,3 +613,101 @@ func TestEveryGuestGetsTheNetworkDataDisk(t *testing.T) {
 		return fmt.Errorf("no cloud-init volume attached")
 	})
 }
+
+func mustVPC(t *testing.T, name, folder, environment string) {
+	t.Helper()
+	vpc := &unstructured.Unstructured{}
+	vpc.SetGroupVersionKind(vpcGVK)
+	vpc.SetName(name)
+	labels := map[string]string{}
+	if folder != "" {
+		labels[naming.FolderLabel] = folder
+	}
+	if environment != "" {
+		labels[naming.EnvironmentLabel] = environment
+	}
+	vpc.SetLabels(labels)
+	if err := unstructured.SetNestedMap(vpc.Object, map[string]any{}, "spec"); err != nil {
+		t.Fatalf("building vpc: %v", err)
+	}
+	if err := k8sClient.Create(testCtx, vpc); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating vpc %s: %v", name, err)
+	}
+}
+
+// Measured on the stand before this check existed: a VM in folder `opdev`
+// attached to a VPC scoped to folder `poc-transit`. The wizard had always
+// hidden that network; the create path took it. One rule, one implementation —
+// this test and the wizard's now describe the same behaviour.
+func TestAVMCannotAttachToAnotherFoldersNetwork(t *testing.T) {
+	ns := "vm-scope-net"
+	mustNamespace(t, ns, "opdev")
+	// mustNamespace labels the environment dev; give it a folder too.
+	eventually(t, "the namespace to carry a folder label", func() error {
+		nsObj := &corev1.Namespace{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Name: ns}, nsObj); err != nil {
+			return err
+		}
+		nsObj.Labels[naming.FolderLabel] = "opdev"
+		return k8sClient.Update(testCtx, nsObj)
+	})
+	readyImage(t, ns, "ubuntu")
+	mustVPC(t, "someone-elses-vpc", "poc-transit", "dev")
+	mustSubnet(t, "someone-elses-subnet", "someone-elses-vpc", "", "")
+
+	vm := newManagedVM(ns, "trespasser", "ubuntu")
+	vm.Spec.Networks = []platformv1alpha1.NetworkAttachment{{Subnet: "someone-elses-subnet"}}
+	if err := k8sClient.Create(testCtx, vm); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+
+	eventually(t, "the refusal to name both folders", func() error {
+		got := getVM(t, ns, "trespasser")
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, platformv1alpha1.ConditionProvisioned)
+		if cond == nil || cond.Reason != "NetworkOutOfScope" {
+			return fmt.Errorf("condition = %+v, want reason NetworkOutOfScope", cond)
+		}
+		if !strings.Contains(cond.Message, "poc-transit") {
+			return fmt.Errorf("message does not name the owning folder: %q", cond.Message)
+		}
+		return nil
+	})
+
+	consistently(t, "no VirtualMachine to be created", 2*time.Second, func() error {
+		if _, err := getKubeVirtVM(ns, "trespasser"); err == nil {
+			return fmt.Errorf("a VM was attached to another folder's network")
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+}
+
+// A secondary VPC NIC would need a per-subnet attachment definition wrapping
+// the OVN CNI, which does not exist. The create path refused this; the hot-plug
+// path did not, which is how a VM ends up with an interface nothing serves.
+func TestOnlyThePrimaryNICMayBeAVPCOverlay(t *testing.T) {
+	ns := "vm-second-vpc"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+	mustSubnet(t, "vlan-first", "", "vlan-300", "")
+	mustSubnet(t, "overlay-second", "free-vpc", "", "")
+
+	vm := newManagedVM(ns, "two-nics", "ubuntu")
+	vm.Spec.Networks = []platformv1alpha1.NetworkAttachment{
+		{Subnet: "vlan-first"},
+		{Subnet: "overlay-second"},
+	}
+	if err := k8sClient.Create(testCtx, vm); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+
+	eventually(t, "the second VPC NIC to be refused", func() error {
+		got := getVM(t, ns, "two-nics")
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, platformv1alpha1.ConditionProvisioned)
+		if cond == nil || cond.Reason != "VPCMustBePrimary" {
+			return fmt.Errorf("condition = %+v, want reason VPCMustBePrimary", cond)
+		}
+		return nil
+	})
+}
