@@ -1,0 +1,312 @@
+"""VPCs as one object the operator reconciles.
+
+The switch is worth making for one thing in particular. A VpcDns pod cannot
+reach the cluster resolver's ClusterIP without a route the create path applied
+once, best-effort, at a moment when kube-ovn has not created the Deployment it
+belongs on — and which nothing applied afterwards except a person calling the
+recreate endpoint.
+
+What is guarded here is the division of ownership, because that is where this
+migration can hurt. With the flag on the endpoint writes intent and nothing
+else; the CIDR allocator, the namespace checks and above all `Subnet.spec.acls`
+stay exactly where they are.
+"""
+
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from kubernetes_asyncio.client.exceptions import ApiException
+
+from app.models.vpc import VpcCreateRequest
+
+
+def _request(**overrides: Any) -> VpcCreateRequest:
+    base: dict[str, Any] = {"name": "opnet", "subnet_cidr": "10.200.40.0/22"}
+    base.update(overrides)
+    return VpcCreateRequest(**base)
+
+
+def _harness(*, ready: bool = True, exists: bool = False):
+    """A client that records every write and answers as the operator would."""
+    calls: dict[str, list[dict[str, Any]]] = {
+        "create_cluster": [], "delete_cluster": [], "patch_cluster": [],
+        "create_ns": [],
+    }
+
+    async def _create_cluster(**kw: Any) -> dict[str, Any]:
+        calls["create_cluster"].append(kw)
+        return kw["body"]
+
+    async def _delete_cluster(**kw: Any) -> dict[str, Any]:
+        calls["delete_cluster"].append(kw)
+        return {}
+
+    async def _get_cluster(**kw: Any) -> dict[str, Any]:
+        if kw.get("plural") == "managednetworks":
+            if not exists and not calls["create_cluster"]:
+                raise ApiException(status=404, reason="NotFound")
+            conditions = [{"type": "Ready", "status": "True" if ready else "False"}]
+            return {"metadata": {"name": kw["name"]}, "status": {"conditions": conditions}}
+        if kw.get("plural") == "subnets":
+            # The normal outcome: the isolation pass found the subnet and wrote
+            # its rules. Tests that care about the other outcome say so.
+            return {"spec": {"acls": [
+                {"action": "drop", "match": "ip4.src == 10.200.0.0/14",
+                 "priority": 3000, "direction": "to-lport"},
+            ]}}
+        raise ApiException(status=404, reason="NotFound")
+
+    async def _list_cluster(**kw: Any) -> dict[str, Any]:
+        return {"items": []}
+
+    custom = MagicMock()
+    custom.create_cluster_custom_object = AsyncMock(side_effect=_create_cluster)
+    custom.delete_cluster_custom_object = AsyncMock(side_effect=_delete_cluster)
+    custom.patch_cluster_custom_object = AsyncMock(
+        side_effect=lambda **kw: calls["patch_cluster"].append(kw) or {})
+    custom.get_cluster_custom_object = AsyncMock(side_effect=_get_cluster)
+    custom.list_cluster_custom_object = AsyncMock(side_effect=_list_cluster)
+    custom.create_namespaced_custom_object = AsyncMock(
+        side_effect=lambda **kw: calls["create_ns"].append(kw) or {})
+
+    core = MagicMock()
+    core.read_namespace = AsyncMock(return_value=MagicMock(
+        metadata=MagicMock(labels={"kubevirt-ui.io/managed": "true"})))
+
+    client = MagicMock()
+    client.custom_api = custom
+    client.core_api = core
+
+    request = MagicMock()
+    request.app.state.k8s_client = client
+    return request, calls
+
+
+@pytest.mark.asyncio
+async def test_the_object_carries_what_the_operator_needs():
+    """A field dropped here is one the operator silently defaults."""
+    from app.api.v1.vpcs import build_managed_network
+
+    data = _request(
+        name="t1", tenant="acme", folder="poc", environment="dev",
+        role="infrastructure", isolated=False, shared_cidrs=["10.1.0.0/16"],
+    )
+    with patch("app.api.v1.vpcs.b3_enabled", return_value=True), \
+         patch("app.api.v1.vpcs.transit_subnet_name", return_value="cp-transit"), \
+         patch("app.api.v1.vpcs.external_subnet", return_value="external"), \
+         patch("app.api.v1.vpcs._vpc_nat_gateway_enabled", return_value=False):
+        spec = build_managed_network(
+            data, cidr="10.200.40.0/22", gateway="10.200.40.1",
+            namespaces=["tenant-acme"], dns_server="10.96.0.200",
+        )["spec"]
+
+    assert spec == {
+        "cidr": "10.200.40.0/22",
+        "gateway": "10.200.40.1",
+        "isolated": False,
+        "natGateway": False,
+        # Created here, so the object really does own it. Adoption is the other
+        # case and defaults to Retain.
+        "deletionPolicy": "Delete",
+        "namespaces": ["tenant-acme"],
+        "tenant": "acme",
+        "folder": "poc",
+        "environment": "dev",
+        "role": "infrastructure",
+        "dnsServer": "10.96.0.200",
+        "sharedCIDRs": ["10.1.0.0/16"],
+        "externalPlane": {
+            "attachments": ["cp-transit", "external"],
+            "egressSubnet": "external",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_next_hop_is_not_carried():
+    """B3_VPC_GATEWAY must equal the external subnet's gateway, so it is the
+    same number in two places. The operator reads it from the subnet instead."""
+    from app.api.v1.vpcs import build_managed_network
+
+    with patch("app.api.v1.vpcs.b3_enabled", return_value=True), \
+         patch("app.api.v1.vpcs.transit_subnet_name", return_value="cp-transit"), \
+         patch("app.api.v1.vpcs.external_subnet", return_value="external"), \
+         patch("app.api.v1.vpcs._vpc_nat_gateway_enabled", return_value=False):
+        plane = build_managed_network(
+            _request(), cidr="10.200.40.0/22", gateway="10.200.40.1",
+            namespaces=[], dns_server=None,
+        )["spec"]["externalPlane"]
+
+    assert set(plane) == {"attachments", "egressSubnet"}
+
+
+@pytest.mark.asyncio
+async def test_create_writes_intent_and_leaves_the_acls_alone():
+    """One writer per object. The ACL list keeps the writer it has."""
+    from app.api.v1 import vpcs
+
+    request, calls = _harness()
+    isolation = AsyncMock(return_value=0)
+    with patch.object(vpcs, "network_path_enabled", return_value=True), \
+         patch.object(vpcs, "_ensure_cluster_config", AsyncMock()), \
+         patch.object(vpcs, "assert_cidr_free", AsyncMock()), \
+         patch.object(vpcs, "_vpcdns_vip", return_value="10.96.0.200"), \
+         patch.object(vpcs, "b3_enabled", return_value=False), \
+         patch.object(vpcs, "_tenant_vpc_cidrs", AsyncMock(return_value=[])), \
+         patch.object(vpcs, "_peer_shared_cidrs", AsyncMock()), \
+         patch.object(vpcs, "reconcile_infra_peerings", AsyncMock(return_value=0)), \
+         patch.object(vpcs, "reconcile_isolation_acls", isolation):
+        result = await vpcs.create_vpc(
+            request, _request(isolated=False), user=MagicMock(),
+        )
+
+    assert result.name == "opnet"
+    plurals = [c["plural"] for c in calls["create_cluster"]]
+    assert plurals == ["managednetworks"], plurals
+    # The Vpc, the Subnet and the VpcDns are the operator's now.
+    assert calls["create_ns"] == []
+    # And the isolation pass still runs, because nothing else writes those rules.
+    assert isolation.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_isolation_waits_for_the_subnet_to_exist():
+    """The ACLs used to be written into the subnet manifest itself, so a VPC was
+    isolated the instant it existed. Now the subnet arrives a moment later and
+    this pass is the only thing that will ever write its rules — run it first
+    and the network stays open with nothing scheduled to look again."""
+    from app.api.v1 import vpcs
+
+    request, _ = _harness()
+    order: list[str] = []
+
+    async def _await(k8s: Any, name: str, attempts: int = 20) -> bool:
+        order.append("waited")
+        return True
+
+    async def _isolate(k8s: Any) -> int:
+        order.append("isolated")
+        return 1
+
+    with patch.object(vpcs, "network_path_enabled", return_value=True), \
+         patch.object(vpcs, "_ensure_cluster_config", AsyncMock()), \
+         patch.object(vpcs, "assert_cidr_free", AsyncMock()), \
+         patch.object(vpcs, "_vpcdns_vip", return_value="10.96.0.200"), \
+         patch.object(vpcs, "b3_enabled", return_value=False), \
+         patch.object(vpcs, "_tenant_vpc_cidrs", AsyncMock(return_value=[])), \
+         patch.object(vpcs, "_peer_shared_cidrs", AsyncMock()), \
+         patch.object(vpcs, "_await_managed_network", _await), \
+         patch.object(vpcs, "reconcile_infra_peerings", AsyncMock(return_value=0)), \
+         patch.object(vpcs, "reconcile_isolation_acls", _isolate):
+        await vpcs.create_vpc(request, _request(isolated=False), user=MagicMock())
+
+    assert order == ["waited", "isolated"], order
+
+
+@pytest.mark.asyncio
+async def test_a_slow_operator_does_not_fail_the_create():
+    """The network is being built either way; refusing would be a worse answer
+    than a slower one."""
+    from app.api.v1 import vpcs
+
+    request, _ = _harness(ready=False)
+    with patch.object(vpcs, "asyncio", MagicMock(sleep=AsyncMock())):
+        got = await vpcs._await_managed_network(request.app.state.k8s_client, "opnet", attempts=2)
+    assert got is False
+
+
+@pytest.mark.asyncio
+async def test_delete_hands_the_teardown_to_whoever_owns_it():
+    """Ownership is a property of the object, not of a flag: tearing the network
+    down from here would race the cascade the operator is already running."""
+    from app.api.v1 import vpcs
+
+    request, calls = _harness(exists=True)
+    with patch.object(vpcs, "network_path_enabled", return_value=False):
+        result = await vpcs.delete_vpc(request, "opnet", user=MagicMock())
+
+    assert "being removed" in result["message"]
+    assert [c["plural"] for c in calls["delete_cluster"]] == ["managednetworks"]
+
+
+@pytest.mark.asyncio
+async def test_delete_of_an_unmanaged_vpc_takes_the_old_path():
+    """A network created before the switch is not the operator's, and the only
+    thing that can tear it down is the code that built it."""
+    from app.api.v1 import vpcs
+
+    request, calls = _harness(exists=False)
+    with patch.object(vpcs, "network_path_enabled", return_value=True), \
+         patch.object(vpcs, "_get_gateway_tracking", AsyncMock(return_value=({}, None)),
+                      create=True):
+        try:
+            await vpcs.delete_vpc(request, "legacy-net", user=MagicMock())
+        except Exception:
+            # The legacy path needs far more of the cluster than this harness
+            # provides; what matters is that it was entered at all.
+            pass
+
+    assert [c["plural"] for c in calls["delete_cluster"]] != ["managednetworks"]
+
+
+@pytest.mark.asyncio
+async def test_an_isolated_network_still_takes_the_atomic_path():
+    """The window is not made small; the network simply does not go that way.
+
+    Waiting for the subnet does not close it — waits expire. Checking afterwards
+    and undoing does not close it either: a crash between the network being
+    created and the rules being applied leaves nobody to check, nothing
+    scheduled to look again, and a tenant network reachable from every other
+    tenant indefinitely.
+
+    So an isolated network is built the way it always has been, atomically, with
+    its rules inside the subnet manifest. The flag does not turn a valid request
+    into an error; it just does not apply here yet.
+    """
+    from app.api.v1 import vpcs
+
+    request, calls = _harness()
+    with patch.object(vpcs, "network_path_enabled", return_value=True), \
+         patch.object(vpcs, "_ensure_cluster_config", AsyncMock()), \
+         patch.object(vpcs, "assert_cidr_free", AsyncMock()), \
+         patch.object(vpcs, "_vpcdns_vip", return_value="10.96.0.200"), \
+         patch.object(vpcs, "b3_enabled", return_value=False), \
+         patch.object(vpcs, "_tenant_vpc_cidrs", AsyncMock(return_value=["10.200.0.0/22"])), \
+         patch.object(vpcs, "_ensure_vpc_dns", AsyncMock()), \
+         patch.object(vpcs, "_peer_shared_cidrs", AsyncMock()), \
+         patch.object(vpcs, "reconcile_infra_peerings", AsyncMock(return_value=0)), \
+         patch.object(vpcs, "reconcile_isolation_acls", AsyncMock(return_value=0)):
+        result = await vpcs.create_vpc(request, _request(isolated=True), user=MagicMock())
+
+    assert result.name == "opnet"
+    # No ManagedNetwork: this network is not the operator's.
+    plurals = [c["plural"] for c in calls["create_cluster"]]
+    assert "managednetworks" not in plurals, plurals
+    # And it was built the old way, rules and all.
+    assert "vpcs" in plurals and "subnets" in plurals, plurals
+    subnet = next(c for c in calls["create_cluster"] if c["plural"] == "subnets")
+    assert subnet["body"]["spec"].get("acls"), "the atomic path must carry its rules"
+
+
+@pytest.mark.asyncio
+async def test_a_network_that_asked_not_to_be_isolated_goes_through():
+    """There is no isolation to lose, so there is nothing to be durable about."""
+    from app.api.v1 import vpcs
+
+    request, calls = _harness()
+    with patch.object(vpcs, "network_path_enabled", return_value=True), \
+         patch.object(vpcs, "_ensure_cluster_config", AsyncMock()), \
+         patch.object(vpcs, "assert_cidr_free", AsyncMock()), \
+         patch.object(vpcs, "_vpcdns_vip", return_value="10.96.0.200"), \
+         patch.object(vpcs, "b3_enabled", return_value=False), \
+         patch.object(vpcs, "_tenant_vpc_cidrs", AsyncMock(return_value=[])), \
+         patch.object(vpcs, "_peer_shared_cidrs", AsyncMock()), \
+         patch.object(vpcs, "reconcile_infra_peerings", AsyncMock(return_value=0)), \
+         patch.object(vpcs, "reconcile_isolation_acls", AsyncMock(return_value=0)):
+        result = await vpcs.create_vpc(
+            request, _request(isolated=False), user=MagicMock(),
+        )
+
+    assert result.name == "opnet"
+    assert [c["plural"] for c in calls["create_cluster"]] == ["managednetworks"]

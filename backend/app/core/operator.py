@@ -71,6 +71,23 @@ def announce_path_enabled() -> bool:
     return _enabled("OPERATOR_ANNOUNCE_ENABLED")
 
 
+def network_path_enabled() -> bool:
+    """True when VPCs are written as ManagedNetwork custom resources.
+
+    Off: the create endpoint writes the Vpc, the Subnet and the VpcDns itself.
+    On: it writes one object and the operator writes those three, plus the
+    service-network route on the resolver — which is the reason the switch is
+    worth making. That route used to be applied once, best-effort, at create
+    time, and only a person calling the recreate endpoint ever applied it again.
+
+    What does *not* move with this flag: the CIDR allocator, namespace
+    validation, VPC peering, and the isolation ACLs. The last one matters most —
+    `Subnet.spec.acls` keeps its single writer here until the composer can adopt
+    it with a provable no-op.
+    """
+    return _enabled("OPERATOR_NETWORK_ENABLED")
+
+
 def underlay_path_enabled() -> bool:
     """True when the egress underlay is written as a ManagedUnderlay resource.
 

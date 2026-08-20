@@ -90,6 +90,37 @@ backend:
     # a ManagedUnderlay, however, takes its external Subnet and every gateway
     # attached to it — the children carry ownerReferences on purpose.
     OPERATOR_UNDERLAY_ENABLED: ""
+    # -- Write VPCs as ManagedNetwork custom resources: the operator creates the
+    # Vpc, its default Subnet, the per-VPC VpcDns, and the service-network route
+    # on that resolver. Empty/false → the endpoint writes those itself, as
+    # before.
+    #
+    # The route is the reason. A VpcDns pod cannot reach the cluster resolver's
+    # ClusterIP without it, and it used to be applied once at create time —
+    # when kube-ovn has not created the Deployment yet — and afterwards only by
+    # a person calling the recreate endpoint.
+    #
+    # What does not move with this flag: the CIDR allocator, namespace
+    # validation, VPC peering, and `Subnet.spec.acls`. The isolation reconciler
+    # keeps its single ownership of the ACL list until the composer can take it
+    # over with a provable no-op.
+    #
+    # Deleting a VPC then removes the ManagedNetwork and the operator cascades
+    # (resolver, subnets, router — in that order, router last). Networks written
+    # down by hand default to `deletionPolicy: Retain` and are unaffected.
+    #
+    # PARTIAL: an isolated network still takes the old path, and says so in the
+    # log rather than failing. On that path the isolation ACLs are part of the
+    # subnet manifest, so a VPC is isolated from the instant it exists; on the
+    # operator path the subnet is written a moment later and the isolation pass
+    # — which runs on create and delete and nowhere else — is the only thing
+    # that will ever write its rules. A crash in between would leave a tenant
+    # network reachable from every other tenant with nothing scheduled to
+    # notice. Waiting does not fix that and neither does undoing afterwards;
+    # only isolation as durable desired state does, which is the ACL composer.
+    # Until that lands, this flag applies to networks created with
+    # isolated=false, and everything else is built exactly as before.
+    OPERATOR_NETWORK_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as

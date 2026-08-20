@@ -134,6 +134,11 @@ rules:
       - managedunderlays
     verbs: ["get", "create", "patch"]
 
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managednetworks
+    verbs: ["get", "create", "delete"]
+
   # -----------------------------------------------------------------------
   # Core resources
   # -----------------------------------------------------------------------

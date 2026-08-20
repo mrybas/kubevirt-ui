@@ -147,6 +147,12 @@ REQUIRED: list[tuple[str, str, str, str]] = [
      "vpc_underlay.ensure_underlay_cr"),
     ("platform.kubevirt-ui.io", "managedunderlays", "patch",
      "vpc_underlay.ensure_underlay_cr"),
+    ("platform.kubevirt-ui.io", "managednetworks", "get",
+     "vpcs._managed_network_exists"),
+    ("platform.kubevirt-ui.io", "managednetworks", "create",
+     "vpcs._create_managed_network"),
+    ("platform.kubevirt-ui.io", "managednetworks", "delete",
+     "vpcs.delete_vpc (the operator cascades)"),
 ]
 
 
