@@ -2157,3 +2157,28 @@ one number; the failure worth catching is not either being wrong but the two
 disagreeing, because a tenant adopted from one and reconciled by the other has
 its quota silently rewritten. Mutating one expectation in the file turns both
 suites red, which is the check.
+
+### Method: mutations no longer happen in the working tree
+
+Three times now a reviewer has read a deliberately broken file mid-mutation and
+reported it as a defect — the `DeletionTimestamp` guard disabled, then the
+worker root pointed at the golden PVC by `claimName`. Both were mutations, both
+lived about seven seconds, and neither was ever committed: the file
+`managedtenant_workers.go` has one commit, and `claimName` appears nowhere in
+its history. In each case the test caught the mutation, which was the point of
+making it.
+
+That is my fault, not the reader's: a mutation applied in place is visible to
+anything reading the repo while it runs, and a deliberately broken file looks
+exactly like a defect. Mutations now run in a throwaway git worktree —
+
+```
+git worktree add --detach .mutation HEAD
+# edit .mutation/…, run the suite there, read the failure
+git worktree remove --force .mutation
+```
+
+— which keeps the tree somebody else may be reading pristine, and has the
+side-benefit of mutating **committed** state rather than whatever is on disk.
+For a mutation against uncommitted work the tree has to be copied in first;
+committing before mutating is usually the better answer anyway.
