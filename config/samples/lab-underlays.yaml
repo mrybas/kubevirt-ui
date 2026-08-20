@@ -1,0 +1,36 @@
+# The two underlays this lab already has, written down.
+#
+# Nothing here invents anything: every value is read back from the objects that
+# were applied by hand from the lab's vpc-bgp manifests, so adopting them must
+# be a no-op on the dataplane. The names are the live ones, not the defaults.
+apiVersion: platform.kubevirt-ui.io/v1alpha1
+kind: ManagedUnderlay
+metadata:
+  name: cp-transit
+spec:
+  interface: eth0.300
+  externalCIDR: 10.199.0.0/22
+  externalGateway: 10.199.0.1
+  vlanID: 0
+  excludeNodes: [kubevirt-lab-cp-1, kubevirt-lab-cp-2, kubevirt-lab-cp-3]
+  excludeIPs: ["10.199.0.1..10.199.0.255"]
+  providerNetworkName: cptransit
+  vlanName: vlan-cptransit
+  subnetName: cp-transit
+  kubeOVNNamespace: o0-kube-ovn
+---
+apiVersion: platform.kubevirt-ui.io/v1alpha1
+kind: ManagedUnderlay
+metadata:
+  name: external
+spec:
+  interface: eth0.310
+  externalCIDR: 10.199.4.0/22
+  externalGateway: 10.199.4.254
+  vlanID: 0
+  excludeNodes: [kubevirt-lab-cp-1, kubevirt-lab-cp-2, kubevirt-lab-cp-3]
+  excludeIPs: ["10.199.4.1..10.199.4.9", "10.199.4.254"]
+  providerNetworkName: extnet
+  vlanName: vlan-extnet
+  subnetName: external
+  kubeOVNNamespace: o0-kube-ovn

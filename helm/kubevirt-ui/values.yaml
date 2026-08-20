@@ -71,6 +71,25 @@ backend:
     # hack/announce-cutover.sh walks it, refuses the wrong order, and compares
     # what the operator would write against the live object first.
     OPERATOR_ANNOUNCE_ENABLED: ""
+    # -- Hand the egress underlay to the operator: the backend writes one
+    # ManagedUnderlay describing the site's physical network, and the operator
+    # keeps the ProviderNetwork, Vlan, NAD, Subnet, the gateway node label and
+    # the two workaround DaemonSets in line with it. Empty/false → the POST
+    # builds them itself, as before.
+    #
+    # The point is not where the code runs. With this off, the
+    # `ovn.kubernetes.io/external-gw` node label is repaired only by a GET, so
+    # nothing puts it back unless somebody opens the page. On this lab it sat at
+    # an explicit `false` on all three workers; the link-watcher DaemonSet
+    # selects on it, so it was scheduled nowhere while `kubectl rollout status`
+    # reported success — zero desired pods are all ready. Two hours later both
+    # provider links were down and had taken transit and egress with them.
+    #
+    # Adopting an existing hand-built fabric is safe: the operator merges only
+    # the fields it renders and leaves kube-ovn's own defaults alone. Deleting
+    # a ManagedUnderlay, however, takes its external Subnet and every gateway
+    # attached to it — the children carry ownerReferences on purpose.
+    OPERATOR_UNDERLAY_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as

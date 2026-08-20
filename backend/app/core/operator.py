@@ -71,6 +71,22 @@ def announce_path_enabled() -> bool:
     return _enabled("OPERATOR_ANNOUNCE_ENABLED")
 
 
+def underlay_path_enabled() -> bool:
+    """True when the egress underlay is written as a ManagedUnderlay resource.
+
+    Off: the POST builds the four fabric objects itself and the GET quietly
+    heals the gateway node label on its way past.
+    On: the backend writes one object describing the site's physical network and
+    the operator keeps the fabric, the label and the workaround DaemonSets in
+    line with it — on a watch rather than on a page view, which is the whole
+    reason this path is being moved. The label was healed only when somebody
+    opened the page; on this lab it sat at `false` on all three workers for two
+    hours, and the link watcher that selects on it was scheduled nowhere and
+    reported success.
+    """
+    return _enabled("OPERATOR_UNDERLAY_ENABLED")
+
+
 # The group the operator's custom resources live in.
 OPERATOR_GROUP = "platform.kubevirt-ui.io"
 OPERATOR_VERSION = "v1alpha1"
