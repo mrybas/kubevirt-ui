@@ -11,19 +11,19 @@ namespace: kubevirt-ui-operator-dev
 # namePrefix comes from ../../default; setting it again here would double it.
 
 resources:
-  - ../../default
+- ../../default
 
-patches:
   # Metrics on plain HTTP for the dev stand: the point here is to read the
   # counters (patches_total above all), not to rehearse metrics TLS.
-  - path: manager_dev_patch.yaml
-    target:
-      kind: Deployment
-      name: controller-manager
+patches:
+- path: manager_dev_patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager
 
-images:
-  - name: controller
-    newName: ghcr.io/mrybas/kubevirt-ui/operator
     # Replaced by `make deploy-dev IMG=...`; the literal below is only a
     # placeholder so a plain `kustomize build` still renders.
-    newTag: dev-latest
+images:
+- name: controller
+  newName: ghcr.io/mrybas/kubevirt-ui/operator
+  newTag: dev-8377fab

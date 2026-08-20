@@ -18,101 +18,154 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
-
-	"k8s.io/client-go/kubernetes/scheme"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
-	// +kubebuilder:scaffold:imports
 )
 
-// These tests use Ginkgo (BDD-style Go testing framework). Refer to
-// http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
-
+// The tests run against a real API server with a real manager, and assert
+// through the manager's client. Two reasons, both learned the expensive way:
+// a test that calls a helper proves the helper, not the controller; and a
+// status read once proves nothing, because status is eventually consistent.
 var (
-	ctx       context.Context
-	cancel    context.CancelFunc
 	testEnv   *envtest.Environment
 	cfg       *rest.Config
 	k8sClient client.Client
+	testCtx   context.Context
+	stopMgr   context.CancelFunc
 )
 
-func TestControllers(t *testing.T) {
-	RegisterFailHandler(Fail)
-
-	RunSpecs(t, "Controller Suite")
+func TestMain(m *testing.M) {
+	code, err := runSuite(m)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "test suite setup failed: %v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(code)
 }
 
-var _ = BeforeSuite(func() {
-	logf.SetLogger(zap.New(zap.WriteTo(GinkgoWriter), zap.UseDevMode(true)))
+func runSuite(m *testing.M) (int, error) {
+	ctrl.SetLogger(logzap.New(logzap.UseDevMode(true), logzap.WriteTo(os.Stderr)))
 
-	ctx, cancel = context.WithCancel(context.TODO())
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(platformv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(cdiv1.AddToScheme(scheme))
 
-	var err error
-	err = platformv1alpha1.AddToScheme(scheme.Scheme)
-	Expect(err).NotTo(HaveOccurred())
-
-	// +kubebuilder:scaffold:scheme
-
-	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths: []string{
+			filepath.Join("..", "..", "config", "crd", "bases"),
+			// CDI's own schemas, exported from the live cluster. The controllers
+			// that would act on them are absent on purpose: this suite tests what
+			// we write, and fakes what CDI would answer.
+			filepath.Join("..", "..", "test", "crds"),
+		},
 		ErrorIfCRDPathMissing: true,
 	}
 
-	// Retrieve the first found binary directory to allow running tests from IDEs
-	if getFirstFoundEnvTestBinaryDir() != "" {
-		testEnv.BinaryAssetsDirectory = getFirstFoundEnvTestBinaryDir()
-	}
-
-	// cfg is defined in this file globally.
+	var err error
 	cfg, err = testEnv.Start()
-	Expect(err).NotTo(HaveOccurred())
-	Expect(cfg).NotTo(BeNil())
-
-	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
-	Expect(err).NotTo(HaveOccurred())
-	Expect(k8sClient).NotTo(BeNil())
-})
-
-var _ = AfterSuite(func() {
-	By("tearing down the test environment")
-	cancel()
-	Eventually(func() error {
-		return testEnv.Stop()
-	}, time.Minute, time.Second).Should(Succeed())
-})
-
-// getFirstFoundEnvTestBinaryDir locates the first binary in the specified path.
-// ENVTEST-based tests depend on specific binaries, usually located in paths set by
-// controller-runtime. When running tests directly (e.g., via an IDE) without using
-// Makefile targets, the 'BinaryAssetsDirectory' must be explicitly configured.
-//
-// This function streamlines the process by finding the required binaries, similar to
-// setting the 'KUBEBUILDER_ASSETS' environment variable. To ensure the binaries are
-// properly set up, run 'make setup-envtest' beforehand.
-func getFirstFoundEnvTestBinaryDir() string {
-	basePath := filepath.Join("..", "..", "bin", "k8s")
-	entries, err := os.ReadDir(basePath)
 	if err != nil {
-		logf.Log.Error(err, "Failed to read directory", "path", basePath)
-		return ""
+		return 0, fmt.Errorf("starting envtest: %w", err)
 	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			return filepath.Join(basePath, entry.Name())
+	defer func() { _ = testEnv.Stop() }()
+
+	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+		Scheme:  scheme,
+		Metrics: metricsserver.Options{BindAddress: "0"},
+	})
+	if err != nil {
+		return 0, fmt.Errorf("creating manager: %w", err)
+	}
+
+	if err := (&ManagedImageReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("managedimage"),
+	}).SetupWithManager(mgr); err != nil {
+		return 0, fmt.Errorf("wiring controller: %w", err)
+	}
+
+	testCtx, stopMgr = context.WithCancel(context.Background())
+	defer stopMgr()
+
+	go func() {
+		if err := mgr.Start(testCtx); err != nil {
+			fmt.Fprintf(os.Stderr, "manager stopped: %v\n", err)
 		}
+	}()
+
+	if !mgr.GetCache().WaitForCacheSync(testCtx) {
+		return 0, fmt.Errorf("cache did not sync")
 	}
-	return ""
+	k8sClient = mgr.GetClient()
+
+	return m.Run(), nil
+}
+
+// mustNamespace creates a namespace carrying the product's labels, the way the
+// folder/environment machinery creates them.
+func mustNamespace(t *testing.T, name, project string) {
+	t.Helper()
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+			Labels: map[string]string{
+				"kubevirt-ui.io/managed":     "true",
+				"kubevirt-ui.io/environment": "dev",
+			},
+		},
+	}
+	if project != "" {
+		ns.Labels["kubevirt-ui.io/project"] = project
+	}
+	if err := k8sClient.Create(testCtx, ns); err != nil {
+		t.Fatalf("creating namespace %s: %v", name, err)
+	}
+}
+
+// eventually retries cond until it holds or the deadline passes, and reports
+// the last failure reason so a red test says what it was waiting for.
+func eventually(t *testing.T, what string, cond func() error) {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	var last error
+	for time.Now().Before(deadline) {
+		last = cond()
+		if last == nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s: %v", what, last)
+}
+
+// consistently asserts cond keeps holding for the whole window. Used where the
+// interesting claim is that nothing happened.
+func consistently(t *testing.T, what string, window time.Duration, cond func() error) {
+	t.Helper()
+	deadline := time.Now().Add(window)
+	for time.Now().Before(deadline) {
+		if err := cond(); err != nil {
+			t.Fatalf("%s stopped holding: %v", what, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }

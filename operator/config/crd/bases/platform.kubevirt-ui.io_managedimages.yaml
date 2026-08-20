@@ -11,13 +11,38 @@ spec:
     kind: ManagedImage
     listKind: ManagedImageList
     plural: managedimages
+    shortNames:
+    - mimg
     singular: managedimage
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.progress
+      name: Progress
+      type: string
+    - jsonPath: .spec.size
+      name: Size
+      type: string
+    - jsonPath: .spec.scope
+      name: Scope
+      type: string
+    - jsonPath: .status.dataVolumeName
+      name: DataVolume
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: ManagedImage is the Schema for the managedimages API
+        description: |-
+          ManagedImage is a disk image the platform owns: one object a user or a
+          Terraform module can name, instead of a generated DataVolume name that had to
+          be read back before anything could reference it.
         properties:
           apiVersion:
             description: |-
@@ -37,27 +62,140 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of ManagedImage
+            description: |-
+              ManagedImageSpec describes a disk image the platform manages.
+
+              Fields that cannot be changed after the import are marked immutable rather
+              than accepted and ignored: CDI will not re-import a DataVolume because its
+              source changed, and an edit that looks applied but does nothing is the defect
+              this API exists to remove.
             properties:
-              foo:
-                description: foo is an example field of ManagedImage. Edit managedimage_types.go
-                  to remove/update
+              description:
+                description: Description is free text shown in the UI.
+                maxLength: 512
                 type: string
+              diskType:
+                default: image
+                description: DiskType separates bootable images from plain data disks.
+                enum:
+                - image
+                - data
+                type: string
+              displayName:
+                description: |-
+                  DisplayName is what humans see. Cosmetic only: it never takes part in the
+                  name of anything the controller creates.
+                maxLength: 128
+                type: string
+              osType:
+                description: OSType labels the guest operating system family, e.g.
+                  linux.
+                type: string
+              osVersion:
+                description: OSVersion labels the guest operating system version,
+                  e.g. 24.04.
+                type: string
+              persistent:
+                default: false
+                description: Persistent marks a disk that is attached rather than
+                  cloned.
+                type: boolean
+              scope:
+                default: environment
+                description: |-
+                  Scope decides who may reference this image.
+
+                    environment — this namespace only (the default, and the private case)
+                    project     — every environment of the same project
+                    folder      — the folder and its descendants
+
+                  All three values have always been understood by the image lister; only the
+                  first two were ever writable, so folder-scoped images could until now be
+                  produced only by labelling a DataVolume by hand.
+                enum:
+                - environment
+                - project
+                - folder
+                type: string
+              size:
+                description: Size of the disk to allocate, e.g. 20Gi.
+                pattern: ^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|K|M|G|T|P|k|m)?$
+                type: string
+                x-kubernetes-validations:
+                - message: 'size is immutable: resize the underlying claim deliberately,
+                    not by editing the image'
+                  rule: self == oldSelf
+              source:
+                description: Source of the image content.
+                properties:
+                  blank:
+                    description: BlankSource allocates an empty disk.
+                    type: object
+                  http:
+                    description: HTTPSource imports the image over HTTP(S).
+                    properties:
+                      url:
+                        description: URL of the disk image to download.
+                        minLength: 1
+                        type: string
+                    required:
+                    - url
+                    type: object
+                  pvc:
+                    description: PVCSource clones an existing PersistentVolumeClaim.
+                    properties:
+                      name:
+                        description: Name of the source PersistentVolumeClaim.
+                        minLength: 1
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace of the source claim. Empty means this image's own namespace.
+                          A foreign namespace additionally requires the CDI clone gate
+                          (create on datavolumes/source in the source namespace), which the
+                          controller reports rather than silently hanging on.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  registry:
+                    description: RegistrySource imports the image from a container
+                      registry.
+                    properties:
+                      url:
+                        description: URL of the container image, e.g. docker://quay.io/org/image:tag.
+                        minLength: 1
+                        type: string
+                    required:
+                    - url
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: 'source is immutable: create a new ManagedImage instead
+                    — CDI does not re-import an existing disk'
+                  rule: self == oldSelf
+                - message: exactly one of http, registry, pvc or blank must be set
+                  rule: '[has(self.http), has(self.registry), has(self.pvc), has(self.blank)].exists_one(x,
+                    x)'
+              storageClass:
+                default: ""
+                description: StorageClass to allocate from. Empty means the cluster
+                  default.
+                type: string
+                x-kubernetes-validations:
+                - message: 'storageClass is immutable: the disk already exists on
+                    a class'
+                  rule: self == oldSelf
+            required:
+            - size
+            - source
             type: object
           status:
-            description: status defines the observed state of ManagedImage
+            description: ManagedImageStatus is what the UI and Terraform read back.
             properties:
               conditions:
-                description: |-
-                  conditions represent the current state of the ManagedImage resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                description: Conditions carry the reasons. A blocked image always
+                  names its blocker.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -116,6 +254,42 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              dataSourceName:
+                description: |-
+                  DataSourceName is the CDI DataSource published for this image, so that
+                  KubeVirt-native consumers can reference it without knowing about us.
+                type: string
+              dataVolumeName:
+                description: |-
+                  DataVolumeName is the DataVolume backing this image. Read it from here —
+                  never reconstruct it from the image name.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the spec generation this status
+                  was computed from.
+                format: int64
+                type: integer
+              phase:
+                description: 'Phase is the coarse state: Pending, Importing, Ready
+                  or Failed.'
+                enum:
+                - Pending
+                - Importing
+                - Ready
+                - Failed
+                type: string
+              progress:
+                description: Progress is CDI's import progress, passed through verbatim,
+                  e.g. "42%".
+                type: string
+              usedBy:
+                description: |-
+                  UsedBy lists the workloads currently cloning from or attached to this
+                  image, as namespace/name. Deletion is refused while it is not empty:
+                  removing a clone source mid-clone leaves an orphaned disk behind.
+                items:
+                  type: string
+                type: array
             type: object
         required:
         - spec

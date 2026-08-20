@@ -35,6 +35,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
+
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 	"github.com/mrybas/kubevirt-ui/operator/internal/controller"
 	"github.com/mrybas/kubevirt-ui/operator/internal/domains"
@@ -50,6 +52,9 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(platformv1alpha1.AddToScheme(scheme))
+	// CDI objects are written by the image controller and read by everything
+	// downstream of it.
+	utilruntime.Must(cdiv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
