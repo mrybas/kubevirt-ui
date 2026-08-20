@@ -88,6 +88,23 @@ def network_path_enabled() -> bool:
     return _enabled("OPERATOR_NETWORK_ENABLED")
 
 
+def tenant_bootstrap_path_enabled() -> bool:
+    """True when the operator repairs worker bootstrap templates.
+
+    Off: `reconcile_loop` calls `ensure_worker_bootstrap_ca` every pass — on a
+    timer, in the request-serving process, with no leader election, so two
+    replicas do it twice and none does it after a restart.
+    On: the operator watches the template, the MachineDeployment and the CA
+    secret, and repairs on a write rather than on a clock.
+
+    Both writing the same repair is not dangerous — it is create-if-absent and a
+    patch to the same value — but two writers of one thing is what this
+    migration is for, and the order is the same as everywhere else: this flag on
+    first, then the operator's controller.
+    """
+    return _enabled("OPERATOR_TENANT_BOOTSTRAP_ENABLED")
+
+
 def underlay_path_enabled() -> bool:
     """True when the egress underlay is written as a ManagedUnderlay resource.
 

@@ -22,6 +22,7 @@ from app.core.b3_announce import ensure_announcements
 from app.core.operator import announce_path_enabled
 
 from app.api.v1.tenants_talos import ensure_worker_bootstrap_ca
+from app.core.operator import tenant_bootstrap_path_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +300,22 @@ async def reconcile_loop(k8s: K8sClient) -> None:
         logger.info("Tenant addon reconciler stopped")
 
 
+async def _repair_worker_bootstrap(k8s: K8sClient) -> bool:
+    """Repair worker templates missing a Kubernetes CA — unless it moved.
+
+    Returns whether this pass did the work, so the decision is a thing that can
+    be checked rather than a branch buried in a long function.
+
+    The repair is harmless to run twice — create-if-absent and a patch to the
+    same value — but two writers of one thing is what this migration exists to
+    remove, and a cutover that half-happens is how that goes wrong quietly.
+    """
+    if tenant_bootstrap_path_enabled():
+        return False
+    await ensure_worker_bootstrap_ca(k8s)
+    return True
+
+
 async def _reconcile_once(k8s: K8sClient) -> None:
     """Run one reconciliation pass across all tenants."""
     # B3 announcements first, and independently of the addon catalog below:
@@ -323,7 +340,7 @@ async def _reconcile_once(k8s: K8sClient) -> None:
     # nothing else in the product can repair it. Same guard as above: this
     # must not be blocked by, or block, anything else in the pass.
     try:
-        await ensure_worker_bootstrap_ca(k8s)
+        await _repair_worker_bootstrap(k8s)
     except Exception as e:  # noqa: BLE001 - one subsystem must not stop another
         logger.error(f"worker bootstrap reconcile failed: {e}")
 

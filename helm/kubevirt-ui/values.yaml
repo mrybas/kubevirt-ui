@@ -121,6 +121,17 @@ backend:
     # own are skipped by the backend's isolation pass — read off the object, not
     # off this flag, so it stays true after the flag goes off.
     OPERATOR_NETWORK_ENABLED: ""
+    # -- Hand the worker-bootstrap repair to the operator. Empty/false → the
+    # tenant reconcile loop keeps doing it.
+    #
+    # The repair puts a Kubernetes CA back into a Talos worker template that
+    # has none; without it a worker boots, runs a kubelet, and never joins,
+    # because nothing files its CSR — the VM looks perfectly healthy throughout.
+    #
+    # Running it in both places is not dangerous (create-if-absent and a patch
+    # to the same value) but it is two writers of one thing, so the order is the
+    # usual one: this flag on first, then the operator's tenant domain.
+    OPERATOR_TENANT_BOOTSTRAP_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as
