@@ -71,7 +71,22 @@ spec:
                 - Restore
                 - Migrate
                 - RollbackDisk
+                - Recreate
+                - Clone
                 type: string
+              clone:
+                description: CloneSpec asks for a copy of a machine.
+                properties:
+                  startAfterClone:
+                    default: false
+                    description: StartAfterClone runs the copy once it exists.
+                    type: boolean
+                  targetName:
+                    description: |-
+                      TargetName is the name of the copy. Empty lets KubeVirt generate one,
+                      which it reports on the clone object.
+                    type: string
+                type: object
               migrate:
                 description: MigrateSpec asks for a running VM to move.
                 properties:
@@ -85,6 +100,15 @@ spec:
                       nothing ever removed it, so every migrated VM stayed welded to whichever
                       node it had been sent to — the first one it could not leave again.
                     type: string
+                type: object
+              recreate:
+                description: |-
+                  RecreateSpec asks for a machine to be wiped back to the image it came from.
+
+                  Destructive by intent — that is what recreating means — but not destructive
+                  by accident: the machine is pointed at a fresh disk before the one it was
+                  using is removed, so a pass that dies partway leaves a machine that still has
+                  a disk described for it.
                 type: object
               restore:
                 description: RestoreSpec asks for a VM to be put back to a snapshot.
@@ -253,6 +277,9 @@ spec:
               startTime:
                 description: StartTime is when the operation began.
                 format: date-time
+                type: string
+              targetName:
+                description: TargetName is the machine a Clone produced.
                 type: string
             type: object
         required:

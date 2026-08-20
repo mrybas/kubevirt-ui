@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	kubevirtv1 "kubevirt.io/api/core/v1"
+	clonev1beta1 "kubevirt.io/api/clone/v1beta1"
 	snapshotv1beta1 "kubevirt.io/api/snapshot/v1beta1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
@@ -60,6 +61,7 @@ func init() {
 	utilruntime.Must(cdiv1.AddToScheme(scheme))
 	utilruntime.Must(kubevirtv1.AddToScheme(scheme))
 	utilruntime.Must(snapshotv1beta1.AddToScheme(scheme))
+	utilruntime.Must(clonev1beta1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 

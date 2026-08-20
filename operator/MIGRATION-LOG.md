@@ -575,3 +575,40 @@ template describing something that no longer exists. A VirtualMachineSnapshot
 and a Restore are the tools for that, and the Restore operation already exists.
 This is a deliberate narrowing of what the old endpoint accepted — the case it
 refuses is the one where the old code was most dangerous.
+
+## M8 (fourth slice) — recreate and clone
+
+**Recreate** is destructive by intent: it wipes a machine back to the image it
+was built from. What it must not be is destructive by accident. The machine's
+own template is pointed at a fresh disk name first, so KubeVirt builds a new
+disk, and only then is the old one removed — where the old path deleted the disk
+and relied on KubeVirt noticing and rebuilding it under the *same* name, leaving
+a window with no disk at all and a name that had to be reused while its
+predecessor might still be terminating.
+
+The fresh name uses the epoch the naming rule was designed around
+(`<vm>-root-<n+1>`), and the epoch is recorded on the machine so the next
+rebuild picks the next one. This is one of the two places allowed to rewrite a
+machine's own volume arrays; it is safe here for the same reason the rule
+exists — the VM controller stands aside for the whole operation, so there is
+exactly one writer.
+
+**Clone** delegates to KubeVirt's own `VirtualMachineClone`, which is installed
+here and handles volume naming, a fresh MAC and a fresh SMBIOS serial. The path
+it replaces built the copy by hand with a rename map covering only
+`dataVolumeTemplates`, so an *attached* claim was copied verbatim and the clone
+referenced the source's own disks — two machines on one filesystem, produced
+deliberately by the feature meant to give you a separate one. The copy is then
+described and adopted, so it is a managed machine rather than a KubeVirt object
+nobody owns; its spec is the source's, minus the attached disks and minus the
+first-boot password, both of which belonged to the original.
+
+### And a defect in my own wiring, caught by existing tests
+
+Routing these endpoints added an ownership probe before the handler's `try`, so
+a failing probe escaped instead of becoming the handler's error — two clone
+authorization tests went red. The fix is not to make the probe quiet: falling
+through on a read that failed would send an operator-owned machine down the old,
+destructive path on the strength of a question nobody managed to answer. The
+probe now reports the failure, which is both what the tests assert and what
+production should do.

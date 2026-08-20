@@ -27,11 +27,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	clonev1beta1 "kubevirt.io/api/clone/v1beta1"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	snapshotv1beta1 "kubevirt.io/api/snapshot/v1beta1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
+	"github.com/mrybas/kubevirt-ui/operator/internal/naming"
 )
 
 func getOp(t *testing.T, ns, name string) *platformv1alpha1.ManagedVMOperation {
@@ -585,6 +587,192 @@ func TestRollingBackARootDiskIsRefusedWithTheAlternative(t *testing.T) {
 		}
 		if !strings.Contains(got.Status.Message, "Restore") {
 			return fmt.Errorf("the refusal does not name the alternative: %q", got.Status.Message)
+		}
+		return nil
+	})
+}
+
+// Recreating means wiping the machine back to its image — destructive by
+// intent. What it must not be is destructive by accident: the machine is
+// pointed at a fresh disk before the one it was using is removed, and the fresh
+// disk gets a new name so it cannot collide with a predecessor that is still
+// terminating.
+func TestRecreatePointsAtAFreshDiskBeforeRemovingTheOldOne(t *testing.T) {
+	ns := "op-recreate"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+
+	vm := newManagedVM(ns, "wipe-me", "ubuntu")
+	vm.Spec.Running = true
+	if err := k8sClient.Create(testCtx, vm); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+	eventually(t, "the machine and its first disk to exist", func() error {
+		kvm, err := getKubeVirtVM(ns, "wipe-me")
+		if err != nil {
+			return err
+		}
+		if kvm.Spec.DataVolumeTemplates[0].Name != "wipe-me-root-1" {
+			return fmt.Errorf("first disk = %q", kvm.Spec.DataVolumeTemplates[0].Name)
+		}
+		return nil
+	})
+
+	// KubeVirt would build this from the template; envtest has no CDI.
+	firstDisk := &cdiv1.DataVolume{
+		ObjectMeta: metav1.ObjectMeta{Name: "wipe-me-root-1", Namespace: ns},
+		Spec: cdiv1.DataVolumeSpec{
+			Source:  &cdiv1.DataVolumeSource{Blank: &cdiv1.DataVolumeBlankImage{}},
+			Storage: &cdiv1.StorageSpec{},
+		},
+	}
+	if err := k8sClient.Create(testCtx, firstDisk); err != nil {
+		t.Fatalf("creating the first disk: %v", err)
+	}
+
+	op := &platformv1alpha1.ManagedVMOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "start-over", Namespace: ns},
+		Spec: platformv1alpha1.ManagedVMOperationSpec{
+			VMName:   "wipe-me",
+			Action:   platformv1alpha1.OperationRecreate,
+			Recreate: &platformv1alpha1.RecreateSpec{},
+		},
+	}
+	if err := k8sClient.Create(testCtx, op); err != nil {
+		t.Fatalf("creating operation: %v", err)
+	}
+
+	eventually(t, "the machine to be pointed at a disk with the next epoch", func() error {
+		kvm, err := getKubeVirtVM(ns, "wipe-me")
+		if err != nil {
+			return err
+		}
+		if kvm.Spec.DataVolumeTemplates[0].Name != "wipe-me-root-2" {
+			return fmt.Errorf("template disk = %q, want the next epoch",
+				kvm.Spec.DataVolumeTemplates[0].Name)
+		}
+		for _, v := range kvm.Spec.Template.Spec.Volumes {
+			if v.Name == "rootdisk" {
+				if v.DataVolume == nil || v.DataVolume.Name != "wipe-me-root-2" {
+					return fmt.Errorf("the root volume still points at the old disk")
+				}
+			}
+		}
+		return nil
+	})
+
+	eventually(t, "the operation to finish and the old disk to be gone", func() error {
+		got := getOp(t, ns, "start-over")
+		if got.Status.Phase != platformv1alpha1.OperationPhaseSucceeded {
+			return fmt.Errorf("phase = %q (%s)", got.Status.Phase, got.Status.Message)
+		}
+		old := &cdiv1.DataVolume{}
+		err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "wipe-me-root-1"}, old)
+		if err == nil {
+			return fmt.Errorf("the old disk is still there")
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+
+	eventually(t, "the epoch to be recorded and the power state restored", func() error {
+		got := getVM(t, ns, "wipe-me")
+		if got.Status.RootDiskEpoch != 2 {
+			return fmt.Errorf("rootDiskEpoch = %d", got.Status.RootDiskEpoch)
+		}
+		if !got.Spec.Running {
+			return fmt.Errorf("the machine was left stopped")
+		}
+		return nil
+	})
+}
+
+// Cloning delegates to KubeVirt, which handles volume naming, fresh MAC
+// addresses and a fresh SMBIOS serial. The path this replaces built the copy by
+// hand with a rename map covering only dataVolumeTemplates, so an *attached*
+// claim was copied verbatim and the clone referenced the source's own disks.
+func TestCloningDelegatesAndBringsTheCopyUnderManagement(t *testing.T) {
+	ns := "op-clone"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+	mustDataVolume(t, ns, "not-to-be-copied")
+
+	vm := newManagedVM(ns, "original", "ubuntu")
+	vm.Spec.Disks = []platformv1alpha1.DiskAttachment{{Claim: "not-to-be-copied"}}
+	if err := k8sClient.Create(testCtx, vm); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+	eventually(t, "the machine to exist", func() error {
+		_, err := getKubeVirtVM(ns, "original")
+		return err
+	})
+
+	op := &platformv1alpha1.ManagedVMOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "copy-it", Namespace: ns},
+		Spec: platformv1alpha1.ManagedVMOperationSpec{
+			VMName: "original",
+			Action: platformv1alpha1.OperationClone,
+			Clone:  &platformv1alpha1.CloneSpec{TargetName: "the-copy"},
+		},
+	}
+	if err := k8sClient.Create(testCtx, op); err != nil {
+		t.Fatalf("creating operation: %v", err)
+	}
+
+	eventually(t, "KubeVirt to be asked, rather than the copy being hand-built", func() error {
+		got := getOp(t, ns, "copy-it")
+		if got.Status.ChildName == "" {
+			return fmt.Errorf("no clone object yet")
+		}
+		clone := &clonev1beta1.VirtualMachineClone{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: ns, Name: got.Status.ChildName,
+		}, clone); err != nil {
+			return err
+		}
+		if clone.Spec.Source == nil || clone.Spec.Source.Name != "original" {
+			return fmt.Errorf("clone source = %+v", clone.Spec.Source)
+		}
+		if clone.Spec.Target == nil || clone.Spec.Target.Name != "the-copy" {
+			return fmt.Errorf("clone target = %+v", clone.Spec.Target)
+		}
+		return nil
+	})
+
+	// KubeVirt reports it done and names what it produced.
+	eventually(t, "the clone to be marked finished", func() error {
+		clone := &clonev1beta1.VirtualMachineClone{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: ns, Name: getOp(t, ns, "copy-it").Status.ChildName,
+		}, clone); err != nil {
+			return err
+		}
+		target := "the-copy"
+		clone.Status.TargetName = &target
+		clone.Status.Phase = clonev1beta1.Succeeded
+		return k8sClient.Status().Update(testCtx, clone)
+	})
+
+	eventually(t, "the copy to be described and adopted, not rendered over", func() error {
+		got := getOp(t, ns, "copy-it")
+		if got.Status.Phase != platformv1alpha1.OperationPhaseSucceeded {
+			return fmt.Errorf("phase = %q (%s)", got.Status.Phase, got.Status.Message)
+		}
+		copyVM := &platformv1alpha1.ManagedVM{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: ns, Name: "the-copy",
+		}, copyVM); err != nil {
+			return err
+		}
+		if copyVM.Annotations[naming.AdoptAnnotation] != "the-copy" {
+			return fmt.Errorf("the copy is not marked for adoption: %v", copyVM.Annotations)
+		}
+		// The source's attached disk belongs to the source. A copy pointing at
+		// it would be two machines on one filesystem — the defect being removed.
+		if len(copyVM.Spec.Disks) != 0 {
+			return fmt.Errorf("the copy claims the original's disks: %v", copyVM.Spec.Disks)
 		}
 		return nil
 	})

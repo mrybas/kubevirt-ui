@@ -29,6 +29,10 @@ const (
 	OperationMigrate = "Migrate"
 	// OperationRollbackDisk puts one attached disk back to a snapshot.
 	OperationRollbackDisk = "RollbackDisk"
+	// OperationRecreate wipes a machine back to the image it was built from.
+	OperationRecreate = "Recreate"
+	// OperationClone copies a machine.
+	OperationClone = "Clone"
 )
 
 // Operation phases.
@@ -57,6 +61,27 @@ type RollbackDiskSpec struct {
 	// SnapshotName is the VolumeSnapshot to roll back to.
 	// +kubebuilder:validation:MinLength=1
 	SnapshotName string `json:"snapshotName"`
+}
+
+// RecreateSpec asks for a machine to be wiped back to the image it came from.
+//
+// Destructive by intent — that is what recreating means — but not destructive
+// by accident: the machine is pointed at a fresh disk before the one it was
+// using is removed, so a pass that dies partway leaves a machine that still has
+// a disk described for it.
+type RecreateSpec struct{}
+
+// CloneSpec asks for a copy of a machine.
+type CloneSpec struct {
+	// TargetName is the name of the copy. Empty lets KubeVirt generate one,
+	// which it reports on the clone object.
+	// +optional
+	TargetName string `json:"targetName,omitempty"`
+
+	// StartAfterClone runs the copy once it exists.
+	// +kubebuilder:default=false
+	// +optional
+	StartAfterClone bool `json:"startAfterClone,omitempty"`
 }
 
 // MigrateSpec asks for a running VM to move.
@@ -89,7 +114,7 @@ type ManagedVMOperationSpec struct {
 	VMName string `json:"vmName"`
 
 	// Action to perform.
-	// +kubebuilder:validation:Enum=Restore;Migrate;RollbackDisk
+	// +kubebuilder:validation:Enum=Restore;Migrate;RollbackDisk;Recreate;Clone
 	Action string `json:"action"`
 
 	// +optional
@@ -100,6 +125,12 @@ type ManagedVMOperationSpec struct {
 
 	// +optional
 	RollbackDisk *RollbackDiskSpec `json:"rollbackDisk,omitempty"`
+
+	// +optional
+	Recreate *RecreateSpec `json:"recreate,omitempty"`
+
+	// +optional
+	Clone *CloneSpec `json:"clone,omitempty"`
 
 	// TTLSecondsAfterFinished is how long a finished operation sticks around.
 	// Long enough to read what happened, short enough that a busy namespace
@@ -151,6 +182,10 @@ type ManagedVMOperationStatus struct {
 	// once the machine is running on its replacement.
 	// +optional
 	ReplacedDisk string `json:"replacedDisk,omitempty"`
+
+	// TargetName is the machine a Clone produced.
+	// +optional
+	TargetName string `json:"targetName,omitempty"`
 
 	// StartTime is when the operation began.
 	// +optional

@@ -51,6 +51,16 @@ rules:
   - update
   - watch
 - apiGroups:
+  - clone.kubevirt.io
+  resources:
+  - virtualmachineclones
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
   - kubeovn.io
   resources:
   - subnets
@@ -136,6 +146,14 @@ rules:
   - snapshot.kubevirt.io
   resources:
   - virtualmachinesnapshots
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshots
   verbs:
   - get
   - list

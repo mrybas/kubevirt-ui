@@ -60,7 +60,13 @@ class ResizeVMRequest(BaseModel):
 
 
 async def _managed_vm_of(k8s_client: Any, namespace: str, name: str) -> str | None:
-    """The ManagedVM behind this machine, if the operator owns it."""
+    """The ManagedVM behind this machine, if the operator owns it.
+
+    A read that fails is reported, never treated as "not owned". Falling
+    through on a transient error would send an operator-owned machine down the
+    old path — which for recreate and clone is the destructive one — on the
+    strength of a question nobody managed to answer.
+    """
     custom_api = client.CustomObjectsApi(k8s_client._api_client)
     try:
         vm = await custom_api.get_namespaced_custom_object(
@@ -70,7 +76,10 @@ async def _managed_vm_of(k8s_client: Any, namespace: str, name: str) -> str | No
     except ApiException as e:
         if e.status == 404:
             return None
-        raise
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not determine who manages VM {name}: {e.reason}",
+        )
     return managed_owner(vm, "ManagedVM")
 
 
@@ -416,6 +425,16 @@ async def recreate_vm(
     """
     k8s_client = request.app.state.k8s_client
 
+    owner = await _managed_vm_of(k8s_client, namespace, name)
+    if owner:
+        op = await _start_operation(k8s_client, namespace, owner, "Recreate", {"recreate": {}})
+        return {
+            "status": "recreating",
+            "vm": name,
+            "operation": op,
+            "message": f"Recreate requested ({op})",
+        }
+
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
         core_api = client.CoreV1Api(k8s_client._api_client)
@@ -626,6 +645,29 @@ async def clone_vm(
                     f"required on target environment"
                 ),
             )
+
+    owner = await _managed_vm_of(k8s_client, namespace, name)
+    if owner and target_ns == namespace:
+        # KubeVirt's own clone controller does this properly: volume naming,
+        # a fresh MAC and a fresh SMBIOS serial. The path below builds the copy
+        # by hand with a rename map that covers only dataVolumeTemplates, so an
+        # attached claim is copied verbatim and the copy ends up referencing the
+        # original's disks.
+        #
+        # Only same-namespace, because that is what the clone API supports.
+        op = await _start_operation(
+            k8s_client, namespace, owner, "Clone",
+            {"clone": {
+                "targetName": sanitize_display_name(clone_request.display_name),
+                "startAfterClone": bool(clone_request.start),
+            }},
+        )
+        return {
+            "status": "cloning",
+            "source": name,
+            "operation": op,
+            "message": f"Clone requested ({op})",
+        }
 
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)

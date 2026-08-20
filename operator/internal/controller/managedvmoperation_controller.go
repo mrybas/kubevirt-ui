@@ -67,6 +67,9 @@ type ManagedVMOperationReconciler struct {
 // +kubebuilder:rbac:groups=snapshot.kubevirt.io,resources=virtualmachinesnapshots,verbs=get;list;watch
 // +kubebuilder:rbac:groups=snapshot.kubevirt.io,resources=virtualmachinerestores,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstancemigrations,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=clone.kubevirt.io,resources=virtualmachineclones,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachineinstances,verbs=get;list;watch
 
 // Reconcile advances one operation by one step.
@@ -117,6 +120,10 @@ func (r *ManagedVMOperationReconciler) Reconcile(ctx context.Context, req ctrl.R
 		result, err = r.reconcileMigrate(ctx, op, vm)
 	case platformv1alpha1.OperationRollbackDisk:
 		result, err = r.reconcileRollbackDisk(ctx, op, vm)
+	case platformv1alpha1.OperationRecreate:
+		result, err = r.reconcileRecreate(ctx, op, vm)
+	case platformv1alpha1.OperationClone:
+		result, err = r.reconcileClone(ctx, op, vm)
 	default:
 		r.finish(op, platformv1alpha1.OperationPhaseFailed,
 			fmt.Sprintf("unknown action %q", op.Spec.Action))
