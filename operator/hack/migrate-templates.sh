@@ -12,16 +12,29 @@
 # usable; retiring the ConfigMap is a separate, deliberate step taken after the
 # report says every entry has a counterpart.
 #
+# Run hack/adopt-images.sh first. A template names a ManagedImage, so migrating
+# templates before their images are managed turns working templates into ones
+# that report ImageNotFound.
+#
 # Usage:
 #   hack/migrate-templates.sh            # plan only
 #   hack/migrate-templates.sh --apply    # write the objects
+#   hack/migrate-templates.sh --apply --force   # even if the image is unadopted
 #
 # Requires kubectl and jq, and a kubeconfig pointing at the target cluster.
 
 set -euo pipefail
 
 APPLY=false
-[[ "${1:-}" == "--apply" ]] && APPLY=true
+FORCE=false
+for arg in "$@"; do
+  case "$arg" in
+    --apply) APPLY=true ;;
+    # Create a template even when its image has not been adopted. The template
+    # will report ImageNotFound until it is.
+    --force) FORCE=true ;;
+  esac
+done
 
 CONFIGMAP="${TEMPLATE_CONFIGMAP:-kubevirt-ui-templates}"
 CONFIGMAP_NS="${TEMPLATE_NAMESPACE:-kubevirt-ui-system}"
@@ -55,6 +68,22 @@ while IFS= read -r key; do
     printf '  %-28s SKIP   names no image namespace; place it by hand\n' "$key"
     skipped=$((skipped + 1))
     continue
+  fi
+
+  # A template's image reference resolves to a ManagedImage, not to a bare
+  # DataVolume. Migrating a template whose image has not been adopted yet turns
+  # a working template into one that reports ImageNotFound — measured exactly
+  # that way on the stand, which is why this check exists and why
+  # hack/adopt-images.sh runs first.
+  if ! kubectl get managedimage "$image" -n "$image_ns" >/dev/null 2>&1; then
+    if $FORCE; then
+      printf '  %-28s FORCED image %s in %s is not managed yet\n' "$key" "$image" "$image_ns"
+    else
+      printf '  %-28s SKIP   image %s in %s is not a ManagedImage yet; run hack/adopt-images.sh %s first\n' \
+        "$key" "$image" "$image_ns" "$image_ns"
+      skipped=$((skipped + 1))
+      continue
+    fi
   fi
 
   if kubectl get managedvmtemplate "$key" -n "$image_ns" >/dev/null 2>&1; then
