@@ -79,8 +79,22 @@ var GuardWired = prometheus.NewGauge(
 	},
 )
 
+// GuardLastCheck is when the wiring was last examined, as a unix timestamp.
+//
+// It exists because a gauge that has never been set reads exactly the same as
+// one set to zero, and "the guard is broken" and "nobody has looked yet" are
+// very different things to be woken up for. Caught while testing the gauge
+// above: the first negative result was read eight seconds after a restart,
+// before the watchdog had run at all, and looked like proof.
+var GuardLastCheck = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "kubevirt_ui_operator_guard_last_check_timestamp_seconds",
+		Help: "Unix time of the last raw VirtualMachine guard wiring check; absent means never checked.",
+	},
+)
+
 func init() {
 	metrics.Registry.MustRegister(
-		PatchesTotal, ReconcileErrorsTotal, GuardDecisionsTotal, GuardWired,
+		PatchesTotal, ReconcileErrorsTotal, GuardDecisionsTotal, GuardWired, GuardLastCheck,
 	)
 }

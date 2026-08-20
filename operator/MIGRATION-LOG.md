@@ -257,3 +257,63 @@ is, from every side except the thing it was supposed to stop. Its acceptance
 test is therefore not "the object was created" — it is "a request that must be
 refused, was". The overlay now patches the annotation explicitly, and the same
 class is why the certificate's dnsNames are recomputed here too.
+
+---
+
+## M7 — the UI writes ManagedVM (done)
+
+Behind `OPERATOR_VM_ENABLED`, the create endpoint writes a ManagedVM and the
+operator renders the machine.
+
+**The comparison, through the same endpoint with the same template**, differed
+by two lines: the `generateName` KubeVirt keeps on the old object, and our
+`owner-kind` label. Everything else — the owner annotation, the template label,
+the disk, the cloud-init, the compute, the console flags — identical.
+
+Live, through the endpoints the UI buttons call:
+
+| Action | Result |
+|---|---|
+| Create | `ManagedVM/flag-vm-9xvq2` → operator rendered the machine |
+| Start | `spec.running: true` → `runStrategy: Always` |
+| Stop | `spec.running: false` → `runStrategy: Halted` |
+| Delete | resource and machine both gone; the machine did not come back |
+
+Three things became explicit in the translation, all of them previously
+implicit and one of them a defect: the profile's SSH keys (the handler injected
+them silently and installed *none* when the profile read failed — a VM with no
+way in and nothing saying so), the owner annotation, and the password, which now
+goes into a Secret the resource points at rather than into the resource itself.
+
+### Two defects found by running it
+
+**Deleting a VM left the machine running.** The controller deliberately did not
+cascade, which is right for a migration rollback and wrong for a person pressing
+Delete. The cascade is a finalizer in the operator — not a second delete from
+the backend, which races the controller into recreating what was just deleted,
+and not an ownerReference, so it stays opt-out: strip the finalizer and machines
+outlive their resources, which is what a rollback needs.
+
+**The controller silently adopted any VirtualMachine sharing the name**, which
+meant it would later delete a machine it never created. Found by the test
+written for the cascade. Adoption is a deliberate annotation now; a collision is
+reported with the annotation to set.
+
+### The guard's fail-open posture, made observable
+
+`failurePolicy: Ignore` is deliberate — failing closed would turn an operator
+outage into a tenant outage by blocking the machinery that replaces unhealthy
+workers — but this exact policy had already hidden a real break. So the wiring is
+checked rather than assumed: a watchdog reads the webhook configuration and
+reports `kubevirt_ui_operator_guard_wired` — it exists, it routes here, it has a
+CA bundle. It checks the wiring rather than inferring health from traffic,
+because traffic cannot tell "never consulted" from "nothing to refuse".
+
+Verified both ways on the stand: wired → `1`; pointed at a configuration that
+does not exist → `0` **and** a log line naming the missing configuration.
+
+And a lesson from testing the gauge itself: the first negative reading was taken
+eight seconds after a restart, before the watchdog had run at all — an unset
+Prometheus gauge reads exactly like one set to zero, so it looked like proof and
+was not. There is now a `guard_last_check_timestamp_seconds` alongside it, so
+"broken" and "nobody has looked yet" are distinguishable.

@@ -100,6 +100,7 @@ func (w *GuardWatchdog) Start(ctx context.Context) error {
 
 func (w *GuardWatchdog) check(ctx context.Context) {
 	log := logf.FromContext(ctx).WithName("guard-watchdog")
+	defer metrics.GuardLastCheck.SetToCurrentTime()
 
 	if err := w.wired(ctx); err != nil {
 		metrics.GuardWired.Set(0)
