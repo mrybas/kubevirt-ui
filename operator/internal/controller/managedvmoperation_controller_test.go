@@ -25,9 +25,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	snapshotv1beta1 "kubevirt.io/api/snapshot/v1beta1"
+	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 )
@@ -403,4 +405,187 @@ func TestAnOperationCannotBeEdited(t *testing.T) {
 	if err := k8sClient.Update(testCtx, got); err == nil {
 		t.Fatal("an operation's spec was edited after creation")
 	}
+}
+
+func mustVolumeSnapshot(t *testing.T, ns, name, sourceClaim, size string, ready bool) {
+	t.Helper()
+	snap := &unstructured.Unstructured{}
+	snap.SetGroupVersionKind(volumeSnapshotGVK)
+	snap.SetName(name)
+	snap.SetNamespace(ns)
+	if err := unstructured.SetNestedMap(snap.Object, map[string]any{
+		"source":                  map[string]any{"persistentVolumeClaimName": sourceClaim},
+		"volumeSnapshotClassName": "csi-class",
+	}, "spec"); err != nil {
+		t.Fatalf("building snapshot: %v", err)
+	}
+	if err := k8sClient.Create(testCtx, snap); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating snapshot: %v", err)
+	}
+	eventually(t, "the snapshot to report itself usable", func() error {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(volumeSnapshotGVK)
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: name}, got); err != nil {
+			return err
+		}
+		if err := unstructured.SetNestedMap(got.Object, map[string]any{
+			"readyToUse":  ready,
+			"restoreSize": size,
+		}, "status"); err != nil {
+			return err
+		}
+		return k8sClient.Status().Update(testCtx, got)
+	})
+}
+
+// The path this replaces deleted the claim and created its successor
+// afterwards, so a process that died in between left a machine with no disk and
+// no record of what it should have had. Here the replacement is built first,
+// the machine is pointed at it, and only then is the old disk removed.
+func TestARollbackReplacesTheDiskInsteadOfDestroyingIt(t *testing.T) {
+	ns := "op-rollback"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+	mustDataVolume(t, ns, "payload")
+	mustVolumeSnapshot(t, ns, "payload-snap", "payload", "1Gi", true)
+
+	vm := newManagedVM(ns, "rollback-target", "ubuntu")
+	vm.Spec.Disks = []platformv1alpha1.DiskAttachment{{Claim: "payload"}}
+	vm.Spec.Running = true
+	if err := k8sClient.Create(testCtx, vm); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+	eventually(t, "the disk to be attached", func() error {
+		got := getVM(t, ns, "rollback-target")
+		if len(got.Status.AttachedDisks) != 1 {
+			return fmt.Errorf("attachedDisks = %v", got.Status.AttachedDisks)
+		}
+		return nil
+	})
+
+	op := &platformv1alpha1.ManagedVMOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "roll-it-back", Namespace: ns},
+		Spec: platformv1alpha1.ManagedVMOperationSpec{
+			VMName:       "rollback-target",
+			Action:       platformv1alpha1.OperationRollbackDisk,
+			RollbackDisk: &platformv1alpha1.RollbackDiskSpec{SnapshotName: "payload-snap"},
+		},
+	}
+	if err := k8sClient.Create(testCtx, op); err != nil {
+		t.Fatalf("creating operation: %v", err)
+	}
+
+	// The replacement is built before anything is taken away, and the original
+	// is still there while it builds.
+	eventually(t, "the replacement disk to be built from the snapshot", func() error {
+		got := getOp(t, ns, "roll-it-back")
+		if got.Status.ReplacementDisk == "" {
+			return fmt.Errorf("no replacement named yet")
+		}
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: ns, Name: got.Status.ReplacementDisk,
+		}, dv); err != nil {
+			return err
+		}
+		if dv.Spec.Source == nil || dv.Spec.Source.Snapshot == nil ||
+			dv.Spec.Source.Snapshot.Name != "payload-snap" {
+			return fmt.Errorf("the replacement is not built from the snapshot")
+		}
+		original := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "payload"}, original); err != nil {
+			return fmt.Errorf("the original disk was removed before its replacement was ready: %w", err)
+		}
+		return nil
+	})
+
+	// CDI finishes building it.
+	replacementName := getOp(t, ns, "roll-it-back").Status.ReplacementDisk
+	eventually(t, "the replacement to report itself complete", func() error {
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: replacementName}, dv); err != nil {
+			return err
+		}
+		dv.Status.Phase = cdiv1.Succeeded
+		return k8sClient.Status().Update(testCtx, dv)
+	})
+
+	// The machine has to come down before the swap; envtest has no
+	// virt-controller, so nothing is running and it is down already.
+	eventually(t, "the machine to be pointed at the replacement", func() error {
+		got := getVM(t, ns, "rollback-target")
+		if len(got.Spec.Disks) != 1 {
+			return fmt.Errorf("disks = %v", got.Spec.Disks)
+		}
+		if got.Spec.Disks[0].Claim != replacementName {
+			return fmt.Errorf("still pointed at %q", got.Spec.Disks[0].Claim)
+		}
+		return nil
+	})
+
+	eventually(t, "the operation to finish and the old disk to be gone", func() error {
+		got := getOp(t, ns, "roll-it-back")
+		if got.Status.Phase != platformv1alpha1.OperationPhaseSucceeded {
+			return fmt.Errorf("phase = %q (%s)", got.Status.Phase, got.Status.Message)
+		}
+		old := &cdiv1.DataVolume{}
+		err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "payload"}, old)
+		if err == nil {
+			return fmt.Errorf("the replaced disk is still there")
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+
+	// And the machine is running again, because it was running before.
+	eventually(t, "the declared power state to be put back", func() error {
+		got := getVM(t, ns, "rollback-target")
+		if !got.Spec.Running {
+			return fmt.Errorf("the machine was left stopped")
+		}
+		return nil
+	})
+}
+
+// A machine's own root disk is not rolled back this way: the machine is built
+// from it, and swapping a claim would leave its template describing something
+// that no longer exists. The refusal says what to use instead.
+func TestRollingBackARootDiskIsRefusedWithTheAlternative(t *testing.T) {
+	ns := "op-rollback-root"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+
+	if err := k8sClient.Create(testCtx, newManagedVM(ns, "rooted", "ubuntu")); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+	eventually(t, "the machine to exist", func() error {
+		_, err := getKubeVirtVM(ns, "rooted")
+		return err
+	})
+	mustVolumeSnapshot(t, ns, "root-snap", "rooted-root-1", "20Gi", true)
+
+	op := &platformv1alpha1.ManagedVMOperation{
+		ObjectMeta: metav1.ObjectMeta{Name: "roll-root", Namespace: ns},
+		Spec: platformv1alpha1.ManagedVMOperationSpec{
+			VMName:       "rooted",
+			Action:       platformv1alpha1.OperationRollbackDisk,
+			RollbackDisk: &platformv1alpha1.RollbackDiskSpec{SnapshotName: "root-snap"},
+		},
+	}
+	if err := k8sClient.Create(testCtx, op); err != nil {
+		t.Fatalf("creating operation: %v", err)
+	}
+
+	eventually(t, "the refusal to point at the right tool", func() error {
+		got := getOp(t, ns, "roll-root")
+		if got.Status.Phase != platformv1alpha1.OperationPhaseFailed {
+			return fmt.Errorf("phase = %q", got.Status.Phase)
+		}
+		if !strings.Contains(got.Status.Message, "Restore") {
+			return fmt.Errorf("the refusal does not name the alternative: %q", got.Status.Message)
+		}
+		return nil
+	})
 }

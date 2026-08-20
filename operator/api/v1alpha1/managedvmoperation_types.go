@@ -27,6 +27,8 @@ const (
 	OperationRestore = "Restore"
 	// OperationMigrate moves a running VM to another node.
 	OperationMigrate = "Migrate"
+	// OperationRollbackDisk puts one attached disk back to a snapshot.
+	OperationRollbackDisk = "RollbackDisk"
 )
 
 // Operation phases.
@@ -40,6 +42,19 @@ const (
 // RestoreSpec asks for a VM to be put back to a snapshot.
 type RestoreSpec struct {
 	// SnapshotName is the VirtualMachineSnapshot to restore from.
+	// +kubebuilder:validation:MinLength=1
+	SnapshotName string `json:"snapshotName"`
+}
+
+// RollbackDiskSpec asks for one attached disk to be put back to a snapshot.
+//
+// The disk is replaced rather than rewritten: a new one is built from the
+// snapshot, the machine is pointed at it, and only then is the old one removed.
+// The path this replaces deleted the claim first and created its replacement
+// afterwards, so a process that died in between left a machine with no disk at
+// all and nothing anywhere that knew what it had been.
+type RollbackDiskSpec struct {
+	// SnapshotName is the VolumeSnapshot to roll back to.
 	// +kubebuilder:validation:MinLength=1
 	SnapshotName string `json:"snapshotName"`
 }
@@ -66,6 +81,7 @@ type MigrateSpec struct {
 // only record of whether the machine had been running before it started.
 // +kubebuilder:validation:XValidation:rule="self.action != 'Restore' || has(self.restore)",message="a Restore operation needs a restore block"
 // +kubebuilder:validation:XValidation:rule="self.action != 'Migrate' || has(self.migrate)",message="a Migrate operation needs a migrate block"
+// +kubebuilder:validation:XValidation:rule="self.action != 'RollbackDisk' || has(self.rollbackDisk)",message="a RollbackDisk operation needs a rollbackDisk block"
 // +kubebuilder:validation:XValidation:rule="self == oldSelf",message="an operation is a request to do something once; create a new one instead of editing this"
 type ManagedVMOperationSpec struct {
 	// VMName is the ManagedVM to act on, in this namespace.
@@ -73,7 +89,7 @@ type ManagedVMOperationSpec struct {
 	VMName string `json:"vmName"`
 
 	// Action to perform.
-	// +kubebuilder:validation:Enum=Restore;Migrate
+	// +kubebuilder:validation:Enum=Restore;Migrate;RollbackDisk
 	Action string `json:"action"`
 
 	// +optional
@@ -81,6 +97,9 @@ type ManagedVMOperationSpec struct {
 
 	// +optional
 	Migrate *MigrateSpec `json:"migrate,omitempty"`
+
+	// +optional
+	RollbackDisk *RollbackDiskSpec `json:"rollbackDisk,omitempty"`
 
 	// TTLSecondsAfterFinished is how long a finished operation sticks around.
 	// Long enough to read what happened, short enough that a busy namespace
@@ -119,6 +138,19 @@ type ManagedVMOperationStatus struct {
 	// VirtualMachineRestore or a VirtualMachineInstanceMigration.
 	// +optional
 	ChildName string `json:"childName,omitempty"`
+
+	// ReplacementDisk is the disk built from the snapshot during a rollback.
+	//
+	// Recorded before it is attached and kept until the old one is gone, so a
+	// pass that resumes after a crash knows which disk it was in the middle of
+	// swapping in rather than starting again and building a second one.
+	// +optional
+	ReplacementDisk string `json:"replacementDisk,omitempty"`
+
+	// ReplacedDisk is the disk being rolled back, kept so it can be removed
+	// once the machine is running on its replacement.
+	// +optional
+	ReplacedDisk string `json:"replacedDisk,omitempty"`
 
 	// StartTime is when the operation began.
 	// +optional

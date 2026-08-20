@@ -70,6 +70,7 @@ spec:
                 enum:
                 - Restore
                 - Migrate
+                - RollbackDisk
                 type: string
               migrate:
                 description: MigrateSpec asks for a running VM to move.
@@ -91,6 +92,23 @@ spec:
                   snapshotName:
                     description: SnapshotName is the VirtualMachineSnapshot to restore
                       from.
+                    minLength: 1
+                    type: string
+                required:
+                - snapshotName
+                type: object
+              rollbackDisk:
+                description: |-
+                  RollbackDiskSpec asks for one attached disk to be put back to a snapshot.
+
+                  The disk is replaced rather than rewritten: a new one is built from the
+                  snapshot, the machine is pointed at it, and only then is the old one removed.
+                  The path this replaces deleted the claim first and created its replacement
+                  afterwards, so a process that died in between left a machine with no disk at
+                  all and nothing anywhere that knew what it had been.
+                properties:
+                  snapshotName:
+                    description: SnapshotName is the VolumeSnapshot to roll back to.
                     minLength: 1
                     type: string
                 required:
@@ -118,6 +136,8 @@ spec:
               rule: self.action != 'Restore' || has(self.restore)
             - message: a Migrate operation needs a migrate block
               rule: self.action != 'Migrate' || has(self.migrate)
+            - message: a RollbackDisk operation needs a rollbackDisk block
+              rule: self.action != 'RollbackDisk' || has(self.rollbackDisk)
             - message: an operation is a request to do something once; create a new
                 one instead of editing this
               rule: self == oldSelf
@@ -207,6 +227,19 @@ spec:
                 - Running
                 - Succeeded
                 - Failed
+                type: string
+              replacedDisk:
+                description: |-
+                  ReplacedDisk is the disk being rolled back, kept so it can be removed
+                  once the machine is running on its replacement.
+                type: string
+              replacementDisk:
+                description: |-
+                  ReplacementDisk is the disk built from the snapshot during a rollback.
+
+                  Recorded before it is attached and kept until the old one is gone, so a
+                  pass that resumes after a crash knows which disk it was in the middle of
+                  swapping in rather than starting again and building a second one.
                 type: string
               runningBefore:
                 description: |-

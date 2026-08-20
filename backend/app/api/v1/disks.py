@@ -8,7 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client.rest import ApiException
 
-from app.core.operator import managed_owner, patch_managed_disks
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    managed_owner,
+    operation_name,
+    patch_managed_disks,
+)
 from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.kubevirt import get_hotplug_mode, kubevirt_subresource_call
 from app.core.naming import (
@@ -1029,6 +1035,42 @@ async def delete_snapshot(
         )
 
 
+async def _managed_owner_holding_snapshot_source(
+    custom_api: Any, namespace: str, snapshot_name: str,
+) -> str | None:
+    """The ManagedVM that has the snapshot's source disk attached, if any."""
+    try:
+        snap = await custom_api.get_namespaced_custom_object(
+            group="snapshot.storage.k8s.io", version="v1",
+            namespace=namespace, plural="volumesnapshots", name=snapshot_name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    source = (
+        ((snap.get("spec", {}) or {}).get("source", {}) or {})
+        .get("persistentVolumeClaimName", "")
+    )
+    if not source:
+        return None
+
+    try:
+        vms = await custom_api.list_namespaced_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            namespace=namespace, plural="managedvms",
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    for vm in vms.get("items", []):
+        for disk in ((vm.get("spec", {}) or {}).get("disks") or []):
+            if disk.get("claim") == source:
+                return vm["metadata"]["name"]
+    return None
+
+
 @snapshots_router.post("/{name}/rollback", status_code=status.HTTP_200_OK)
 async def rollback_snapshot(
     namespace: str,
@@ -1036,12 +1078,47 @@ async def rollback_snapshot(
     request: Request,
     user: User = Depends(require_env_member()),
 ) -> dict[str, Any]:
-    """Rollback a VolumeSnapshot: stop VM, replace original PVC with snapshot content, start VM."""
+    """Roll a disk back to a snapshot.
+
+    For a disk attached to a machine the operator owns this asks for an
+    operation, which builds the replacement first, points the machine at it, and
+    only then removes what it replaced.
+
+    The path below is what remains for everything else, and it is why this
+    endpoint is being replaced: it deletes the claim and creates its successor
+    afterwards, so a process that dies in between leaves a machine with no disk
+    and nothing anywhere that knows what it had.
+    """
     k8s_client = request.app.state.k8s_client
 
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
         core_api = client.CoreV1Api(k8s_client._api_client)
+
+        owner = await _managed_owner_holding_snapshot_source(custom_api, namespace, name)
+        if owner:
+            op_name = operation_name("RollbackDisk", owner)
+            await custom_api.create_namespaced_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                namespace=namespace, plural="managedvmoperations",
+                body={
+                    "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+                    "kind": "ManagedVMOperation",
+                    "metadata": {"name": op_name, "namespace": namespace},
+                    "spec": {
+                        "vmName": owner,
+                        "action": "RollbackDisk",
+                        "rollbackDisk": {"snapshotName": name},
+                    },
+                },
+            )
+            return {
+                "status": "rolling_back",
+                "snapshot": name,
+                "vm": owner,
+                "operation": op_name,
+                "message": f"Rollback requested ({op_name})",
+            }
 
         # 1. Get snapshot info
         snap = await custom_api.get_namespaced_custom_object(

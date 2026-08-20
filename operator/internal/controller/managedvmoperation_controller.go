@@ -115,6 +115,8 @@ func (r *ManagedVMOperationReconciler) Reconcile(ctx context.Context, req ctrl.R
 		result, err = r.reconcileRestore(ctx, op, vm)
 	case platformv1alpha1.OperationMigrate:
 		result, err = r.reconcileMigrate(ctx, op, vm)
+	case platformv1alpha1.OperationRollbackDisk:
+		result, err = r.reconcileRollbackDisk(ctx, op, vm)
 	default:
 		r.finish(op, platformv1alpha1.OperationPhaseFailed,
 			fmt.Sprintf("unknown action %q", op.Spec.Action))

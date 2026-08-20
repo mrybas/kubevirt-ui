@@ -549,3 +549,29 @@ each looked like a valid mutation:
 
 Only the third mutation proves anything. A comment on the update in
 `claimDisk` now records why it is an Update and not a patch.
+
+## M8 (third slice) — rolling a disk back without destroying it first
+
+The path this replaces stopped the machine, **deleted** the claim and its
+DataVolume, and created the replacement afterwards. A process that died in
+between left a machine with no disk and nothing anywhere that knew what it
+should have had. Its delete-wait loops also read any API error as "gone"
+(`except ApiException: break`), so a transient failure looked like success.
+
+The operation inverts the order, which is the entire design: build the
+replacement from the snapshot, point the machine at it, remove the old one last.
+Every failure before the swap leaves the machine on the disk it started with;
+every failure after it leaves the machine on the new one. Neither leaves it with
+nothing. CDI can build a DataVolume straight from a VolumeSnapshot
+(`spec.source.snapshot`, checked against the CRD), so no staging copy is needed.
+
+The names of both disks are recorded on the operation before either is touched,
+so a pass resuming after a crash knows which swap it was in the middle of rather
+than starting again and building a second replacement.
+
+**A machine's own root disk is refused**, with the alternative named: the
+machine is built from that disk, and swapping a claim would leave its own
+template describing something that no longer exists. A VirtualMachineSnapshot
+and a Restore are the tools for that, and the Restore operation already exists.
+This is a deliberate narrowing of what the old endpoint accepted — the case it
+refuses is the one where the old code was most dangerous.
