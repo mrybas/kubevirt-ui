@@ -278,3 +278,85 @@ class TestPowerActionsFollowOwnership:
     async def test_an_unowned_machine_keeps_the_old_path(self) -> None:
         touched, _ = await self._run(None, "start")
         assert touched == ["virtualmachines"]
+
+
+def _operation_harness(owner: str | None):
+    """A CustomObjectsApi that reports ownership and captures created objects."""
+    created: list[dict[str, Any]] = []
+
+    async def _get(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["plural"] == "virtualmachines":
+            return _owned_vm(owner)
+        raise AssertionError(f"unexpected get of {kwargs['plural']}")
+
+    async def _create(**kwargs: Any) -> dict[str, Any]:
+        created.append(kwargs)
+        body = dict(kwargs["body"])
+        body["metadata"] = dict(body["metadata"])
+        return body
+
+    async def _patch(**kwargs: Any) -> dict[str, Any]:
+        created.append(kwargs)
+        return {}
+
+    api = MagicMock()
+    api.get_namespaced_custom_object = AsyncMock(side_effect=_get)
+    api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
+    api.patch_namespaced_custom_object = AsyncMock(side_effect=_patch)
+    return api, created
+
+
+@pytest.mark.asyncio
+class TestLifecycleActionsBecomeOperations:
+    async def test_migrating_an_owned_machine_asks_for_an_operation(self) -> None:
+        """And therefore never pins the machine.
+
+        The endpoint's own fallback sets a nodeSelector on the VM that nothing
+        removes, so a machine migrated once cannot leave that node again —
+        measured on the stand, on the same machine, minutes apart.
+        """
+        from app.api.v1 import vm_actions
+
+        api, created = _operation_harness("web-01-x7k2p")
+        k8s = MagicMock()
+        k8s.patch_virtual_machine = AsyncMock()
+        request = MagicMock()
+        request.app.state.k8s_client = k8s
+
+        with patch.object(vm_actions.client, "CustomObjectsApi", return_value=api):
+            got = await vm_actions.migrate_vm(
+                request=request, namespace="opdev-dev", name="web-01-x7k2p",
+                migrate_request=vm_actions.MigrateVMRequest(target_node="worker-2"),
+                user=MagicMock(),
+            )
+
+        assert got.success
+        assert len(created) == 1
+        body = created[0]["body"]
+        assert created[0]["plural"] == "managedvmoperations"
+        assert body["spec"]["action"] == "Migrate"
+        assert body["spec"]["migrate"] == {"targetNode": "worker-2"}
+        # And nothing was written to the machine itself.
+        assert k8s.patch_virtual_machine.await_count == 0
+
+    async def test_restoring_an_owned_machine_asks_for_an_operation(self) -> None:
+        """The old path kept "was it running" in a local variable."""
+        from app.api.v1 import vm_snapshots
+
+        api, created = _operation_harness("web-01-x7k2p")
+        k8s = MagicMock()
+        request = MagicMock()
+        request.app.state.k8s_client = k8s
+
+        with patch.object(vm_snapshots.client, "CustomObjectsApi", return_value=api):
+            got = await vm_snapshots.restore_vm_snapshot(
+                request=request, namespace="opdev-dev", name="web-01-x7k2p",
+                snapshot_name="snap-1", restore_request=None, user=MagicMock(),
+            )
+
+        assert got["status"] == "InProgress"
+        assert len(created) == 1
+        body = created[0]["body"]
+        assert created[0]["plural"] == "managedvmoperations"
+        assert body["spec"]["action"] == "Restore"
+        assert body["spec"]["restore"] == {"snapshotName": "snap-1"}

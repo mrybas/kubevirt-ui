@@ -66,6 +66,19 @@ OWNER_KIND_LABEL = "platform.kubevirt-ui.io/owner-kind"
 OWNER_NAME_LABEL = "platform.kubevirt-ui.io/owner-name"
 
 
+def operation_name(action: str, vm_name: str) -> str:
+    """A stable-ish name for an operation object.
+
+    Operations are immutable records of one act, so each needs its own name.
+    The suffix comes from the clock rather than a counter: a counter would need
+    a read-modify-write to allocate, and the whole point of these objects is
+    that nothing about them depends on a process staying alive.
+    """
+    import time
+
+    return f"{vm_name}-{action.lower()}-{int(time.time())}"
+
+
 def managed_owner(obj: dict, kind: str) -> str | None:
     """Name of the custom resource that owns this object, if any.
 

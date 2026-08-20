@@ -15,6 +15,7 @@ from app.core.operator import (
     OPERATOR_GROUP,
     OPERATOR_VERSION,
     managed_owner,
+    operation_name,
 )
 from app.core.auth import User, require_auth, require_env_member
 from app.core.groups import is_env_member, load_folder, resolve_env
@@ -56,6 +57,42 @@ class ResizeVMRequest(BaseModel):
     cpu_cores: int | None = Field(None, ge=1, le=256, description="Number of CPU cores")
     cpu_sockets: int | None = Field(None, ge=1, le=16, description="Number of CPU sockets")
     memory: str | None = Field(None, pattern=r"^\d+[MGT]i$", description="Memory (e.g. '4Gi')")
+
+
+async def _managed_vm_of(k8s_client: Any, namespace: str, name: str) -> str | None:
+    """The ManagedVM behind this machine, if the operator owns it."""
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    try:
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    return managed_owner(vm, "ManagedVM")
+
+
+async def _start_operation(
+    k8s_client: Any, namespace: str, owner: str, action: str, body: dict[str, Any],
+) -> str:
+    """Ask for an operation and return its name."""
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    op_name = operation_name(action, owner)
+    spec: dict[str, Any] = {"vmName": owner, "action": action}
+    spec.update(body)
+    await custom_api.create_namespaced_custom_object(
+        group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+        namespace=namespace, plural="managedvmoperations",
+        body={
+            "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+            "kind": "ManagedVMOperation",
+            "metadata": {"name": op_name, "namespace": namespace},
+            "spec": spec,
+        },
+    )
+    return op_name
 
 
 async def _set_managed_running(
@@ -233,12 +270,30 @@ async def migrate_vm(
 ) -> VMStatusResponse:
     """Live migrate a running VM to a target node.
 
+    For a machine the operator owns this asks for an operation and returns; the
+    target node then lives on the migration object, and the machine is never
+    touched. The path below is what remains for machines that predate the
+    migration, and it is the reason this endpoint is being replaced: it pins the
+    machine with a nodeSelector that nothing ever removes, so a VM migrated once
+    cannot leave that node again.
+
     1. Validates the VM is running and not already on the target node.
     2. Patches the VM template with nodeSelector for the target node.
     3. Creates a VirtualMachineInstanceMigration CR to trigger migration.
     """
     k8s_client = request.app.state.k8s_client
     target_node = migrate_request.target_node
+
+    owner = await _managed_vm_of(k8s_client, namespace, name)
+    if owner:
+        op = await _start_operation(
+            k8s_client, namespace, owner, "Migrate",
+            {"migrate": {"targetNode": target_node} if target_node else {}},
+        )
+        return VMStatusResponse(
+            name=name, namespace=namespace, action="migrate", success=True,
+            message=f"Migration requested ({op})",
+        )
 
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
