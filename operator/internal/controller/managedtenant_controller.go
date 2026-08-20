@@ -66,6 +66,12 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups="",resources=namespaces;resourcequotas;limitranges,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedimages,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch
+// Held so it can be granted: Kubernetes refuses to create a Role conferring
+// permissions the writer does not have itself, and this controller's whole job
+// here is handing `datavolumes/source` to each tenant's ServiceAccount. Nothing
+// in the lab could show this — envtest and the dev backend both run as admin,
+// where an escalation check never fires.
+// +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes/source,verbs=create
 
 // Reconcile brings the tenant's namespace into line with the declaration.
 func (r *ManagedTenantReconciler) Reconcile(
