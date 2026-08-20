@@ -21,13 +21,6 @@ resources:
   # The guard only governs namespaces the product manages. Without this it
   # would police every namespace on the cluster, including ones it knows
   # nothing about.
-patches:
-- path: manager_dev_patch.yaml
-  target:
-    kind: Deployment
-    name: controller-manager
-- path: drop_metrics_cert.yaml
-- path: guard_namespace_selector.yaml
 # The CA-injection annotation is written by the base against the base's
 # namespace, and a replacement here does not reach it. It is the one that
 # actually bites: pointing at a certificate that is not there means cert-manager
@@ -36,6 +29,13 @@ patches:
 # error anywhere. Measured exactly that way before this patch existed: empty
 # caBundle, "tls: bad certificate" in the operator log, and a cluster-admin
 # creating a raw VM unchallenged.
+patches:
+- path: manager_dev_patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager
+- path: drop_metrics_cert.yaml
+- path: guard_namespace_selector.yaml
 - path: webhook_ca_annotation.yaml
 
 # The base computes the webhook certificate's dnsNames from the service's
@@ -68,4 +68,4 @@ replacements:
 images:
 - name: controller
   newName: ghcr.io/mrybas/kubevirt-ui/operator
-  newTag: dev-eea467d
+  newTag: dev-37d7aed

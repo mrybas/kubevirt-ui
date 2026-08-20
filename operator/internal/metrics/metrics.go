@@ -51,6 +51,36 @@ var ReconcileErrorsTotal = prometheus.NewCounterVec(
 	[]string{"controller", "reason"},
 )
 
+// GuardDecisionsTotal counts what the raw-VirtualMachine guard decided.
+//
+// A guard that is never consulted is indistinguishable from one that finds
+// nothing to refuse, so the allowed count matters as much as the denied one.
+var GuardDecisionsTotal = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "kubevirt_ui_operator_guard_decisions_total",
+		Help: "Admission decisions made by the raw VirtualMachine guard.",
+	},
+	[]string{"decision"},
+)
+
+// GuardWired is 1 when the guard's webhook configuration is actually usable —
+// it exists, it points at this operator, and it carries a CA bundle.
+//
+// This gauge exists because the guard fails open on purpose. A fail-open
+// webhook that is not wired up behaves exactly like one that is, from every
+// side except the thing it was meant to stop: measured once already, an empty
+// caBundle let a cluster-admin create a raw VirtualMachine with no error
+// anywhere except "tls: bad certificate" in this operator's own log. The policy
+// is only safe if the misconfiguration is loud.
+var GuardWired = prometheus.NewGauge(
+	prometheus.GaugeOpts{
+		Name: "kubevirt_ui_operator_guard_wired",
+		Help: "1 when the raw VirtualMachine guard's webhook configuration is usable, 0 otherwise.",
+	},
+)
+
 func init() {
-	metrics.Registry.MustRegister(PatchesTotal, ReconcileErrorsTotal)
+	metrics.Registry.MustRegister(
+		PatchesTotal, ReconcileErrorsTotal, GuardDecisionsTotal, GuardWired,
+	)
 }

@@ -41,3 +41,12 @@ spec:
                 system:serviceaccount:kubevirt-ui-system:kubevirt-ui
             - name: KUBE_OVN_NAMESPACE
               value: o0-kube-ovn
+            # The guard fails open, so something has to notice when it is not
+            # in the request path at all. The watchdog reads this configuration
+            # and reports kubevirt_ui_operator_guard_wired.
+            - name: OPERATOR_GUARD_WEBHOOK_CONFIG
+              value: kubevirt-ui-operator-validating-webhook-configuration
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace

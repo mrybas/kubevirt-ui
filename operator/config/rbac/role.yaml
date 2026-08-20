@@ -30,6 +30,14 @@ rules:
   - list
   - watch
 - apiGroups:
+  - admissionregistration.k8s.io
+  resources:
+  - validatingwebhookconfigurations
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - cdi.kubevirt.io
   resources:
   - datasources

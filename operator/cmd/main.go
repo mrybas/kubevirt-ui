@@ -232,6 +232,12 @@ func main() {
 			setupLog.Error(err, "Failed to create webhook", "webhook", "RawVirtualMachineGuard")
 			os.Exit(1)
 		}
+		// The guard admits everything when it cannot be reached, which is the
+		// right trade for availability and the wrong one to leave unobserved.
+		if err := webhookv1alpha1.SetupGuardWatchdogWithManager(mgr, os.Getenv("POD_NAMESPACE")); err != nil {
+			setupLog.Error(err, "Failed to start the guard watchdog")
+			os.Exit(1)
+		}
 	}
 	// +kubebuilder:scaffold:builder
 

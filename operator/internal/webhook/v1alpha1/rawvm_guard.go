@@ -25,6 +25,8 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/mrybas/kubevirt-ui/operator/internal/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -96,9 +98,11 @@ func (g *RawVMGuard) Handle(_ context.Context, req admission.Request) admission.
 	user := req.UserInfo.Username
 	for _, allowed := range g.allowed() {
 		if user == allowed {
+			metrics.GuardDecisionsTotal.WithLabelValues("allowed").Inc()
 			return admission.Allowed("")
 		}
 	}
+	metrics.GuardDecisionsTotal.WithLabelValues("denied").Inc()
 
 	// Log every refusal. The allowlist is a claim about which machinery on this
 	// cluster creates VMs, and a claim like that is only ever verified by
