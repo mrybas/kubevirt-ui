@@ -2650,3 +2650,38 @@ role.yaml less `secrets` create            -> the live error, in the suite
 
 All three now fail here instead of on a cluster. The direct-call tests did not
 need a restricted client after all: the manager-driven ones reach those paths.
+
+## M12e (first slice) — one renderer for the addons
+
+There were two, and they did not agree.
+
+`tenants_addons` builds the release the create path writes; `tenant_reconciler`
+builds one of its own when a release is missing. Same object, different content:
+
+```
+                       create path              repair path
+kubeConfig secret      <t>-admin-kubeconfig     <t>-kubeconfig
+kubeConfig key         super-admin.svc          value
+install.disableWait    true                     absent
+remediation            retries 5                retries 5, retryInterval 30s
+labels                 tenant, addon            + reconciler-managed
+```
+
+Both kubeconfig secrets exist on the stand and both keys are real — I checked,
+having assumed otherwise. The difference that matters is `disableWait`, and the
+comment explaining it is in the file that has it: without it the CNI install
+waits for workloads that the install is supposed to cause, times out, Flux
+remediates by uninstalling, and the release sits in `uninstalling` for ever.
+Measured on the lab with zero nodes registered.
+
+The repair path omits it — and fires **only when a release is missing**, which
+is the state a fresh tenant is in, which is exactly when omitting it wedges. All
+five live releases carry the create path's shape, so the repair has not written
+one yet; it is a trap set rather than a fire lit.
+
+So: one renderer, and the acceptance is byte parity rather than resemblance —
+"the same HelmRelease as through the old UI" is what the plan asks for and it is
+now a table both suites read, built from the catalogue the stand carries and all
+four addons it offers, including alloy's config substitution and the CSI
+driver's namespace. Removing `disableWait` from the port turns three of the four
+red.

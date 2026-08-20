@@ -1,0 +1,435 @@
+{
+  "_why": "HelmReleases as the product renders them, frozen once and asserted by both. The acceptance for this slice is that an addon enabled through the operator produces the same release, byte for byte, as one enabled through the old UI.",
+  "catalog": {
+    "basePath": "tenant-charts",
+    "components": [
+      {
+        "category": "core",
+        "chartPath": "core/namespaces",
+        "default": true,
+        "defaultValues": {},
+        "description": "Manage Kubernetes namespaces declaratively",
+        "discovery_type": "",
+        "id": "namespaces",
+        "name": "Namespaces",
+        "namespace": "default",
+        "parameters": [],
+        "required": true
+      },
+      {
+        "category": "networking",
+        "chartPath": "networking/calico",
+        "default": true,
+        "defaultValues": {
+          "tigera-operator": {
+            "installation": {
+              "calicoNetwork": {
+                "bgp": "Disabled",
+                "ipPools": [
+                  {
+                    "cidr": "10.244.0.0/16",
+                    "encapsulation": "VXLAN"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "description": "Pod networking and NetworkPolicy enforcement via Tigera Operator",
+        "discovery_type": "",
+        "id": "calico",
+        "name": "Calico CNI",
+        "namespace": "tigera-operator",
+        "parameters": [],
+        "required": true
+      },
+      {
+        "category": "observability",
+        "chartPath": "observability/alloy",
+        "default": false,
+        "defaultValues": {},
+        "description": "Metrics collection agent - scrapes node metrics, ServiceMonitors, kubelet/cadvisor, and remote-writes to VictoriaMetrics",
+        "discovery_type": "monitoring",
+        "id": "alloy",
+        "name": "Grafana Alloy",
+        "namespace": "alloy",
+        "parameters": [
+          {
+            "auto_discover": true,
+            "default": "",
+            "id": "VM_REMOTE_WRITE_URL",
+            "name": "VictoriaMetrics Write URL",
+            "options": [],
+            "type": "string",
+            "valuesPath": ""
+          },
+          {
+            "auto_discover": false,
+            "default": "30s",
+            "id": "SCRAPE_INTERVAL",
+            "name": "Scrape Interval",
+            "options": [
+              "15s",
+              "30s",
+              "60s"
+            ],
+            "type": "select",
+            "valuesPath": ""
+          }
+        ],
+        "required": false
+      },
+      {
+        "category": "storage",
+        "chartPath": "storage/kubevirt-csi-driver",
+        "default": false,
+        "defaultValues": {
+          "infraClusterKubeconfigSecret": {
+            "key": "kubeconfig",
+            "name": "infra-cluster-credentials"
+          },
+          "infraClusterLabels": "csi-driver/cluster=tenant",
+          "infraClusterNamespace": "",
+          "infraStorageClassEnforcement": "",
+          "snapshots": {
+            "enabled": false
+          },
+          "storageClasses": [
+            {
+              "bus": "scsi",
+              "infraStorageClassName": "",
+              "isDefault": true,
+              "name": "kubevirt"
+            }
+          ]
+        },
+        "description": "Tenant CSI driver that forwards PersistentVolumeClaims to host CDI\nDataVolumes (kubevirt-csi pattern). Required for tenant pods to mount\npersistent volumes backed by host storage.\n",
+        "discovery_type": "storage",
+        "id": "kubevirt-csi-driver",
+        "name": "KubeVirt CSI Driver",
+        "namespace": "kube-system",
+        "parameters": [
+          {
+            "auto_discover": false,
+            "default": "",
+            "id": "INFRA_CLUSTER_NAMESPACE",
+            "name": "Host tenant namespace",
+            "options": [],
+            "type": "string",
+            "valuesPath": "infraClusterNamespace"
+          },
+          {
+            "auto_discover": true,
+            "default": "",
+            "id": "INFRA_STORAGE_CLASS_NAME",
+            "name": "Host StorageClass",
+            "options": [],
+            "type": "string",
+            "valuesPath": "storageClasses.0.infraStorageClassName"
+          }
+        ],
+        "required": false
+      }
+    ],
+    "gitRepositoryRef": {
+      "name": "flux-system",
+      "namespace": "flux-system"
+    }
+  },
+  "namespace": "tenant-tcat",
+  "releases": [
+    {
+      "apiVersion": "helm.toolkit.fluxcd.io/v2",
+      "kind": "HelmRelease",
+      "metadata": {
+        "labels": {
+          "kubevirt-ui.io/addon": "alloy",
+          "kubevirt-ui.io/tenant": "tcat"
+        },
+        "name": "tcat-alloy",
+        "namespace": "tenant-tcat"
+      },
+      "spec": {
+        "chart": {
+          "spec": {
+            "chart": "./tenant-charts/observability/alloy",
+            "interval": "12h",
+            "sourceRef": {
+              "kind": "GitRepository",
+              "name": "flux-system",
+              "namespace": "flux-system"
+            }
+          }
+        },
+        "dependsOn": [
+          {
+            "name": "tcat-calico",
+            "namespace": "tenant-tcat"
+          }
+        ],
+        "install": {
+          "crds": "CreateReplace",
+          "createNamespace": true,
+          "disableWait": true,
+          "remediation": {
+            "retries": 5
+          }
+        },
+        "interval": "30m",
+        "kubeConfig": {
+          "secretRef": {
+            "key": "super-admin.svc",
+            "name": "tcat-admin-kubeconfig"
+          }
+        },
+        "releaseName": "alloy",
+        "storageNamespace": "kube-system",
+        "targetNamespace": "alloy",
+        "timeout": "15m",
+        "upgrade": {
+          "crds": "CreateReplace",
+          "remediation": {
+            "retries": 5
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "helm.toolkit.fluxcd.io/v2",
+      "kind": "HelmRelease",
+      "metadata": {
+        "labels": {
+          "kubevirt-ui.io/addon": "calico",
+          "kubevirt-ui.io/tenant": "tcat"
+        },
+        "name": "tcat-calico",
+        "namespace": "tenant-tcat"
+      },
+      "spec": {
+        "chart": {
+          "spec": {
+            "chart": "./tenant-charts/networking/calico",
+            "interval": "12h",
+            "sourceRef": {
+              "kind": "GitRepository",
+              "name": "flux-system",
+              "namespace": "flux-system"
+            }
+          }
+        },
+        "dependsOn": [
+          {
+            "name": "tcat-namespaces",
+            "namespace": "tenant-tcat"
+          }
+        ],
+        "install": {
+          "crds": "CreateReplace",
+          "createNamespace": true,
+          "disableWait": true,
+          "remediation": {
+            "retries": 5
+          }
+        },
+        "interval": "30m",
+        "kubeConfig": {
+          "secretRef": {
+            "key": "super-admin.svc",
+            "name": "tcat-admin-kubeconfig"
+          }
+        },
+        "releaseName": "calico",
+        "storageNamespace": "kube-system",
+        "targetNamespace": "tigera-operator",
+        "timeout": "15m",
+        "upgrade": {
+          "crds": "CreateReplace",
+          "remediation": {
+            "retries": 5
+          }
+        },
+        "values": {
+          "tigera-operator": {
+            "installation": {
+              "calicoNetwork": {
+                "bgp": "Disabled",
+                "ipPools": [
+                  {
+                    "cidr": "10.244.0.0/16",
+                    "encapsulation": "VXLAN"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "helm.toolkit.fluxcd.io/v2",
+      "kind": "HelmRelease",
+      "metadata": {
+        "labels": {
+          "kubevirt-ui.io/addon": "kubevirt-csi-driver",
+          "kubevirt-ui.io/tenant": "tcat"
+        },
+        "name": "tcat-kubevirt-csi-driver",
+        "namespace": "tenant-tcat"
+      },
+      "spec": {
+        "chart": {
+          "spec": {
+            "chart": "./tenant-charts/storage/kubevirt-csi-driver",
+            "interval": "12h",
+            "sourceRef": {
+              "kind": "GitRepository",
+              "name": "flux-system",
+              "namespace": "flux-system"
+            }
+          }
+        },
+        "dependsOn": [
+          {
+            "name": "tcat-calico",
+            "namespace": "tenant-tcat"
+          }
+        ],
+        "install": {
+          "crds": "CreateReplace",
+          "createNamespace": true,
+          "disableWait": true,
+          "remediation": {
+            "retries": 5
+          }
+        },
+        "interval": "30m",
+        "kubeConfig": {
+          "secretRef": {
+            "key": "super-admin.svc",
+            "name": "tcat-admin-kubeconfig"
+          }
+        },
+        "releaseName": "kubevirt-csi-driver",
+        "storageNamespace": "kube-system",
+        "targetNamespace": "kube-system",
+        "timeout": "15m",
+        "upgrade": {
+          "crds": "CreateReplace",
+          "remediation": {
+            "retries": 5
+          }
+        },
+        "values": {
+          "infraClusterKubeconfigSecret": {
+            "key": "kubeconfig",
+            "name": "infra-cluster-credentials"
+          },
+          "infraClusterLabels": "csi-driver/cluster=tenant",
+          "infraClusterNamespace": "tenant-tcat",
+          "infraStorageClassEnforcement": "",
+          "snapshots": {
+            "enabled": false
+          },
+          "storageClasses": [
+            {
+              "bus": "scsi",
+              "infraStorageClassName": "ceph-block",
+              "isDefault": true,
+              "name": "kubevirt"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "apiVersion": "helm.toolkit.fluxcd.io/v2",
+      "kind": "HelmRelease",
+      "metadata": {
+        "labels": {
+          "kubevirt-ui.io/addon": "namespaces",
+          "kubevirt-ui.io/tenant": "tcat"
+        },
+        "name": "tcat-namespaces",
+        "namespace": "tenant-tcat"
+      },
+      "spec": {
+        "chart": {
+          "spec": {
+            "chart": "./tenant-charts/core/namespaces",
+            "interval": "12h",
+            "sourceRef": {
+              "kind": "GitRepository",
+              "name": "flux-system",
+              "namespace": "flux-system"
+            }
+          }
+        },
+        "install": {
+          "crds": "CreateReplace",
+          "createNamespace": true,
+          "disableWait": true,
+          "remediation": {
+            "retries": 5
+          }
+        },
+        "interval": "30m",
+        "kubeConfig": {
+          "secretRef": {
+            "key": "super-admin.svc",
+            "name": "tcat-admin-kubeconfig"
+          }
+        },
+        "releaseName": "namespaces",
+        "storageNamespace": "kube-system",
+        "targetNamespace": "default",
+        "timeout": "15m",
+        "upgrade": {
+          "crds": "CreateReplace",
+          "remediation": {
+            "retries": 5
+          }
+        },
+        "values": {
+          "namespaces": [
+            {
+              "name": "default"
+            },
+            {
+              "name": "tigera-operator"
+            },
+            {
+              "name": "kube-system"
+            },
+            {
+              "name": "alloy"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "requested": [
+    {
+      "id": "namespaces",
+      "parameters": {}
+    },
+    {
+      "id": "calico",
+      "parameters": {}
+    },
+    {
+      "id": "kubevirt-csi-driver",
+      "parameters": {
+        "INFRA_STORAGE_CLASS_NAME": "ceph-block"
+      }
+    },
+    {
+      "id": "alloy",
+      "parameters": {
+        "SCRAPE_INTERVAL": "15s",
+        "VM_REMOTE_WRITE_URL": "https://vm.example/api/v1/write"
+      }
+    }
+  ],
+  "tenant": "tcat"
+}
