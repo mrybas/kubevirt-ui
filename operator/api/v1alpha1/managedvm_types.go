@@ -109,6 +109,13 @@ type DiskAttachment struct {
 	// +kubebuilder:validation:MinLength=1
 	Claim string `json:"claim"`
 
+	// Name the volume carries inside the machine. Empty means the claim's own
+	// name, which is the usual case; it is separate because the attach dialog
+	// lets a person choose one, and dropping that choice silently would be a
+	// worse answer than carrying it.
+	// +optional
+	Name string `json:"name,omitempty"`
+
 	// Bus the guest sees the disk on.
 	// +kubebuilder:validation:Enum=virtio;scsi;sata
 	// +kubebuilder:default=virtio

@@ -145,6 +145,13 @@ spec:
                         namespace.
                       minLength: 1
                       type: string
+                    name:
+                      description: |-
+                        Name the volume carries inside the machine. Empty means the claim's own
+                        name, which is the usual case; it is separate because the attach dialog
+                        lets a person choose one, and dropping that choice silently would be a
+                        worse answer than carrying it.
+                      type: string
                   required:
                   - claim
                   type: object

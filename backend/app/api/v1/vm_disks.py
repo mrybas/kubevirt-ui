@@ -89,13 +89,14 @@ async def attach_disk_to_vm(
         owner = await _managed_owner_of_vm(custom_api, namespace, name)
         if owner:
             await patch_managed_disks(
-                custom_api, namespace, owner, attach_request.disk_name, attach=True,
+                custom_api, namespace, owner, attach_request.pvc_name, attach=True,
+                volume_name=attach_request.disk_name, bus=attach_request.bus,
             )
             return {
                 "vm": name,
-                "disk": attach_request.disk_name,
+                "disk": attach_request.pvc_name,
                 "attached": True,
-                "message": f"Disk {attach_request.disk_name} attached to {name}",
+                "message": f"Disk {attach_request.pvc_name} attached to {name}",
             }
 
         # --- Check persistent disk constraints ---

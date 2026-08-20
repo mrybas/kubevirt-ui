@@ -80,7 +80,13 @@ def operation_name(action: str, vm_name: str) -> str:
 
 
 async def patch_managed_disks(
-    custom_api, namespace: str, owner: str, claim: str, attach: bool,
+    custom_api,
+    namespace: str,
+    owner: str,
+    claim: str,
+    attach: bool,
+    volume_name: str | None = None,
+    bus: str | None = None,
 ) -> None:
     """Add or remove a disk on the machine's declared list.
 
@@ -95,7 +101,14 @@ async def patch_managed_disks(
     disks = list((vm.get("spec", {}) or {}).get("disks") or [])
     disks = [d for d in disks if d.get("claim") != claim]
     if attach:
-        disks.append({"claim": claim})
+        entry: dict = {"claim": claim}
+        # The attach dialog lets a person name the volume separately from the
+        # claim; carrying only the claim would drop that choice silently.
+        if volume_name and volume_name != claim:
+            entry["name"] = volume_name
+        if bus:
+            entry["bus"] = bus
+        disks.append(entry)
 
     await custom_api.patch_namespaced_custom_object(
         group=OPERATOR_GROUP, version=OPERATOR_VERSION,

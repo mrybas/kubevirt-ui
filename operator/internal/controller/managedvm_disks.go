@@ -57,9 +57,11 @@ func (r *ManagedVMReconciler) syncDisks(
 	vm *platformv1alpha1.ManagedVM,
 	existing *kubevirtv1.VirtualMachine,
 ) error {
+	// Keyed by the name the volume carries inside the machine, because that is
+	// what the machine's own arrays are matched on.
 	desired := make(map[string]platformv1alpha1.DiskAttachment, len(vm.Spec.Disks))
 	for _, d := range vm.Spec.Disks {
-		desired[d.Claim] = d
+		desired[volumeNameOf(d)] = d
 	}
 	previously := make(map[string]struct{}, len(vm.Status.AttachedDisks))
 	for _, claim := range vm.Status.AttachedDisks {
@@ -75,17 +77,17 @@ func (r *ManagedVMReconciler) syncDisks(
 		toAttach []platformv1alpha1.DiskAttachment
 		toDetach []string
 	)
-	for claim, disk := range desired {
-		if _, ok := present[claim]; !ok {
+	for name, disk := range desired {
+		if _, ok := present[name]; !ok {
 			toAttach = append(toAttach, disk)
 		}
 	}
-	for claim := range previously {
-		if _, stillWanted := desired[claim]; stillWanted {
+	for name := range previously {
+		if _, stillWanted := desired[name]; stillWanted {
 			continue
 		}
-		if _, ok := present[claim]; ok {
-			toDetach = append(toDetach, claim)
+		if _, ok := present[name]; ok {
+			toDetach = append(toDetach, name)
 		}
 	}
 
@@ -146,7 +148,7 @@ func (r *ManagedVMReconciler) applyDiskChanges(
 			bus = kubevirtv1.DiskBusVirtio
 		}
 		volumes = append(volumes, kubevirtv1.Volume{
-			Name: want.Claim,
+			Name: volumeNameOf(want),
 			VolumeSource: kubevirtv1.VolumeSource{
 				DataVolume: &kubevirtv1.DataVolumeSource{
 					Name: want.Claim,
@@ -159,7 +161,7 @@ func (r *ManagedVMReconciler) applyDiskChanges(
 			},
 		})
 		disks = append(disks, kubevirtv1.Disk{
-			Name:       want.Claim,
+			Name:       volumeNameOf(want),
 			DiskDevice: kubevirtv1.DiskDevice{Disk: &kubevirtv1.DiskTarget{Bus: bus}},
 		})
 	}
@@ -187,16 +189,19 @@ func (r *ManagedVMReconciler) syncAttachedLabels(
 	desired map[string]platformv1alpha1.DiskAttachment,
 	previously map[string]struct{},
 ) error {
-	for claim := range desired {
-		if err := r.setAttachedTo(ctx, vm.Namespace, claim, vm.Name); err != nil {
+	for _, disk := range desired {
+		if err := r.setAttachedTo(ctx, vm.Namespace, disk.Claim, vm.Name); err != nil {
 			return err
 		}
 	}
-	for claim := range previously {
-		if _, stillWanted := desired[claim]; stillWanted {
+	for name := range previously {
+		if _, stillWanted := desired[name]; stillWanted {
 			continue
 		}
-		if err := r.setAttachedTo(ctx, vm.Namespace, claim, ""); err != nil {
+		// The recorded entry is the volume name; for the label it is the claim
+		// that matters, and the two are the same unless someone chose
+		// otherwise. Release by whichever name is there.
+		if err := r.setAttachedTo(ctx, vm.Namespace, name, ""); err != nil {
 			return err
 		}
 	}
@@ -242,6 +247,14 @@ func (r *ManagedVMReconciler) setAttachedTo(
 	return nil
 }
 
+// volumeNameOf is the name a disk carries inside the machine.
+func volumeNameOf(d platformv1alpha1.DiskAttachment) string {
+	if d.Name != "" {
+		return d.Name
+	}
+	return d.Claim
+}
+
 // releaseDisks drops the attachment labels when a machine goes away, so its
 // disks can be attached to something else.
 //
@@ -251,7 +264,14 @@ func (r *ManagedVMReconciler) setAttachedTo(
 func (r *ManagedVMReconciler) releaseDisks(
 	ctx context.Context, vm *platformv1alpha1.ManagedVM,
 ) error {
-	for _, claim := range vm.Status.AttachedDisks {
+	seen := map[string]struct{}{}
+	for _, disk := range vm.Spec.Disks {
+		seen[disk.Claim] = struct{}{}
+	}
+	for _, name := range vm.Status.AttachedDisks {
+		seen[name] = struct{}{}
+	}
+	for claim := range seen {
 		if err := r.setAttachedTo(ctx, vm.Namespace, claim, ""); err != nil {
 			return err
 		}
