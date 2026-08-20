@@ -132,6 +132,15 @@ backend:
     # to the same value) but it is two writers of one thing, so the order is the
     # usual one: this flag on first, then the operator's tenant domain.
     OPERATOR_TENANT_BOOTSTRAP_ENABLED: ""
+    # -- Hand the tenant's time source to the operator. Off, the backend writes
+    # the shared chrony Deployment and ConfigMap and the per-tenant NTP Service
+    # on every tenant creation.
+    #
+    # Unlike the flag above, this one is not merely tidiness. The chrony
+    # Deployment would have two renderers the moment both sides run, and any
+    # difference between them rolls it — chrony is what a joining worker asks
+    # for the time, so rolling it during a join is a node that never appears.
+    OPERATOR_TENANT_TIME_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as

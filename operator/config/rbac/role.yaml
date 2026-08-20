@@ -8,21 +8,6 @@ rules:
   - ""
   resources:
   - configmaps
-  - pods
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - ""
-  resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - ""
-  resources:
   - limitranges
   - namespaces
   - resourcequotas
@@ -37,12 +22,27 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ""
+  resources:
   - nodes
   verbs:
   - get
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - ""
@@ -78,9 +78,11 @@ rules:
   resources:
   - deployments
   verbs:
+  - create
   - get
   - list
   - patch
+  - update
   - watch
 - apiGroups:
   - bootstrap.cluster.x-k8s.io
@@ -141,6 +143,14 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - frrk8s.metallb.io

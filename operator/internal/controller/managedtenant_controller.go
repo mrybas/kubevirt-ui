@@ -95,7 +95,10 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=metallb.io,resources=ipaddresspools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=issuers;certificates,verbs=get;list;watch;create;update;patch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets;configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;update;patch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeovn.io,resources=subnets,verbs=get;list;watch
 
 // Reconcile brings the tenant's namespace into line with the declaration.
@@ -239,6 +242,21 @@ func (r *ManagedTenantReconciler) Reconcile(
 			pkiCondition(pkiReady, pkiReason, pkiMessage))
 		pending = pending || !pkiReady
 	}
+
+	// On the same address as the API server, which is what makes it reachable
+	// from a VPC with no egress at all.
+	timeReady, timeReason, timeMessage, err := r.reconcileTime(
+		ctx, obj, obj.Status.ControlPlaneVIP)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			timeCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	apimeta.SetStatusCondition(&obj.Status.Conditions,
+		timeCondition(timeReady, timeReason, timeMessage))
+	pending = pending || !timeReady
 
 	// After the namespace, because the clone grant names it as its subject.
 	goldenReady, goldenMessage, err := r.reconcileGolden(ctx, obj, namespace, release)

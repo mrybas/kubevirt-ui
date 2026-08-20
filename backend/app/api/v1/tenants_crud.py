@@ -113,6 +113,7 @@ from app.core.tenant_transit import (
     transit_subnet_name,
 )
 from app.api.v1.tenants_ntp import ensure_ntp_server, ensure_tenant_ntp_service
+from app.core.operator import tenant_time_path_enabled
 from app.api.v1.tenants_talosconfig import (
     DEFAULT_TTL_HOURS,
     build_talosconfig,
@@ -176,6 +177,29 @@ _OVERHEAD_MARGIN = 1.25
 # placement, VFIO/GPU passthrough, SEV, downward metrics. Worker VMs set none
 # of them — `test_worker_vms_stay_within_the_reserved_shape` fails if that
 # ever stops being true, because each would add its own term.
+
+
+async def _ensure_tenant_time(k8s, name: str, namespace: str, vip: str | None) -> bool:
+    """Give the tenant somewhere to ask for the time, unless the operator does.
+
+    Best-effort by design: without it the public fallbacks still work wherever
+    egress does, and failing a whole create over the clock would be worse than
+    the symptom.
+
+    Handed over under a flag, and not because two writers of a Service are
+    dangerous. The chrony **Deployment** has two renderers the moment both sides
+    run, and any difference between them rolls it — during a join that is a
+    worker with nowhere to ask for the time, which is a node that never appears.
+
+    Returns whether it did the work, so the caller and the tests can tell
+    "handed over" from "nothing to do".
+    """
+    if tenant_time_path_enabled():
+        return False
+    await ensure_ntp_server(k8s)
+    if vip:
+        await ensure_tenant_ntp_service(k8s, name, namespace, vip)
+    return True
 
 
 def _vmi_memory_overhead(memory: int, vcpu: int) -> int:
@@ -1550,12 +1574,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                     k8s, req.name, ns, worker_os=req.worker_os,
                 )
             await ensure_talos_tenant_objects(k8s, req.name, ns, vip=talos_vip)
-            # Time on the transit plane. Best-effort by design: without it the
-            # public fallbacks still work wherever egress does, and failing the
-            # whole create over the clock would be worse than the symptom.
-            await ensure_ntp_server(k8s)
-            if talos_vip:
-                await ensure_tenant_ntp_service(k8s, req.name, ns, talos_vip)
+            await _ensure_tenant_time(k8s, req.name, ns, talos_vip)
             # Resolved here rather than trusted: the wizard renders the pairs
             # this same function accepts, so a mismatch means one of them has
             # drifted and the tenant would be built on an image whose kubelet

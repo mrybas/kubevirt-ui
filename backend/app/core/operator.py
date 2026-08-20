@@ -105,6 +105,22 @@ def tenant_bootstrap_path_enabled() -> bool:
     return _enabled("OPERATOR_TENANT_BOOTSTRAP_ENABLED")
 
 
+def tenant_time_path_enabled() -> bool:
+    """True when the operator owns the tenant time source.
+
+    Off: creating a tenant writes the shared chrony Deployment and ConfigMap and
+    the per-tenant NTP Service.
+    On: none of it, because the ManagedTenant controller renders the same three
+    objects — and two renderers of one Deployment is worse than two writers of a
+    Service. Any difference between them rolls chrony from whichever side wrote
+    last, and chrony is what a joining worker asks for the time: rolling it
+    during a join is a node that does not appear.
+
+    Order as always: this flag on first, then the operator's tenant domain.
+    """
+    return _enabled("OPERATOR_TENANT_TIME_ENABLED")
+
+
 def underlay_path_enabled() -> bool:
     """True when the egress underlay is written as a ManagedUnderlay resource.
 

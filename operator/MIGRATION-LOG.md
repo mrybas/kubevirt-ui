@@ -1852,3 +1852,52 @@ Secret and every ManagedImage in the cluster to notice one object apiece, so the
 tenant requeues every ten seconds while something is pending and stops as soon
 as it is not. The PKI test found this the honest way: it assigned the secret and
 waited twenty seconds for a condition that had nothing to wake it.
+
+## M12c (fifth slice) — somewhere to ask for the time
+
+Talos will not start a kubelet against an unsynchronised clock, so a worker in a
+VPC with no egress does not join, and the symptom is a VM that boots, stays up,
+and never becomes a node. The answer is the tenant's own address again: chrony
+behind it, on 123/udp, sharing the address the API server already answers on.
+
+Ported with its scars intact, all of them measured rather than reasoned:
+
+* `local stratum 10`, without which chronyd answers nothing at all until it
+  considers itself synchronised — while the pod reports Ready throughout;
+* `rm -f` of the pid file before exec, because chronyd is pid 1 here and writes
+  "1" into its own pid file on an emptyDir that survives a restart, so the next
+  start finds a live process with that pid (itself) and dies forever;
+* `-x`, which is what "serves a clock, never sets one" means to chronyd —
+  without it, it tries to discipline the node's clock and dies for want of
+  CAP_SYS_TIME, and the alternative is granting a pod CAP_SYS_TIME;
+* the capability set, arrived at from crash logs rather than from principle;
+* `externalTrafficPolicy: Cluster`, because Local black-holes the request from
+  any node without a replica — including, during a join, the node making it.
+
+### Ready means somebody answers
+
+The condition is not "the Service exists". It failed once in exactly that shape:
+the Service was created in the tenant's namespace, where a Service selects only
+pods beside it, so it had an address and no endpoints. Every query timed out,
+which looks exactly like a server refusing to answer — and the first round of
+diagnosis went to chronyd's configuration instead of to the Service. So
+readiness reads EndpointSlices and requires a ready endpoint, and separately
+requires the address MetalLB actually assigned to equal the one asked for,
+because a sharing-key mismatch leaves the second Service pending forever.
+
+Both gates were mutated out; both tests went red, one reporting `Served` with
+"0 chrony endpoint(s)" in its own message.
+
+### The retire flag, which is not tidiness here
+
+The backend writes the same three objects when a tenant is created. For the
+per-tenant Service that would be harmless, but the chrony **Deployment** would
+have two renderers, and any difference between them rolls it from whichever side
+wrote last. Chrony is what a joining worker asks for the time: rolling it during
+a join is a node that never appears.
+
+So `OPERATOR_TENANT_TIME_ENABLED`, in the N7 shape — flag on first (writers
+1 → 0), then the operator's tenant domain (0 → 1). The write is extracted into
+one function so the flag can be tested directly, and the test also asserts the
+guarded calls appear exactly once in the module, because a flag that covers one
+of two call sites is worse than no flag.

@@ -189,6 +189,14 @@ const (
 	// token, so without this nothing signs its CSR and the node never appears
 	// — while the VM looks perfectly healthy.
 	ConditionPKIReady = "PKIReady"
+
+	// ConditionTimeServed is whether the tenant has somewhere to get the time
+	// before it has an egress.
+	//
+	// Talos will not start a kubelet against an unsynchronised clock, so a
+	// worker in an isolated VPC that cannot reach an NTP server does not join —
+	// and the symptom is a VM that boots, stays up, and never becomes a node.
+	ConditionTimeServed = "TimeServed"
 )
 
 // TenantReservation is what this tenant asks of its folder.
