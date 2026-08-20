@@ -11,23 +11,32 @@ namespace: kubevirt-ui-operator-dev
 # namePrefix comes from ../../default; setting it again here would double it.
 
 resources:
-  - ../../default
+- ../../default
 
-patches:
   # Metrics on plain HTTP for the dev stand: the point here is to read the
   # counters (patches_total above all), not to rehearse metrics TLS.
-  - path: manager_dev_patch.yaml
-    target:
-      kind: Deployment
-      name: controller-manager
   # …which also means the metrics certificate has no consumer. It ships from
   # the base with unresolved placeholders in its dnsNames, so leaving it in
   # would put a permanently failing Certificate on the cluster.
-  - path: drop_metrics_cert.yaml
   # The guard only governs namespaces the product manages. Without this it
   # would police every namespace on the cluster, including ones it knows
   # nothing about.
-  - path: guard_namespace_selector.yaml
+patches:
+- path: manager_dev_patch.yaml
+  target:
+    kind: Deployment
+    name: controller-manager
+- path: drop_metrics_cert.yaml
+- path: guard_namespace_selector.yaml
+# The CA-injection annotation is written by the base against the base's
+# namespace, and a replacement here does not reach it. It is the one that
+# actually bites: pointing at a certificate that is not there means cert-manager
+# injects nothing, the API server cannot verify the webhook's TLS, and — because
+# the guard fails open on purpose — every raw VirtualMachine is admitted with no
+# error anywhere. Measured exactly that way before this patch existed: empty
+# caBundle, "tls: bad certificate" in the operator log, and a cluster-admin
+# creating a raw VM unchallenged.
+- path: webhook_ca_annotation.yaml
 
 # The base computes the webhook certificate's dnsNames from the service's
 # namespace, which at that point is still the base namespace. Re-running the
@@ -35,28 +44,28 @@ patches:
 # into the dev namespace — otherwise the certificate is issued for a hostname
 # nothing answers on, and every admission call fails TLS verification.
 replacements:
-  - source:
-      kind: Service
+- source:
+    fieldPath: .metadata.namespace
+    kind: Service
+    name: webhook-service
+    version: v1
+  targets:
+  - fieldPaths:
+    - .spec.dnsNames.0
+    - .spec.dnsNames.1
+    options:
+      create: true
+      delimiter: .
+      index: 1
+    select:
+      group: cert-manager.io
+      kind: Certificate
+      name: serving-cert
       version: v1
-      name: webhook-service
-      fieldPath: .metadata.namespace
-    targets:
-      - select:
-          kind: Certificate
-          group: cert-manager.io
-          version: v1
-          name: serving-cert
-        fieldPaths:
-          - .spec.dnsNames.0
-          - .spec.dnsNames.1
-        options:
-          delimiter: '.'
-          index: 1
-          create: true
 
-images:
-  - name: controller
-    newName: ghcr.io/mrybas/kubevirt-ui/operator
     # Replaced by `make deploy-dev IMG=...`; the literal below is only a
     # placeholder so a plain `kustomize build` still renders.
-    newTag: dev-latest
+images:
+- name: controller
+  newName: ghcr.io/mrybas/kubevirt-ui/operator
+  newTag: dev-eea467d

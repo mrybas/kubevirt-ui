@@ -100,6 +100,14 @@ func (g *RawVMGuard) Handle(_ context.Context, req admission.Request) admission.
 		}
 	}
 
+	// Log every refusal. The allowlist is a claim about which machinery on this
+	// cluster creates VMs, and a claim like that is only ever verified by
+	// watching what gets turned away — a controller silently unable to
+	// provision looks like a slow cluster, not like a policy decision.
+	managedvmlog.Info("refused a raw VirtualMachine",
+		"user", user, "namespace", req.Namespace, "name", req.Name,
+		"allowed", g.allowed())
+
 	return admission.Errored(http.StatusForbidden, fmt.Errorf(
 		"creating a KubeVirt VirtualMachine directly is not allowed in this namespace: "+
 			"create a ManagedVM (platform.kubevirt-ui.io/v1alpha1) instead, so that the "+

@@ -220,3 +220,40 @@ be a VPC overlay — the create path checked this and the hot-plug path did not.
 | 3 | Supplying user-data silently discarded the initial password | The password is always applied | Two branches of one handler; a password that vanishes because an unrelated field was filled in is a defect |
 | 4 | The `vm-name` label was patched in after create, failure swallowed | Rendered with the object | Backup selection targets that label, so best-effort meant occasionally unselectable VMs |
 | 5 | project/environment labels copied once at create | Reconciled every pass | A VM created before its namespace was labelled stayed invisible to folder views forever |
+
+### Admission and the guard (live)
+
+Both webhooks served by the operator, certificate issued by cert-manager.
+
+| Check | Result |
+|---|---|
+| Raw KubeVirt VM, cluster-admin identity not on the allowlist | **Denied** by `guard-virtualmachine.kb.io`, message says to create a ManagedVM instead |
+| Raw KubeVirt VM as `o0-capi:capk-manager` (the tenant machinery) | Allowed |
+| Raw KubeVirt VM as `kubevirt-ui-system:kubevirt-ui` (the UI backend, until M7) | Allowed |
+| Raw KubeVirt VM in a namespace without `kubevirt-ui.io/enabled` | Allowed — the guard is none of its business |
+| ManagedVM naming a subnet from another folder | **Refused at admission**: "subnet uat-net-vm-default belongs to folder poc-transit and this namespace is in folder opdev" |
+| ManagedVM naming a subnet that does not exist yet | **Accepted** — apply order is not part of the API; the controller waits |
+| Resizing a running machine | **Refused**: "cores and memory can only be changed while the machine is stopped" |
+| Stop, then resize | Applied, and it **reached the machine**: cpu 4, memory 8Gi, requests and limits updated — with the disk arrays untouched |
+
+Tenant namespaces do carry `kubevirt-ui.io/enabled=true`, so the guard does
+police them. That is why the CAPK identity is on the allowlist and has a test of
+its own; a guard that forgot it would not tighten policy, it would stop tenants
+from replacing an unhealthy worker.
+
+### The bug this nearly shipped with, and why it was nearly invisible
+
+The first deployment of the guard admitted a raw VM from a cluster-admin
+identity. It was not a logic error: kustomize wrote the `inject-ca-from`
+annotation against the base's namespace, this overlay moves everything to
+another one, cert-manager therefore injected nothing, the API server could not
+verify the webhook's TLS — and because the guard **fails open on purpose**, it
+admitted everything with no error visible anywhere except `tls: bad certificate`
+in the operator's own log.
+
+Worth writing down as a rule rather than a fix: a webhook with
+`failurePolicy: Ignore` that is not wired up is indistinguishable from one that
+is, from every side except the thing it was supposed to stop. Its acceptance
+test is therefore not "the object was created" — it is "a request that must be
+refused, was". The overlay now patches the annotation explicitly, and the same
+class is why the certificate's dnsNames are recomputed here too.
