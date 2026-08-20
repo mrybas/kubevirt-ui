@@ -329,3 +329,35 @@ func TestNoRuleSetIsAmbiguous(t *testing.T) {
 func withPeers(in Input, peers ...string) Input     { in.PeerCIDRs = peers; return in }
 func withShared(in Input, shared ...string) Input   { in.SharedCIDRs = shared; return in }
 func withTenants(in Input, tenants ...string) Input { in.TenantCIDRs = tenants; return in }
+
+// TestAnInfrastructureNetworkTakesNoFloor. It serves the others, so it is not
+// one of them. This is not a nicety: the isolation pass had already written
+// tenant drops and the management baseline onto a shared gateway's own subnet,
+// and a pod on a hub tenant's subnet lost the internet for it.
+func TestAnInfrastructureNetworkTakesNoFloor(t *testing.T) {
+	in := standInput()
+	in.Role = "infrastructure"
+
+	rendered, outOfRange := Render(in)
+	if len(rendered) != 0 || len(outOfRange) != 0 {
+		t.Fatalf("rendered %v / %v onto an infrastructure network", rendered, outOfRange)
+	}
+
+	// Everything reaches it, which is the point of it existing.
+	for _, raw := range []string{"10.200.8.9", "10.198.160.3", "8.8.8.8"} {
+		addr := netip.MustParseAddr(raw)
+		if got := Evaluate(rendered, addr, "to-lport"); got != Allowed {
+			t.Errorf("%s is blocked on an infrastructure network: %s", raw, got)
+		}
+	}
+
+	// And a rule somebody asked for by hand survives.
+	in.Manual = []Rule{{
+		Action: "drop", Direction: "to-lport",
+		Match: "ip4.src == 192.0.2.0/24", Priority: 2900,
+	}}
+	withManual, _ := Render(in)
+	if len(withManual) != 1 {
+		t.Fatalf("manual rules were dropped: %v", withManual)
+	}
+}

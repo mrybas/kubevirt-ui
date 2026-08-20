@@ -74,6 +74,14 @@ type Input struct {
 	Manual []Rule
 	// Isolated is whether the tenant-to-tenant floor applies at all.
 	Isolated bool
+	// Role is declared. A network that serves the others is not one of them:
+	// it takes no floor and no management deny, because the pods on it are the
+	// thing everybody else reaches through.
+	//
+	// This is not a nicety. The isolation pass had already written tenant drops
+	// and the management baseline onto a shared gateway's own subnet, and a pod
+	// on a hub tenant's subnet lost the internet for it.
+	Role string
 }
 
 // Render is the whole list, and the tenant networks that fall outside the
@@ -84,6 +92,12 @@ type Input struct {
 // the tenants, and a deployment once had a supernet containing none of them. So
 // containment is checked on every pass rather than configured and trusted.
 func Render(in Input) (rules []Rule, outOfRange []string) {
+	if in.Role != "" {
+		// Infrastructure. Nothing below applies, and the manual rules are the
+		// only thing this network's list is for.
+		return normalise(append([]Rule(nil), in.Manual...)), nil
+	}
+
 	for _, cidr := range dedupe(in.MgmtCIDRs) {
 		// One direction only, deliberately: this drops connections coming *at*
 		// the tenant. Traffic the tenant starts towards the management network

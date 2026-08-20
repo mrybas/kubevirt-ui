@@ -109,17 +109,17 @@ backend:
     # (resolver, subnets, router — in that order, router last). Networks written
     # down by hand default to `deletionPolicy: Retain` and are unaffected.
     #
-    # PARTIAL: an isolated network still takes the old path, and says so in the
-    # log rather than failing. On that path the isolation ACLs are part of the
-    # subnet manifest, so a VPC is isolated from the instant it exists; on the
-    # operator path the subnet is written a moment later and the isolation pass
-    # — which runs on create and delete and nowhere else — is the only thing
-    # that will ever write its rules. A crash in between would leave a tenant
-    # network reachable from every other tenant with nothing scheduled to
-    # notice. Waiting does not fix that and neither does undoing afterwards;
-    # only isolation as durable desired state does, which is the ACL composer.
-    # Until that lands, this flag applies to networks created with
-    # isolated=false, and everything else is built exactly as before.
+    # Isolation travels in the object and the operator applies it, so a network
+    # is closed before it is reported ready and stays closed if this process
+    # dies mid-create. That was the one thing blocking this switch: the subnet
+    # is written first and the rules afterwards, and neither waiting nor undoing
+    # afterwards survives a crash in between.
+    #
+    # The operator becomes the single writer of a subnet's ACL list only after
+    # proving it can reproduce the live one exactly; a list carrying a rule it
+    # cannot account for is named and left to whoever wrote it. Subnets it does
+    # own are skipped by the backend's isolation pass — read off the object, not
+    # off this flag, so it stays true after the flag goes off.
     OPERATOR_NETWORK_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a

@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,29 @@ func mustExternalSubnet(t *testing.T, name, cidr, gateway string) {
 	if err := k8sClient.Create(testCtx, subnet); err != nil && !apierrors.IsAlreadyExists(err) {
 		t.Fatalf("creating the external subnet %s: %v", name, err)
 	}
+}
+
+// poke wakes the controller without changing anything it renders.
+//
+// Retried on conflict: the controller writes status on its own schedule, and a
+// test that loses that race is reporting on the test, not on the controller.
+func poke(t *testing.T, name, value string) {
+	t.Helper()
+	var last error
+	for i := 0; i < 20; i++ {
+		current := getNetwork(t, name)
+		patched := current.DeepCopy()
+		if patched.Annotations == nil {
+			patched.Annotations = map[string]string{}
+		}
+		patched.Annotations["test.kubevirt-ui.io/poke"] = value
+		last = k8sClient.Patch(testCtx, patched, client.MergeFrom(current))
+		if last == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("poking %s: %v", name, last)
 }
 
 // mustKubeOVNNamespace tolerates the namespace already being there: several
@@ -323,12 +347,7 @@ func TestNetworkNeverTouchesACLs(t *testing.T) {
 
 	// Poke the controller so this is a statement about reconciles, not about
 	// the controller having been asleep.
-	current := getNetwork(t, "netacl")
-	patched := current.DeepCopy()
-	patched.Annotations = map[string]string{"test.kubevirt-ui.io/poke": "1"}
-	if err := k8sClient.Update(testCtx, patched); err != nil {
-		t.Fatalf("poking: %v", err)
-	}
+	poke(t, "netacl", "1")
 
 	consistently(t, "the other writer's ACLs surviving", 3*time.Second, func() error {
 		live := &unstructured.Unstructured{}
@@ -385,12 +404,7 @@ func TestNetworkLeavesAnotherWritersRoutesAlone(t *testing.T) {
 		t.Fatalf("writing the peering route: %v", err)
 	}
 
-	current := getNetwork(t, "netkeep")
-	patched := current.DeepCopy()
-	patched.Annotations = map[string]string{"test.kubevirt-ui.io/poke": "1"}
-	if err := k8sClient.Update(testCtx, patched); err != nil {
-		t.Fatalf("poking: %v", err)
-	}
+	poke(t, "netkeep", "1")
 
 	consistently(t, "both routes surviving", 3*time.Second, func() error {
 		vpc, err := readVPC("netkeep")
@@ -451,15 +465,7 @@ func TestNetworkStopsWriting(t *testing.T) {
 	baseline := networkWrites()
 
 	for i := 0; i < 5; i++ {
-		current := getNetwork(t, "netquiet")
-		patched := current.DeepCopy()
-		if patched.Annotations == nil {
-			patched.Annotations = map[string]string{}
-		}
-		patched.Annotations["test.kubevirt-ui.io/poke"] = fmt.Sprintf("%d", i)
-		if err := k8sClient.Patch(testCtx, patched, client.MergeFrom(current)); err != nil {
-			t.Fatalf("poking: %v", err)
-		}
+		poke(t, "netquiet", fmt.Sprintf("%d", i))
 	}
 
 	consistently(t, "no further writes", 3*time.Second, func() error {
@@ -1045,4 +1051,135 @@ func TestAListWithAForeignRuleIsNotTakenOver(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// TestANetworkTheOperatorCreatedIsClosedBeforeItIsReady.
+//
+// This is the property the UI cutover needs. On the old path the rules are part
+// of the subnet manifest, so a network is isolated from the instant it exists.
+// Anything that writes the subnet first and the rules afterwards has a window,
+// and a window that survives a process dying is not a window — it is a network
+// that stays open.
+//
+// So: the operator writes both, and does not call the network ready until the
+// rules are on it.
+func TestANetworkTheOperatorCreatedIsClosedBeforeItIsReady(t *testing.T) {
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netclosedfirst"},
+		Spec: platformv1alpha1.ManagedNetworkSpec{
+			CIDR:           "10.200.160.0/22",
+			DeletionPolicy: "Delete",
+		},
+	})
+
+	eventually(t, "the network to become ready", func() error {
+		net := getNetwork(t, "netclosedfirst")
+		cond := networkCondition(net, platformv1alpha1.ConditionNetworkReady)
+		if cond == nil || cond.Status != metav1.ConditionTrue {
+			return fmt.Errorf("Ready = %v", cond)
+		}
+		return nil
+	})
+
+	// By the time it says ready, the rules are there and it owns them.
+	rules := liveACLsOf(t, "netclosedfirst-default")
+	if len(rules) == 0 {
+		t.Fatal("ready with no isolation rules — the window this exists to close")
+	}
+	if owner := aclOwnerOf(t, "netclosedfirst-default"); owner != aclOwnerOperator {
+		t.Fatalf("the list is unowned: %q", owner)
+	}
+
+	// And the floor is the aggregate, not an enumeration.
+	var floor bool
+	for _, rule := range rules {
+		if rule.Action == "drop" && strings.Contains(rule.Match, "10.200.0.0/14") {
+			floor = true
+		}
+	}
+	if !floor {
+		t.Fatalf("no aggregate floor in %v", rules)
+	}
+}
+
+// TestAnAdoptedNetworkIsNotClaimedJustBecauseItsListIsEmpty. The shortcut above
+// is for networks this controller created. A network merely described here —
+// Retain, the adoption case — has an empty list because somebody chose not to
+// isolate it, and writing rules onto it would be taking a decision that was
+// already made.
+func TestAnAdoptedNetworkIsNotClaimedJustBecauseItsListIsEmpty(t *testing.T) {
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netdescribed"},
+		Spec:       platformv1alpha1.ManagedNetworkSpec{CIDR: "10.200.164.0/22"},
+	})
+
+	eventually(t, "the subnet", func() error {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(subnetGVK)
+		return k8sClient.Get(testCtx, types.NamespacedName{Name: "netdescribed-default"}, obj)
+	})
+
+	consistently(t, "the empty list staying empty and unclaimed", 3*time.Second, func() error {
+		if rules := liveACLsOf(t, "netdescribed-default"); len(rules) != 0 {
+			return fmt.Errorf("rules were written onto a described network: %v", rules)
+		}
+		if owner := aclOwnerOf(t, "netdescribed-default"); owner != "" {
+			return fmt.Errorf("claimed: %q", owner)
+		}
+		return nil
+	})
+}
+
+// TestTheSubnetIsNeverBrieflyOpen: the rules must be in the create payload, not
+// patched on afterwards.
+//
+// A subnet created open and closed a moment later is open for that moment.
+// kube-ovn realises it as soon as it exists, and "eventually consistent" is not
+// a property to have on the boundary between two tenants — the path this
+// replaces put the rules in the manifest, and so must this one.
+//
+// `generation` is the evidence: the API server sets it to 1 on create and
+// increments it on every spec change. Rules present at generation 1 can only
+// have arrived with the object.
+func TestTheSubnetIsNeverBrieflyOpen(t *testing.T) {
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netatomic"},
+		Spec: platformv1alpha1.ManagedNetworkSpec{
+			CIDR:           "10.200.168.0/22",
+			DeletionPolicy: "Delete",
+		},
+	})
+
+	var subnet *unstructured.Unstructured
+	eventually(t, "the subnet", func() error {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(subnetGVK)
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Name: "netatomic-default",
+		}, obj); err != nil {
+			return err
+		}
+		subnet = obj
+		return nil
+	})
+
+	rules := readACLs(subnet)
+	if len(rules) == 0 {
+		t.Fatal("the subnet exists with no rules — it is open right now")
+	}
+	if got := subnet.GetGeneration(); got != 1 {
+		t.Fatalf("generation %d: the spec was written more than once, so the "+
+			"rules were patched on rather than shipped with the object", got)
+	}
+	if owner := subnet.GetAnnotations()[aclOwnerAnnotation]; owner != aclOwnerOperator {
+		t.Fatalf("the list arrived unowned: %q", owner)
+	}
+
+	// And it really is closed, not merely populated.
+	if got := acl.Evaluate(rules, netip.MustParseAddr("10.200.4.9"), "to-lport"); got != acl.Dropped {
+		t.Errorf("another tenant reaches it at generation 1: %s", got)
+	}
+	if got := acl.Evaluate(rules, netip.MustParseAddr("8.8.8.8"), "to-lport"); got != acl.Allowed {
+		t.Errorf("the internet is blocked: %s", got)
+	}
 }

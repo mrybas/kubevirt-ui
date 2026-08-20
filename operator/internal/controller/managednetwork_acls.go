@@ -56,7 +56,7 @@ const systemVPC = "ovn-cluster"
 func (r *ManagedNetworkReconciler) reconcileACLs(
 	ctx context.Context, net *platformv1alpha1.ManagedNetwork,
 ) error {
-	if r.TenantSupernet == "" && network.IsIsolated(net) {
+	if r.TenantSupernet == "" && network.IsIsolated(net) && net.Spec.Role == "" {
 		r.setNetworkCondition(net, platformv1alpha1.ConditionIsolated, false, "NoSupernet",
 			"no tenant supernet configured, so there is nothing to scope the "+
 				"isolation floor to; a drop without one would take the internet "+
@@ -64,11 +64,10 @@ func (r *ManagedNetworkReconciler) reconcileACLs(
 		return nil
 	}
 
-	input, err := r.aclInput(ctx, net)
+	rendered, outOfRange, err := r.composeACLsWithRange(ctx, net)
 	if err != nil {
 		return err
 	}
-	rendered, outOfRange := acl.Render(input)
 
 	name := network.DefaultSubnetName(net)
 	subnet := &unstructured.Unstructured{}
@@ -81,7 +80,16 @@ func (r *ManagedNetworkReconciler) reconcileACLs(
 	live := readACLs(subnet)
 
 	if subnet.GetAnnotations()[aclOwnerAnnotation] != aclOwnerOperator {
-		return r.adoptACLs(ctx, net, subnet, live, rendered, outOfRange)
+		// A network this controller created has no incumbent: the subnet is its
+		// own and the list is empty, so there is nobody to take it from. The
+		// adoption dance exists to avoid stealing a list something else
+		// maintains, and stealing nothing from nobody is not a risk worth
+		// paying for — paying for it here would mean a freshly created network
+		// waits for an external pass before it is closed, which is the window
+		// this design refuses to have.
+		if !(cascadeOnDelete(net) && len(live) == 0) {
+			return r.adoptACLs(ctx, net, subnet, live, rendered, outOfRange)
+		}
 	}
 
 	if acl.Equal(live, rendered) {
@@ -93,6 +101,12 @@ func (r *ManagedNetworkReconciler) reconcileACLs(
 	if err := writeACLs(patched, rendered); err != nil {
 		return err
 	}
+	annotations := patched.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[aclOwnerAnnotation] = aclOwnerOperator
+	patched.SetAnnotations(annotations)
 	if err := r.Update(ctx, patched); err != nil {
 		return fmt.Errorf("writing the rules on Subnet/%s: %w", name, err)
 	}
@@ -167,6 +181,12 @@ func (r *ManagedNetworkReconciler) reportIsolated(
 				len(rendered), r.TenantSupernet, strings.Join(outOfRange, ", ")))
 		return
 	}
+	if net.Spec.Role != "" {
+		r.setNetworkCondition(net, platformv1alpha1.ConditionIsolated, true, "Infrastructure",
+			fmt.Sprintf("%d rule(s); this network serves the others, so it takes "+
+				"neither the tenant floor nor the management deny", len(rendered)))
+		return
+	}
 	if !network.IsIsolated(net) {
 		r.setNetworkCondition(net, platformv1alpha1.ConditionIsolated, false, "NotIsolated",
 			fmt.Sprintf("%d rule(s); this network was created open to other "+
@@ -175,6 +195,32 @@ func (r *ManagedNetworkReconciler) reportIsolated(
 	}
 	r.setNetworkCondition(net, platformv1alpha1.ConditionIsolated, true, "Isolated",
 		fmt.Sprintf("%d rule(s)", len(rendered)))
+}
+
+// composeACLs is the rendered list, or nothing if it cannot be composed.
+//
+// Errors are swallowed here on purpose: this is called on the create path,
+// where the alternative to "no rules yet" is "no subnet yet", and the
+// steady-state pass reports the same failure properly a moment later.
+func (r *ManagedNetworkReconciler) composeACLs(
+	ctx context.Context, net *platformv1alpha1.ManagedNetwork,
+) ([]acl.Rule, []string) {
+	rendered, outOfRange, err := r.composeACLsWithRange(ctx, net)
+	if err != nil {
+		return nil, nil
+	}
+	return rendered, outOfRange
+}
+
+func (r *ManagedNetworkReconciler) composeACLsWithRange(
+	ctx context.Context, net *platformv1alpha1.ManagedNetwork,
+) ([]acl.Rule, []string, error) {
+	input, err := r.aclInput(ctx, net)
+	if err != nil {
+		return nil, nil, err
+	}
+	rendered, outOfRange := acl.Render(input)
+	return rendered, outOfRange, nil
 }
 
 // aclInput gathers the sources the list is derived from.
@@ -186,6 +232,7 @@ func (r *ManagedNetworkReconciler) aclInput(
 		Supernet:    r.TenantSupernet,
 		SharedCIDRs: net.Spec.SharedCIDRs,
 		Isolated:    network.IsIsolated(net),
+		Role:        net.Spec.Role,
 	}
 
 	tenants, err := r.tenantCIDRs(ctx)

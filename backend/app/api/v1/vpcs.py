@@ -220,6 +220,12 @@ from app.core.operator import (  # noqa: E402  (kept beside the constants it ser
     network_path_enabled,
 )
 
+# Marks a subnet whose ACL list the operator's composer writes. Set by the
+# operator, and only after it has proved that taking the list over changes
+# nothing — so its presence means "somebody else is the single writer here".
+ACL_OWNER_ANNOTATION = "platform.kubevirt-ui.io/acl-owner"
+ACL_OWNER_OPERATOR = "operator"
+
 VPC_ROLE_LABEL = "kubevirt-ui.io/role"
 EGRESS_GATEWAY_LABEL = "kubevirt-ui.io/egress-gateway"
 ROLE_INFRASTRUCTURE = "infrastructure"
@@ -1258,6 +1264,25 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
         # that CIDR next.
         and not (i.get("metadata", {}) or {}).get("deletionTimestamp")
     ]
+
+    # Subnets the operator's composer has taken over are still part of the
+    # census — every other VPC has to know their prefixes — but their own rule
+    # lists belong to it now, and writing them from here as well is the
+    # two-writer failure this whole migration exists to remove.
+    #
+    # Ownership is read off the object, not off a feature flag: it is a property
+    # of the subnet, and it stays true after the flag goes off.
+    owned = {
+        (i.get("metadata", {}) or {}).get("name")
+        for i in tenant_subnets
+        if ((i.get("metadata", {}) or {}).get("annotations") or {})
+        .get(ACL_OWNER_ANNOTATION) == ACL_OWNER_OPERATOR
+    }
+    if owned:
+        logger.info(
+            "Isolation reconcile: %d subnet(s) are the operator's and are left "
+            "to it: %s", len(owned), ", ".join(sorted(owned)),
+        )
     supernet = get_settings().tenant_supernet
 
     # A peering is a declared intent to reach the other VPC. It writes the
@@ -1294,6 +1319,10 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
     for item in tenant_subnets:
         spec = item.get("spec", {}) or {}
         name = item["metadata"]["name"]
+        if name in owned:
+            # Its prefix still counts in everybody else's census above; its own
+            # list is not this pass's to write.
+            continue
         existing = spec.get("acls") or []
         if _vpc_role(item):
             # Infrastructure is not a tenant. It is also not merely skipped:
@@ -1510,44 +1539,6 @@ async def _await_managed_network(k8s, name: str, attempts: int = 20) -> bool:
     return False
 
 
-def _operator_path_refusal(data: VpcCreateRequest, tenant_isolation: list) -> str:
-    """Why this network takes the legacy path despite the flag, or "".
-
-    Returned as prose and logged, not raised: the caller asked for a network,
-    not for a lecture about which internal path builds it.
-
-    Isolation is the reason, and it is a durability argument rather than a
-    timing one. In the old path the ACLs are part of the subnet manifest, so a
-    VPC is isolated from the instant it exists. On the operator path the subnet
-    is written a moment later, and the isolation pass — which runs on create and
-    delete and nowhere else — is the only thing that will ever write its rules.
-
-    Waiting for the subnet does not close that: waits expire. Checking
-    afterwards and undoing does not close it either — if this process dies
-    between the network being created and the rules being applied, there is
-    nobody left to check, nothing scheduled to look again, and a tenant network
-    sits reachable from every other tenant indefinitely.
-
-    What closes it is isolation being durable desired state the operator
-    reconciles before reporting the network ready, which is the ACL composer and
-    is not built yet. Until then this refuses **before** anything is written, so
-    there is no window at all rather than a small one.
-
-    A network that explicitly asked not to be isolated has nothing to lose and
-    goes through.
-    """
-    if not tenant_isolation:
-        return ""
-    return (
-        f"VPC '{data.name}' asks to be isolated, and OPERATOR_NETWORK_ENABLED "
-        "cannot honour that yet: the operator writes the subnet, and the "
-        "isolation rules are still written afterwards by a pass that runs only "
-        "on create and delete. A crash in between would leave the network "
-        "reachable from every other tenant with nothing scheduled to notice, so "
-        "this one is built the old way, atomically, as it always has been."
-    )
-
-
 async def _managed_network_exists(k8s, name: str) -> bool:
     try:
         await k8s.custom_api.get_cluster_custom_object(
@@ -1705,17 +1696,7 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             *isolation_acls, *build_mgmt_deny_acls(await _mgmt_deny_sources(k8s)),
         ]
 
-    # The operator path is taken only where it is safe today. Where it is not,
-    # this falls back to the path that has always worked rather than turning a
-    # valid request into an error: a migration flag that breaks network creation
-    # is a worse thing to ship than a migration that is still partial.
-    use_operator_path = network_path_enabled()
-    if use_operator_path:
-        if reason := _operator_path_refusal(data, tenant_isolation):
-            logger.info("VPC %r: %s", data.name, reason)
-            use_operator_path = False
-
-    if use_operator_path:
+    if network_path_enabled():
 
         # One writer per object: with this on, the Vpc, the Subnet and the
         # VpcDns below belong to the operator and nothing here writes them.
@@ -1727,12 +1708,14 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
             k8s, data, cidr=cidr, gateway=gateway,
             namespaces=bind_namespaces, dns_server=_vpcdns_vip(),
         )
-        # Waited for, not assumed. The ACLs used to be written into the subnet
-        # manifest itself, so a new VPC was isolated the instant it existed.
-        # Here the subnet arrives a moment later, and the isolation pass below
-        # is the only thing that will ever write those rules — if it runs before
-        # the subnet exists, it skips a network that then stays open with
-        # nothing scheduled to notice.
+        # Waited for, and what is waited for changed. The operator writes the
+        # isolation rules itself now and does not report the network ready until
+        # they are on the subnet, so isolation is durable desired state rather
+        # than something this process has to survive long enough to apply. If
+        # this process dies here the network still ends up closed.
+        #
+        # The pass below is still run, and still matters: the tenants whose own
+        # lists are still enumerated have to learn this prefix.
         await _await_managed_network(k8s, data.name)
         await _peer_shared_cidrs(k8s, data.name, data.shared_cidrs or [])
         await _post_create_isolation(k8s, data.name)

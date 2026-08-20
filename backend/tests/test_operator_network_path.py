@@ -251,18 +251,17 @@ async def test_delete_of_an_unmanaged_vpc_takes_the_old_path():
 
 
 @pytest.mark.asyncio
-async def test_an_isolated_network_still_takes_the_atomic_path():
-    """The window is not made small; the network simply does not go that way.
+async def test_an_isolated_network_goes_through_too():
+    """It did not, until isolation became durable desired state.
 
-    Waiting for the subnet does not close it — waits expire. Checking afterwards
-    and undoing does not close it either: a crash between the network being
-    created and the rules being applied leaves nobody to check, nothing
-    scheduled to look again, and a tenant network reachable from every other
-    tenant indefinitely.
+    The objection was never timing. It was that the subnet is written first and
+    the rules afterwards, so a process dying in between leaves a tenant network
+    reachable from every other tenant with nothing scheduled to notice. Waiting
+    does not fix that and neither does undoing afterwards.
 
-    So an isolated network is built the way it always has been, atomically, with
-    its rules inside the subnet manifest. The flag does not turn a valid request
-    into an error; it just does not apply here yet.
+    What fixed it is the operator writing the rules itself and not reporting the
+    network ready until they are on the subnet. This process is no longer part
+    of the guarantee.
     """
     from app.api.v1 import vpcs
 
@@ -273,20 +272,16 @@ async def test_an_isolated_network_still_takes_the_atomic_path():
          patch.object(vpcs, "_vpcdns_vip", return_value="10.96.0.200"), \
          patch.object(vpcs, "b3_enabled", return_value=False), \
          patch.object(vpcs, "_tenant_vpc_cidrs", AsyncMock(return_value=["10.200.0.0/22"])), \
-         patch.object(vpcs, "_ensure_vpc_dns", AsyncMock()), \
          patch.object(vpcs, "_peer_shared_cidrs", AsyncMock()), \
          patch.object(vpcs, "reconcile_infra_peerings", AsyncMock(return_value=0)), \
          patch.object(vpcs, "reconcile_isolation_acls", AsyncMock(return_value=0)):
         result = await vpcs.create_vpc(request, _request(isolated=True), user=MagicMock())
 
     assert result.name == "opnet"
-    # No ManagedNetwork: this network is not the operator's.
-    plurals = [c["plural"] for c in calls["create_cluster"]]
-    assert "managednetworks" not in plurals, plurals
-    # And it was built the old way, rules and all.
-    assert "vpcs" in plurals and "subnets" in plurals, plurals
-    subnet = next(c for c in calls["create_cluster"] if c["plural"] == "subnets")
-    assert subnet["body"]["spec"].get("acls"), "the atomic path must carry its rules"
+    assert [c["plural"] for c in calls["create_cluster"]] == ["managednetworks"]
+    # The intent travels in the object, which is what makes it durable.
+    body = calls["create_cluster"][0]["body"]
+    assert body["spec"]["isolated"] is True
 
 
 @pytest.mark.asyncio
@@ -310,3 +305,50 @@ async def test_a_network_that_asked_not_to_be_isolated_goes_through():
 
     assert result.name == "opnet"
     assert [c["plural"] for c in calls["create_cluster"]] == ["managednetworks"]
+
+
+@pytest.mark.asyncio
+async def test_the_isolation_pass_leaves_the_operators_subnets_alone():
+    """Two writers of one ACL list is the failure this migration exists to
+    remove, so ownership is read off the object and honoured.
+
+    The subnet still counts in the census — every other VPC has to know its
+    prefix — but its own rules are not written from here.
+    """
+    from app.api.v1 import vpcs
+
+    patched: list[dict[str, Any]] = []
+
+    def _subnet(name: str, vpc: str, cidr: str, owned: bool) -> dict[str, Any]:
+        metadata: dict[str, Any] = {"name": name}
+        if owned:
+            metadata["annotations"] = {vpcs.ACL_OWNER_ANNOTATION: vpcs.ACL_OWNER_OPERATOR}
+        return {"metadata": metadata,
+                "spec": {"vpc": vpc, "cidrBlock": cidr, "acls": []}}
+
+    async def _list(**kw: Any) -> dict[str, Any]:
+        if kw.get("plural") == "vpcs":
+            return {"items": [{"metadata": {"name": "a"}, "spec": {}},
+                              {"metadata": {"name": "b"}, "spec": {}}]}
+        return {"items": [
+            _subnet("a-default", "a", "10.200.0.0/22", owned=True),
+            _subnet("b-default", "b", "10.200.4.0/22", owned=False),
+        ]}
+
+    k8s = MagicMock()
+    k8s.custom_api.list_cluster_custom_object = AsyncMock(side_effect=_list)
+    k8s.custom_api.patch_cluster_custom_object = AsyncMock(
+        side_effect=lambda **kw: patched.append(kw) or {})
+
+    with patch.object(vpcs, "b3_enabled", return_value=False):
+        await vpcs.reconcile_isolation_acls(k8s)
+
+    touched = {c["name"] for c in patched}
+    assert "a-default" not in touched, "the pass wrote to a subnet it does not own"
+    assert "b-default" in touched, "the pass stopped writing the subnets it does own"
+
+    # And the owned network's prefix is still denied on the unowned one: leaving
+    # its list alone must not mean forgetting it exists.
+    body = next(c for c in patched if c["name"] == "b-default")["body"]
+    matches = " ".join(a["match"] for a in body["spec"]["acls"])
+    assert "10.200.0.0/22" in matches, matches

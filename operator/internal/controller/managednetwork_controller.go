@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
+	"github.com/mrybas/kubevirt-ui/operator/internal/acl"
 	"github.com/mrybas/kubevirt-ui/operator/internal/kube"
 	"github.com/mrybas/kubevirt-ui/operator/internal/network"
 )
@@ -143,7 +144,16 @@ func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		_ = kube.UpdateStatus(ctx, r.Client, networkControllerName, net, before)
 		return ctrl.Result{}, err
 	}
-	if err := r.ensureSubnet(ctx, net, gateway, r.resolveDNSServer(ctx, net, r.kubeOVNNamespaceFor(ctx))); err != nil {
+	// Composed before the subnet is written, not after. A subnet created open
+	// and closed a moment later is open for that moment: kube-ovn realises it
+	// as soon as it exists, and "eventually consistent" is not a property you
+	// want on the boundary between two tenants. So the rules go into the create
+	// payload itself, the way the path this replaces always did.
+	initialACLs, _ := r.composeACLs(ctx, net)
+	if err := r.ensureSubnet(
+		ctx, net, gateway,
+		r.resolveDNSServer(ctx, net, r.kubeOVNNamespaceFor(ctx)), initialACLs,
+	); err != nil {
 		r.setNetworkCondition(net, platformv1alpha1.ConditionNetworkReady, false, "WriteFailed", err.Error())
 		net.Status.ObservedGeneration = net.Generation
 		_ = kube.UpdateStatus(ctx, r.Client, networkControllerName, net, before)
@@ -161,6 +171,30 @@ func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	r.judgeAttachment(ctx, net, nextHop)
+
+	// Ready is not "the objects exist". A network this controller built that
+	// asked to be closed and is not closed yet is not ready to be used, and
+	// saying otherwise is how a tenant network ends up carrying workloads while
+	// reachable from every other tenant.
+	//
+	// Only for networks it built, though. A network merely described here has
+	// its rule list written by something else, and this controller is in no
+	// position to call that a failure — it reports what it sees on the Isolated
+	// condition and leaves Ready to mean what it can actually answer for.
+	if isolation := apimeta.FindStatusCondition(
+		net.Status.Conditions, platformv1alpha1.ConditionIsolated,
+	); cascadeOnDelete(net) && network.IsIsolated(net) && net.Spec.Role == "" &&
+		(isolation == nil || isolation.Status != metav1.ConditionTrue) {
+		reason, message := "IsolationPending", "the isolation rules are not on the subnet yet"
+		if isolation != nil {
+			reason, message = isolation.Reason, isolation.Message
+		}
+		r.setNetworkCondition(net, platformv1alpha1.ConditionNetworkReady, false, reason, message)
+		net.Status.ObservedGeneration = net.Generation
+		return ctrl.Result{RequeueAfter: drainRetry},
+			kube.UpdateStatus(ctx, r.Client, networkControllerName, net, before)
+	}
+
 	r.setNetworkCondition(net, platformv1alpha1.ConditionNetworkReady, true, "Built",
 		fmt.Sprintf("Vpc/%s and Subnet/%s exist with %s",
 			net.Name, network.DefaultSubnetName(net), net.Spec.CIDR))
@@ -246,7 +280,8 @@ func (r *ManagedNetworkReconciler) ensureVPC(
 
 // ensureSubnet writes the default subnet.
 func (r *ManagedNetworkReconciler) ensureSubnet(
-	ctx context.Context, net *platformv1alpha1.ManagedNetwork, gateway, dnsServer string,
+	ctx context.Context, net *platformv1alpha1.ManagedNetwork,
+	gateway, dnsServer string, initialACLs []acl.Rule,
 ) error {
 	name := network.DefaultSubnetName(net)
 	want := network.SubnetSpec(net, gateway, dnsServer)
@@ -288,9 +323,25 @@ func (r *ManagedNetworkReconciler) ensureSubnet(
 		for k, v := range want {
 			spec[k] = v
 		}
-		// `acls` is deliberately absent from `want` and never touched here: the
-		// isolation reconciler is its single writer until the composer adopts
-		// it with a diff-empty handover.
+		// On create only, and only for a network this controller owns: the
+		// rules ship with the object so it is never briefly open. An existing
+		// subnet is left alone here — its list belongs to whoever writes it
+		// until the composer can prove a handover changes nothing.
+		if live.GetResourceVersion() == "" && cascadeOnDelete(net) && len(initialACLs) > 0 {
+			if err := unstructured.SetNestedMap(live.Object, spec, "spec"); err != nil {
+				return err
+			}
+			if err := writeACLs(live, initialACLs); err != nil {
+				return err
+			}
+			annotations := live.GetAnnotations()
+			if annotations == nil {
+				annotations = map[string]string{}
+			}
+			annotations[aclOwnerAnnotation] = aclOwnerOperator
+			live.SetAnnotations(annotations)
+			return nil
+		}
 		return unstructured.SetNestedMap(live.Object, spec, "spec")
 	})
 	if err != nil {

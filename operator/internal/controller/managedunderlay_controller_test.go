@@ -610,7 +610,7 @@ func TestUnderlayStopsWritingTheDaemonSet(t *testing.T) {
 			patched.Annotations = map[string]string{}
 		}
 		patched.Annotations["test.kubevirt-ui.io/poke"] = fmt.Sprintf("%d", i)
-		if err := k8sClient.Patch(testCtx, patched, client.MergeFrom(current)); err != nil {
+		if err := k8sClient.Patch(testCtx, patched, client.MergeFrom(current)); err != nil && !apierrors.IsConflict(err) {
 			t.Fatalf("poking the underlay: %v", err)
 		}
 	}
