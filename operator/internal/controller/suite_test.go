@@ -36,6 +36,7 @@ import (
 	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	kubevirtv1 "kubevirt.io/api/core/v1"
+	snapshotv1beta1 "kubevirt.io/api/snapshot/v1beta1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
@@ -70,6 +71,7 @@ func runSuite(m *testing.M) (int, error) {
 	utilruntime.Must(platformv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(cdiv1.AddToScheme(scheme))
 	utilruntime.Must(kubevirtv1.AddToScheme(scheme))
+	utilruntime.Must(snapshotv1beta1.AddToScheme(scheme))
 
 	testEnv = &envtest.Environment{
 		CRDDirectoryPaths: []string{
@@ -103,6 +105,14 @@ func runSuite(m *testing.M) (int, error) {
 		Recorder: mgr.GetEventRecorderFor("managedimage"),
 	}).SetupWithManager(mgr); err != nil {
 		return 0, fmt.Errorf("wiring image controller: %w", err)
+	}
+
+	if err := (&ManagedVMOperationReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("managedvmoperation"),
+	}).SetupWithManager(mgr); err != nil {
+		return 0, fmt.Errorf("wiring operation controller: %w", err)
 	}
 
 	if err := (&ManagedVMTemplateReconciler{

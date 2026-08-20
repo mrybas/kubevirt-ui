@@ -359,3 +359,30 @@ such label. It now selects on the absence of a `VirtualMachine` ownerReference,
 which KubeVirt writes itself and which states what a disk is for. The platform's
 own namespace is skipped: the Talos golden there is owned by the tenant path as
 a deterministic singleton, and adopting it would give it a second owner.
+
+### What counts as an image: the predicate, and two wrong answers before it
+
+Adoption has to select exactly what the product calls an image — no more, or it
+takes over disks nobody asked it to manage; no less, or images stay visible in
+the UI and unmanaged.
+
+Two exclusionary attempts, both wrong, both caught by running the plan:
+
+1. *Not carrying our `vm-disk` label.* Offered four tenant worker root disks:
+   the tenant machinery creates disks through `dataVolumeTemplates` and writes
+   no such label.
+2. *Not owned by a VirtualMachine.* Fixed that, and still admitted a hand-made
+   claim that had never been through the product at all.
+
+What a thing is cannot be established by what it is not. Measured across every
+DataVolume on the stand, there is a positive marker: `kubevirt-ui.io/disk-type`
+is written by the image endpoint and by nothing else — absent on every VM root
+disk (ours and the tenant machinery's), on the Talos golden, and on a stray
+claim; present on every image the UI lists. The ownerReference check stays as a
+guard rather than as the definition.
+
+Verified both directions on the stand: the candidate set now equals the set the
+product's own lister returns for managed namespaces, and a deliberately created
+standalone `DataVolume` carrying `managed=true` but no `disk-type` is not
+offered. The Talos golden now falls out on its own merits rather than by the
+namespace rule, which stays as a second guard.

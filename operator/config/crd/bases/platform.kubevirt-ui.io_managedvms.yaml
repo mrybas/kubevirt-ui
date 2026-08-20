@@ -324,6 +324,17 @@ spec:
                   was computed from.
                 format: int64
                 type: integer
+              operationInProgress:
+                description: |-
+                  OperationInProgress names the ManagedVMOperation currently acting on this
+                  machine, if any.
+
+                  Derived, not told: the VM controller works it out by looking for
+                  unfinished operations that target it, rather than having another
+                  controller write into this status. Two writers of one object is the
+                  defect this whole design is built to avoid, and it would be an odd place
+                  to make an exception.
+                type: string
               rootDiskEpoch:
                 description: |-
                   RootDiskEpoch counts how many times the root disk has been provisioned.

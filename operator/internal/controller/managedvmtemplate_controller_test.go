@@ -19,6 +19,9 @@ package controller
 import (
 	"fmt"
 	"testing"
+	"time"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,13 +43,22 @@ func newTemplate(ns, name, image string) *platformv1alpha1.ManagedVMTemplate {
 	}
 }
 
+// getTemplate retries: reads go through the manager's cache, which trails a
+// create by a beat, so a bare Get right after one is a coin flip.
 func getTemplate(t *testing.T, ns, name string) *platformv1alpha1.ManagedVMTemplate {
 	t.Helper()
 	tpl := &platformv1alpha1.ManagedVMTemplate{}
-	if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: name}, tpl); err != nil {
-		t.Fatalf("reading template: %v", err)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: name}, tpl)
+		if err == nil {
+			return tpl
+		}
+		if !apierrors.IsNotFound(err) || time.Now().After(deadline) {
+			t.Fatalf("reading template: %v", err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return tpl
 }
 
 // A template pointing at nothing used to be possible and invisible: the

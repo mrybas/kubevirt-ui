@@ -36,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	kubevirtv1 "kubevirt.io/api/core/v1"
+	snapshotv1beta1 "kubevirt.io/api/snapshot/v1beta1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
@@ -58,6 +59,7 @@ func init() {
 	// downstream of it.
 	utilruntime.Must(cdiv1.AddToScheme(scheme))
 	utilruntime.Must(kubevirtv1.AddToScheme(scheme))
+	utilruntime.Must(snapshotv1beta1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -206,6 +208,14 @@ func main() {
 			Recorder: mgr.GetEventRecorderFor("managedimage"),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "managedimage")
+			os.Exit(1)
+		}
+		if err := (&controller.ManagedVMOperationReconciler{
+			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
+			Recorder: mgr.GetEventRecorderFor("managedvmoperation"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "managedvmoperation")
 			os.Exit(1)
 		}
 		if err := (&controller.ManagedVMTemplateReconciler{

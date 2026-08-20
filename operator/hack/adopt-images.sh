@@ -53,14 +53,23 @@ fi
 
 adopted=0; existing=0; skipped=0
 
-# A golden disk is one that no VirtualMachine owns.
+# A disk is a candidate when it was created by the product's image endpoint,
+# which is a positive fact: that endpoint, and only that endpoint, stamps
+# kubevirt-ui.io/disk-type. Measured across every DataVolume on the stand — VM
+# root disks (ours and the tenant machinery's), the Talos golden and a stray
+# hand-made claim all lack it, and every image the UI lists has it.
 #
-# The first version of this filtered on the absence of our own vm-disk label,
-# which is a convention rather than a fact: disks the tenant machinery creates
-# through dataVolumeTemplates carry no such label, and the plan cheerfully
-# offered to adopt four tenant worker root disks as golden images. An
-# ownerReference is written by KubeVirt itself and says what the disk is for.
-dvs=$(kubectl get datavolume "${scope[@]}" -l 'kubevirt-ui.io/managed=true' -o json \
+# Two earlier attempts are worth remembering, because both were exclusionary and
+# both were wrong. Filtering on the absence of our vm-disk label offered four
+# tenant worker root disks for adoption, since the tenant machinery writes no
+# such label. Filtering on the absence of a VirtualMachine ownerReference fixed
+# that and still admitted disks nobody had created through the product at all.
+# What a thing is cannot be established by what it is not.
+#
+# The ownerReference check stays, as a guard rather than as the definition: a
+# disk that some VM owns is that VM's, whatever labels it carries.
+dvs=$(kubectl get datavolume "${scope[@]}" \
+        -l 'kubevirt-ui.io/managed=true,kubevirt-ui.io/disk-type' -o json \
       | jq '{items: [.items[] | select(
             ((.metadata.ownerReferences // []) | map(select(.kind == "VirtualMachine")) | length) == 0
           )]}')

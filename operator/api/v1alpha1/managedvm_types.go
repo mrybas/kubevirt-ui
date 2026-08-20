@@ -249,6 +249,17 @@ type ManagedVMStatus struct {
 	// +optional
 	RootDiskName string `json:"rootDiskName,omitempty"`
 
+	// OperationInProgress names the ManagedVMOperation currently acting on this
+	// machine, if any.
+	//
+	// Derived, not told: the VM controller works it out by looking for
+	// unfinished operations that target it, rather than having another
+	// controller write into this status. Two writers of one object is the
+	// defect this whole design is built to avoid, and it would be an odd place
+	// to make an exception.
+	// +optional
+	OperationInProgress string `json:"operationInProgress,omitempty"`
+
 	// RootDiskEpoch counts how many times the root disk has been provisioned.
 	// It appears in the disk's name so that a replacement cannot collide with a
 	// predecessor that is still terminating.

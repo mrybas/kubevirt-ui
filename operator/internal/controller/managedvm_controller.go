@@ -107,6 +107,25 @@ func (r *ManagedVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	before := vm.DeepCopy()
 
+	// While an operation is running, the machine belongs to it. A restore stops
+	// the machine and rewrites its disks; reconciling runStrategy underneath
+	// that would fight KubeVirt's own restore controller, and re-rendering the
+	// spec would undo the restore. The operation is found rather than
+	// announced, so this status has exactly one writer.
+	active, err := r.activeOperation(ctx, vm)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	vm.Status.OperationInProgress = active
+	if active != "" {
+		vm.Status.ObservedGeneration = vm.Generation
+		if err := kube.UpdateStatus(ctx, r.Client, vmControllerName, vm, before); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating status while yielding: %w", err)
+		}
+		log.V(1).Info("Yielding to an operation", "operation", active)
+		return ctrl.Result{}, nil
+	}
+
 	if !controllerutil.ContainsFinalizer(vm, vmFinalizer) {
 		controllerutil.AddFinalizer(vm, vmFinalizer)
 		if err := r.Update(ctx, vm); err != nil {
@@ -262,6 +281,28 @@ func (r *ManagedVMReconciler) deleteOwnedPasswordSecret(
 		return nil
 	}
 	return kube.Delete(ctx, r.Client, vmControllerName, secret)
+}
+
+// activeOperation names the unfinished operation acting on this machine, if
+// there is one.
+func (r *ManagedVMReconciler) activeOperation(
+	ctx context.Context, vm *platformv1alpha1.ManagedVM,
+) (string, error) {
+	ops := &platformv1alpha1.ManagedVMOperationList{}
+	if err := r.List(ctx, ops,
+		client.InNamespace(vm.Namespace),
+		client.MatchingFields{operationVMIndex: vm.Name},
+	); err != nil {
+		return "", fmt.Errorf("looking for operations on %s/%s: %w", vm.Namespace, vm.Name, err)
+	}
+	for i := range ops.Items {
+		op := &ops.Items[i]
+		if !op.DeletionTimestamp.IsZero() || op.Status.Finished() {
+			continue
+		}
+		return op.Name, nil
+	}
+	return "", nil
 }
 
 func (r *ManagedVMReconciler) existingVM(
@@ -559,16 +600,47 @@ func (r *ManagedVMReconciler) event(obj client.Object, eventType, reason, messag
 	r.Recorder.Event(obj, eventType, reason, message)
 }
 
+// operationVMIndex indexes operations by the machine they act on.
+const operationVMIndex = "spec.vmName"
+
 // SetupWithManager wires the controller.
 func (r *ManagedVMReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(), &platformv1alpha1.ManagedVMOperation{}, operationVMIndex,
+		func(obj client.Object) []string {
+			op, ok := obj.(*platformv1alpha1.ManagedVMOperation)
+			if !ok || op.Spec.VMName == "" {
+				return nil
+			}
+			return []string{op.Spec.VMName}
+		},
+	); err != nil {
+		return fmt.Errorf("indexing operations by machine: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.ManagedVM{}).
+		// An operation starting or finishing changes whether this controller
+		// may touch the machine, so the yield lifts as soon as it is over
+		// rather than at the next unrelated event.
+		Watches(&platformv1alpha1.ManagedVMOperation{},
+			handler.EnqueueRequestsFromMapFunc(mapOperationToVM)).
 		Watches(&kubevirtv1.VirtualMachine{}, handler.EnqueueRequestsFromMapFunc(mapOwnedToManagedVM)).
 		// An image becoming Ready is what unblocks every VM waiting on it, so
 		// the wait costs nothing and needs no polling.
 		Watches(&platformv1alpha1.ManagedImage{}, handler.EnqueueRequestsFromMapFunc(r.mapImageToVMs)).
 		Named(vmControllerName).
 		Complete(r)
+}
+
+func mapOperationToVM(_ context.Context, obj client.Object) []reconcile.Request {
+	op, ok := obj.(*platformv1alpha1.ManagedVMOperation)
+	if !ok || op.Spec.VMName == "" {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{Namespace: op.Namespace, Name: op.Spec.VMName},
+	}}
 }
 
 func mapOwnedToManagedVM(_ context.Context, obj client.Object) []reconcile.Request {

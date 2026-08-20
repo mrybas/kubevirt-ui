@@ -62,6 +62,24 @@ rules:
 - apiGroups:
   - kubevirt.io
   resources:
+  - virtualmachineinstancemigrations
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachineinstances
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kubevirt.io
+  resources:
   - virtualmachines
   verbs:
   - create
@@ -75,6 +93,7 @@ rules:
   - platform.kubevirt-ui.io
   resources:
   - managedimages
+  - managedvmoperations
   - managedvms
   - managedvmtemplates
   verbs:
@@ -96,9 +115,28 @@ rules:
   - platform.kubevirt-ui.io
   resources:
   - managedimages/status
+  - managedvmoperations/status
   - managedvms/status
   - managedvmtemplates/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - snapshot.kubevirt.io
+  resources:
+  - virtualmachinerestores
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - snapshot.kubevirt.io
+  resources:
+  - virtualmachinesnapshots
+  verbs:
+  - get
+  - list
+  - watch
