@@ -141,6 +141,17 @@ backend:
     # difference between them rolls it — chrony is what a joining worker asks
     # for the time, so rolling it during a join is a node that never appears.
     OPERATOR_TENANT_TIME_ENABLED: ""
+    # -- Hand a tenant's addon releases to the operator. Off, the create path
+    # writes them and the reconcile loop writes any that are missing.
+    #
+    # Those are two renderers of one HelmRelease and they do not agree. The
+    # repair one omits `install.disableWait`, and without it the CNI install
+    # waits for workloads the install is supposed to cause, times out, Flux
+    # remediates by uninstalling, and the release sits in `uninstalling` for
+    # ever — measured on the lab with no nodes registered. It fires only when a
+    # release is missing, which is the state a fresh tenant is in, which is
+    # exactly when omitting it wedges.
+    OPERATOR_TENANT_ADDONS_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as

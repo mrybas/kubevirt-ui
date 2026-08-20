@@ -22,7 +22,7 @@ from app.core.b3_announce import ensure_announcements
 from app.core.operator import announce_path_enabled
 
 from app.api.v1.tenants_talos import ensure_worker_bootstrap_ca
-from app.core.operator import tenant_bootstrap_path_enabled
+from app.core.operator import tenant_addons_path_enabled, tenant_bootstrap_path_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +264,11 @@ async def _reconcile_tenant(
 
     for component in ordered:
         try:
+            if tenant_addons_path_enabled():
+                # The operator renders these now, from one function, and a
+                # second writer here would put back the disagreement the flag
+                # exists to end.
+                break
             await _create_required_addon(
                 k8s, name, ns, component, catalog, required_components, existing_ids,
             )

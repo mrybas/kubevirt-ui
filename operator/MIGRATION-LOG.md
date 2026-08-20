@@ -2743,3 +2743,39 @@ does not turn the test red, it makes it **hang** — `panic: test timed out afte
 5m0s` — which is exactly what the silent tenant would do to the controller. It
 also showed that `hack/mutate.sh` had no bound of its own, so a mutant that
 hangs hung the script; it passes `-timeout` now.
+
+## M12e (third slice) — the addons are written by one thing now
+
+The renderer from the first slice is wired, and the two writers it replaces are
+retired behind `OPERATOR_TENANT_ADDONS_ENABLED` — the create path and the
+reconcile loop's repair, gated separately, because a flag covering one of two
+writers is worse than no flag: it reads as handed over while the other keeps
+writing.
+
+Two decisions worth their own lines.
+
+**The catalogue's required components are installed whether or not they were
+asked for.** A tenant without its CNI is not a smaller tenant; its nodes never
+go Ready and nothing on the page says why. Required is not a default the caller
+may drop, and the chain is expressed as Flux's own `dependsOn` — namespaces,
+then the CNI, then everything else — rather than by ordering the writes, because
+the ordering has to hold across restarts and this operator's write order does
+not.
+
+**A stuck release is named, not counted.** The plan asks for a tenant with an
+undeployable addon to go Degraded with a reason while its neighbours keep
+reconciling, and the useful thing to say is *which* release is stuck and what
+Flux said about it. The test asserts the message names the failing one and does
+not name the one that installed.
+
+### An intermittent, recorded rather than smoothed
+
+One full run of the controller suite failed on `TestUnderlayHealsTheGatewayLabel`
+— the label came back, the counter had not caught up inside twenty seconds. It
+passes three times out of three alone and two full runs since have been clean.
+
+The plausible mechanism is mine: this slice adds a HelmRelease informer and a
+1600-line CRD to the suite, which makes every startup and every pass a little
+slower, and that assertion was already close to its edge. Not chased further
+because two clean runs is thin evidence either way — but the output is kept, so
+the next occurrence can be diffed against this one instead of re-argued.

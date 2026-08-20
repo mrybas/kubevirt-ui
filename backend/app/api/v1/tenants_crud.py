@@ -112,7 +112,7 @@ from app.core.tenant_transit import (
     transit_subnet_name,
 )
 from app.api.v1.tenants_ntp import ensure_ntp_server, ensure_tenant_ntp_service
-from app.core.operator import tenant_time_path_enabled
+from app.core.operator import tenant_addons_path_enabled, tenant_time_path_enabled
 from app.api.v1.tenants_talosconfig import (
     DEFAULT_TTL_HOURS,
     build_talosconfig,
@@ -176,6 +176,21 @@ _OVERHEAD_MARGIN = 1.25
 # placement, VFIO/GPU passthrough, SEV, downward metrics. Worker VMs set none
 # of them — `test_worker_vms_stay_within_the_reserved_shape` fails if that
 # ever stops being true, because each would add its own term.
+
+
+
+async def _create_tenant_addons(k8s, name: str, addons, catalog) -> bool:
+    """Write the tenant's addon releases, unless the operator does.
+
+    Handed over under a flag because there were two renderers of this object
+    and they disagreed — see `tenant_addons_path_enabled`. Returns whether it
+    did the work, so the caller and the tests can tell "handed over" from
+    "nothing to do".
+    """
+    if tenant_addons_path_enabled():
+        return False
+    await _create_addon_resources(k8s, name, addons, catalog)
+    return True
 
 
 async def _ensure_tenant_time(k8s, name: str, namespace: str, vip: str | None) -> bool:
@@ -1681,7 +1696,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                 )
 
         if all_addons and catalog.git_repository_ref:
-            await _create_addon_resources(k8s, req.name, all_addons, catalog)
+            await _create_tenant_addons(k8s, req.name, all_addons, catalog)
 
         # Best-effort: push the infra-cluster-credentials secret into the
         # tenant cluster so the CSI controller can mount it. At create time

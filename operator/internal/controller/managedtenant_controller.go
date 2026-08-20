@@ -92,6 +92,10 @@ type ManagedTenantReconciler struct {
 	// TenantClient opens a client to a tenant's own API server. Replaced in
 	// tests, where there is no second cluster to talk to.
 	TenantClient TenantClientFor
+
+	// CatalogNamespace holds the addon catalogue. Empty falls back to the
+	// environment, then to where the product keeps it.
+	CatalogNamespace string
 }
 
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants,verbs=get;list;watch;create;update;patch;delete
@@ -116,6 +120,7 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
+// +kubebuilder:rbac:groups=helm.toolkit.fluxcd.io,resources=helmreleases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machinehealthchecks;machinedeployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=talosconfigtemplates,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;create;update;patch
@@ -353,6 +358,21 @@ func (r *ManagedTenantReconciler) Reconcile(
 		apimeta.SetStatusCondition(&obj.Status.Conditions,
 			insideCondition(insideReady, insideReason, insideMessage))
 		pending = pending || !insideReady
+	}
+
+	// After the tenant answers: these install into its cluster, not this one.
+	addonsReady, addonsReason, addonsMessage, err := r.reconcileAddons(ctx, obj, namespace)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			addonsCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if addonsReason != "" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			addonsCondition(addonsReady, addonsReason, addonsMessage))
+		pending = pending || !addonsReady
 	}
 
 	// After the namespace, because the clone grant names it as its subject.

@@ -89,6 +89,19 @@ type TenantStorage struct {
 	ClassName string `json:"className,omitempty"`
 }
 
+// TenantAddon is one thing installed into the tenant's own cluster.
+type TenantAddon struct {
+	// ID names a component of the deployment's addon catalogue.
+	// +kubebuilder:validation:MinLength=1
+	ID string `json:"id"`
+
+	// Parameters are the knobs that component exposes. What is not given here
+	// takes the catalogue's default — the catalogue is the one statement of
+	// what a component is, and repeating its defaults here would be a second.
+	// +optional
+	Parameters map[string]string `json:"parameters,omitempty"`
+}
+
 // ManagedTenantSpec is a tenant Kubernetes cluster.
 type ManagedTenantSpec struct {
 	// +kubebuilder:validation:MinLength=1
@@ -137,6 +150,15 @@ type ManagedTenantSpec struct {
 	// certificate it does not trust — actually needs.
 	// +optional
 	EnableOIDC bool `json:"enableOIDC,omitempty"`
+
+	// Addons are installed into the tenant's cluster once it answers.
+	//
+	// The catalogue's required components are installed whether or not they are
+	// listed: a tenant without its CNI is not a smaller tenant, it is a broken
+	// one, and leaving that to a checkbox is how a cluster comes up with no
+	// network and a green page.
+	// +optional
+	Addons []TenantAddon `json:"addons,omitempty"`
 
 	// Network is the VPC the tenant's machines live in. Empty means the
 	// cluster's default overlay.
@@ -248,6 +270,14 @@ const (
 	// worker's certificate is issued, every component reports healthy, and the
 	// cluster simply has no node.
 	ConditionTenantBootstrapped = "TenantBootstrapped"
+
+	// ConditionAddonsReady is whether what the tenant's cluster is built from
+	// has installed.
+	//
+	// One condition for the set, with the failing releases named in the
+	// message: a tenant is not half-built, and the useful question is which
+	// release is stuck rather than how many are.
+	ConditionAddonsReady = "AddonsReady"
 )
 
 // TenantReservation is what this tenant asks of its folder.

@@ -121,6 +121,21 @@ def tenant_time_path_enabled() -> bool:
     return _enabled("OPERATOR_TENANT_TIME_ENABLED")
 
 
+def tenant_addons_path_enabled() -> bool:
+    """True when the operator installs a tenant's addons.
+
+    Off: the create path writes the HelmReleases and the reconcile loop writes
+    any that are missing — two renderers of one object, and they do not agree.
+    The repair one omits `install.disableWait`, whose absence wedges a CNI
+    release in `uninstalling` for ever, and it fires exactly when a release is
+    missing, which is the state a fresh tenant is in.
+    On: neither writes, and the operator renders both cases from one function.
+
+    Order as always: this flag on first, then the operator's tenant domain.
+    """
+    return _enabled("OPERATOR_TENANT_ADDONS_ENABLED")
+
+
 def underlay_path_enabled() -> bool:
     """True when the egress underlay is written as a ManagedUnderlay resource.
 

@@ -60,6 +60,35 @@ spec:
           spec:
             description: ManagedTenantSpec is a tenant Kubernetes cluster.
             properties:
+              addons:
+                description: |-
+                  Addons are installed into the tenant's cluster once it answers.
+
+                  The catalogue's required components are installed whether or not they are
+                  listed: a tenant without its CNI is not a smaller tenant, it is a broken
+                  one, and leaving that to a checkbox is how a cluster comes up with no
+                  network and a green page.
+                items:
+                  description: TenantAddon is one thing installed into the tenant's
+                    own cluster.
+                  properties:
+                    id:
+                      description: ID names a component of the deployment's addon
+                        catalogue.
+                      minLength: 1
+                      type: string
+                    parameters:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        Parameters are the knobs that component exposes. What is not given here
+                        takes the catalogue's default — the catalogue is the one statement of
+                        what a component is, and repeating its defaults here would be a second.
+                      type: object
+                  required:
+                  - id
+                  type: object
+                type: array
               controlPlaneReplicas:
                 default: 2
                 format: int32
