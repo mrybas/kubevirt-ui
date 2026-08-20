@@ -693,8 +693,16 @@ standing in for the backend. Nothing on the real BGP path was touched.
 | flag set, **rollout still in progress** | `ON` — refused. The check reads the *running pods*, not the Deployment: a flag in a spec is an intention, and a pod that has not been replaced is still writing |
 | flag set, rollout complete | `off` — phase 2 allowed |
 | takeover | `unchanged — the handover moved ownership and nothing else` |
-| ownership, behaviourally | the object was tampered with (`router bgp 1`) and the operator put it back |
-| rollback | operator stepped back; `resourceVersion` then held still for twenty seconds — nobody writing |
+| ownership while owned | the object was tampered with (`router bgp 1`) and the operator put it back |
+| ownership after stepping back | the **same** tamper was made again with `dryRun: true`, and it was still `router bgp 1` forty-five seconds later — the operator really had let go |
+| backend back on | only after that, and the writer state read `ON` again |
+| teardown | the real object never took part, and the dry-run render still matches it byte for byte |
+
+The negative half is the one that matters for a rollback. "The operator stopped
+writing" and "nothing happened to be writing" look identical from outside until
+something perturbs the object: only a perturbation that is *not* repaired proves
+the first. Turning the backend back on before that check is how a rollback
+becomes two writers.
 
 Two defects in the script itself came out of running it. The first version read
 the flag off the Deployment spec, so it would have let phase 2 start mid-rollout
