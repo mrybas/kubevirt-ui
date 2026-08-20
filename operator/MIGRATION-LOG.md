@@ -1378,3 +1378,67 @@ disabled there — and it was left that way deliberately: enabling them would
 start the tenant reconciler against the two live UAT tenants, which is another
 writer this migration does not need. The comparison was made against the module
 the endpoint calls.
+
+## M12b (first slice) — the tenant namespace, and one quota instead of two
+
+Phases 7 and 8: the namespace, the LimitRange, the quota.
+
+### The two quotas, measured before being merged
+
+The plan says to merge them. Measuring first changed the design twice.
+
+Both objects in `tenant-uat-t1` carry **no scopes** and report the *same*
+`used: requests.storage` — one counter under two ceilings:
+
+```
+tenant-storage        requests.storage 100Gi   persistentvolumeclaims 20   used 44023414784
+tenant-uat-t1-quota   requests.storage 120Gi   requests.cpu 7              used 44023414784
+```
+
+Kubernetes requires every quota to be satisfied, so what is enforced is the
+smaller. Demonstrated rather than reasoned: in a scratch namespace with the same
+two objects, a 110Gi claim is refused —
+
+```
+persistentvolumeclaims "probe" is forbidden: exceeded quota: a-storage,
+requested: requests.storage=110Gi, used: 0, limited: 100Gi
+```
+
+— and under a single 220Gi quota the same claim is admitted.
+
+Meanwhile the folder ceiling sums every quota it finds. So that tenant reserves
+120Gi, may use 100Gi, and is charged 220Gi. The tenant beside it has only one
+object, so the double count is not even consistent between them.
+
+One object, summed, makes the charge and the permission agree. Enforcement does
+loosen — 100 to 220 — and that is the point rather than an oversight: 220 was
+already being charged, and charging for capacity you forbid is the worse of the
+two.
+
+**Except in an adopted namespace.** Adding the allowance while another writer's
+cap is still there would take the charge to 320 and change nothing about the
+limit, because the other object still binds at its own number. So an adopted
+tenant gets the machines only — exactly what the product writes today — and a
+condition naming the other quota. Nothing is deleted: something else wrote it.
+
+That redundancy is only ever noticed because the controller watches **every**
+ResourceQuota in a tenant namespace rather than the ones it owns. `Owns` would
+never deliver the interesting one, and the test proved it: with ownership
+watching alone, the foreign quota appeared and the summed value stayed.
+
+### Live, against the tenant the UI built
+
+| | result |
+|---|---|
+| namespace labels | **identical** (496 bytes each, empty diff) |
+| LimitRange | **identical** |
+| quota cpu / memory | identical — `7` and `9651617792` = `9425408Ki` |
+| quota storage | one object at 220Gi where the UI has two at 100 + 120 |
+
+The last row is the whole change, and everything around it matches.
+
+### M13a note
+
+The tenant domain runs as its own deployment (`--domains=tenant`), a third
+alongside vm and network, so a crash in one does not stop the others and each
+service account carries only its own rights.
