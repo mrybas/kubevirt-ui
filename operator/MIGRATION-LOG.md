@@ -2180,8 +2180,19 @@ git worktree remove --force .mutation
 
 — which keeps the tree somebody else may be reading pristine, and has the
 side-benefit of mutating **committed** state rather than whatever is on disk.
-For a mutation against uncommitted work the tree has to be copied in first;
-committing before mutating is usually the better answer anyway.
+
+That caveat then bit on its first real use: the harness under test was
+uncommitted, the worktree was at HEAD, and the mutation measured the old code
+and stayed green — reading as "the restriction is silent" when the restriction
+simply was not there. And twice after that I fell back to mutating in the tree
+anyway, because the change was uncommitted and the worktree could not see it.
+
+A practice that depends on remembering is not a practice, so it is a script now:
+`hack/mutate.sh` copies the **working** tree — uncommitted changes included —
+into a throwaway directory, applies the mutation there, runs the tests, and
+refuses with a distinct exit code when the expression matched nothing. That last
+guard is the one that matters: a mutation run that silently changed nothing
+reads exactly like a test that caught something.
 
 ## M12d live: the graph built end to end, and five differences
 
