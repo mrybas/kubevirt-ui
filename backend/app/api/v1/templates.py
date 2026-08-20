@@ -10,6 +10,13 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client.rest import ApiException
 
 from app.core.auth import User, require_auth
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    OWNER_KIND_LABEL,
+    OWNER_NAME_LABEL,
+    image_path_enabled,
+)
 from app.core.naming import DISPLAY_NAME_ANNOTATION, SLUG_LABEL, sanitize_display_name
 from app.models.template import (
     VMTemplate,
@@ -685,6 +692,98 @@ async def list_golden_images(
         )
 
 
+async def _create_managed_image(
+    *,
+    k8s_client: Any,
+    image: GoldenImageCreate,
+    namespace: str,
+    slug: str,
+    display_name_value: str,
+    source: dict[str, Any],
+    source_url_display: str | None,
+    scope: str,
+    project_name: str | None,
+) -> GoldenImage:
+    """Create the image as a ManagedImage and let the operator build the disk.
+
+    The response is deliberately the same shape the DataVolume path returns, so
+    the UI cannot tell which side of the flag it is on. Status starts at Pending
+    because nothing has been imported yet — the operator publishes progress and
+    the terminal state on the resource, and the image lister picks it up from
+    the disk's labels the same way it always has.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+
+    spec: dict[str, Any] = {
+        "displayName": display_name_value,
+        "source": source,
+        "size": image.size,
+        "scope": scope,
+        "diskType": image.disk_type or "image",
+        "persistent": bool(image.persistent),
+    }
+    if image.storage_class:
+        spec["storageClass"] = image.storage_class
+    if image.description:
+        spec["description"] = image.description
+    if image.os_type:
+        spec["osType"] = image.os_type
+    if image.os_version:
+        spec["osVersion"] = image.os_version
+
+    body = {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedImage",
+        "metadata": {
+            "generateName": f"{slug}-",
+            "namespace": namespace,
+        },
+        "spec": spec,
+    }
+
+    try:
+        created = await custom_api.create_namespaced_custom_object(
+            group=OPERATOR_GROUP,
+            version=OPERATOR_VERSION,
+            namespace=namespace,
+            plural="managedimages",
+            body=body,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            # The flag is on and the CRD is not installed. Saying so beats a
+            # generic 500 that reads as "the import failed".
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Image creation is routed to the operator "
+                    "(OPERATOR_IMAGE_ENABLED), but the ManagedImage CRD is not "
+                    "installed in this cluster"
+                ),
+            )
+        raise HTTPException(
+            status_code=e.status or status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create image: {e.reason}",
+        )
+
+    return GoldenImage(
+        name=created["metadata"]["name"],
+        namespace=created["metadata"]["namespace"],
+        display_name=display_name_value,
+        description=image.description,
+        os_type=image.os_type,
+        os_version=image.os_version,
+        disk_type=image.disk_type,
+        persistent=image.persistent,
+        size=image.size,
+        status="Pending",
+        source_url=source_url_display,
+        created=created["metadata"].get("creationTimestamp"),
+        scope=scope,
+        project=project_name,
+    )
+
+
 @images_router.post("", response_model=GoldenImage, status_code=status.HTTP_201_CREATED)
 async def create_golden_image(
     image: GoldenImageCreate,
@@ -757,6 +856,24 @@ async def create_golden_image(
             source = {"blank": {}}
             source_url_display = "blank"
         
+        # With the operator owning images, the backend stops writing the disk
+        # and writes the intent instead. Same request, same namespace, same
+        # naming: generateName on our own resource, exactly as it was on the
+        # DataVolume — so the disk still ends up named `<slug>-xxxxx` and every
+        # caller that reads a name back keeps working.
+        if image_path_enabled():
+            return await _create_managed_image(
+                k8s_client=k8s_client,
+                image=image,
+                namespace=target_namespace,
+                slug=slug,
+                display_name_value=display_name_value,
+                source=source,
+                source_url_display=source_url_display,
+                scope=image.scope or "environment",
+                project_name=project_name,
+            )
+
         # Build storage spec (new CDI format)
         image_storage: dict[str, Any] = {
             "volumeMode": "Block",  # Required for snapshot-based cloning
@@ -848,6 +965,79 @@ async def create_golden_image(
         )
 
 
+async def _managed_image_owner(
+    custom_api: Any, namespace: str, dv_name: str,
+) -> str | None:
+    """Name of the ManagedImage owning this disk, or None if nothing owns it."""
+    try:
+        dv = await custom_api.get_namespaced_custom_object(
+            group="cdi.kubevirt.io",
+            version="v1beta1",
+            namespace=namespace,
+            plural="datavolumes",
+            name=dv_name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    labels = (dv.get("metadata", {}) or {}).get("labels", {}) or {}
+    if labels.get(OWNER_KIND_LABEL) != "ManagedImage":
+        return None
+    return labels.get(OWNER_NAME_LABEL) or None
+
+
+async def _delete_managed_image(
+    custom_api: Any, namespace: str, name: str,
+) -> None:
+    """Delete the owning resource, refusing up front if the image is in use.
+
+    The operator would refuse this deletion anyway — its finalizer holds while
+    something is still cloning from the disk — but it refuses asynchronously,
+    which from a browser looks like a delete that did nothing. Reading the
+    holders and answering 409 with their names turns that into an answer.
+    """
+    try:
+        mi = await custom_api.get_namespaced_custom_object(
+            group=OPERATOR_GROUP,
+            version=OPERATOR_VERSION,
+            namespace=namespace,
+            plural="managedimages",
+            name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            # The disk claims an owner that is gone. Nothing left to release —
+            # fall through to deleting the disk itself.
+            mi = None
+        else:
+            raise
+
+    if mi is not None:
+        used_by = (mi.get("status", {}) or {}).get("usedBy") or []
+        if used_by:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Image {name} is still in use by: {', '.join(used_by)}",
+            )
+        await custom_api.delete_namespaced_custom_object(
+            group=OPERATOR_GROUP,
+            version=OPERATOR_VERSION,
+            namespace=namespace,
+            plural="managedimages",
+            name=name,
+        )
+        return
+
+    await custom_api.delete_namespaced_custom_object(
+        group="cdi.kubevirt.io",
+        version="v1beta1",
+        namespace=namespace,
+        plural="datavolumes",
+        name=name,
+    )
+
+
 @images_router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_golden_image(
     name: str,
@@ -855,11 +1045,24 @@ async def delete_golden_image(
     user: User = Depends(require_auth),
     namespace: str = "default",
 ) -> None:
-    """Delete an image from a project namespace."""
+    """Delete an image from a project namespace.
+
+    Ownership decides what gets deleted, not the feature flag. A disk the
+    operator owns has to be released by deleting its ManagedImage: deleting the
+    disk directly would only make the controller build it again, and the user
+    would watch a deleted image reappear. Ownership is stamped on the object, so
+    it keeps being true after the flag is turned back off.
+    """
     k8s_client = request.app.state.k8s_client
-    
+
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
+
+        owner = await _managed_image_owner(custom_api, namespace, name)
+        if owner:
+            await _delete_managed_image(custom_api, namespace, owner)
+            return
+
         await custom_api.delete_namespaced_custom_object(
             group="cdi.kubevirt.io",
             version="v1beta1",

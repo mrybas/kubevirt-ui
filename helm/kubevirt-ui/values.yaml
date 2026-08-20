@@ -29,6 +29,16 @@ backend:
     LOG_LEVEL: INFO
     CORS_ORIGINS: ""
     ENABLE_TENANTS: "false"
+    # -- Route golden-image creation through the operator: the backend writes a
+    # ManagedImage custom resource and the operator creates the DataVolume, the
+    # DataSource and the status. Empty/false → the backend creates the
+    # DataVolume itself, exactly as before. Requires the ManagedImage CRD to be
+    # installed; with the flag on and the CRD absent the create call answers 503
+    # saying so rather than failing as if the import broke.
+    #
+    # Turning the flag back off does not orphan anything: ownership is stamped
+    # on the disk, so images the operator owns keep being deleted through it.
+    OPERATOR_IMAGE_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as
