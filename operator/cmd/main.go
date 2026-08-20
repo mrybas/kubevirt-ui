@@ -296,6 +296,16 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	if enabled.Has(domains.Tenant) {
+		if err := (&controller.ManagedTenantReconciler{
+			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
+			Recorder: mgr.GetEventRecorderFor("managedtenant"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "managedtenant")
+			os.Exit(1)
+		}
+	}
 	if enabled.Has(domains.Network) {
 		if err := (&controller.AnnouncementPolicyReconciler{
 			Client:   mgr.GetClient(),

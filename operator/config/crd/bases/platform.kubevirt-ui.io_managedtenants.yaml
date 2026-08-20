@@ -102,6 +102,34 @@ spec:
                   is the adjacent block, disjoint from it, and the host's actual ranges are
                   still checked because a cluster may of course use 10.112 itself.
                 type: string
+              storage:
+                description: |-
+                  Storage is what the tenant's own workloads may provision inside its
+                  namespace, through the CSI driver that turns a PVC in the tenant cluster
+                  into a PVC on the host.
+
+                  Separate from the workers' disks, and added to them. They used to be two
+                  ResourceQuota objects in one namespace, which Kubernetes applies
+                  independently — so the effective cap was the smaller of the two — while
+                  the folder ceiling, which sums every quota it finds, counted the tenant's
+                  storage twice. Measured on this stand: one tenant with both objects
+                  counted 220Gi against its folder while reserving 120Gi, and the tenant
+                  beside it had only one object, so the double-count was not even
+                  consistent.
+                properties:
+                  allowanceGi:
+                    default: 100
+                    format: int32
+                    maximum: 10000
+                    minimum: 1
+                    type: integer
+                  pvcCount:
+                    default: 20
+                    format: int32
+                    maximum: 200
+                    minimum: 1
+                    type: integer
+                type: object
               workers:
                 description: TenantWorkers is the shape of the worker pool.
                 properties:
@@ -218,6 +246,17 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              redundantQuotas:
+                description: |-
+                  RedundantQuotas are other ResourceQuota objects in this namespace that
+                  also cap storage.
+
+                  Reported rather than deleted: another writer put them there, and the
+                  folder ceiling sums every quota it finds, so each one is counted again
+                  against the folder. Named so somebody can decide.
+                items:
+                  type: string
+                type: array
               reservation:
                 description: Reservation is what was sized from the request, before
                   any of it exists.

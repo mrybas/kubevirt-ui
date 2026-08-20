@@ -63,6 +63,21 @@ type TenantWorkers struct {
 	TalosVersion string `json:"talosVersion,omitempty"`
 }
 
+// TenantStorage is the allowance for workloads inside the tenant.
+type TenantStorage struct {
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=10000
+	// +kubebuilder:default=100
+	// +optional
+	AllowanceGi int32 `json:"allowanceGi,omitempty"`
+
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=200
+	// +kubebuilder:default=20
+	// +optional
+	PVCCount int32 `json:"pvcCount,omitempty"`
+}
+
 // ManagedTenantSpec is a tenant Kubernetes cluster.
 type ManagedTenantSpec struct {
 	// +kubebuilder:validation:MinLength=1
@@ -89,6 +104,21 @@ type ManagedTenantSpec struct {
 
 	// +optional
 	Workers TenantWorkers `json:"workers,omitempty"`
+
+	// Storage is what the tenant's own workloads may provision inside its
+	// namespace, through the CSI driver that turns a PVC in the tenant cluster
+	// into a PVC on the host.
+	//
+	// Separate from the workers' disks, and added to them. They used to be two
+	// ResourceQuota objects in one namespace, which Kubernetes applies
+	// independently — so the effective cap was the smaller of the two — while
+	// the folder ceiling, which sums every quota it finds, counted the tenant's
+	// storage twice. Measured on this stand: one tenant with both objects
+	// counted 220Gi against its folder while reserving 120Gi, and the tenant
+	// beside it had only one object, so the double-count was not even
+	// consistent.
+	// +optional
+	Storage TenantStorage `json:"storage,omitempty"`
 
 	// Network is the VPC the tenant's machines live in. Empty means the
 	// cluster's default overlay.
@@ -126,6 +156,15 @@ const (
 	// ConditionQuotaReserved is the folder ceiling's answer, taken before
 	// anything exists — the one place a ceiling can legally refuse.
 	ConditionQuotaReserved = "QuotaReserved"
+
+	// ConditionNamespaceReady is false while the namespace, its single quota
+	// and its LimitRange are not all in place.
+	//
+	// The LimitRange is not decoration. A quota on requests makes requests
+	// mandatory, and Kamaji's control-plane containers declare none: without
+	// defaults supplied, every tenant created in a folder had no control plane
+	// at all, and the page said Provisioning forever.
+	ConditionNamespaceReady = "NamespaceReady"
 )
 
 // TenantReservation is what this tenant asks of its folder.
@@ -152,6 +191,15 @@ type ManagedTenantStatus struct {
 	// image the workers clone.
 	// +optional
 	TalosRelease string `json:"talosRelease,omitempty"`
+
+	// RedundantQuotas are other ResourceQuota objects in this namespace that
+	// also cap storage.
+	//
+	// Reported rather than deleted: another writer put them there, and the
+	// folder ceiling sums every quota it finds, so each one is counted again
+	// against the folder. Named so somebody can decide.
+	// +optional
+	RedundantQuotas []string `json:"redundantQuotas,omitempty"`
 
 	// Reservation is what was sized from the request, before any of it exists.
 	// +optional
