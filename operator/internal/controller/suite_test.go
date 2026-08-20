@@ -25,6 +25,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -39,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	logzap "sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/yaml"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 )
@@ -72,6 +74,51 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// managerUser is who the controllers are, as far as the API server is
+// concerned. Impersonated rather than a real ServiceAccount because envtest has
+// no token issuer worth the trouble; the authorisation path is identical.
+const managerUser = "system:serviceaccount:kubevirt-ui-operator-system:kubevirt-ui-operator-controller-manager"
+
+// restrictedConfig binds the generated ClusterRole to that user and returns a
+// config that impersonates it.
+func restrictedConfig(admin *rest.Config) (*rest.Config, error) {
+	adminClient, err := client.New(admin, client.Options{})
+	if err != nil {
+		return nil, fmt.Errorf("admin client: %w", err)
+	}
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config", "rbac", "role.yaml"))
+	if err != nil {
+		return nil, fmt.Errorf("reading the operator's role: %w", err)
+	}
+	role := &rbacv1.ClusterRole{}
+	if err := yaml.Unmarshal(raw, role); err != nil {
+		return nil, fmt.Errorf("parsing the operator's role: %w", err)
+	}
+	role.Name = "kubevirt-ui-operator-manager-role"
+	role.ResourceVersion = ""
+	if err := adminClient.Create(context.Background(), role); err != nil {
+		return nil, fmt.Errorf("installing the operator's role: %w", err)
+	}
+
+	binding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "kubevirt-ui-operator-manager-binding"},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: role.Name,
+		},
+		Subjects: []rbacv1.Subject{{
+			APIGroup: rbacv1.GroupName, Kind: "User", Name: managerUser,
+		}},
+	}
+	if err := adminClient.Create(context.Background(), binding); err != nil {
+		return nil, fmt.Errorf("binding the operator's role: %w", err)
+	}
+
+	restricted := rest.CopyConfig(admin)
+	restricted.Impersonate = rest.ImpersonationConfig{UserName: managerUser}
+	return restricted, nil
+}
+
 func runSuite(m *testing.M) (int, error) {
 	ctrl.SetLogger(logzap.New(logzap.UseDevMode(true), logzap.WriteTo(os.Stderr)))
 
@@ -101,7 +148,21 @@ func runSuite(m *testing.M) (int, error) {
 	}
 	defer func() { _ = testEnv.Stop() }()
 
-	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+	// The controllers run as the ServiceAccount the chart gives them, not as
+	// the admin envtest hands out.
+	//
+	// Three live runs have now been spent on a verb the code needed and the
+	// role did not grant — `datavolumes/source`, `secrets` create, a Role that
+	// could not be created because the writer did not hold what it was granting
+	// — and none of them could fail in a suite where every request is
+	// cluster-admin. The RBAC is part of what this operator is; testing it
+	// against a subject that ignores RBAC tests the other half only.
+	restricted, err := restrictedConfig(cfg)
+	if err != nil {
+		return 0, err
+	}
+
+	mgr, err := ctrl.NewManager(restricted, ctrl.Options{
 		Scheme:  scheme,
 		Metrics: metricsserver.Options{BindAddress: "0"},
 	})
@@ -219,8 +280,15 @@ func runSuite(m *testing.M) (int, error) {
 	if !mgr.GetCache().WaitForCacheSync(testCtx) {
 		return 0, fmt.Errorf("cache did not sync")
 	}
-	k8sClient = mgr.GetClient()
-	k8sReader = mgr.GetAPIReader()
+	// The tests are the cluster: they play CDI finishing an import, MetalLB
+	// handing out an address, kube-ovn allocating one. That is admin work and
+	// it is not what is under test, so it keeps an admin client — while the
+	// manager above runs as the ServiceAccount the chart gives it, which is.
+	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		return 0, fmt.Errorf("admin client: %w", err)
+	}
+	k8sReader = k8sClient
 
 	// The controllers read cluster-wide configuration from this namespace, so
 	// it has to exist before any of them run.

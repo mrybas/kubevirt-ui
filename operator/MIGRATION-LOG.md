@@ -2523,3 +2523,27 @@ It is the same "on but not off" shape as the teardown gaps: every switch in this
 migration has been easier to turn on than off, and each time the missing half
 has only shown up when somebody needed it. Logged as the next thing owed to the
 network controller rather than folded in here.
+
+## Hygiene: the suite stops being cluster-admin
+
+Three live runs have been spent on a verb the code needed and the role did not
+grant — `datavolumes/source` for the clone gate, `create` on secrets for the
+machine token, a Role that could not be created because the writer did not hold
+what it was granting. None of them could fail in a suite where every request is
+cluster-admin, which is what envtest hands out.
+
+So the manager now runs impersonating the ServiceAccount the chart gives it,
+with the generated `config/rbac/role.yaml` installed and bound. The tests keep
+an admin client: they play CDI finishing an import, MetalLB handing out an
+address, kube-ovn allocating one — that is the cluster's work, not the
+operator's, and it is not what is under test.
+
+Getting the split wrong the first time was instructive. With the tests sharing
+the manager's client, 68 tests failed on five verbs — `datavolumes/status`,
+`services/status`, `nodes`, `ovn-eips/status`, `ipaddresspools` — and every one
+was a test pretending to be another controller, not a controller missing a
+right. The right line is: **the test may be the cluster; the operator may not.**
+
+With the line drawn there the suite is green, which is the useful answer: the
+role already grants everything the controllers actually do. From here a missing
+verb fails in the suite instead of on the stand.
