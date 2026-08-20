@@ -57,6 +57,11 @@ type ExternalPlane struct {
 	// +optional
 	ServiceRoute string `json:"serviceRoute,omitempty"`
 
+	// Rules is how many entries the composed list has. Published because the
+	// number not moving as tenants are added is the whole point of the shape.
+	// +optional
+	Rules int32 `json:"rules,omitempty"`
+
 	// EgressSubnet is the attachment the default route leaves through. Its
 	// gateway address is read from the Subnet itself rather than configured:
 	// the same number in two places is the same number until one of them
@@ -188,6 +193,14 @@ const (
 	// missing, refused, or not yet reported ready by kube-ovn.
 	ConditionNetworkReady = "Ready"
 
+	// ConditionIsolated says whether the rules that close this network to other
+	// tenants are actually on it, and who writes them.
+	//
+	// False is not always a fault: a network created open reports false and
+	// says so. What it never does is report true because somebody asked for
+	// isolation.
+	ConditionIsolated = "Isolated"
+
 	// ConditionDNSReady is false when this network's resolver is missing, or
 	// present and unable to answer.
 	//
@@ -237,6 +250,11 @@ type ManagedNetworkStatus struct {
 	// +optional
 	ServiceRoute string `json:"serviceRoute,omitempty"`
 
+	// Rules is how many entries the composed list has. Published because the
+	// number not moving as tenants are added is the whole point of the shape.
+	// +optional
+	Rules int32 `json:"rules,omitempty"`
+
 	// +optional
 	// +listType=map
 	// +listMapKey=type
@@ -252,6 +270,8 @@ type ManagedNetworkStatus struct {
 // +kubebuilder:printcolumn:name="Attached",type=string,JSONPath=`.status.conditions[?(@.type=="Attached")].status`
 // +kubebuilder:printcolumn:name="Via",type=string,JSONPath=`.status.defaultRouteVia`
 // +kubebuilder:printcolumn:name="DNS",type=string,JSONPath=`.status.conditions[?(@.type=="DNSReady")].status`
+// +kubebuilder:printcolumn:name="Isolated",type=string,JSONPath=`.status.conditions[?(@.type=="Isolated")].status`
+// +kubebuilder:printcolumn:name="Rules",type=integer,JSONPath=`.status.rules`
 // +kubebuilder:printcolumn:name="OnDelete",type=string,JSONPath=`.spec.deletionPolicy`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

@@ -55,6 +55,8 @@ var (
 	stopMgr   context.CancelFunc
 )
 
+var networkReconciler *ManagedNetworkReconciler
+
 func TestMain(m *testing.M) {
 	code, err := runSuite(m)
 	if err != nil {
@@ -117,7 +119,7 @@ func runSuite(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("wiring announcement controller: %w", err)
 	}
 
-	if err := (&ManagedNetworkReconciler{
+	networkReconciler = &ManagedNetworkReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorderFor("managednetwork"),
@@ -125,12 +127,15 @@ func runSuite(m *testing.M) (int, error) {
 		// several namespaces of their own and discovery would pick whichever
 		// the API server listed first.
 		KubeOVNNamespace: "kube-ovn",
+		TenantSupernet:   "10.200.0.0/14",
+		MgmtCIDRs:        []string{"10.198.160.1/32", "10.198.160.2/32"},
 		// The real one. envtest has no apiserver pod and no kubeadm ConfigMap,
 		// which is the same shape as a managed control plane — so discovery
 		// genuinely fails here, and that is worth exercising rather than
 		// stubbing.
 		APIReader: mgr.GetAPIReader(),
-	}).SetupWithManager(mgr); err != nil {
+	}
+	if err := networkReconciler.SetupWithManager(mgr); err != nil {
 		return 0, fmt.Errorf("wiring network controller: %w", err)
 	}
 

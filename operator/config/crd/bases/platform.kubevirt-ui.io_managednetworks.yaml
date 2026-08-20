@@ -35,6 +35,12 @@ spec:
     - jsonPath: .status.conditions[?(@.type=="DNSReady")].status
       name: DNS
       type: string
+    - jsonPath: .status.conditions[?(@.type=="Isolated")].status
+      name: Isolated
+      type: string
+    - jsonPath: .status.rules
+      name: Rules
+      type: integer
     - jsonPath: .spec.deletionPolicy
       name: OnDelete
       priority: 1
@@ -159,6 +165,12 @@ spec:
                       does not leave. That is a legitimate shape — the control-plane transit
                       plane is exactly that — so it is not an error.
                     type: string
+                  rules:
+                    description: |-
+                      Rules is how many entries the composed list has. Published because the
+                      number not moving as tenants are added is the whole point of the shape.
+                    format: int32
+                    type: integer
                   serviceRoute:
                     description: |-
                       ServiceRoute is the route added to the VpcDns pod so it can reach the
@@ -340,6 +352,12 @@ spec:
                 type: string
               observedGeneration:
                 format: int64
+                type: integer
+              rules:
+                description: |-
+                  Rules is how many entries the composed list has. Published because the
+                  number not moving as tenants are added is the whole point of the shape.
+                format: int32
                 type: integer
               serviceRoute:
                 description: |-

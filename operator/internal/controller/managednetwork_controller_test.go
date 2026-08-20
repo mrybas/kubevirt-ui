@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
+	"github.com/mrybas/kubevirt-ui/operator/internal/acl"
 	"github.com/mrybas/kubevirt-ui/operator/internal/metrics"
 	"github.com/mrybas/kubevirt-ui/operator/internal/network"
 
@@ -849,6 +850,198 @@ func TestDeleteWaitsRatherThanStranding(t *testing.T) {
 		}
 		if _, err := readVPC("netstuck"); err == nil {
 			return fmt.Errorf("the router is still there")
+		}
+		return nil
+	})
+}
+
+func liveACLsOf(t *testing.T, subnet string) []acl.Rule {
+	t.Helper()
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: subnet}, obj); err != nil {
+		t.Fatalf("reading Subnet/%s: %v", subnet, err)
+	}
+	return readACLs(obj)
+}
+
+func aclOwnerOf(t *testing.T, subnet string) string {
+	t.Helper()
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: subnet}, obj); err != nil {
+		t.Fatalf("reading Subnet/%s: %v", subnet, err)
+	}
+	return obj.GetAnnotations()[aclOwnerAnnotation]
+}
+
+// TestAFreshNetworkIsAdoptedAndComposed: a subnet this controller just created
+// has an empty list, the composer renders one, and the two differ — so adoption
+// declines and says what it would add. That is deliberate: a handover is only
+// automatic when it changes nothing.
+func TestAFreshNetworkIsAdoptedAndComposed(t *testing.T) {
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netacls"},
+		Spec:       platformv1alpha1.ManagedNetworkSpec{CIDR: "10.200.148.0/22"},
+	})
+
+	eventually(t, "adoption to decline and explain itself", func() error {
+		net := getNetwork(t, "netacls")
+		cond := networkCondition(net, platformv1alpha1.ConditionIsolated)
+		if cond == nil || cond.Reason != "AdoptionWouldChange" {
+			return fmt.Errorf("condition = %v", cond)
+		}
+		if !strings.Contains(cond.Message, "Nothing was written") {
+			return fmt.Errorf("message = %s", cond.Message)
+		}
+		return nil
+	})
+
+	// And it wrote nothing, which is the claim.
+	if rules := liveACLsOf(t, "netacls-default"); len(rules) != 0 {
+		t.Fatalf("adoption wrote rules: %v", rules)
+	}
+	if owner := aclOwnerOf(t, "netacls-default"); owner != "" {
+		t.Fatalf("adoption claimed the list: %q", owner)
+	}
+}
+
+// TestOwnershipTransfersOnlyWhenItChangesNothing, and then the composer keeps
+// the list. This is the handover: the rules are put in place by whatever owns
+// them today, and only once the render matches does the annotation go on.
+func TestOwnershipTransfersOnlyWhenItChangesNothing(t *testing.T) {
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "nethandover"},
+		Spec:       platformv1alpha1.ManagedNetworkSpec{CIDR: "10.200.152.0/22"},
+	})
+
+	var wanted []acl.Rule
+	eventually(t, "the composer to say what it wants", func() error {
+		net := getNetwork(t, "nethandover")
+		cond := networkCondition(net, platformv1alpha1.ConditionIsolated)
+		if cond == nil || cond.Reason != "AdoptionWouldChange" {
+			return fmt.Errorf("condition = %v", cond)
+		}
+		input, err := networkReconciler.aclInput(testCtx, net)
+		if err != nil {
+			return err
+		}
+		wanted, _ = acl.Render(input)
+		if len(wanted) == 0 {
+			return fmt.Errorf("nothing rendered")
+		}
+		return nil
+	})
+
+	// Somebody else — the isolation pass, today — puts them there.
+	subnet := &unstructured.Unstructured{}
+	subnet.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Name: "nethandover-default",
+	}, subnet); err != nil {
+		t.Fatalf("reading the subnet: %v", err)
+	}
+	if err := writeACLs(subnet, wanted); err != nil {
+		t.Fatalf("building the list: %v", err)
+	}
+	if err := k8sClient.Update(testCtx, subnet); err != nil {
+		t.Fatalf("writing the list: %v", err)
+	}
+
+	eventually(t, "ownership to transfer", func() error {
+		if owner := aclOwnerOf(t, "nethandover-default"); owner != aclOwnerOperator {
+			return fmt.Errorf("owner = %q", owner)
+		}
+		cond := networkCondition(getNetwork(t, "nethandover"),
+			platformv1alpha1.ConditionIsolated)
+		if cond == nil || cond.Status != metav1.ConditionTrue {
+			return fmt.Errorf("condition = %v", cond)
+		}
+		return nil
+	})
+
+	// The handover changed nothing on the object.
+	if got := liveACLsOf(t, "nethandover-default"); !acl.Equal(got, wanted) {
+		t.Fatalf("the list changed during the handover:\n  before %v\n  after  %v",
+			wanted, got)
+	}
+
+	// And now it is kept. Somebody deletes a rule; it comes back.
+	owned := &unstructured.Unstructured{}
+	owned.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Name: "nethandover-default",
+	}, owned); err != nil {
+		t.Fatalf("reading the owned subnet: %v", err)
+	}
+	if err := writeACLs(owned, wanted[1:]); err != nil {
+		t.Fatalf("removing a rule: %v", err)
+	}
+	if err := k8sClient.Update(testCtx, owned); err != nil {
+		t.Fatalf("removing a rule: %v", err)
+	}
+
+	eventually(t, "the missing rule to come back", func() error {
+		if got := liveACLsOf(t, "nethandover-default"); !acl.Equal(got, wanted) {
+			return fmt.Errorf("still %d rules", len(got))
+		}
+		return nil
+	})
+}
+
+// TestAListWithAForeignRuleIsNotTakenOver. Taking ownership means being able to
+// reproduce all of it; a rule nobody here wrote is named, and the subnet keeps
+// whatever wrote it. Silently dropping somebody's rule to take over a list is a
+// worse outcome than not taking it over.
+func TestAListWithAForeignRuleIsNotTakenOver(t *testing.T) {
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netforeign"},
+		Spec:       platformv1alpha1.ManagedNetworkSpec{CIDR: "10.200.156.0/22"},
+	})
+
+	eventually(t, "the subnet", func() error {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(subnetGVK)
+		return k8sClient.Get(testCtx, types.NamespacedName{Name: "netforeign-default"}, obj)
+	})
+
+	foreign := acl.Rule{
+		Action: "allow-related", Direction: "to-lport",
+		Match: "ip4.src == 192.0.2.0/24", Priority: 2900,
+	}
+	subnet := &unstructured.Unstructured{}
+	subnet.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Name: "netforeign-default",
+	}, subnet); err != nil {
+		t.Fatalf("reading the subnet: %v", err)
+	}
+	if err := writeACLs(subnet, []acl.Rule{foreign}); err != nil {
+		t.Fatalf("planting the rule: %v", err)
+	}
+	if err := k8sClient.Update(testCtx, subnet); err != nil {
+		t.Fatalf("planting the rule: %v", err)
+	}
+
+	eventually(t, "the refusal to name the rule", func() error {
+		cond := networkCondition(getNetwork(t, "netforeign"),
+			platformv1alpha1.ConditionIsolated)
+		if cond == nil || cond.Reason != "NotAdopted" {
+			return fmt.Errorf("condition = %v", cond)
+		}
+		if !strings.Contains(cond.Message, "192.0.2.0/24") {
+			return fmt.Errorf("the refusal does not name it: %s", cond.Message)
+		}
+		return nil
+	})
+
+	consistently(t, "the foreign rule surviving", 3*time.Second, func() error {
+		got := liveACLsOf(t, "netforeign-default")
+		if len(got) != 1 || got[0] != foreign {
+			return fmt.Errorf("acls = %v", got)
+		}
+		if owner := aclOwnerOf(t, "netforeign-default"); owner != "" {
+			return fmt.Errorf("it was claimed anyway: %q", owner)
 		}
 		return nil
 	})

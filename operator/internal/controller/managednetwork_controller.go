@@ -67,6 +67,16 @@ type ManagedNetworkReconciler struct {
 	// KubeOVNNamespace is where kube-ovn runs. Empty means find it.
 	KubeOVNNamespace string
 
+	// TenantSupernet is the aggregate every tenant network is carved from, and
+	// what the isolation floor is scoped to. Empty means no isolation is
+	// written at all — a drop with nothing to scope it to would take the
+	// internet with it.
+	TenantSupernet string
+
+	// MgmtCIDRs is where the management plane is. Empty means each node's own
+	// address as a /32, which is exact and cannot over-block.
+	MgmtCIDRs []string
+
 	// ServiceCIDR states the cluster's service network for installs where it
 	// cannot be discovered — a managed control plane exposes neither the
 	// kubeadm ConfigMap nor an apiserver pod. Set once on the operator instead
@@ -143,6 +153,10 @@ func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	kubeOVNNS := r.kubeOVNNamespaceFor(ctx)
 	net.Status.DNSServer = r.resolveDNSServer(ctx, net, kubeOVNNS)
 	if err := r.reconcileDNS(ctx, net, kubeOVNNS); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	if err := r.reconcileACLs(ctx, net); err != nil {
 		return ctrl.Result{}, err
 	}
 
