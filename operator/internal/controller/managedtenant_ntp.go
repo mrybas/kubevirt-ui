@@ -41,17 +41,28 @@ const (
 	defaultNTPIm = "cturra/ntp:latest"
 )
 
-// chronyConf serves the node's clock with no upstream of its own.
+// chronyConf is byte-identical to the configuration the backend writes.
 //
-// `local stratum 10` is not optional and its absence is silent: chronyd refuses
-// to answer at all until it considers itself synchronised, so without it the
-// pod runs, reports Ready, and every query times out. Measured — the deployment
-// was 1/1 and `ntpd -q` against both the Service and the pod address returned
-// nothing.
+// Deliberately, and it was measured otherwise first: with the text shortened —
+// the same directives, the explanation moved into this comment — an operator
+// pass rewrote the ConfigMap the backend had just written. Harmless in itself,
+// since nothing reloads chronyd on a ConfigMap change, but it is two renderers
+// of one object, and the only reason it does not become a fight is that the
+// backend has been retired from this write. Identical text means it would not
+// be a fight even if it had not.
 //
-// The clock it serves is the node's, which the platform keeps correct; stratum
-// 10 says plainly that this is a local reference and not a traceable chain.
+// The explanation belongs in the file rather than here for the same reason:
+// whoever reads it reads it in the cluster.
 const chronyConf = `# Serve the node's clock, with no upstream of our own.
+#
+# ` + "`" + `local stratum 10` + "`" + ` is not optional here and its absence is silent: chronyd
+# refuses to answer at all until it considers itself synchronised, so without
+# it the pod runs, reports Ready, and every query times out. Measured — the
+# deployment was 1/1 and ` + "`" + `ntpd -q` + "`" + ` against both the Service and the pod IP
+# returned nothing.
+#
+# The clock it serves is the node's, which the platform keeps correct; stratum
+# 10 says plainly that this is a local reference and not a traceable chain.
 local stratum 10
 
 # Clients are tenant workers arriving through their own transit VIP; the

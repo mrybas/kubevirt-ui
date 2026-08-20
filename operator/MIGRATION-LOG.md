@@ -1901,3 +1901,58 @@ So `OPERATOR_TENANT_TIME_ENABLED`, in the N7 shape — flag on first (writers
 one function so the flag can be tested directly, and the test also asserts the
 guarded calls appear exactly once in the module, because a flag that covers one
 of two call sites is worse than no flag.
+
+### Live: the two renderers compared, and a time source that was not there
+
+The stand answered the question before the acceptance could: **the chrony
+Deployment did not exist.** Its ConfigMap did, created at 01:18 by the backend's
+own client, from the same call that should have created the Deployment beside
+it. Both live tenants were holding NTP addresses that served nothing — the exact
+shape the new condition exists to name, found by looking for something else.
+
+Who removed it is not established, and it is worth saying so rather than
+guessing. What is established: nothing in this repository deletes a Deployment
+by that name — neither the backend nor any controller has such a path — the
+ConfigMap from the same moment survived, so nothing swept the namespace, and no
+operator or backend log mentions it. Events last an hour and the deletion is
+older than that. The backend's own writer swallows a failed create with a log
+line, so "never created" is as consistent with the evidence as "deleted",
+and both are invisible for the same reason: nothing reported on it afterwards.
+
+Then the acceptance the two-renderer question deserved. The backend's rendering
+was applied first, from the backend's own code, on the stand:
+
+```
+kubectl exec … python -c 'print(build_chrony_config_map(), build_chrony_deployment())'
+deployment.apps/kubevirt-ui-ntp created   gen=1  2/2 ready
+```
+
+— which also put the live tenants' time back. Then the flag on, the operator's
+tenant domain up, and a tenant created through a CR:
+
+```
+chrony Deployment  generation 1 -> 1   resourceVersion 1135120 -> 1135120
+chrony ConfigMap   resourceVersion 1134857 -> 1136536
+tim1  AddressAssigned=True PKIReady=True TimeServed=True(Served: 10.199.0.102:123,
+      2 chrony endpoint(s)) GoldenReady=True NamespaceReady=True QuotaReserved=True
+```
+
+The Deployment did not move — the two renderers agree on the object that would
+roll a joining worker's time source. **The ConfigMap did**, and that is the
+finding: the same directives with the explanation moved into a Go comment is a
+different file, so each pass rewrote what the other wrote. Harmless in itself —
+nothing reloads chronyd on a ConfigMap change — but it is the fight the flag
+exists to prevent, arriving on the one object where it did not matter. The Go
+text is now byte-identical to the backend's, with the explanation back in the
+file where whoever reads it reads it in the cluster, and a test reads
+`CHRONY_CONF` out of the backend's source and compares. When that writer is
+deleted the test goes with it.
+
+PKIReady=True on that tenant is worth its own line: cert-manager issued the
+signer certificate, and the SAN check — the VIP among the IP addresses, both DNS
+names present — passed against a real certificate rather than a hand-built one.
+
+Open, and recorded rather than smoothed over: one full run of the controller
+suite failed while this slice was being finished, and the output was not kept —
+three runs since have passed. If it is real it will show in CI, where the suite
+runs on every push; if it does, the run that catches it will name it.

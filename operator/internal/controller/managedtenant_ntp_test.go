@@ -2,6 +2,8 @@ package controller
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -170,6 +172,16 @@ func TestAnUnsharedAddressIsReportedRatherThanIgnored(t *testing.T) {
 
 // TestTheTimeServerIsOneForTheWholeCluster.
 func TestTheTimeServerIsOneForTheWholeCluster(t *testing.T) {
+	// A tenant of its own, so the test does not depend on one its neighbours
+	// happened to leave behind: chrony is written when a tenant with an address
+	// reconciles, and running this alone would otherwise find nothing.
+	mustTenant(t, talosTenant("tntc"))
+	eventually(t, "the request for an address", func() error {
+		_, err := cpService("tntc")
+		return err
+	})
+	assignAddress(t, "tntc", "10.199.0.106")
+
 	eventually(t, "chrony", func() error {
 		deployment := &appsv1.Deployment{}
 		if err := k8sClient.Get(testCtx, types.NamespacedName{
@@ -214,5 +226,36 @@ func TestTheTimeServerIsOneForTheWholeCluster(t *testing.T) {
 	// synchronised, and the pod reports Ready throughout.
 	if !strings.Contains(config.Data["chrony.conf"], "local stratum 10") {
 		t.Errorf("chrony.conf = %q", config.Data["chrony.conf"])
+	}
+}
+
+// TestTheChronyConfigMatchesTheBackendsByte.
+//
+// Two renderers of one ConfigMap exist for as long as the backend's writer does,
+// and they must not disagree. Measured the wrong way round first: with the same
+// directives but the explanation moved into a Go comment, an operator pass
+// rewrote the ConfigMap the backend had just written on the live stand.
+//
+// Read out of the backend's own source rather than copied here, because a copy
+// is what drifts. When the backend's writer is deleted this test goes with it.
+func TestTheChronyConfigMatchesTheBackendsByte(t *testing.T) {
+	source, err := os.ReadFile(
+		filepath.Join("..", "..", "..", "backend", "app", "api", "v1", "tenants_ntp.py"))
+	if err != nil {
+		t.Skipf("the backend is not beside us here: %v", err)
+	}
+	const opener = "CHRONY_CONF = \"\"\"\\\n"
+	start := strings.Index(string(source), opener)
+	if start < 0 {
+		t.Skip("the backend no longer renders a chrony configuration of its own")
+	}
+	rest := string(source)[start+len(opener):]
+	end := strings.Index(rest, "\"\"\"")
+	if end < 0 {
+		t.Fatalf("CHRONY_CONF in the backend is not a closed string literal")
+	}
+	if theirs := rest[:end]; theirs != chronyConf {
+		t.Errorf("the two renderings differ, so each pass rewrites what the "+
+			"other wrote.\nbackend:\n%s\noperator:\n%s", theirs, chronyConf)
 	}
 }
