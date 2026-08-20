@@ -818,6 +818,10 @@ rather than left implicit.
    Worth keeping as a rule: `resourceVersion` stability is not proof of
    write-on-diff. The counter is.
 
+   Verified on the stand after the fix: six reconciles across two resync
+   cycles, `kubevirt_ui_operator_patches_total{controller="managedunderlay"}`
+   absent entirely — not one write of any kind.
+
 ### Deliberate design notes
 
 - The heal is add-only. A node dropping out of `readyNodes` is far more often
