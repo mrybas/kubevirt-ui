@@ -152,6 +152,25 @@ type ManagedNetworkSpec struct {
 	// +optional
 	VPCDNS *bool `json:"vpcDNS,omitempty"`
 
+	// DeletionPolicy decides what happens to the Vpc and its Subnet when this
+	// object is deleted.
+	//
+	// `Retain` is the default, and deliberately so. A network is very often
+	// written down after it already exists and already carries workloads, and
+	// describing something must not quietly become owning it — `kubectl delete`
+	// on a description would then delete a running network. With `Retain` this
+	// object can be added and removed freely; the network is untouched either
+	// way, and removing it is a separate, deliberate act.
+	//
+	// `Delete` opts in to the cascade, in the order kube-ovn requires: the
+	// resolver, then the subnets, then the router — and the router only once
+	// the subnets are really gone, because every one of them is finalized
+	// against it and removing it first strands them permanently.
+	// +kubebuilder:validation:Enum=Retain;Delete
+	// +kubebuilder:default=Retain
+	// +optional
+	DeletionPolicy string `json:"deletionPolicy,omitempty"`
+
 	// ServiceCIDR is the cluster's service network, needed for the one route a
 	// VpcDns pod does not get by itself.
 	//
@@ -233,6 +252,7 @@ type ManagedNetworkStatus struct {
 // +kubebuilder:printcolumn:name="Attached",type=string,JSONPath=`.status.conditions[?(@.type=="Attached")].status`
 // +kubebuilder:printcolumn:name="Via",type=string,JSONPath=`.status.defaultRouteVia`
 // +kubebuilder:printcolumn:name="DNS",type=string,JSONPath=`.status.conditions[?(@.type=="DNSReady")].status`
+// +kubebuilder:printcolumn:name="OnDelete",type=string,JSONPath=`.spec.deletionPolicy`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ManagedNetwork is a tenant network.

@@ -151,6 +151,11 @@ const (
 	ConditionReady = "Ready"
 	// ConditionDeleting is true while deletion is being held back, and its
 	// message names what is holding it.
+	//
+	// Shared with ManagedNetwork, where the thing holding it back is a subnet
+	// still finalizing against the router that must outlive it. In both cases
+	// the point is the same: the wait is reported rather than turned into an
+	// error somebody has to notice and retry.
 	ConditionDeleting = "Deleting"
 )
 

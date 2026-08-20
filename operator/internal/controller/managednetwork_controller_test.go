@@ -29,6 +29,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -660,6 +661,194 @@ func TestServiceCIDRIsConfigurableWhenItCannotBeDiscovered(t *testing.T) {
 			if !strings.Contains(cond.Message, phrase) {
 				return fmt.Errorf("message does not mention %q: %s", phrase, cond.Message)
 			}
+		}
+		return nil
+	})
+}
+
+// TestRetainIsTheDefaultAndDeletingTheCRChangesNothing is the property that
+// makes adoption safe, and the one that saved a live network on this stand when
+// an adoption CR had to be withdrawn in a hurry.
+func TestRetainIsTheDefaultAndDeletingTheCRChangesNothing(t *testing.T) {
+	net := mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netretain"},
+		Spec:       platformv1alpha1.ManagedNetworkSpec{CIDR: "10.200.136.0/22"},
+	})
+
+	eventually(t, "the VPC and subnet", func() error {
+		if _, err := readVPC("netretain"); err != nil {
+			return err
+		}
+		subnet := &unstructured.Unstructured{}
+		subnet.SetGroupVersionKind(subnetGVK)
+		return k8sClient.Get(testCtx, types.NamespacedName{Name: "netretain-default"}, subnet)
+	})
+
+	// No finalizer, because nothing was claimed.
+	current := getNetwork(t, "netretain")
+	if len(current.Finalizers) != 0 {
+		t.Fatalf("a Retain network claimed a finalizer: %v", current.Finalizers)
+	}
+
+	if err := k8sClient.Delete(testCtx, net); err != nil {
+		t.Fatalf("deleting the CR: %v", err)
+	}
+	eventually(t, "the CR to be gone", func() error {
+		out := &platformv1alpha1.ManagedNetwork{}
+		err := k8sClient.Get(testCtx, types.NamespacedName{Name: "netretain"}, out)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("still there: %v", err)
+	})
+
+	consistently(t, "the network surviving its description", 3*time.Second, func() error {
+		if _, err := readVPC("netretain"); err != nil {
+			return fmt.Errorf("the Vpc went with the CR: %w", err)
+		}
+		subnet := &unstructured.Unstructured{}
+		subnet.SetGroupVersionKind(subnetGVK)
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Name: "netretain-default",
+		}, subnet); err != nil {
+			return fmt.Errorf("the Subnet went with the CR: %w", err)
+		}
+		return nil
+	})
+}
+
+// TestDeleteCascadesInOrder: the router goes last, and only once its subnets
+// are really gone. Every subnet is finalized against that router, so removing
+// it first strands them permanently — measured on this lab two hours after a
+// delete, with the subnet still terminating and its addresses still missing
+// from the pool.
+func TestDeleteCascadesInOrder(t *testing.T) {
+	net := mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netcascade"},
+		Spec: platformv1alpha1.ManagedNetworkSpec{
+			CIDR:           "10.200.140.0/22",
+			DeletionPolicy: "Delete",
+		},
+	})
+
+	eventually(t, "the finalizer to be claimed", func() error {
+		current := getNetwork(t, "netcascade")
+		if len(current.Finalizers) == 0 {
+			return fmt.Errorf("no finalizer yet")
+		}
+		if _, err := readVPC("netcascade"); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err := k8sClient.Delete(testCtx, net); err != nil {
+		t.Fatalf("deleting the CR: %v", err)
+	}
+
+	eventually(t, "everything to be gone", func() error {
+		for _, check := range []struct {
+			what string
+			gvk  schema.GroupVersionKind
+			name string
+		}{
+			{"Vpc", vpcGVK, "netcascade"},
+			{"Subnet", subnetGVK, "netcascade-default"},
+			{"VpcDns", vpcDNSGVK, "netcascade-dns"},
+		} {
+			obj := &unstructured.Unstructured{}
+			obj.SetGroupVersionKind(check.gvk)
+			err := k8sClient.Get(testCtx, types.NamespacedName{Name: check.name}, obj)
+			if err == nil {
+				return fmt.Errorf("%s/%s is still there", check.what, check.name)
+			}
+			if !apierrors.IsNotFound(err) {
+				return err
+			}
+		}
+		out := &platformv1alpha1.ManagedNetwork{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Name: "netcascade"}, out); !apierrors.IsNotFound(err) {
+			return fmt.Errorf("the CR is still held: %v", out.Finalizers)
+		}
+		return nil
+	})
+}
+
+// TestDeleteWaitsRatherThanStranding: while a subnet is still finalizing, the
+// router must not go. The endpoint this replaces answered 409 with the same
+// list and the words "retry in a moment" — and nobody retried.
+func TestDeleteWaitsRatherThanStranding(t *testing.T) {
+	net := mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netstuck"},
+		Spec: platformv1alpha1.ManagedNetworkSpec{
+			CIDR:           "10.200.144.0/22",
+			DeletionPolicy: "Delete",
+		},
+	})
+
+	eventually(t, "the subnet", func() error {
+		subnet := &unstructured.Unstructured{}
+		subnet.SetGroupVersionKind(subnetGVK)
+		return k8sClient.Get(testCtx, types.NamespacedName{Name: "netstuck-default"}, subnet)
+	})
+
+	// Stand in for kube-ovn taking its time: a finalizer nothing will remove.
+	subnet := &unstructured.Unstructured{}
+	subnet.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: "netstuck-default"}, subnet); err != nil {
+		t.Fatalf("reading the subnet: %v", err)
+	}
+	subnet.SetFinalizers([]string{"test.kubevirt-ui.io/hold"})
+	if err := k8sClient.Update(testCtx, subnet); err != nil {
+		t.Fatalf("holding the subnet: %v", err)
+	}
+
+	if err := k8sClient.Delete(testCtx, net); err != nil {
+		t.Fatalf("deleting the CR: %v", err)
+	}
+
+	eventually(t, "the wait to be reported", func() error {
+		out := &platformv1alpha1.ManagedNetwork{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Name: "netstuck"}, out); err != nil {
+			return err
+		}
+		cond := networkCondition(out, platformv1alpha1.ConditionDeleting)
+		if cond == nil || cond.Reason != "Draining" {
+			return fmt.Errorf("condition = %v", cond)
+		}
+		if !strings.Contains(cond.Message, "netstuck-default") {
+			return fmt.Errorf("the message does not name what it waits for: %s", cond.Message)
+		}
+		return nil
+	})
+
+	// The router must still be there. Deleting it now is the permanent damage.
+	consistently(t, "the router outliving its subnets", 4*time.Second, func() error {
+		if _, err := readVPC("netstuck"); err != nil {
+			return fmt.Errorf("the router was removed while a subnet was still "+
+				"finalizing against it: %w", err)
+		}
+		return nil
+	})
+
+	// Let it go, and the cascade finishes on its own — no second request.
+	held := &unstructured.Unstructured{}
+	held.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: "netstuck-default"}, held); err != nil {
+		t.Fatalf("reading the held subnet: %v", err)
+	}
+	held.SetFinalizers(nil)
+	if err := k8sClient.Update(testCtx, held); err != nil {
+		t.Fatalf("releasing the subnet: %v", err)
+	}
+
+	eventually(t, "the cascade to finish by itself", func() error {
+		out := &platformv1alpha1.ManagedNetwork{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Name: "netstuck"}, out); !apierrors.IsNotFound(err) {
+			return fmt.Errorf("still held: %v", out.Finalizers)
+		}
+		if _, err := readVPC("netstuck"); err == nil {
+			return fmt.Errorf("the router is still there")
 		}
 		return nil
 	})

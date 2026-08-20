@@ -35,6 +35,10 @@ spec:
     - jsonPath: .status.conditions[?(@.type=="DNSReady")].status
       name: DNS
       type: string
+    - jsonPath: .spec.deletionPolicy
+      name: OnDelete
+      priority: 1
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -86,6 +90,27 @@ spec:
               cidr:
                 description: CIDR of the default subnet.
                 minLength: 1
+                type: string
+              deletionPolicy:
+                default: Retain
+                description: |-
+                  DeletionPolicy decides what happens to the Vpc and its Subnet when this
+                  object is deleted.
+
+                  `Retain` is the default, and deliberately so. A network is very often
+                  written down after it already exists and already carries workloads, and
+                  describing something must not quietly become owning it — `kubectl delete`
+                  on a description would then delete a running network. With `Retain` this
+                  object can be added and removed freely; the network is untouched either
+                  way, and removing it is a separate, deliberate act.
+
+                  `Delete` opts in to the cascade, in the order kube-ovn requires: the
+                  resolver, then the subnets, then the router — and the router only once
+                  the subnets are really gone, because every one of them is finalized
+                  against it and removing it first strands them permanently.
+                enum:
+                - Retain
+                - Delete
                 type: string
               dnsServer:
                 description: |-

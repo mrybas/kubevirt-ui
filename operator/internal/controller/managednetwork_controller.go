@@ -88,8 +88,22 @@ func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err := r.Get(ctx, req.NamespacedName, net); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	if net.Annotations[pausedAnnotation] == "true" || !net.DeletionTimestamp.IsZero() {
+	if !net.DeletionTimestamp.IsZero() {
+		return r.tearDown(ctx, net)
+	}
+	if net.Annotations[pausedAnnotation] == "true" {
 		return ctrl.Result{}, nil
+	}
+
+	// Done before anything is built, so a network that asked to be cascaded
+	// cannot exist for even one pass without the finalizer that makes the
+	// cascade possible.
+	if updated, err := r.reconcileFinalizer(ctx, net); err != nil {
+		return ctrl.Result{}, err
+	} else if updated {
+		// The object just changed under us; come back with the fresh copy
+		// rather than writing status against a stale resourceVersion.
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	before := net.DeepCopy()
