@@ -9,6 +9,7 @@ rules:
   resources:
   - configmaps
   - namespaces
+  - nodes
   verbs:
   - get
   - list
@@ -61,8 +62,28 @@ rules:
   - list
   - watch
 - apiGroups:
+  - frrk8s.metallb.io
+  resources:
+  - frrconfigurations
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - frrk8s.metallb.io
+  resources:
+  - frrnodestates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - kubeovn.io
   resources:
+  - ovn-eips
   - subnets
   - vpcs
   verbs:
@@ -102,6 +123,7 @@ rules:
 - apiGroups:
   - platform.kubevirt-ui.io
   resources:
+  - announcementpolicies
   - managedimages
   - managedvmoperations
   - managedvms
@@ -117,13 +139,7 @@ rules:
 - apiGroups:
   - platform.kubevirt-ui.io
   resources:
-  - managedimages/finalizers
-  - managedvms/finalizers
-  verbs:
-  - update
-- apiGroups:
-  - platform.kubevirt-ui.io
-  resources:
+  - announcementpolicies/status
   - managedimages/status
   - managedvmoperations/status
   - managedvms/status
@@ -131,6 +147,13 @@ rules:
   verbs:
   - get
   - patch
+  - update
+- apiGroups:
+  - platform.kubevirt-ui.io
+  resources:
+  - managedimages/finalizers
+  - managedvms/finalizers
+  verbs:
   - update
 - apiGroups:
   - snapshot.kubevirt.io

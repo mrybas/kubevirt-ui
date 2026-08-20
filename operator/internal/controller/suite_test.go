@@ -109,6 +109,14 @@ func runSuite(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("wiring image controller: %w", err)
 	}
 
+	if err := (&AnnouncementPolicyReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("announcementpolicy"),
+	}).SetupWithManager(mgr); err != nil {
+		return 0, fmt.Errorf("wiring announcement controller: %w", err)
+	}
+
 	if err := (&ManagedVMOperationReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),

@@ -6,6 +6,7 @@ resources:
 - bases/platform.kubevirt-ui.io_managedvms.yaml
 - bases/platform.kubevirt-ui.io_managedvmtemplates.yaml
 - bases/platform.kubevirt-ui.io_managedvmoperations.yaml
+- bases/platform.kubevirt-ui.io_announcementpolicies.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:
