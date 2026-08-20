@@ -357,3 +357,99 @@ func TestRemovingThePeeringRemovesBothEnds(t *testing.T) {
 		return nil
 	})
 }
+
+// TestAPeeringThatRoutesButDropsSaysSo.
+//
+// This is the failure the product has actually shipped: the link and the routes
+// perfect on both routers, the object reporting Active, and every packet
+// dropped by isolation. Measured again on the stand with this very controller —
+// two networks peered through a CR, both ends written, ping failing in both
+// directions — because the rule lists belonged to something that had not seen
+// the peering.
+//
+// So the verdict is not "did something write an allow" but "would a packet get
+// through", evaluated the way OVN evaluates it.
+func TestAPeeringThatRoutesButDropsSaysSo(t *testing.T) {
+	mustPeeredNetwork(t, "pj", "10.215.0.0/22")
+	mustPeeredNetwork(t, "pk", "10.215.4.0/22")
+
+	// The isolation floor, as something else would have written it.
+	for _, pair := range [][2]string{{"pj", "10.215.4.0/22"}, {"pk", "10.215.0.0/22"}} {
+		subnet := &unstructured.Unstructured{}
+		subnet.SetGroupVersionKind(subnetGVK)
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Name: pair[0] + "-default",
+		}, subnet); err != nil {
+			t.Fatalf("reading Subnet/%s: %v", pair[0], err)
+		}
+		if err := unstructured.SetNestedSlice(subnet.Object, []any{map[string]any{
+			"action": "drop", "direction": "to-lport",
+			"match": "ip4.src == " + pair[1], "priority": int64(3000),
+		}}, "spec", "acls"); err != nil {
+			t.Fatalf("building the drop: %v", err)
+		}
+		if err := k8sClient.Update(testCtx, subnet); err != nil {
+			t.Fatalf("writing the drop: %v", err)
+		}
+	}
+
+	mustPeering(t, "pj-pk", "pj", "pk")
+
+	eventually(t, "established and honest about the traffic", func() error {
+		link := getPeering(t, "pj-pk")
+		established := apimeta.FindStatusCondition(link.Status.Conditions,
+			platformv1alpha1.ConditionEstablished)
+		traffic := apimeta.FindStatusCondition(link.Status.Conditions,
+			platformv1alpha1.ConditionTrafficAllowed)
+		if established == nil || established.Status != metav1.ConditionTrue {
+			return fmt.Errorf("Established = %v", established)
+		}
+		if traffic == nil || traffic.Status != metav1.ConditionFalse {
+			return fmt.Errorf("TrafficAllowed = %v", traffic)
+		}
+		if traffic.Reason != "IsolationDrops" {
+			return fmt.Errorf("reason = %s", traffic.Reason)
+		}
+		for _, phrase := range []string{"pj", "pk", "still drop"} {
+			if !strings.Contains(traffic.Message, phrase) {
+				return fmt.Errorf("message does not mention %q: %s", phrase, traffic.Message)
+			}
+		}
+		return nil
+	})
+
+	// Lift the drops the way a composer would, and the verdict changes.
+	for _, pair := range [][2]string{{"pj", "10.215.4.0/22"}, {"pk", "10.215.0.0/22"}} {
+		subnet := &unstructured.Unstructured{}
+		subnet.SetGroupVersionKind(subnetGVK)
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Name: pair[0] + "-default",
+		}, subnet); err != nil {
+			t.Fatalf("reading Subnet/%s: %v", pair[0], err)
+		}
+		if err := unstructured.SetNestedSlice(subnet.Object, []any{
+			map[string]any{
+				"action": "drop", "direction": "to-lport",
+				"match": "ip4.src == " + pair[1], "priority": int64(3000),
+			},
+			map[string]any{
+				"action": "allow-related", "direction": "to-lport",
+				"match": "ip4.src == " + pair[1], "priority": int64(3100),
+			},
+		}, "spec", "acls"); err != nil {
+			t.Fatalf("building the allow: %v", err)
+		}
+		if err := k8sClient.Update(testCtx, subnet); err != nil {
+			t.Fatalf("writing the allow: %v", err)
+		}
+	}
+
+	eventually(t, "the verdict to change on its own", func() error {
+		traffic := apimeta.FindStatusCondition(getPeering(t, "pj-pk").Status.Conditions,
+			platformv1alpha1.ConditionTrafficAllowed)
+		if traffic == nil || traffic.Status != metav1.ConditionTrue {
+			return fmt.Errorf("TrafficAllowed = %v", traffic)
+		}
+		return nil
+	})
+}

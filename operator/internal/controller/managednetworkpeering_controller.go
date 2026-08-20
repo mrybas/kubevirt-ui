@@ -19,9 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"sort"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
+	"github.com/mrybas/kubevirt-ui/operator/internal/acl"
 	"github.com/mrybas/kubevirt-ui/operator/internal/kube"
 	"github.com/mrybas/kubevirt-ui/operator/internal/peering"
 )
@@ -149,17 +152,22 @@ func (r *ManagedNetworkPeeringReconciler) Reconcile(
 			kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before)
 	}
 
-	// The record goes in before the first write, not after: the point of it is
-	// to know what to undo when the process does not get to the end.
-	link.Status.LinkCIDR = chosen.CIDR
-	link.Status.Legs = []platformv1alpha1.PeeringLeg{
+	// The plan is recorded before anything is written, and that is the point of
+	// it: what has to be undone is what was *attempted*, not what is known to
+	// have landed. A process that stops mid-write leaves no report of the
+	// second, and removing an end that was never written costs nothing.
+	planned := []platformv1alpha1.PeeringLeg{
 		{Network: a, ConnectIP: chosen.A},
 		{Network: b, ConnectIP: chosen.B},
 	}
-	if err := kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before); err != nil {
-		return ctrl.Result{}, err
+	if link.Status.LinkCIDR != chosen.CIDR || !samePlan(link.Status.Legs, planned) {
+		link.Status.LinkCIDR = chosen.CIDR
+		link.Status.Legs = planned
+		if err := kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before); err != nil {
+			return ctrl.Result{}, err
+		}
+		before = link.DeepCopy()
 	}
-	before = link.DeepCopy()
 
 	ends := [][2]string{{a, b}, {b, a}}
 	for index, pair := range ends {
@@ -180,15 +188,12 @@ func (r *ManagedNetworkPeeringReconciler) Reconcile(
 				kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before)
 		}
 		link.Status.Legs[index].Applied = true
-		if err := kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before); err != nil {
-			return ctrl.Result{}, err
-		}
-		before = link.DeepCopy()
 	}
 
 	r.setPeeringCondition(link, true, "Established",
 		fmt.Sprintf("%s <-> %s over %s (%s <-> %s)",
 			a, b, chosen.CIDR, chosen.A, chosen.B))
+	r.judgeTraffic(ctx, link, a, b, cidrs)
 	link.Status.ObservedGeneration = link.Generation
 	return ctrl.Result{}, kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before)
 }
@@ -278,9 +283,25 @@ func (r *ManagedNetworkPeeringReconciler) applySide(
 	if spec == nil {
 		spec = map[string]any{}
 	}
-	spec["vpcPeerings"] = withPeering(spec["vpcPeerings"], remote, side.Peering)
-	spec["staticRoutes"] = withRoutes(spec["staticRoutes"], side.Routes)
-	spec["policyRoutes"] = withPolicies(spec["policyRoutes"], side.Policies)
+	wanted := map[string]any{
+		"vpcPeerings":  withPeering(spec["vpcPeerings"], remote, side.Peering),
+		"staticRoutes": withRoutes(spec["staticRoutes"], side.Routes),
+		"policyRoutes": withPolicies(spec["policyRoutes"], side.Policies),
+	}
+	// Written only when it differs. Re-applying an unchanged peering every pass
+	// is a write per reconcile on a router shared with other peerings and with
+	// the network controller, and each one is a chance for somebody else's
+	// concurrent write to lose.
+	unchanged := true
+	for key, value := range wanted {
+		if !equality.Semantic.DeepEqual(spec[key], value) {
+			unchanged = false
+		}
+		spec[key] = value
+	}
+	if unchanged {
+		return nil
+	}
 	if err := unstructured.SetNestedMap(vpc.Object, spec, "spec"); err != nil {
 		return err
 	}
@@ -289,6 +310,21 @@ func (r *ManagedNetworkPeeringReconciler) applySide(
 	}
 	kube.CountWrite(r.Scheme, vpc, peeringControllerName, "updated")
 	return nil
+}
+
+// samePlan compares the addresses, not the applied flags: an unchanged plan
+// must not be rewritten just because one end has since been written.
+func samePlan(current, planned []platformv1alpha1.PeeringLeg) bool {
+	if len(current) != len(planned) {
+		return false
+	}
+	for i := range planned {
+		if current[i].Network != planned[i].Network ||
+			current[i].ConnectIP != planned[i].ConnectIP {
+			return false
+		}
+	}
+	return true
 }
 
 // removeSide takes one router's half back off.
@@ -329,10 +365,10 @@ func (r *ManagedNetworkPeeringReconciler) removeSide(ctx context.Context, local,
 func (r *ManagedNetworkPeeringReconciler) rollBack(
 	ctx context.Context, link *platformv1alpha1.ManagedNetworkPeering,
 ) {
+	// Every planned end, not only the ones known to have landed: a process that
+	// stopped mid-write left no report of the second, and removing an end that
+	// was never written costs nothing.
 	for index := range link.Status.Legs {
-		if !link.Status.Legs[index].Applied {
-			continue
-		}
 		local := link.Status.Legs[index].Network
 		remote := link.Status.Legs[1-index].Network
 		if err := r.removeSide(ctx, local, remote); err != nil {
@@ -393,6 +429,96 @@ func (r *ManagedNetworkPeeringReconciler) subnetCIDRs(
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+// judgeTraffic asks whether a packet would get through, rather than whether
+// something wrote an allow.
+//
+// The routes and the link can be perfect while isolation still drops the peer's
+// prefix, and the product has shipped exactly that: peered on both routers,
+// reporting Active, carrying nothing in either direction. So each side's rule
+// list is evaluated the way OVN evaluates it, against an address out of the
+// other side's range.
+func (r *ManagedNetworkPeeringReconciler) judgeTraffic(
+	ctx context.Context, link *platformv1alpha1.ManagedNetworkPeering,
+	a, b string, cidrs map[string][]string,
+) {
+	var blocked []string
+	for _, pair := range [][2]string{{a, b}, {b, a}} {
+		local, remote := pair[0], pair[1]
+		for _, cidr := range cidrs[remote] {
+			source, err := firstAddressOf(cidr)
+			if err != nil {
+				continue
+			}
+			rules, err := r.aclsOf(ctx, local)
+			if err != nil {
+				r.setTrafficCondition(link, false, "Unreadable", err.Error())
+				return
+			}
+			if verdict := acl.Evaluate(rules, source, "to-lport"); verdict != acl.Allowed {
+				blocked = append(blocked,
+					fmt.Sprintf("%s from %s (%s)", local, cidr, verdict))
+			}
+		}
+	}
+
+	if len(blocked) > 0 {
+		r.setTrafficCondition(link, false, "IsolationDrops",
+			fmt.Sprintf("the link and the routes are in place and the isolation "+
+				"rules still drop the traffic: %s. Whatever owns those rule lists "+
+				"has not seen this peering — a ManagedNetwork's composer picks it "+
+				"up on its own; a list written elsewhere does not",
+				strings.Join(blocked, "; ")))
+		return
+	}
+	r.setTrafficCondition(link, true, "Allowed",
+		"both sides let the other's prefixes in")
+}
+
+// aclsOf reads the rule lists of every subnet in a network.
+func (r *ManagedNetworkPeeringReconciler) aclsOf(
+	ctx context.Context, vpc string,
+) ([]acl.Rule, error) {
+	subnets := &unstructured.UnstructuredList{}
+	subnets.SetGroupVersionKind(subnetGVK.GroupVersion().WithKind("SubnetList"))
+	if err := r.List(ctx, subnets); err != nil {
+		return nil, fmt.Errorf("listing subnets of %s: %w", vpc, err)
+	}
+	var out []acl.Rule
+	for i := range subnets.Items {
+		owner, _, _ := unstructured.NestedString(subnets.Items[i].Object, "spec", "vpc")
+		if owner != vpc {
+			continue
+		}
+		out = append(out, readACLs(&subnets.Items[i])...)
+	}
+	return out, nil
+}
+
+// firstAddressOf is a representative host inside a prefix.
+func firstAddressOf(cidr string) (netip.Addr, error) {
+	prefix, err := netip.ParsePrefix(cidr)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	return prefix.Masked().Addr().Next(), nil
+}
+
+func (r *ManagedNetworkPeeringReconciler) setTrafficCondition(
+	link *platformv1alpha1.ManagedNetworkPeering, ok bool, reason, message string,
+) {
+	status := metav1.ConditionTrue
+	if !ok {
+		status = metav1.ConditionFalse
+	}
+	apimeta.SetStatusCondition(&link.Status.Conditions, metav1.Condition{
+		Type:               platformv1alpha1.ConditionTrafficAllowed,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: link.Generation,
+	})
 }
 
 func (r *ManagedNetworkPeeringReconciler) setPeeringCondition(

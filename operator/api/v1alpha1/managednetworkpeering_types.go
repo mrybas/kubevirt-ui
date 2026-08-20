@@ -63,6 +63,16 @@ const (
 	// ConditionEstablished is true only when both ends are written. There is no
 	// partial success here worth reporting as success.
 	ConditionEstablished = "Established"
+
+	// ConditionTrafficAllowed is whether a packet would actually get through.
+	//
+	// Separate from Established because the two came apart in practice: the
+	// routes and the link can be perfect while the isolation rules still drop
+	// the peer's prefix, and the product has shipped exactly that — a peering
+	// written on both routers, reporting Active, carrying nothing. The check is
+	// not "did something write an allow" but "does the rule set on each side
+	// let the other side's address in", evaluated the way OVN evaluates it.
+	ConditionTrafficAllowed = "TrafficAllowed"
 )
 
 // ManagedNetworkPeeringStatus is what was actually written.
@@ -91,6 +101,7 @@ type ManagedNetworkPeeringStatus struct {
 // +kubebuilder:printcolumn:name="Networks",type=string,JSONPath=`.spec.networks`
 // +kubebuilder:printcolumn:name="Link",type=string,JSONPath=`.status.linkCIDR`
 // +kubebuilder:printcolumn:name="Established",type=string,JSONPath=`.status.conditions[?(@.type=="Established")].status`
+// +kubebuilder:printcolumn:name="Traffic",type=string,JSONPath=`.status.conditions[?(@.type=="TrafficAllowed")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ManagedNetworkPeering connects two networks directly.
