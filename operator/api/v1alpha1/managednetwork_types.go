@@ -46,6 +46,17 @@ type ExternalPlane struct {
 	// +optional
 	Attachments []string `json:"attachments,omitempty"`
 
+	// DNSServer is the resolver handed to workloads over DHCP, after resolving
+	// it — published because it is otherwise invisible: it lives inside a DHCP
+	// option string on another object.
+	// +optional
+	DNSServer string `json:"dnsServer,omitempty"`
+
+	// ServiceRoute is the route added to the VpcDns pod so it can reach the
+	// cluster resolver, in `<cidr> via <gateway>` form.
+	// +optional
+	ServiceRoute string `json:"serviceRoute,omitempty"`
+
 	// EgressSubnet is the attachment the default route leaves through. Its
 	// gateway address is read from the Subnet itself rather than configured:
 	// the same number in two places is the same number until one of them
@@ -133,6 +144,23 @@ type ManagedNetworkSpec struct {
 
 	// +optional
 	ExternalPlane *ExternalPlane `json:"externalPlane,omitempty"`
+
+	// VPCDNS gives the network its own DNS deployment, forwarding to the
+	// cluster's resolver. Without it a workload in this network can reach
+	// nothing by name.
+	// +kubebuilder:default=true
+	// +optional
+	VPCDNS *bool `json:"vpcDNS,omitempty"`
+
+	// ServiceCIDR is the cluster's service network, needed for the one route a
+	// VpcDns pod does not get by itself.
+	//
+	// Empty means read it from the cluster — the kubeadm ConfigMap if there is
+	// one, otherwise the apiserver's own `--service-cluster-ip-range`. Both are
+	// the cluster stating a fact about itself, which beats a value somebody
+	// retypes here and nobody notices going stale.
+	// +optional
+	ServiceCIDR string `json:"serviceCIDR,omitempty"`
 }
 
 // Condition types published by the network controller.
@@ -140,6 +168,15 @@ const (
 	// ConditionNetworkReady is false while the VPC or its default subnet is
 	// missing, refused, or not yet reported ready by kube-ovn.
 	ConditionNetworkReady = "Ready"
+
+	// ConditionDNSReady is false when this network's resolver is missing, or
+	// present and unable to answer.
+	//
+	// Its own condition because it fails on its own and quietly. A VpcDns
+	// reports ACTIVE with both pods Running while answering nothing, which is
+	// exactly what happened when a CoreDNS restart moved the pods the Corefile
+	// had pinned.
+	ConditionDNSReady = "DNSReady"
 
 	// ConditionAttached is false when the external plane was asked for and the
 	// VPC does not have it.
@@ -170,6 +207,17 @@ type ManagedNetworkStatus struct {
 	// +optional
 	Attachments []string `json:"attachments,omitempty"`
 
+	// DNSServer is the resolver handed to workloads over DHCP, after resolving
+	// it — published because it is otherwise invisible: it lives inside a DHCP
+	// option string on another object.
+	// +optional
+	DNSServer string `json:"dnsServer,omitempty"`
+
+	// ServiceRoute is the route added to the VpcDns pod so it can reach the
+	// cluster resolver, in `<cidr> via <gateway>` form.
+	// +optional
+	ServiceRoute string `json:"serviceRoute,omitempty"`
+
 	// +optional
 	// +listType=map
 	// +listMapKey=type
@@ -184,6 +232,7 @@ type ManagedNetworkStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Attached",type=string,JSONPath=`.status.conditions[?(@.type=="Attached")].status`
 // +kubebuilder:printcolumn:name="Via",type=string,JSONPath=`.status.defaultRouteVia`
+// +kubebuilder:printcolumn:name="DNS",type=string,JSONPath=`.status.conditions[?(@.type=="DNSReady")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ManagedNetwork is a tenant network.

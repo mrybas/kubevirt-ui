@@ -144,7 +144,7 @@ func TestTheRenderMatchesWhatTheProductBuilt(t *testing.T) {
 			nextHop := "10.199.4.254"
 
 			assertRenderedKeysMatch(t, "Vpc", VPCSpec(net), liveVPC.Spec)
-			assertRenderedKeysMatch(t, "Subnet", SubnetSpec(net, gateway), liveSubnet.Spec)
+			assertRenderedKeysMatch(t, "Subnet", SubnetSpec(net, gateway, net.Spec.DNSServer), liveSubnet.Spec)
 
 			// The list-valued fields are merged, so the acceptance is sharper
 			// than equality: adopting a network the product already built must
@@ -189,7 +189,7 @@ func TestAnEmptyListIsNotWritten(t *testing.T) {
 	if _, present := spec["namespaces"]; present {
 		t.Errorf("namespaces written for an empty list: %v", spec["namespaces"])
 	}
-	subnet := SubnetSpec(tenantNetwork("x", "10.200.0.0/22"), "10.200.0.1")
+	subnet := SubnetSpec(tenantNetwork("x", "10.200.0.0/22"), "10.200.0.1", "10.96.0.200")
 	if _, present := subnet["namespaces"]; present {
 		t.Errorf("namespaces written for an empty list: %v", subnet["namespaces"])
 	}
@@ -249,13 +249,11 @@ func TestTheEgressSubnetIsAlwaysAttached(t *testing.T) {
 // exactly like a working one until something tries to resolve, so a plausible
 // default is worse than none.
 func TestTheResolverIsOnlyPromisedWhenDeclared(t *testing.T) {
-	net := tenantNetwork("x", "10.200.0.0/22")
-	if got := DHCPOptions(net, "10.200.0.1"); got !=
+	if got := DHCPOptions("10.200.0.1", "10.96.0.200"); got !=
 		"lease_time=3600,router=10.200.0.1,server_id=10.200.0.1,dns_server=10.96.0.200" {
 		t.Errorf("got %q", got)
 	}
-	net.Spec.DNSServer = ""
-	if got := DHCPOptions(net, "10.200.0.1"); got !=
+	if got := DHCPOptions("10.200.0.1", ""); got !=
 		"lease_time=3600,router=10.200.0.1,server_id=10.200.0.1" {
 		t.Errorf("got %q", got)
 	}

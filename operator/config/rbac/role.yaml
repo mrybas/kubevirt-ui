@@ -9,6 +9,7 @@ rules:
   resources:
   - configmaps
   - namespaces
+  - pods
   verbs:
   - get
   - list
@@ -58,6 +59,15 @@ rules:
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - get
+  - list
+  - patch
   - watch
 - apiGroups:
   - cdi.kubevirt.io
@@ -127,6 +137,7 @@ rules:
   - provider-networks
   - subnets
   - vlans
+  - vpc-dnses
   - vpcs
   verbs:
   - create

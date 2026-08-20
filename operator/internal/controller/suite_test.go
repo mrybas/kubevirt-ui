@@ -121,6 +121,15 @@ func runSuite(m *testing.M) (int, error) {
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorderFor("managednetwork"),
+		// Pinned, because the underlay tests plant kube-ovn CNI DaemonSets in
+		// several namespaces of their own and discovery would pick whichever
+		// the API server listed first.
+		KubeOVNNamespace: "kube-ovn",
+		// The real one. envtest has no apiserver pod and no kubeadm ConfigMap,
+		// which is the same shape as a managed control plane — so discovery
+		// genuinely fails here, and that is worth exercising rather than
+		// stubbing.
+		APIReader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		return 0, fmt.Errorf("wiring network controller: %w", err)
 	}

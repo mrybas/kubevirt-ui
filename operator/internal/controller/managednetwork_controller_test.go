@@ -18,8 +18,12 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
@@ -71,6 +75,23 @@ func mustExternalSubnet(t *testing.T, name, cidr, gateway string) {
 	if err := k8sClient.Create(testCtx, subnet); err != nil && !apierrors.IsAlreadyExists(err) {
 		t.Fatalf("creating the external subnet %s: %v", name, err)
 	}
+}
+
+// mustKubeOVNNamespace tolerates the namespace already being there: several
+// tests share the one the controller is pinned to.
+func mustSharedNamespace(t *testing.T, name string) {
+	t.Helper()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	if err := k8sClient.Create(testCtx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating namespace %s: %v", name, err)
+	}
+}
+
+// mustOverlaySubnet is the default cluster overlay; its gateway is the next hop
+// the service route uses.
+func mustOverlaySubnet(t *testing.T) {
+	t.Helper()
+	mustExternalSubnet(t, overlaySubnet, "10.16.0.0/16", "10.16.0.1")
 }
 
 func networkCondition(net *platformv1alpha1.ManagedNetwork, kind string) *metav1.Condition {
@@ -442,6 +463,203 @@ func TestNetworkStopsWriting(t *testing.T) {
 	consistently(t, "no further writes", 3*time.Second, func() error {
 		if now := networkWrites(); now != baseline {
 			return fmt.Errorf("writes went from %v to %v with nothing changed", baseline, now)
+		}
+		return nil
+	})
+}
+
+// TestTheServiceRouteGoesOnWhenTheDeploymentAppears is the defect this slice
+// exists for.
+//
+// kube-ovn creates the VpcDns Deployment *after* the VpcDns object, so at
+// create time there is nothing to annotate. The old path tried once, logged
+// that it would be applied "on the next reconcile", and had no next reconcile —
+// only a person calling the recreate endpoint. Without the route a VpcDns pod
+// cannot reach the cluster resolver's ClusterIP at all, and the object reports
+// ACTIVE with its pods Running the whole time.
+func TestTheServiceRouteGoesOnWhenTheDeploymentAppears(t *testing.T) {
+	mustSharedNamespace(t, "kube-ovn")
+	mustOverlaySubnet(t)
+
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netdns"},
+		Spec: platformv1alpha1.ManagedNetworkSpec{
+			CIDR:        "10.200.128.0/22",
+			ServiceCIDR: "10.96.0.0/12",
+		},
+	})
+
+	eventually(t, "the VpcDns object", func() error {
+		dns := &unstructured.Unstructured{}
+		dns.SetGroupVersionKind(vpcDNSGVK)
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Name: "netdns-dns"}, dns); err != nil {
+			return err
+		}
+		vpc, _, _ := unstructured.NestedString(dns.Object, "spec", "vpc")
+		subnet, _, _ := unstructured.NestedString(dns.Object, "spec", "subnet")
+		if vpc != "netdns" || subnet != "netdns-default" {
+			return fmt.Errorf("spec = %s / %s", vpc, subnet)
+		}
+		return nil
+	})
+
+	// Before the Deployment exists this is a waiting state, and it is reported
+	// as one rather than passed over in silence.
+	eventually(t, "the wait to be visible", func() error {
+		cond := networkCondition(getNetwork(t, "netdns"), platformv1alpha1.ConditionDNSReady)
+		if cond == nil || cond.Reason != "DeploymentPending" {
+			return fmt.Errorf("condition = %v", cond)
+		}
+		return nil
+	})
+
+	// Now kube-ovn's controller does its part, some time later.
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "vpc-dns-netdns-dns", Namespace: "kube-ovn"},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "vpc-dns"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "vpc-dns"}},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name: "coredns", Image: "coredns/coredns:1.11.1",
+				}}},
+			},
+		},
+	}
+	if err := k8sClient.Create(testCtx, deployment); err != nil {
+		t.Fatalf("creating the VpcDns deployment: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(testCtx, deployment) })
+
+	eventually(t, "the route to be applied without anybody asking", func() error {
+		live := &appsv1.Deployment{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "kube-ovn", Name: "vpc-dns-netdns-dns",
+		}, live); err != nil {
+			return err
+		}
+		got := live.Spec.Template.Annotations[serviceRouteAnnotation]
+		want := `[{"dst":"10.96.0.0/12","gw":"10.16.0.1"}]`
+		if got != want {
+			return fmt.Errorf("annotation = %q, want %q", got, want)
+		}
+		return nil
+	})
+
+	eventually(t, "DNSReady", func() error {
+		net := getNetwork(t, "netdns")
+		cond := networkCondition(net, platformv1alpha1.ConditionDNSReady)
+		if cond == nil || cond.Status != metav1.ConditionTrue {
+			return fmt.Errorf("condition = %v", cond)
+		}
+		if net.Status.ServiceRoute != "10.96.0.0/12 via 10.16.0.1" {
+			return fmt.Errorf("status.serviceRoute = %q", net.Status.ServiceRoute)
+		}
+		return nil
+	})
+
+	// And it is put back. Something else editing the pod template — a helm
+	// upgrade of kube-ovn, a person — used to mean the route was gone until
+	// somebody thought to call an endpoint.
+	live := &appsv1.Deployment{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "kube-ovn", Name: "vpc-dns-netdns-dns",
+	}, live); err != nil {
+		t.Fatalf("reading the deployment: %v", err)
+	}
+	// Tampered rather than deleted, deliberately. A missing annotation and a
+	// wrong one are different code paths, and the wrong one is the dangerous
+	// shape: the route is present, so anything checking for presence is
+	// satisfied, and the packets still go nowhere.
+	tampered := live.DeepCopy()
+	tampered.Spec.Template.Annotations[serviceRouteAnnotation] =
+		`[{"dst":"10.96.0.0/12","gw":"10.16.0.99"}]`
+	if err := k8sClient.Patch(testCtx, tampered, client.MergeFrom(live)); err != nil {
+		t.Fatalf("tampering with the route: %v", err)
+	}
+
+	eventually(t, "the wrong route to be corrected on its own", func() error {
+		current := &appsv1.Deployment{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "kube-ovn", Name: "vpc-dns-netdns-dns",
+		}, current); err != nil {
+			return err
+		}
+		got := current.Spec.Template.Annotations[serviceRouteAnnotation]
+		if got != `[{"dst":"10.96.0.0/12","gw":"10.16.0.1"}]` {
+			return fmt.Errorf("still %q", got)
+		}
+		return nil
+	})
+
+	// And the same for it being removed outright.
+	current := &appsv1.Deployment{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "kube-ovn", Name: "vpc-dns-netdns-dns",
+	}, current); err != nil {
+		t.Fatalf("reading the deployment: %v", err)
+	}
+	stripped := current.DeepCopy()
+	delete(stripped.Spec.Template.Annotations, serviceRouteAnnotation)
+	if err := k8sClient.Patch(testCtx, stripped, client.MergeFrom(current)); err != nil {
+		t.Fatalf("stripping the route: %v", err)
+	}
+
+	eventually(t, "the missing route to come back on its own", func() error {
+		after := &appsv1.Deployment{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "kube-ovn", Name: "vpc-dns-netdns-dns",
+		}, after); err != nil {
+			return err
+		}
+		if after.Spec.Template.Annotations[serviceRouteAnnotation] == "" {
+			return fmt.Errorf("still missing")
+		}
+		return nil
+	})
+}
+
+// TestServiceCIDRIsConfigurableWhenItCannotBeDiscovered: on a managed control
+// plane there is no kubeadm ConfigMap and no readable apiserver pod, so the
+// cluster genuinely cannot be asked. That is a configuration case, and it has
+// to say so rather than leaving DNS quietly unrouted.
+func TestServiceCIDRIsConfigurableWhenItCannotBeDiscovered(t *testing.T) {
+	mustSharedNamespace(t, "kube-ovn")
+	mustOverlaySubnet(t)
+
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netnocidr"},
+		Spec:       platformv1alpha1.ManagedNetworkSpec{CIDR: "10.200.132.0/22"},
+	})
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "vpc-dns-netnocidr-dns", Namespace: "kube-ovn"},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "vpc-dns"}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "vpc-dns"}},
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{
+					Name: "coredns", Image: "coredns/coredns:1.11.1",
+				}}},
+			},
+		},
+	}
+	if err := k8sClient.Create(testCtx, deployment); err != nil {
+		t.Fatalf("creating the VpcDns deployment: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(testCtx, deployment) })
+
+	// envtest has no apiserver pod and no kubeadm ConfigMap, which is exactly
+	// the shape of a managed control plane.
+	eventually(t, "an honest refusal naming both ways out", func() error {
+		cond := networkCondition(getNetwork(t, "netnocidr"), platformv1alpha1.ConditionDNSReady)
+		if cond == nil || cond.Reason != "ServiceCIDRUnknown" {
+			return fmt.Errorf("condition = %v", cond)
+		}
+		for _, phrase := range []string{"--service-cidr", "spec.serviceCIDR", "managed control plane"} {
+			if !strings.Contains(cond.Message, phrase) {
+				return fmt.Errorf("message does not mention %q: %s", phrase, cond.Message)
+			}
 		}
 		return nil
 	})

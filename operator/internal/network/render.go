@@ -245,7 +245,7 @@ func VPCSpec(net *platformv1alpha1.ManagedNetwork) map[string]any {
 //
 // `acls` is not here on purpose. That list has one writer, and this controller
 // is not it until the composer can prove its render equals the live list.
-func SubnetSpec(net *platformv1alpha1.ManagedNetwork, gateway string) map[string]any {
+func SubnetSpec(net *platformv1alpha1.ManagedNetwork, gateway, dnsServer string) map[string]any {
 	spec := map[string]any{
 		"protocol":  "IPv4",
 		"cidrBlock": net.Spec.CIDR,
@@ -258,7 +258,7 @@ func SubnetSpec(net *platformv1alpha1.ManagedNetwork, gateway string) map[string
 		"enableDHCP":  true,
 		"natOutgoing": net.Spec.NATGateway,
 	}
-	if options := DHCPOptions(net, gateway); options != "" {
+	if options := DHCPOptions(gateway, dnsServer); options != "" {
 		spec["dhcpV4Options"] = options
 	}
 	if len(net.Spec.Namespaces) > 0 {
@@ -272,14 +272,14 @@ func SubnetSpec(net *platformv1alpha1.ManagedNetwork, gateway string) map[string
 // The resolver is included only when one was declared. Defaulting it to
 // something plausible would be worse than leaving it out: a wrong resolver
 // address behaves exactly like a working one until something tries to resolve.
-func DHCPOptions(net *platformv1alpha1.ManagedNetwork, gateway string) string {
+func DHCPOptions(gateway, dnsServer string) string {
 	parts := []string{
 		"lease_time=3600",
 		"router=" + gateway,
 		"server_id=" + gateway,
 	}
-	if net.Spec.DNSServer != "" {
-		parts = append(parts, "dns_server="+net.Spec.DNSServer)
+	if dnsServer != "" {
+		parts = append(parts, "dns_server="+dnsServer)
 	}
 	return strings.Join(parts, ",")
 }

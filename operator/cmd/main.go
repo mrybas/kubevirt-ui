@@ -75,6 +75,7 @@ func main() {
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var domainsFlag string
+	var serviceCIDRFlag string
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -93,6 +94,12 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.StringVar(&serviceCIDRFlag, "service-cidr", "",
+		"The cluster's service network, e.g. 10.96.0.0/12. Empty means read it "+
+			"from the cluster: the kubeadm ConfigMap, else the apiserver's own "+
+			"--service-cluster-ip-range. Set this where neither is readable — a "+
+			"managed control plane exposes no apiserver pod, and VPC DNS needs "+
+			"the range to route to the cluster resolver.")
 	flag.StringVar(&domainsFlag, "domains", domains.VM,
 		"Comma-separated controller domains this process runs: "+
 			"vm, network, tenant, remediation. Each domain is deployed separately so "+
@@ -269,9 +276,11 @@ func main() {
 			os.Exit(1)
 		}
 		if err := (&controller.ManagedNetworkReconciler{
-			Client:   mgr.GetClient(),
-			Scheme:   mgr.GetScheme(),
-			Recorder: mgr.GetEventRecorderFor("managednetwork"),
+			Client:      mgr.GetClient(),
+			Scheme:      mgr.GetScheme(),
+			Recorder:    mgr.GetEventRecorderFor("managednetwork"),
+			APIReader:   mgr.GetAPIReader(),
+			ServiceCIDR: serviceCIDRFlag,
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "managednetwork")
 			os.Exit(1)

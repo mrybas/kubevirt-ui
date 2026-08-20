@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1"
+
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -29,8 +31,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
@@ -53,11 +57,30 @@ type ManagedNetworkReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
 	Recorder record.EventRecorder
+
+	// APIReader reads straight from the API server. Used for the one lookup
+	// that must not build a cache: the cluster's service network, which is
+	// asked for once per process and lives among every Pod and ConfigMap in
+	// kube-system.
+	APIReader client.Reader
+
+	// KubeOVNNamespace is where kube-ovn runs. Empty means find it.
+	KubeOVNNamespace string
+
+	// ServiceCIDR states the cluster's service network for installs where it
+	// cannot be discovered — a managed control plane exposes neither the
+	// kubeadm ConfigMap nor an apiserver pod. Set once on the operator instead
+	// of on every network.
+	ServiceCIDR string
+
+	serviceCIDRs serviceCIDRCache
 }
 
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managednetworks,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managednetworks/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=kubeovn.io,resources=vpcs,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kubeovn.io,resources=vpcs;vpc-dnses,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups="",resources=configmaps;pods,verbs=get;list;watch
 
 // Reconcile writes the VPC and its default subnet.
 func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -96,10 +119,16 @@ func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		_ = kube.UpdateStatus(ctx, r.Client, networkControllerName, net, before)
 		return ctrl.Result{}, err
 	}
-	if err := r.ensureSubnet(ctx, net, gateway); err != nil {
+	if err := r.ensureSubnet(ctx, net, gateway, r.resolveDNSServer(ctx, net, r.kubeOVNNamespaceFor(ctx))); err != nil {
 		r.setNetworkCondition(net, platformv1alpha1.ConditionNetworkReady, false, "WriteFailed", err.Error())
 		net.Status.ObservedGeneration = net.Generation
 		_ = kube.UpdateStatus(ctx, r.Client, networkControllerName, net, before)
+		return ctrl.Result{}, err
+	}
+
+	kubeOVNNS := r.kubeOVNNamespaceFor(ctx)
+	net.Status.DNSServer = r.resolveDNSServer(ctx, net, kubeOVNNS)
+	if err := r.reconcileDNS(ctx, net, kubeOVNNS); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -189,10 +218,10 @@ func (r *ManagedNetworkReconciler) ensureVPC(
 
 // ensureSubnet writes the default subnet.
 func (r *ManagedNetworkReconciler) ensureSubnet(
-	ctx context.Context, net *platformv1alpha1.ManagedNetwork, gateway string,
+	ctx context.Context, net *platformv1alpha1.ManagedNetwork, gateway, dnsServer string,
 ) error {
 	name := network.DefaultSubnetName(net)
-	want := network.SubnetSpec(net, gateway)
+	want := network.SubnetSpec(net, gateway, dnsServer)
 	live := &unstructured.Unstructured{}
 	live.SetGroupVersionKind(subnetGVK)
 	live.SetName(name)
@@ -303,6 +332,24 @@ func (r *ManagedNetworkReconciler) judgeAttachment(
 	}
 }
 
+// kubeOVNNamespaceFor is where kube-ovn runs: configured, or found from its own
+// CNI DaemonSet.
+func (r *ManagedNetworkReconciler) kubeOVNNamespaceFor(ctx context.Context) string {
+	if r.KubeOVNNamespace != "" {
+		return r.KubeOVNNamespace
+	}
+	list := &appsv1.DaemonSetList{}
+	if err := r.List(ctx, list); err != nil {
+		return ""
+	}
+	for i := range list.Items {
+		if list.Items[i].Name == "kube-ovn-cni" {
+			return list.Items[i].Namespace
+		}
+	}
+	return ""
+}
+
 func toAnySlice(in []string) []any {
 	out := make([]any, 0, len(in))
 	for _, v := range in {
@@ -360,11 +407,22 @@ func (r *ManagedNetworkReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	vpcs.SetGroupVersionKind(vpcGVK)
 	subnets := &unstructured.Unstructured{}
 	subnets.SetGroupVersionKind(subnetGVK)
+	vpcDNSes := &unstructured.Unstructured{}
+	vpcDNSes.SetGroupVersionKind(vpcDNSGVK)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&platformv1alpha1.ManagedNetwork{}).
 		Watches(vpcs, toNetworks).
 		Watches(subnets, toNetworks).
+		Watches(vpcDNSes, toNetworks).
+		// The whole point of moving the service route here: kube-ovn creates
+		// the VpcDns Deployment after the object, so the route used to be
+		// applied best-effort at create time and then only by a person calling
+		// an endpoint. A Deployment write now wakes the controller.
+		Watches(&appsv1.Deployment{}, toNetworks,
+			builder.WithPredicates(predicate.NewPredicateFuncs(func(o client.Object) bool {
+				return strings.HasPrefix(o.GetName(), "vpc-dns-")
+			}))).
 		Named(networkControllerName).
 		Complete(r)
 }

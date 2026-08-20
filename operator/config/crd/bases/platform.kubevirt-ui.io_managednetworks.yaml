@@ -32,6 +32,9 @@ spec:
     - jsonPath: .status.defaultRouteVia
       name: Via
       type: string
+    - jsonPath: .status.conditions[?(@.type=="DNSReady")].status
+      name: DNS
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -114,6 +117,12 @@ spec:
                     items:
                       type: string
                     type: array
+                  dnsServer:
+                    description: |-
+                      DNSServer is the resolver handed to workloads over DHCP, after resolving
+                      it — published because it is otherwise invisible: it lives inside a DHCP
+                      option string on another object.
+                    type: string
                   egressSubnet:
                     description: |-
                       EgressSubnet is the attachment the default route leaves through. Its
@@ -124,6 +133,11 @@ spec:
                       Empty means no default route, and therefore a VPC that is attached but
                       does not leave. That is a legitimate shape — the control-plane transit
                       plane is exactly that — so it is not an error.
+                    type: string
+                  serviceRoute:
+                    description: |-
+                      ServiceRoute is the route added to the VpcDns pod so it can reach the
+                      cluster resolver, in `<cidr> via <gateway>` form.
                     type: string
                 type: object
               folder:
@@ -171,6 +185,16 @@ spec:
                   tenant a drop on the very address it egresses through. `infrastructure`
                   means this network serves the others.
                 type: string
+              serviceCIDR:
+                description: |-
+                  ServiceCIDR is the cluster's service network, needed for the one route a
+                  VpcDns pod does not get by itself.
+
+                  Empty means read it from the cluster — the kubeadm ConfigMap if there is
+                  one, otherwise the apiserver's own `--service-cluster-ip-range`. Both are
+                  the cluster stating a fact about itself, which beats a value somebody
+                  retypes here and nobody notices going stale.
+                type: string
               sharedCIDRs:
                 description: SharedCIDRs are prefixes this network may still reach
                   while isolated.
@@ -197,6 +221,13 @@ spec:
                 type: array
               tenant:
                 type: string
+              vpcDNS:
+                default: true
+                description: |-
+                  VPCDNS gives the network its own DNS deployment, forwarding to the
+                  cluster's resolver. Without it a workload in this network can reach
+                  nothing by name.
+                type: boolean
             required:
             - cidr
             type: object
@@ -274,11 +305,22 @@ spec:
                   announced when its default route leads into the external subnet — so the
                   datapath and the announcement cannot drift apart.
                 type: string
+              dnsServer:
+                description: |-
+                  DNSServer is the resolver handed to workloads over DHCP, after resolving
+                  it — published because it is otherwise invisible: it lives inside a DHCP
+                  option string on another object.
+                type: string
               gateway:
                 type: string
               observedGeneration:
                 format: int64
                 type: integer
+              serviceRoute:
+                description: |-
+                  ServiceRoute is the route added to the VpcDns pod so it can reach the
+                  cluster resolver, in `<cidr> via <gateway>` form.
+                type: string
               subnetName:
                 type: string
             type: object
