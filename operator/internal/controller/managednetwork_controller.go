@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -28,6 +29,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -139,6 +141,9 @@ func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	net.Status.Attachments = network.Attachments(net)
 
 	if err := r.ensureVPC(ctx, net, nextHop); err != nil {
+		if errors.Is(err, errObjectGoing) {
+			return r.standDown(ctx, net, before, "Vpc/"+net.Name)
+		}
 		r.setNetworkCondition(net, platformv1alpha1.ConditionNetworkReady, false, "WriteFailed", err.Error())
 		net.Status.ObservedGeneration = net.Generation
 		_ = kube.UpdateStatus(ctx, r.Client, networkControllerName, net, before)
@@ -154,6 +159,10 @@ func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		ctx, net, gateway,
 		r.resolveDNSServer(ctx, net, r.kubeOVNNamespaceFor(ctx)), initialACLs,
 	); err != nil {
+		if errors.Is(err, errObjectGoing) {
+			return r.standDown(ctx, net, before,
+				"Subnet/"+network.DefaultSubnetName(net))
+		}
 		r.setNetworkCondition(net, platformv1alpha1.ConditionNetworkReady, false, "WriteFailed", err.Error())
 		net.Status.ObservedGeneration = net.Generation
 		_ = kube.UpdateStatus(ctx, r.Client, networkControllerName, net, before)
@@ -237,6 +246,12 @@ func (r *ManagedNetworkReconciler) ensureVPC(
 	live.SetGroupVersionKind(vpcGVK)
 	live.SetName(net.Name)
 
+	if going, err := r.beingDeleted(ctx, vpcGVK, net.Name); err != nil {
+		return err
+	} else if going {
+		return errObjectGoing
+	}
+
 	_, err := kube.Ensure(ctx, r.Client, networkControllerName, live, func() error {
 		mergeLabels(live, network.Labels(net))
 		spec, _, _ := unstructured.NestedMap(live.Object, "spec")
@@ -288,6 +303,12 @@ func (r *ManagedNetworkReconciler) ensureSubnet(
 	live := &unstructured.Unstructured{}
 	live.SetGroupVersionKind(subnetGVK)
 	live.SetName(name)
+
+	if going, err := r.beingDeleted(ctx, subnetGVK, name); err != nil {
+		return err
+	} else if going {
+		return errObjectGoing
+	}
 
 	_, err := kube.Ensure(ctx, r.Client, networkControllerName, live, func() error {
 		mergeLabels(live, network.Labels(net))
@@ -411,6 +432,19 @@ func (r *ManagedNetworkReconciler) judgeAttachment(
 	}
 }
 
+// standDown stops writing and says why. Something else is taking this network
+// apart, and the only useful thing to do is get out of its way.
+func (r *ManagedNetworkReconciler) standDown(
+	ctx context.Context, net, before *platformv1alpha1.ManagedNetwork, what string,
+) (ctrl.Result, error) {
+	r.setNetworkCondition(net, platformv1alpha1.ConditionNetworkReady, false, "BeingDeleted",
+		what+" is being deleted by something else; this controller has stopped "+
+			"writing to it. Remove this object if the network is going away.")
+	net.Status.ObservedGeneration = net.Generation
+	return ctrl.Result{RequeueAfter: drainRetry},
+		kube.UpdateStatus(ctx, r.Client, networkControllerName, net, before)
+}
+
 // kubeOVNNamespaceFor is where kube-ovn runs: configured, or found from its own
 // CNI DaemonSet.
 func (r *ManagedNetworkReconciler) kubeOVNNamespaceFor(ctx context.Context) string {
@@ -427,6 +461,31 @@ func (r *ManagedNetworkReconciler) kubeOVNNamespaceFor(ctx context.Context) stri
 		}
 	}
 	return ""
+}
+
+// errObjectGoing means the thing this controller was about to write is on its
+// way out, put there by something else.
+//
+// Writing to an object with a deletionTimestamp is legal and is exactly the
+// wrong thing to do here: `CreateOrUpdate` on a subnet that has just been
+// deleted either keeps a dying object alive or recreates one the deleter
+// believes is gone. Two reconcilers pulling in opposite directions is how a
+// teardown wedges, and the half of it this controller owns is not writing.
+var errObjectGoing = errors.New("the object is being deleted by something else")
+
+// beingDeleted reports whether the live object is on its way out.
+func (r *ManagedNetworkReconciler) beingDeleted(
+	ctx context.Context, gvk schema.GroupVersionKind, name string,
+) (bool, error) {
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(gvk)
+	if err := r.Get(ctx, types.NamespacedName{Name: name}, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading %s/%s: %w", gvk.Kind, name, err)
+	}
+	return !obj.GetDeletionTimestamp().IsZero(), nil
 }
 
 func toAnySlice(in []string) []any {

@@ -1183,3 +1183,85 @@ func TestTheSubnetIsNeverBrieflyOpen(t *testing.T) {
 		t.Errorf("the internet is blocked: %s", got)
 	}
 }
+
+// TestTheControllerStandsDownForSomebodyElsesDelete.
+//
+// Writing to an object with a deletionTimestamp is legal and is exactly the
+// wrong thing to do: CreateOrUpdate on a subnet that has just been deleted
+// either keeps a dying object alive or recreates one the deleter believes is
+// gone. Two reconcilers pulling in opposite directions is how a teardown
+// wedges, and the half of it this controller owns is not writing.
+func TestTheControllerStandsDownForSomebodyElsesDelete(t *testing.T) {
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netstanddown"},
+		Spec:       platformv1alpha1.ManagedNetworkSpec{CIDR: "10.200.172.0/22"},
+	})
+
+	eventually(t, "the subnet", func() error {
+		obj := &unstructured.Unstructured{}
+		obj.SetGroupVersionKind(subnetGVK)
+		return k8sClient.Get(testCtx, types.NamespacedName{
+			Name: "netstanddown-default",
+		}, obj)
+	})
+
+	// Somebody else starts taking it apart, and something holds it there — the
+	// state a real teardown passes through while kube-ovn finalizes.
+	subnet := &unstructured.Unstructured{}
+	subnet.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Name: "netstanddown-default",
+	}, subnet); err != nil {
+		t.Fatalf("reading the subnet: %v", err)
+	}
+	subnet.SetFinalizers([]string{"test.kubevirt-ui.io/hold"})
+	if err := k8sClient.Update(testCtx, subnet); err != nil {
+		t.Fatalf("holding the subnet: %v", err)
+	}
+	if err := k8sClient.Delete(testCtx, subnet); err != nil {
+		t.Fatalf("deleting the subnet: %v", err)
+	}
+
+	eventually(t, "the controller to say it has stopped", func() error {
+		cond := networkCondition(getNetwork(t, "netstanddown"),
+			platformv1alpha1.ConditionNetworkReady)
+		if cond == nil || cond.Reason != "BeingDeleted" {
+			return fmt.Errorf("condition = %v", cond)
+		}
+		return nil
+	})
+
+	// It is dying, and it stays dying: nothing here revived it or held it open.
+	before := getNetwork(t, "netstanddown")
+	poke(t, "netstanddown", "1")
+	consistently(t, "the subnet still on its way out", 3*time.Second, func() error {
+		live := &unstructured.Unstructured{}
+		live.SetGroupVersionKind(subnetGVK)
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Name: "netstanddown-default",
+		}, live); err != nil {
+			return err
+		}
+		if live.GetDeletionTimestamp().IsZero() {
+			return fmt.Errorf("the deletion was undone")
+		}
+		if live.GetUID() != subnet.GetUID() {
+			return fmt.Errorf("it was recreated: %s != %s", live.GetUID(), subnet.GetUID())
+		}
+		return nil
+	})
+	_ = before
+
+	// Let it go.
+	held := &unstructured.Unstructured{}
+	held.SetGroupVersionKind(subnetGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Name: "netstanddown-default",
+	}, held); err != nil {
+		t.Fatalf("reading the held subnet: %v", err)
+	}
+	held.SetFinalizers(nil)
+	if err := k8sClient.Update(testCtx, held); err != nil {
+		t.Fatalf("releasing the subnet: %v", err)
+	}
+}

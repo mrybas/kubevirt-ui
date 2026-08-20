@@ -1539,17 +1539,50 @@ async def _await_managed_network(k8s, name: str, attempts: int = 20) -> bool:
     return False
 
 
-async def _managed_network_exists(k8s, name: str) -> bool:
+async def _await_managed_network_gone(k8s, name: str, attempts: int = 30) -> bool:
+    """Block until the ManagedNetwork is really gone.
+
+    Bounded: expiry is logged rather than raised, because refusing to delete a
+    network because a description is slow to disappear would be a worse answer
+    than a slightly racy one. But it is waited for, because the alternative is
+    two controllers writing the same objects in opposite directions.
+    """
+    for _ in range(attempts):
+        try:
+            await k8s.custom_api.get_cluster_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                plural=NETWORK_PLURAL, name=name,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return True
+            raise
+        await asyncio.sleep(1)
+    logger.warning(
+        "ManagedNetwork %r is still present; deleting the network anyway. If "
+        "the operator is still reconciling it, the two will fight.", name,
+    )
+    return False
+
+
+async def _managed_network_cascades(k8s, name: str) -> bool | None:
+    """Whether a ManagedNetwork exists, and whether deleting it takes the
+    network with it.
+
+    None means there is no such object. True means the operator will tear the
+    network down. False means the object only describes it, and something else
+    still has to do the work.
+    """
     try:
-        await k8s.custom_api.get_cluster_custom_object(
+        cr = await k8s.custom_api.get_cluster_custom_object(
             group=OPERATOR_GROUP, version=OPERATOR_VERSION,
             plural=NETWORK_PLURAL, name=name,
         )
     except ApiException as e:
         if e.status == 404:
-            return False
+            return None
         raise
-    return True
+    return ((cr.get("spec") or {}).get("deletionPolicy")) == "Delete"
 
 
 async def _post_create_isolation(k8s, name: str) -> None:
@@ -2193,16 +2226,36 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
     # Ownership is a property of the object, not of a flag: a network created
     # while the operator owned this path stays the operator's afterwards, and
     # tearing it down from here would race the cascade it is already running.
-    if await _managed_network_exists(k8s, name):
+    #
+    # But only a CR that will actually cascade counts. A `Retain` one describes
+    # a network it does not own — deleting it removes the description and
+    # nothing else. Handing the teardown to it reported "being removed" and
+    # removed nothing at all, which is how a delete endpoint lies. Measured on
+    # the stand before this line existed.
+    cascades = await _managed_network_cascades(k8s, name)
+    if cascades is not None:
         await k8s.custom_api.delete_cluster_custom_object(
             group=OPERATOR_GROUP, version=OPERATOR_VERSION,
             plural=NETWORK_PLURAL, name=name,
         )
-        # No drain loop and no 409 here. The operator holds the object with a
-        # finalizer until the subnets are really gone and the router can follow
-        # them safely — which is the same wait, done by something that does not
-        # need to be asked twice.
-        return {"message": f"VPC '{name}' is being removed"}
+        if cascades:
+            # No drain loop and no 409 here. The operator holds the object with
+            # a finalizer until the subnets are really gone and the router can
+            # follow them safely — the same wait, done by something that does
+            # not need to be asked twice.
+            return {"message": f"VPC '{name}' is being removed"}
+        # Waited for, and this is ordering rather than politeness. The operator
+        # keeps reconciling that object until it observes the deletion, and its
+        # writes are `CreateOrUpdate` — so a subnet deleted below can be kept
+        # alive, or recreated, by a controller still working from a description
+        # that no longer exists. Two reconcilers pulling in opposite directions
+        # is how a teardown wedges.
+        await _await_managed_network_gone(k8s, name)
+        logger.info(
+            "VPC %r had a ManagedNetwork with deletionPolicy=Retain: the "
+            "description is gone and the network is being deleted here.",
+            name,
+        )
 
     # Clean up OVN NAT gateway if exists (keyed by vpc_name)
     from app.api.v1.ovn_gateway import OVN_GW_LABEL, _cleanup_ovn_gateway, _get_gateway_tracking

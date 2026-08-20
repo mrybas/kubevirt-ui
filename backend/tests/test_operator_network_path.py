@@ -27,7 +27,7 @@ def _request(**overrides: Any) -> VpcCreateRequest:
     return VpcCreateRequest(**base)
 
 
-def _harness(*, ready: bool = True, exists: bool = False):
+def _harness(*, ready: bool = True, exists: bool = False, policy: str = "Delete"):
     """A client that records every write and answers as the operator would."""
     calls: dict[str, list[dict[str, Any]]] = {
         "create_cluster": [], "delete_cluster": [], "patch_cluster": [],
@@ -47,7 +47,9 @@ def _harness(*, ready: bool = True, exists: bool = False):
             if not exists and not calls["create_cluster"]:
                 raise ApiException(status=404, reason="NotFound")
             conditions = [{"type": "Ready", "status": "True" if ready else "False"}]
-            return {"metadata": {"name": kw["name"]}, "status": {"conditions": conditions}}
+            return {"metadata": {"name": kw["name"]},
+                    "spec": {"deletionPolicy": policy},
+                    "status": {"conditions": conditions}}
         if kw.get("plural") == "subnets":
             # The normal outcome: the isolation pass found the subnet and wrote
             # its rules. Tests that care about the other outcome say so.
@@ -352,3 +354,102 @@ async def test_the_isolation_pass_leaves_the_operators_subnets_alone():
     body = next(c for c in patched if c["name"] == "b-default")["body"]
     matches = " ".join(a["match"] for a in body["spec"]["acls"])
     assert "10.200.0.0/22" in matches, matches
+
+
+@pytest.mark.asyncio
+async def test_a_describing_cr_does_not_get_handed_the_teardown():
+    """A `Retain` object describes a network it does not own.
+
+    Deleting it removes the description and nothing else, so handing the
+    teardown to it reports "being removed" and removes nothing — a delete
+    endpoint that lies. Measured on the stand: the CR went, the Vpc and Subnet
+    stayed, and the caller was told the network was going away.
+    """
+    from app.api.v1 import vpcs
+
+    request, calls = _harness(exists=True, policy="Retain")
+    entered_legacy = False
+
+    async def _tracking(k8s: Any, name: str) -> tuple[dict, None]:
+        nonlocal entered_legacy
+        entered_legacy = True
+        raise RuntimeError("stop here; the legacy path needs a whole cluster")
+
+    # Patched where the legacy path imports it from, not where it is used: that
+    # import happens inside the function, so patching the caller's module misses
+    # it entirely.
+    with patch("app.api.v1.ovn_gateway._get_gateway_tracking", _tracking), \
+         patch.object(vpcs.asyncio, "sleep", AsyncMock()):
+        try:
+            await vpcs.delete_vpc(request, "described", user=MagicMock())
+        except RuntimeError:
+            pass
+
+    # The description was removed…
+    assert [c["plural"] for c in calls["delete_cluster"]] == ["managednetworks"]
+    # …and the network is still this endpoint's to take apart.
+    assert entered_legacy, "the teardown was handed to a CR that does not cascade"
+
+
+@pytest.mark.asyncio
+async def test_a_cascading_cr_is_handed_the_teardown():
+    from app.api.v1 import vpcs
+
+    request, calls = _harness(exists=True, policy="Delete")
+    result = await vpcs.delete_vpc(request, "owned", user=MagicMock())
+
+    assert "being removed" in result["message"]
+    assert [c["plural"] for c in calls["delete_cluster"]] == ["managednetworks"]
+
+
+@pytest.mark.asyncio
+async def test_the_teardown_waits_for_the_description_to_be_gone():
+    """Ordering, not politeness.
+
+    The operator keeps reconciling that object until it observes the deletion,
+    and its writes are CreateOrUpdate — so a subnet deleted by the legacy path
+    can be kept alive, or recreated, by a controller still working from a
+    description that no longer exists. Two reconcilers pulling in opposite
+    directions is how a teardown wedges.
+    """
+    from app.api.v1 import vpcs
+
+    request, calls = _harness(exists=True, policy="Retain")
+    order: list[str] = []
+    still_there = {"n": 2}
+
+    async def _get_cluster(**kw: Any) -> dict[str, Any]:
+        if kw.get("plural") != "managednetworks":
+            raise ApiException(status=404, reason="NotFound")
+        if calls["delete_cluster"]:
+            # After the delete, it lingers for a couple of reads.
+            if still_there["n"] > 0:
+                still_there["n"] -= 1
+                return {"metadata": {"name": kw["name"]}, "spec": {"deletionPolicy": "Retain"}}
+            raise ApiException(status=404, reason="NotFound")
+        return {"metadata": {"name": kw["name"]}, "spec": {"deletionPolicy": "Retain"}}
+
+    async def _delete_cluster(**kw: Any) -> dict[str, Any]:
+        order.append("cr-deleted")
+        calls["delete_cluster"].append(kw)
+        return {}
+
+    async def _tracking(k8s: Any, name: str) -> tuple[dict, None]:
+        order.append("legacy-started")
+        raise RuntimeError("stop here")
+
+    request.app.state.k8s_client.custom_api.get_cluster_custom_object = AsyncMock(
+        side_effect=_get_cluster)
+    request.app.state.k8s_client.custom_api.delete_cluster_custom_object = AsyncMock(
+        side_effect=_delete_cluster)
+
+    with patch("app.api.v1.ovn_gateway._get_gateway_tracking", _tracking), \
+         patch.object(vpcs.asyncio, "sleep", AsyncMock()):
+        try:
+            await vpcs.delete_vpc(request, "described", user=MagicMock())
+        except RuntimeError:
+            pass
+
+    assert order == ["cr-deleted", "legacy-started"], order
+    # And it really waited: the reads after the delete are the wait.
+    assert still_there["n"] == 0, "the teardown started before the object was gone"
