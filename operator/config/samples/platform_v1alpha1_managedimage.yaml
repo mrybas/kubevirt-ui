@@ -1,0 +1,9 @@
+apiVersion: platform.kubevirt-ui.io/v1alpha1
+kind: ManagedImage
+metadata:
+  labels:
+    app.kubernetes.io/name: kubevirt-ui-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: managedimage-sample
+spec:
+  # TODO(user): Add fields here

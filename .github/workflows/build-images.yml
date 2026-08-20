@@ -1,11 +1,18 @@
 # Build & push Docker images and Helm chart for KubeVirt UI
-# Triggered on CalVer tags (2026.01.0, etc.) or manual dispatch.
+# Triggered on CalVer tags (2026.01.0, etc.), on the operator-dev branch, or
+# manual dispatch.
+#
+# Two tagging worlds that must never mix: a CalVer tag is a release and also
+# moves `latest`; a branch build is a dev image tagged `dev-<sha7>` and moves
+# nothing. A dev image that could be pulled as `latest` would eventually be
+# deployed as one.
 
 name: Build Images
 
 on:
   push:
     tags: ['20*']
+    branches: ['operator-dev']
   workflow_dispatch:
 
 env:
@@ -21,7 +28,9 @@ jobs:
     outputs:
       tags_backend: ${{ steps.meta.outputs.tags_backend }}
       tags_frontend: ${{ steps.meta.outputs.tags_frontend }}
+      tags_operator: ${{ steps.meta.outputs.tags_operator }}
       version: ${{ steps.meta.outputs.version }}
+      is_release: ${{ steps.meta.outputs.is_release }}
     steps:
       - name: Compute image metadata
         id: meta
@@ -32,27 +41,42 @@ jobs:
 
           BACKEND_IMAGE="${REGISTRY}/${REPO}/backend"
           FRONTEND_IMAGE="${REGISTRY}/${REPO}/frontend"
+          OPERATOR_IMAGE="${REGISTRY}/${REPO}/operator"
 
           TAGS_BACKEND=""
           TAGS_FRONTEND=""
+          TAGS_OPERATOR=""
 
           add_tag() {
             TAGS_BACKEND="${TAGS_BACKEND:+${TAGS_BACKEND},}${BACKEND_IMAGE}:${1}"
             TAGS_FRONTEND="${TAGS_FRONTEND:+${TAGS_FRONTEND},}${FRONTEND_IMAGE}:${1}"
+            TAGS_OPERATOR="${TAGS_OPERATOR:+${TAGS_OPERATOR},}${OPERATOR_IMAGE}:${1}"
           }
 
-          VERSION="${GITHUB_REF#refs/tags/}"
-          add_tag "${VERSION}"
-          add_tag "latest"
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            IS_RELEASE="true"
+            VERSION="${GITHUB_REF#refs/tags/}"
+            add_tag "${VERSION}"
+            add_tag "latest"
+          else
+            # Dev build from a branch: never `latest`, never CalVer-shaped.
+            IS_RELEASE="false"
+            VERSION="dev-${GITHUB_SHA::7}"
+            add_tag "${VERSION}"
+          fi
 
           echo "tags_backend=${TAGS_BACKEND}" >> "$GITHUB_OUTPUT"
           echo "tags_frontend=${TAGS_FRONTEND}" >> "$GITHUB_OUTPUT"
+          echo "tags_operator=${TAGS_OPERATOR}" >> "$GITHUB_OUTPUT"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_release=${IS_RELEASE}" >> "$GITHUB_OUTPUT"
 
           echo "### Image Tags" >> "$GITHUB_STEP_SUMMARY"
           echo "**Version:** ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Release:** ${IS_RELEASE}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Backend:** ${TAGS_BACKEND}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Frontend:** ${TAGS_FRONTEND}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Operator:** ${TAGS_OPERATOR}" >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # Build backend image
@@ -135,11 +159,54 @@ jobs:
             org.opencontainers.image.description=KubeVirt UI Frontend
 
   # ---------------------------------------------------------------------------
+  # Build operator image
+  # ---------------------------------------------------------------------------
+  build-operator:
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push operator
+        uses: docker/build-push-action@v5
+        with:
+          context: ./operator
+          file: ./operator/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ needs.prepare.outputs.tags_operator }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.title=kubevirt-ui-operator
+            org.opencontainers.image.description=KubeVirt UI Operator
+
+  # ---------------------------------------------------------------------------
   # Package and push Helm chart to OCI registry
   # ---------------------------------------------------------------------------
   helm-package:
     runs-on: ubuntu-latest
     needs: prepare
+    # The dev operator is deployed with kustomize, deliberately bypassing the
+    # chart and Flux, so a branch build must not publish a chart version.
+    if: needs.prepare.outputs.is_release == 'true'
     permissions:
       contents: read
       packages: write

@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+            - --metrics-secure=false
+            # Only the VM domain exists so far. Network/tenant/remediation get
+            # their own Deployments as their controllers land, each with its own
+            # service account and its own leader-election lease.
+            - --domains=vm
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
