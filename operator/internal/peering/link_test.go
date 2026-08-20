@@ -106,9 +106,16 @@ func TestTheRouteAndThePolicyTravelTogether(t *testing.T) {
 	}
 	for i, policy := range side.Policies {
 		if policy["priority"] != int64(PolicyPriority) {
-			t.Errorf("policy %d at priority %v — below the gateway catch-all it "+
-				"does nothing", i, policy["priority"])
+			t.Errorf("policy %d at priority %v", i, policy["priority"])
 		}
+	}
+	// The number itself, not just self-consistency. A VpcEgressGateway reroutes
+	// everything leaving the VPC at 29100; anything at or below that loses, and
+	// the peering carries nothing while looking perfectly configured. The first
+	// value written here was 29000 and every test still passed.
+	if PolicyPriority <= 29100 {
+		t.Fatalf("PolicyPriority %d is not above the egress gateway catch-all "+
+			"at 29100", PolicyPriority)
 	}
 	if side.Peering["localConnectIP"] != "169.254.101.9/30" {
 		t.Errorf("connect address = %v", side.Peering["localConnectIP"])

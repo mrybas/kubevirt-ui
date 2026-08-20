@@ -30,11 +30,19 @@ const (
 	// routed, announced, or reachable from anywhere else.
 	LinkBase = "169.254.101.0/24"
 
-	// PolicyPriority puts the peering above the egress gateway's catch-all
-	// reroute. Without it the traffic hairpins out to the upstream router
-	// anyway and the peering looks broken for no visible reason — the routes
-	// are there, the link is up, and nothing goes through it.
-	PolicyPriority = 29000
+	// PolicyPriority puts the peering above the egress gateway's catch-all.
+	//
+	// A VpcEgressGateway installs a reroute policy at 29100 that catches
+	// *everything* leaving the VPC, so it beats a peering static route and the
+	// traffic hairpins out to the upstream router anyway. The peering only
+	// takes effect once a higher-priority allow sits above it — the routes are
+	// there, the link is up, and nothing goes through.
+	//
+	// 29000 was the first number written here, and it is below the catch-all,
+	// which is the failure with extra steps. It survived every unit test and
+	// was caught by rendering a peering both ways on a live cluster and
+	// diffing: the product writes 31001.
+	PolicyPriority = 31001
 )
 
 // Link is one point-to-point subnet and the address each end holds.

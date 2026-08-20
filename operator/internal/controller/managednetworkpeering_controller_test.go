@@ -147,7 +147,7 @@ func TestBothEndsOrNeither(t *testing.T) {
 				"upstream router and the peering will look broken for no reason", local)
 		}
 		policy, _ := policies[0].(map[string]any)
-		if policy["priority"] != int64(29000) {
+		if policy["priority"] != int64(31001) {
 			t.Errorf("%s policy at %v — below the gateway catch-all it does nothing",
 				local, policy["priority"])
 		}
