@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -330,7 +331,7 @@ func (r *ManagedTenantReconciler) ensureKamajiControlPlane(
 			network["advertiseAddress"] = vip
 		}
 
-		return unstructured.SetNestedMap(live.Object, map[string]any{
+		spec := map[string]any{
 			"replicas":      int64(obj.Spec.ControlPlaneReplicas),
 			"version":       obj.Spec.KubernetesVersion,
 			"dataStoreName": "default",
@@ -356,13 +357,43 @@ func (r *ManagedTenantReconciler) ensureKamajiControlPlane(
 			},
 			"network":    network,
 			"deployment": deployment,
-		}, "spec")
+		}
+		// Only when the tenant asked for it *and* the platform has a provider
+		// to point at. A tenant that opted out runs with no `--oidc-*` flags at
+		// all, which is what a deployment whose provider the apiserver cannot
+		// reach actually needs.
+		if args := oidcArgs(obj); len(args) > 0 {
+			spec["apiServer"] = map[string]any{"extraArgs": args}
+		}
+		return unstructured.SetNestedMap(live.Object, spec, "spec")
 	})
 	if err != nil {
 		return fmt.Errorf("declaring the KamajiControlPlane %s/%s: %w",
 			namespace, obj.Name, err)
 	}
 	return nil
+}
+
+// oidcArgs are the apiserver flags that make the platform's identity provider
+// usable inside a tenant.
+//
+// Gated on the issuer being https: an apiserver told to trust an http issuer
+// refuses to start, and a control plane that will not start is a worse answer
+// than one without single sign-on.
+func oidcArgs(obj *platformv1alpha1.ManagedTenant) []any {
+	if !obj.Spec.EnableOIDC {
+		return nil
+	}
+	issuer := envOr("OIDC_ISSUER", "")
+	if !strings.HasPrefix(issuer, "https://") {
+		return nil
+	}
+	return []any{
+		"--oidc-issuer-url=" + issuer,
+		"--oidc-client-id=" + envOr("OIDC_CLIENT_ID", "kubevirt-ui"),
+		"--oidc-username-claim=email",
+		"--oidc-groups-claim=groups",
+	}
 }
 
 // ingressHost is the external name for this tenant's apiserver, when the

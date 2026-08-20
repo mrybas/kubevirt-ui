@@ -70,6 +70,13 @@ spec:
                 maxLength: 128
                 minLength: 1
                 type: string
+              enableOIDC:
+                description: |-
+                  EnableOIDC decides whether the tenant's apiserver accepts the platform's
+                  identity provider. Off means no `--oidc-*` flags at all, which is what a
+                  deployment whose provider the apiserver cannot reach — or whose
+                  certificate it does not trust — actually needs.
+                type: boolean
               environment:
                 minLength: 1
                 type: string
@@ -123,6 +130,17 @@ spec:
                     maximum: 10000
                     minimum: 1
                     type: integer
+                  className:
+                    description: |-
+                      ClassName is the StorageClass a worker's root clone lands on, and the one
+                      the tenant's own volumes use. Empty means the cluster default.
+
+                      Not the class the shared golden image sits on: that one is meant for an
+                      erasure-coded pool, because it is read-only reference data cloned many
+                      times, while the clones themselves want replica. Sending a clone to the
+                      golden's class was the first version of this and it is a real difference
+                      — the live tenants' roots are on `ceph-block`.
+                    type: string
                   pvcCount:
                     default: 20
                     format: int32

@@ -76,6 +76,17 @@ type TenantStorage struct {
 	// +kubebuilder:default=20
 	// +optional
 	PVCCount int32 `json:"pvcCount,omitempty"`
+
+	// ClassName is the StorageClass a worker's root clone lands on, and the one
+	// the tenant's own volumes use. Empty means the cluster default.
+	//
+	// Not the class the shared golden image sits on: that one is meant for an
+	// erasure-coded pool, because it is read-only reference data cloned many
+	// times, while the clones themselves want replica. Sending a clone to the
+	// golden's class was the first version of this and it is a real difference
+	// — the live tenants' roots are on `ceph-block`.
+	// +optional
+	ClassName string `json:"className,omitempty"`
 }
 
 // ManagedTenantSpec is a tenant Kubernetes cluster.
@@ -119,6 +130,13 @@ type ManagedTenantSpec struct {
 	// consistent.
 	// +optional
 	Storage TenantStorage `json:"storage,omitempty"`
+
+	// EnableOIDC decides whether the tenant's apiserver accepts the platform's
+	// identity provider. Off means no `--oidc-*` flags at all, which is what a
+	// deployment whose provider the apiserver cannot reach — or whose
+	// certificate it does not trust — actually needs.
+	// +optional
+	EnableOIDC bool `json:"enableOIDC,omitempty"`
 
 	// Network is the VPC the tenant's machines live in. Empty means the
 	// cluster's default overlay.

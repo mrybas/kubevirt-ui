@@ -305,6 +305,7 @@ func main() {
 			MetalLBPool:      os.Getenv("TENANTS_CP_METALLB_POOL"),
 			MetalLBNamespace: os.Getenv("TENANTS_CP_METALLB_NAMESPACE"),
 			TransitSubnet:    os.Getenv("TENANTS_CP_TRANSIT_SUBNET"),
+			KubeOVNNamespace: os.Getenv("KUBE_OVN_NAMESPACE"),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "managedtenant")
 			os.Exit(1)

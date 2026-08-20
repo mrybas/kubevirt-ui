@@ -2182,3 +2182,70 @@ git worktree remove --force .mutation
 side-benefit of mutating **committed** state rather than whatever is on disk.
 For a mutation against uncommitted work the tree has to be copied in first;
 committing before mutating is usually the better answer anyway.
+
+## M12d live: the graph built end to end, and five differences
+
+A disposable tenant in a VPC of its own, the same shape as `uat-t1`, built from
+one CR — and then its whole graph diffed against the live one, normalised for
+names, addresses, tokens and base64.
+
+```
+cluster, kamajicontrolplane, kubevirtcluster, machinedeployment,
+kubevirtmachinetemplate, machinehealthcheck, talosconfigtemplate
+```
+
+All seven objects, from a `ManagedTenant` and nothing else. The health check is
+byte-identical to the live one. The others differ in five ways, and only two of
+them were agreed beforehand.
+
+### It could not create its own secrets
+
+The first attempt stopped at
+
+```
+creating tenant-cmp1/cmp1-talos-secrets: secrets is forbidden:
+User "…operator-tenant-controller-manager" cannot create resource "secrets"
+```
+
+— the marker granted `get;list;watch` and the code writes. Third time this class
+has cost a live run and it will keep costing them: envtest is admin, so no RBAC
+check ever fires in the suite.
+
+### Two things it would have got wrong, found only by the diff
+
+**The worker's resolver.** The live config lists `10.96.0.200` first — the
+VpcDns address — then the public servers; the operator's listed the public ones
+alone. In an isolated VPC that is a node that resolves nothing, and it is
+written into an **immutable** template, so it would have been wrong for that
+node's whole life.
+
+Fixing it turned up the sharper half. The address exists in two places the
+cluster already states it: the network's own status, and kube-ovn's
+`vpc-dns-config`, which is where the network controller reads it from. Neither
+is an environment variable, and that matters — a VPC the product built has no
+ManagedNetwork, so insisting on our own object would be the operator requiring
+the world to be its shape. Both are read, in that order, **straight from the API
+server**: a cached read a beat early bakes the wrong answer into an immutable
+object. And the config is not written at all until one of them answers, which is
+the same wait as the two CAs and for the same reason.
+
+**The root clone's storage class.** The live roots are on `ceph-block`; the port
+sent them to the *golden's* class. Those are deliberately different pools — the
+golden is read-only reference data cloned many times and wants erasure coding,
+the clones want replica — so this was not a missing environment variable but a
+wrong field. The CRD gained `storage.className` for it.
+
+### Two named gaps and one difference that is not one
+
+`--oidc-*` on the apiserver: the live control plane carries four flags, the
+operator wrote none, because the CRD had no field for the per-tenant toggle. It
+has one now, and the flags are gated on the issuer being https — an apiserver
+told to trust an http issuer refuses to start, and a control plane that will not
+start is worse than one without single sign-on.
+
+`infraClusterSecretRef` on the KubevirtCluster: tenant CSI storage, which is
+M12e, and confirmed absent rather than assumed.
+
+The rest is additive metadata — a `kubevirt-ui.io/tenant` label on objects the
+product leaves unlabelled — and the ingress certSAN, which is empty because the
+operator has no ingress domain configured yet.

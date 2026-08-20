@@ -348,3 +348,37 @@ func TestTheControlPlaneConditionFollowsCAPIRatherThanOurOwnWrite(t *testing.T) 
 		return nil
 	})
 }
+
+// TestTheApiserverTakesTheIdentityProviderOnlyWhenAsked.
+//
+// Off means no `--oidc-*` flags at all, which is what a deployment whose
+// provider the apiserver cannot reach — or whose certificate it does not trust
+// — actually needs. Found missing by diffing against a live tenant, which
+// carries four of them.
+func TestTheApiserverTakesTheIdentityProviderOnlyWhenAsked(t *testing.T) {
+	t.Setenv("OIDC_ISSUER", "https://example.invalid/dex")
+	t.Setenv("OIDC_CLIENT_ID", "kubevirt-ui")
+
+	off := vpcTenant("tcp6")
+	if args := oidcArgs(off); args != nil {
+		t.Errorf("a tenant that did not ask for it got %v", args)
+	}
+
+	on := vpcTenant("tcp7")
+	on.Spec.EnableOIDC = true
+	args := oidcArgs(on)
+	if len(args) != 4 {
+		t.Fatalf("args = %v", args)
+	}
+	if fmt.Sprint(args[0]) != "--oidc-issuer-url=https://example.invalid/dex" {
+		t.Errorf("args = %v", args)
+	}
+
+	// An apiserver told to trust an http issuer refuses to start, and a control
+	// plane that will not start is a worse answer than one without single
+	// sign-on.
+	t.Setenv("OIDC_ISSUER", "http://example.invalid/dex")
+	if args := oidcArgs(on); args != nil {
+		t.Errorf("an http issuer was accepted: %v", args)
+	}
+}

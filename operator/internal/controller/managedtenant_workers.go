@@ -21,6 +21,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -164,6 +165,15 @@ func (r *ManagedTenantReconciler) ensureTalosBootstrap(
 		return "", "", "", fmt.Errorf("reading the machine secrets: %w", err)
 	}
 
+	if r.resolverPending(ctx, obj) {
+		return "", "WaitingForResolver", fmt.Sprintf(
+			"no resolver for network %q yet — neither its own status nor "+
+				"kube-ovn's vpc-dns-config names one. A worker in a VPC cannot "+
+				"reach the public resolvers before egress exists, and this "+
+				"config is written once into an immutable template",
+			obj.Spec.Network), nil
+	}
+
 	talosCA, err := r.certificateFrom(ctx, namespace, obj.Name+"-talos-ca", "tls.crt")
 	if err != nil {
 		return "", "", "", err
@@ -186,7 +196,7 @@ func (r *ManagedTenantReconciler) ensureTalosBootstrap(
 				"CAs'", namespace, obj.Name), nil
 	}
 
-	config := r.talosWorkerConfig(obj, namespace, vip, addressNeeded,
+	config := r.talosWorkerConfig(ctx, obj, namespace, vip, addressNeeded,
 		string(secrets.Data["machine.token"]),
 		string(secrets.Data["cluster.id"]),
 		string(secrets.Data["cluster.secret"]),
@@ -269,7 +279,8 @@ func (r *ManagedTenantReconciler) certificateFrom(
 //   - `kubePrism` is off. It proxies the apiserver via localhost, which would
 //     bypass the name and take the SNI with it.
 func (r *ManagedTenantReconciler) talosWorkerConfig(
-	obj *platformv1alpha1.ManagedTenant, namespace, vip string, addressNeeded bool,
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
+	namespace, vip string, addressNeeded bool,
 	machineToken, clusterID, clusterSecret, talosCA, k8sCA string,
 ) map[string]any {
 	endpointHost := talosServiceName(obj.Name) + "." + namespace + ".svc"
@@ -294,7 +305,7 @@ func (r *ManagedTenantReconciler) talosWorkerConfig(
 	// resolver, which a VPC cannot reach. kube-ovn's own subnet DHCP option
 	// never arrives. The node then resolves nothing, NTP fails, and Talos parks
 	// the kubelet on "waiting for time sync" with no error naming DNS.
-	if resolvers := r.workerNameservers(obj); len(resolvers) > 0 {
+	if resolvers := r.workerNameservers(ctx, obj); len(resolvers) > 0 {
 		machineNetwork["nameservers"] = toAny(resolvers)
 	}
 
@@ -386,16 +397,74 @@ func toAny(values []string) []any {
 // object has (`dns_mode`, `dns_servers`). The CRD has no field for them, and
 // inventing one here would be a second place to configure the same thing.
 func (r *ManagedTenantReconciler) workerNameservers(
-	obj *platformv1alpha1.ManagedTenant,
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
 ) []string {
 	public := []string{"1.1.1.1", "8.8.8.8"}
 	if obj.Spec.Network == "" {
 		return public
 	}
-	if vip := envOr("TENANTS_VPCDNS_VIP", ""); vip != "" {
+	// Read off the network the tenant is in, which already resolved it from
+	// kube-ovn's own configuration and published it. One fact in one place: an
+	// environment variable here would be a second, and the two would agree
+	// until they did not.
+	if vip := r.vpcResolver(ctx, obj); vip != "" {
 		return append([]string{vip}, public...)
 	}
 	return public
+}
+
+// vpcResolver is the address a worker in this tenant's VPC resolves through.
+//
+// Two sources, in order, and neither is an environment variable: the network
+// object if this VPC is described by one — it has already resolved the address
+// and published it — and otherwise kube-ovn's own `vpc-dns-config`, which is
+// where the cluster states it and where the network controller reads it from
+// too. A VPC built by the product has no ManagedNetwork, and refusing to build
+// workers in one would be this operator insisting the world be its own shape.
+//
+// Read straight from the API server. The value is written into an immutable
+// template — read it a beat early from a cache that has not caught up, and the
+// worker resolves nothing for the rest of its life.
+func (r *ManagedTenantReconciler) vpcResolver(
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
+) string {
+	network := &platformv1alpha1.ManagedNetwork{}
+	if err := r.reader().Get(ctx, types.NamespacedName{
+		Name: obj.Spec.Network,
+	}, network); err == nil && network.Status.DNSServer != "" {
+		return network.Status.DNSServer
+	}
+
+	namespace := r.KubeOVNNamespace
+	if namespace == "" {
+		namespace = os.Getenv("KUBE_OVN_NAMESPACE")
+	}
+	if namespace == "" {
+		return ""
+	}
+	config := &corev1.ConfigMap{}
+	if err := r.reader().Get(ctx, types.NamespacedName{
+		Namespace: namespace, Name: vpcDNSConfigMap,
+	}, config); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(config.Data["coredns-vip"])
+}
+
+// resolverPending is whether this tenant's network has not yet said which
+// resolver its workers should use.
+//
+// The same shape as the CA wait, and for the same reason: the config is written
+// once into an immutable template. A tenant created moments after its network
+// would otherwise be given the public resolvers permanently — which in an
+// isolated VPC means a node that resolves nothing until somebody notices.
+func (r *ManagedTenantReconciler) resolverPending(
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
+) bool {
+	if obj.Spec.Network == "" {
+		return false
+	}
+	return r.vpcResolver(ctx, obj) == ""
 }
 
 // workerTimeServers put the tenant's own address first, because it is the one
@@ -514,7 +583,12 @@ func (r *ManagedTenantReconciler) workerRootDisk(
 	storage := map[string]any{
 		"resources": map[string]any{"requests": map[string]any{"storage": size}},
 	}
-	if class := os.Getenv(goldenStorageClassEnv); class != "" {
+	// The tenant's class, not the golden's. The golden is meant for an
+	// erasure-coded pool — read-only reference data cloned many times — and the
+	// clones want replica. Measured: the live tenants' roots are on
+	// `ceph-block`, and the first version of this sent them wherever the golden
+	// lives.
+	if class := obj.Spec.Storage.ClassName; class != "" {
 		storage["storageClassName"] = class
 	}
 	return map[string]any{

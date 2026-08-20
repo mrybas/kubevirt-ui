@@ -150,6 +150,10 @@ func runSuite(m *testing.M) (int, error) {
 		Scheme:    mgr.GetScheme(),
 		Recorder:  mgr.GetEventRecorderFor("managedtenant"),
 		APIReader: mgr.GetAPIReader(),
+		// Pinned, like the network controller's: the tests plant kube-ovn's own
+		// objects here, and discovery would pick whichever namespace the API
+		// server listed first.
+		KubeOVNNamespace: "kube-ovn",
 	}).SetupWithManager(mgr); err != nil {
 		return 0, fmt.Errorf("wiring tenant controller: %w", err)
 	}

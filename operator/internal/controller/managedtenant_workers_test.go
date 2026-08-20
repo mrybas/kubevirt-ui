@@ -17,6 +17,25 @@ import (
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 )
 
+// mustKubeOVNResolver plants the address kube-ovn states for VPC workloads.
+//
+// Every tenant in a VPC needs it before its worker config can be written, so
+// the tests that build one plant it the way the cluster would.
+func mustKubeOVNResolver(t *testing.T) {
+	t.Helper()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-ovn"}}
+	if err := k8sClient.Create(testCtx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating the kube-ovn namespace: %v", err)
+	}
+	config := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "kube-ovn", Name: "vpc-dns-config",
+	}}
+	config.Data = map[string]string{"coredns-vip": "10.96.0.200"}
+	if err := k8sClient.Create(testCtx, config); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("planting the resolver: %v", err)
+	}
+}
+
 // issueCA plays cert-manager and Kamaji, which envtest has nobody to play.
 func issueCA(t *testing.T, namespace, name, key string) {
 	t.Helper()
@@ -56,6 +75,7 @@ func workerConfig(t *testing.T, namespace, name string) map[string]any {
 // failed every boot with "missing accepted Kubernetes CAs" twelve seconds in,
 // before any network, so it read as a mystery rather than a race.
 func TestTheWorkerConfigIsNotWrittenUntilBothCAsExist(t *testing.T) {
+	mustKubeOVNResolver(t)
 	mustTenant(t, vpcTalosTenant("twk1"))
 	eventually(t, "the request for an address", func() error {
 		_, err := cpService("twk1")
@@ -132,6 +152,7 @@ func TestTheWorkerConfigIsNotWrittenUntilBothCAsExist(t *testing.T) {
 // pins the name inside the node anyway, because the node has no working DNS
 // until it has joined.
 func TestAVPCWorkerJoinsByAddressAndPinsTheNameToIt(t *testing.T) {
+	mustKubeOVNResolver(t)
 	mustTenant(t, vpcTalosTenant("twk2"))
 	eventually(t, "the request for an address", func() error {
 		_, err := cpService("twk2")
@@ -197,6 +218,7 @@ func TestAVPCWorkerJoinsByAddressAndPinsTheNameToIt(t *testing.T) {
 // device; and deleting worker A takes the DataVolume with it, which silently
 // wipes worker B's root during a rolling update.
 func TestEachWorkerClonesItsOwnRootFromTheSharedGolden(t *testing.T) {
+	mustKubeOVNResolver(t)
 	mustTenant(t, vpcTalosTenant("twk3"))
 	eventually(t, "the request for an address", func() error {
 		_, err := cpService("twk3")
@@ -261,6 +283,7 @@ func TestEachWorkerClonesItsOwnRootFromTheSharedGolden(t *testing.T) {
 // seconds of margin, and the check did fire during an ordinary reboot — it
 // started its clock and only failed to remediate because the node beat it.
 func TestTheHealthCheckWindowIsDerivedFromTheMeasurement(t *testing.T) {
+	mustKubeOVNResolver(t)
 	mustTenant(t, vpcTalosTenant("twk4"))
 	eventually(t, "the request for an address", func() error {
 		_, err := cpService("twk4")
@@ -333,5 +356,112 @@ func TestACloudInitPoolIsRefusedRatherThanHalfBuilt(t *testing.T) {
 		t.Error("it built half a pool for an OS it cannot bootstrap")
 	} else if !apierrors.IsNotFound(err) {
 		t.Fatalf("reading the MachineDeployment: %v", err)
+	}
+}
+
+// TestTheWorkerResolvesThroughItsOwnNetworksResolver.
+//
+// A worker in a VPC must use the VpcDns address first: the public resolvers are
+// only reachable once the VPC has egress, and a tenant is normally created
+// before any gateway is attached to it. Found by diffing against a live tenant
+// — the operator's first worker config had the public list alone, which is a
+// node that cannot resolve anything until something else is fixed.
+//
+// Read off the network's own status rather than an environment variable: the
+// network already resolved it from kube-ovn's configuration and published it,
+// and a second copy would agree until it did not.
+func TestTheWorkerResolvesThroughItsOwnNetworksResolver(t *testing.T) {
+	network := &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "net-twk6"},
+		Spec:       platformv1alpha1.ManagedNetworkSpec{CIDR: "10.200.60.0/22"},
+	}
+	if err := k8sClient.Create(testCtx, network); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating the network: %v", err)
+	}
+	// The resolver the network controller would publish. Through eventually
+	// because the client reads from a cache and the network controller is also
+	// writing to this object.
+	eventually(t, "the resolver to be published", func() error {
+		live := &platformv1alpha1.ManagedNetwork{}
+		if err := k8sReader.Get(testCtx, types.NamespacedName{Name: "net-twk6"}, live); err != nil {
+			return err
+		}
+		if live.Status.DNSServer == "10.96.0.200" {
+			return nil
+		}
+		live.Status.DNSServer = "10.96.0.200"
+		return k8sClient.Status().Update(testCtx, live)
+	})
+
+	mustTenant(t, vpcTalosTenant("twk6"))
+	eventually(t, "the request for an address", func() error {
+		_, err := cpService("twk6")
+		return err
+	})
+	assignAddress(t, "twk6", "10.199.0.126")
+	issueCA(t, "tenant-twk6", "twk6-talos-ca", "tls.crt")
+	issueCA(t, "tenant-twk6", "twk6-ca", "ca.crt")
+
+	eventually(t, "the worker config", func() error {
+		template := &unstructured.Unstructured{}
+		template.SetGroupVersionKind(talosConfigTemplateGVK)
+		return k8sReader.Get(testCtx, types.NamespacedName{
+			Namespace: "tenant-twk6", Name: "twk6-workers",
+		}, template)
+	})
+	config := workerConfig(t, "tenant-twk6", "twk6-workers")
+	machine, _ := config["machine"].(map[string]any)
+	network2, _ := machine["network"].(map[string]any)
+	resolvers := fmt.Sprint(network2["nameservers"])
+	if !strings.HasPrefix(resolvers, "[10.96.0.200") {
+		t.Errorf("nameservers = %s — the VPC resolver has to come first, "+
+			"because the public ones are unreachable until egress exists",
+			resolvers)
+	}
+}
+
+// TestTheRootClonesLandOnTheTenantsStorageClass.
+//
+// Not the golden's. That one is meant for an erasure-coded pool — read-only
+// reference data cloned many times — while the clones want replica. The first
+// version of this sent them wherever the golden lives, which the live diff
+// showed as a missing `ceph-block`.
+func TestTheRootClonesLandOnTheTenantsStorageClass(t *testing.T) {
+	mustKubeOVNResolver(t)
+	obj := vpcTalosTenant("twk7")
+	obj.Spec.Storage.ClassName = "ceph-block"
+	mustTenant(t, obj)
+	eventually(t, "the request for an address", func() error {
+		_, err := cpService("twk7")
+		return err
+	})
+	assignAddress(t, "twk7", "10.199.0.127")
+	issueCA(t, "tenant-twk7", "twk7-talos-ca", "tls.crt")
+	issueCA(t, "tenant-twk7", "twk7-ca", "ca.crt")
+
+	eventually(t, "the machine template", func() error {
+		template := &unstructured.Unstructured{}
+		template.SetGroupVersionKind(kubevirtMachineTemplateGVK)
+		return k8sReader.Get(testCtx, types.NamespacedName{
+			Namespace: "tenant-twk7", Name: "twk7-workers",
+		}, template)
+	})
+	template := &unstructured.Unstructured{}
+	template.SetGroupVersionKind(kubevirtMachineTemplateGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-twk7", Name: "twk7-workers",
+	}, template); err != nil {
+		t.Fatalf("reading the machine template: %v", err)
+	}
+	disks, _, _ := unstructured.NestedSlice(template.Object, "spec", "template",
+		"spec", "virtualMachineTemplate", "spec", "dataVolumeTemplates")
+	if len(disks) != 1 {
+		t.Fatalf("dataVolumeTemplates = %v", disks)
+	}
+	disk, _ := disks[0].(map[string]any)
+	spec, _ := disk["spec"].(map[string]any)
+	storage, _ := spec["storage"].(map[string]any)
+	if storage["storageClassName"] != "ceph-block" {
+		t.Errorf("storageClassName = %v", storage["storageClassName"])
 	}
 }

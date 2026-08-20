@@ -79,6 +79,12 @@ type ManagedTenantReconciler struct {
 	MetalLBPool      string
 	MetalLBNamespace string
 	TransitSubnet    string
+
+	// KubeOVNNamespace is where kube-ovn states the resolver a VPC worker uses.
+	// Read when the tenant's network is not one of ours — a VPC the product
+	// built has no ManagedNetwork, and refusing to build workers in one would
+	// be this operator insisting the world be its own shape.
+	KubeOVNNamespace string
 }
 
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants,verbs=get;list;watch;create;update;patch;delete
@@ -95,7 +101,11 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=metallb.io,resources=ipaddresspools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=issuers;certificates,verbs=get;list;watch;create;update;patch
-// +kubebuilder:rbac:groups="",resources=secrets;configmaps,verbs=get;list;watch
+// The machine secrets are written here — once, and never rewritten — so this
+// needs create as well as read. Nothing in the suite could have caught the
+// omission: envtest runs as admin, where no RBAC check ever fires.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
