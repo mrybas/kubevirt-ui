@@ -1190,3 +1190,52 @@ come. The operator's cascade did not reproduce it in three teardowns
 (`opnet1`, `opnet3`, and `opnet2/4/5`), which is evidence but not an
 explanation; the difference between the two paths has not been established and
 this log does not claim one.
+
+### Chasing it, and what the experiments actually settled
+
+Four controlled runs, because "the operator path is fine" resting on three
+lucky teardowns is not an acceptance:
+
+| experiment | setup | result |
+|---|---|---|
+| A | created by the UI, torn down by the **operator** | clean, 5 s |
+| B | created and torn down by the **UI**, 20 s old | clean |
+| C | same, 100 s old, DNS pods **2/2 Running** | clean |
+| D | created by the UI, **a ManagedNetwork describing it**, torn down by the UI | **found two bugs of mine** |
+
+A rules out the create path. B and C rule out the age of the network and the
+state of its DNS pods — the hypothesis I had been carrying.
+
+D found something better than the thing I was looking for:
+
+1. **The delete endpoint lied.** It handed the teardown to the operator the
+   moment a ManagedNetwork existed. A `Retain` object describes a network it
+   does not own, so deleting it removed the description and nothing else — the
+   endpoint answered "VPC 'xd1' is being removed" and the Vpc and Subnet were
+   still there a minute later. It now hands over only to an object that will
+   cascade.
+2. **And then it must wait.** The operator keeps reconciling until it observes
+   the deletion, and its writes are `CreateOrUpdate`: a subnet the legacy path
+   deletes can be kept alive, or recreated, by a controller still working from a
+   description that no longer exists.
+3. **The controller stands down too**, which is the same hazard from the other
+   side and does not rely on anybody waiting: an object carrying a
+   deletionTimestamp is not written to, and the test proves the subnet keeps
+   both its timestamp and its UID.
+
+D re-run against the fixes: `status: deleted`, and all three objects gone.
+
+### The acceptance, repeated rather than observed
+
+| path | runs | clean |
+|---|---|---|
+| operator cascade | 3 | 3 |
+| UI delete | 3 | 3 |
+
+Six end-to-end deletions with no manual finalizer removal and no hand-deleted
+Vpc, after the fixes.
+
+The two original wedges remain unexplained as such. Both happened before those
+fixes; one had a ManagedNetwork in play, which fix 2 and 3 address, and the
+other reused a name, where the two-UIDs evidence stands. Neither is claimed as
+the cause of the other.
