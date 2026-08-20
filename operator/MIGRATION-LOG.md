@@ -2323,3 +2323,53 @@ join needed the VPC's external plane and **nothing from `_wire_tenant_to_transit
 at all** — no SNAT rule was created for this tenant and none was missing. What
 that function is still for, on this path, is now an open question with evidence
 attached rather than an assumption to port.
+
+## M12d (third slice, part one) — the transit plane's rules
+
+The user settled what this plane is for, and it is worth writing down because it
+decides the shape: **a tenant's workers reach their control plane, and the CSI
+path reaches the host API, over the underlay leg — so that an egress gateway
+falling over takes the internet and nothing else.** The lab's plan says the same
+thing in one line: cp-transit is VLAN 300, L2-only, *without a gateway leg*.
+Ceph is not on this path at all; tenant workers never touch it.
+
+That also corrects something I got wrong. I had reported that the join needed
+nothing from the product's transit wiring, having checked one artefact of three.
+Measured properly, the live tenants carry all three and my disposable one
+carried none:
+
+```
+                                uat-net-t1              cmp-net
+policy route @30000             ip4.dst == 10.199.0.0/22   —
+OvnEip (nat) on cp-transit      cpt-eip-uat-t1 → .1.4      —
+OvnSnatRule                     10.200.4.0/22 → .1.4       —
+```
+
+It joined anyway, by a return path I have not identified — the subnet does not
+NAT outgoing and the tenant prefix is not announced. So "nothing was needed" was
+not a conclusion I could stand behind; three things the reference creates were
+absent, and the reference documents exactly the silent failure their absence
+produces.
+
+### The rules, ported and checked against the reference itself
+
+The arithmetic is the interesting part and it is easy to get almost right. The
+deny is scoped by **source** to the range kube-ovn actually allocates from — the
+subnet minus its excludeIps — because the whole subnet would put the nodes and
+the control-plane VIP on the left of a drop rule; and it is taken whole rather
+than as its first /24, or the rule is about the tenants numbered lowest and the
+129th quietly falls out of it.
+
+Go has no `address_exclude` and no `summarize_address_range`, so both are
+written here. Rather than trust that, the reference was asked for its own
+answers on five inputs and they are frozen in `test/parity/transit-rules.json`,
+which both suites now assert:
+
+```
+10.199.0.0/22 less 10.199.0.1..10.199.0.255 -> 10.199.1.0/24, 10.199.2.0/23
+10.0.0.0/24   less 10.0.0.1                 -> /31 /30 /29 /28 /27 /26 /25
+```
+
+The second is the one that would have gone unnoticed: a single reserved address
+decomposes into seven prefixes, and any of them being off by one bit is a hole
+or a locked-out tenant. Mutating one entry in the table turns both suites red.

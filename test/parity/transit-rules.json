@@ -1,0 +1,146 @@
+{
+  "_why": "The transit plane rules, taken once from the product implementation that is still the reference and now asserted by both. The operator must render these byte for byte: an allow is keyed on an address and the deny is what it punches through, so a difference of one prefix is a tenant that cannot reach its control plane, or one that can reach somebody elses.",
+  "allowsExample": {
+    "eip": "10.199.1.4",
+    "vip": "10.199.0.101",
+    "tcp": [
+      6443,
+      8132,
+      50001
+    ],
+    "udp": [
+      123
+    ],
+    "rules": [
+      {
+        "action": "allow-related",
+        "direction": "from-lport",
+        "priority": 3200,
+        "match": "ip4.src == 10.199.1.4 && ip4.dst == 10.199.0.101 && tcp.dst == 6443"
+      },
+      {
+        "action": "allow-related",
+        "direction": "from-lport",
+        "priority": 3200,
+        "match": "ip4.src == 10.199.1.4 && ip4.dst == 10.199.0.101 && tcp.dst == 8132"
+      },
+      {
+        "action": "allow-related",
+        "direction": "from-lport",
+        "priority": 3200,
+        "match": "ip4.src == 10.199.1.4 && ip4.dst == 10.199.0.101 && tcp.dst == 50001"
+      },
+      {
+        "action": "allow-related",
+        "direction": "from-lport",
+        "priority": 3200,
+        "match": "ip4.src == 10.199.1.4 && ip4.dst == 10.199.0.101 && udp.dst == 123"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "the lab transit subnet",
+      "cidr": "10.199.0.0/22",
+      "excludeIps": [
+        "10.199.0.1..10.199.0.255"
+      ],
+      "ranges": [
+        "10.199.1.0/24",
+        "10.199.2.0/23"
+      ],
+      "deny": {
+        "action": "drop",
+        "direction": "from-lport",
+        "priority": 3000,
+        "match": "ip4.src == {10.199.1.0/24, 10.199.2.0/23}"
+      }
+    },
+    {
+      "name": "nothing reserved",
+      "cidr": "10.199.0.0/24",
+      "excludeIps": [],
+      "ranges": [
+        "10.199.0.0/24"
+      ],
+      "deny": {
+        "action": "drop",
+        "direction": "from-lport",
+        "priority": 3000,
+        "match": "ip4.src == 10.199.0.0/24"
+      }
+    },
+    {
+      "name": "a single reserved address",
+      "cidr": "10.0.0.0/24",
+      "excludeIps": [
+        "10.0.0.1"
+      ],
+      "ranges": [
+        "10.0.0.2/31",
+        "10.0.0.4/30",
+        "10.0.0.8/29",
+        "10.0.0.16/28",
+        "10.0.0.32/27",
+        "10.0.0.64/26",
+        "10.0.0.128/25"
+      ],
+      "deny": {
+        "action": "drop",
+        "direction": "from-lport",
+        "priority": 3000,
+        "match": "ip4.src == {10.0.0.2/31, 10.0.0.4/30, 10.0.0.8/29, 10.0.0.16/28, 10.0.0.32/27, 10.0.0.64/26, 10.0.0.128/25}"
+      }
+    },
+    {
+      "name": "a reserved cidr and a range",
+      "cidr": "10.0.0.0/22",
+      "excludeIps": [
+        "10.0.0.0/25",
+        "10.0.2.10..10.0.2.20"
+      ],
+      "ranges": [
+        "10.0.0.128/25",
+        "10.0.1.0/24",
+        "10.0.2.0/29",
+        "10.0.2.8/31",
+        "10.0.2.21/32",
+        "10.0.2.22/31",
+        "10.0.2.24/29",
+        "10.0.2.32/27",
+        "10.0.2.64/26",
+        "10.0.2.128/25",
+        "10.0.3.0/24"
+      ],
+      "deny": {
+        "action": "drop",
+        "direction": "from-lport",
+        "priority": 3000,
+        "match": "ip4.src == {10.0.0.128/25, 10.0.1.0/24, 10.0.2.0/29, 10.0.2.8/31, 10.0.2.21/32, 10.0.2.22/31, 10.0.2.24/29, 10.0.2.32/27, 10.0.2.64/26, 10.0.2.128/25, 10.0.3.0/24}"
+      }
+    },
+    {
+      "name": "an unreadable entry is skipped",
+      "cidr": "10.0.0.0/24",
+      "excludeIps": [
+        "not-an-address",
+        "10.0.0.1"
+      ],
+      "ranges": [
+        "10.0.0.2/31",
+        "10.0.0.4/30",
+        "10.0.0.8/29",
+        "10.0.0.16/28",
+        "10.0.0.32/27",
+        "10.0.0.64/26",
+        "10.0.0.128/25"
+      ],
+      "deny": {
+        "action": "drop",
+        "direction": "from-lport",
+        "priority": 3000,
+        "match": "ip4.src == {10.0.0.2/31, 10.0.0.4/30, 10.0.0.8/29, 10.0.0.16/28, 10.0.0.32/27, 10.0.0.64/26, 10.0.0.128/25}"
+      }
+    }
+  ]
+}
