@@ -37,3 +37,21 @@ spec:
             # all, and "no complaint" reads exactly like "checked and fine".
             - name: TENANTS_CP_TRANSIT_SUBNET
               value: cp-transit
+            # Where kube-ovn states the resolver a VPC worker uses. Needed for
+            # a VPC the product built, which has no ManagedNetwork to read it
+            # from — the operator must not require the world to be its shape.
+            - name: KUBE_OVN_NAMESPACE
+              value: kube-ovn
+            # The external name a tenant's apiserver answers to. Without it the
+            # certificate carries no such SAN and kubectl through the ingress
+            # fails TLS — invisible from inside the cluster, which is where
+            # every test looks.
+            - name: TENANTS_INGRESS_DOMAIN
+              value: tenants.lab.beardlabs.cc
+            # The identity provider a tenant may opt into. Same values the
+            # backend reads: two deployments configured by different names for
+            # one fact drift apart in silence.
+            - name: OIDC_ISSUER
+              value: https://kubevirt-ui.lab.beardlabs.cc/dex
+            - name: OIDC_CLIENT_ID
+              value: kubevirt-ui
