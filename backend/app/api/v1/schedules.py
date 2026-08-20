@@ -236,6 +236,54 @@ async def list_scheduled_actions(
         )
 
 
+async def _own_the_schedule(
+    k8s_client: Any,
+    body: dict[str, Any],
+    req: CreateScheduleRequest,
+    namespace: str,
+) -> None:
+    """Tie the schedule to the machine it acts on, so it dies with it.
+
+    The link between the two was a name in a label and a name in a shell
+    command, which means a schedule outlives its machine: it keeps firing
+    kubectl at something that is not there, and — worse — a new machine created
+    with the same name inherits every schedule the old one had.
+
+    An ownerReference makes the cluster's own garbage collector handle it. No
+    controller, no finalizer, and it still works when nothing of ours is
+    running.
+
+    Best-effort: a schedule that could not be tied to its machine is still a
+    schedule someone asked for. It is created, and the old behaviour is what it
+    falls back to.
+    """
+    if req.vm_namespace != namespace:
+        # An ownerReference cannot cross namespaces; the garbage collector would
+        # read it as an owner that does not exist and delete the schedule at
+        # once. Leaving it untied is the lesser wrong.
+        return
+    try:
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=req.vm_name,
+        )
+        body["metadata"]["ownerReferences"] = [{
+            "apiVersion": "kubevirt.io/v1",
+            "kind": "VirtualMachine",
+            "name": vm["metadata"]["name"],
+            "uid": vm["metadata"]["uid"],
+            # Not blocking: a machine should not wait on its schedules to be
+            # cleaned up before it can be deleted.
+            "blockOwnerDeletion": False,
+        }]
+    except Exception as e:
+        logger.warning(
+            f"Could not tie schedule to VM {namespace}/{req.vm_name}: {e}; "
+            "it will outlive the machine",
+        )
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_scheduled_action(
     request: Request,
@@ -250,6 +298,7 @@ async def create_scheduled_action(
         batch_api = client.BatchV1Api(k8s_client._api_client)
 
         cronjob_body = _build_cronjob(schedule_request, namespace)
+        await _own_the_schedule(k8s_client, cronjob_body, schedule_request, namespace)
 
         result = await batch_api.create_namespaced_cron_job(
             namespace=namespace,

@@ -437,3 +437,38 @@ before clone is rewritten: measure upstream `VirtualMachineClone`, which has its
 own state machine and volume-naming policy — porting the current rename-map,
 which copies attached PVCs verbatim and so points a clone at the source's disks,
 would be rebuilding a defect in a new language.
+
+## M8 (second slice) — disks are declared, and things stop outliving their machine
+
+**Declarative disks.** What is attached lives in `spec.disks`; attach and detach
+through the UI patch that list for machines the operator owns. Live on the
+stand, on a **running** guest: attach → declared, plugged in, holder label set,
+and `volumeStatus` shows `op-data-1=Ready` with no restart; detach → gone from
+all three.
+
+The root disk is deliberately not one of these, and that is what makes
+declarative disks compatible with restores: a restore replaces the disk behind
+the root volume and keeps the *volume's* name. Matching by volume name rather
+than by the disk behind it makes a restore invisible to this reconciliation
+instead of undone by it.
+
+Two holes closed:
+
+- **A disk attached to two machines** is refused at admission. Live:
+  `disk "op-data-1" is already attached to "op-target"; a disk written by two
+  machines is corrupted by both`. The old check lived in one handler, so a
+  manifest or the hot-plug path on a second machine walked past it.
+- **A deleted machine releases its disks.** The attach path reads the holder
+  label before it scans, so a disk whose holder no longer existed could never be
+  attached to anything again.
+
+A disk plugged in by another route is left alone: the controller detaches only
+what it attached, recorded in status.
+
+**Schedules die with their machine.** The link was a name in a label and a name
+inside a shell command, so a schedule kept firing kubectl at a deleted VM, and a
+new machine with the same name inherited the old one's schedules. It is an
+ownerReference now — the cluster's own garbage collector, no controller, no
+finalizer, and it still works when nothing of ours is running. Not blocking, so
+a machine never waits on its schedules; not set across namespaces, where the
+collector would read it as a missing owner and delete the schedule at once.
