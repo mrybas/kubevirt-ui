@@ -1603,3 +1603,70 @@ had to be rewritten first: the version that broke the MachineDeployment pointer
 by hand and watched a private recorder was racing the running manager for who
 would fix it, and losing that race is indistinguishable from silence. It counts
 the manager's own events now, aggregation included.
+
+## M12c (second slice) — one golden image per release, not per tenant
+
+A Talos worker's root disk is a clone of a shared image, and the sharing is what
+makes a second tenant of the same release cheap: it clones a disk that is
+already there instead of pulling 20Gi over HTTP again. H2 is that property
+stated as an acceptance — second tenant, zero new imports.
+
+### The tenant declares an image; it does not import one
+
+The product's version created the DataVolume itself and then waited, inside the
+HTTP request, up to twenty seconds for an import it had just started. The
+operator writes a **ManagedImage** instead and lets the image controller do what
+it already does. Two things follow from that and both are the point of this
+migration: importing disks has one writer rather than two, and "not yet" has
+somewhere to live — a `GoldenReady` condition — instead of being a timeout in a
+request handler.
+
+It crosses domains on purpose: the tenant domain writes the CR, the vm domain
+reconciles it. One writer of the declaration, one writer of the disk.
+
+Nothing about the image is owned by the tenant. An ownerReference would make the
+first tenant deleted take the shared disk away from everyone still cloning it.
+What protects it instead is already in the image controller: deletion is refused
+while any DataVolume clones from the claim, and it removes only what carries its
+own ownership stamp.
+
+### The name is the mechanism
+
+`talos-golden-1-13-8` — the catalogue key with its dots flattened. Two tenants
+asking for one release ask for one object, so sharing is not a lookup that could
+go wrong but the identity of the thing. The test says so directly: same release
+must give the same name, different releases must not, or an upgrade would
+silently reuse the old disk.
+
+### Two subjects on the clone path
+
+The grant is `datavolumes/source` in the namespace that holds the image, and the
+subject is **not** the backend. The worker's root disk is a `dataVolumeTemplate`
+on the VirtualMachine, so KubeVirt creates it and CDI evaluates the tenant
+namespace's default ServiceAccount — which the cluster once said in as many
+words. One Role, one RoleBinding per tenant namespace, so a second tenant adds a
+grant rather than rewriting the first one's.
+
+### What the acceptance had to prove
+
+Not just "one image": that the disk behind it was not touched. The test holds
+the golden DataVolume's UID and resourceVersion across the second tenant's whole
+reconcile, and separately checks the write counter for the tenant controller —
+because a no-op update comes back from the API server as identical bytes, so
+resourceVersion alone cannot tell a write that changed nothing from no write at
+all. Mutating the name to include the tenant turns the test red on the first
+assertion.
+
+Two branches were named honestly rather than dressed up: the condition test
+proves the status is read from the image rather than from the write that made it
+(envtest has no CDI, so a True would mean it is not reading at all), and the
+"catalogue has no image" refusal is exercised by calling the function directly,
+since a release the catalogue does not have is already refused at `Accepted`.
+
+### Still one writer short
+
+The backend creates the golden itself on its own tenant path. There is no
+conflict today because nothing in production creates a ManagedTenant yet — the
+operator's golden runs only for CRs written by hand. When the backend starts
+creating ManagedTenants (M12d/M12e), the golden call has to come out of the
+backend in the same change, not after it.

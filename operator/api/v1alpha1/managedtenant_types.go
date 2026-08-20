@@ -165,6 +165,15 @@ const (
 	// defaults supplied, every tenant created in a folder had no control plane
 	// at all, and the page said Provisioning forever.
 	ConditionNamespaceReady = "NamespaceReady"
+
+	// ConditionGoldenReady is the shared Talos image this tenant's workers are
+	// cloned from — one per release, not one per tenant.
+	//
+	// False is not a refusal: CDI's clone waits for its source, so a golden
+	// still importing delays the first worker's disk rather than failing the
+	// tenant. It is here because "the tenant is stuck" and "a 20Gi image is
+	// still downloading" look identical from the outside otherwise.
+	ConditionGoldenReady = "GoldenReady"
 )
 
 // TenantReservation is what this tenant asks of its folder.

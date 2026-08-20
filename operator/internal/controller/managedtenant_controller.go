@@ -64,6 +64,8 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups="",resources=namespaces;resourcequotas;limitranges,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedimages,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch
 
 // Reconcile brings the tenant's namespace into line with the declaration.
 func (r *ManagedTenantReconciler) Reconcile(
@@ -166,6 +168,20 @@ func (r *ManagedTenantReconciler) Reconcile(
 	}
 
 	obj.Status.RedundantQuotas = redundant
+
+	// After the namespace, because the clone grant names it as its subject.
+	goldenReady, goldenMessage, err := r.reconcileGolden(ctx, obj, namespace, release)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			goldenCondition(false, err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if goldenMessage != "" || obj.Spec.Workers.OS == "talos" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			goldenCondition(goldenReady, goldenMessage))
+	}
 
 	r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady, true, "Ready",
 		fmt.Sprintf("%s has its quota and its LimitRange", namespace))
