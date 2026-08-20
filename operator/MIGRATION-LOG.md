@@ -881,3 +881,74 @@ business being able to.
 - The in-cluster backend now runs a branch image. Putting the stand back is
   `kubectl set image ... backend=ghcr.io/mrybas/kubevirt-ui/backend:2026.10.36`
   plus `hack/underlay-cutover.sh rollback --apply`, in that order reversed.
+
+## M10a (first slice) — ManagedNetwork: the VPC and its default subnet
+
+One declaration produces the kube-ovn `Vpc` and the `<name>-default` `Subnet`:
+labels the tenant wizard filters on, DHCP options workloads resolve through, and
+the external-plane attachment with its default route.
+
+### Where the slice deliberately stops
+
+**No ACLs.** `Subnet.spec.acls` has one writer — the isolation reconciler in the
+backend — and the composer that takes it over needs an adoption step that proves
+render == live first. The `isolated` flag here records the decision (it stamps
+the opt-out annotation the reconciler reads) and writes no rules. Guarded by a
+test that plants somebody else's ACL and pokes the controller five times.
+
+**Lists are merged, not set.** Peering writes `staticRoutes`, the
+egress-gateway attach path appends to `extraExternalSubnets`. Replacing either
+would delete another writer's work on the first pass. The limitation this buys:
+removing an entry from the CR does not remove it from the VPC. Closes when those
+paths move here.
+
+**No ownerReferences**, and this is the opposite of ManagedUnderlay's choice.
+A network is usually written down after it already exists and already carries
+workloads, so describing one must be reversible in both directions. Recorded in
+the type doc, next to the underlay's opposite reasoning.
+
+### Three write-loops caught before they reached a cluster
+
+The acceptance is parity with the two networks the stand already has, using the
+live objects as fixtures rather than hand-written expectations. It failed
+immediately, three times, all the same class as the DaemonSet one:
+
+1. kube-ovn defaults `bfdId`, `ecmpMode`, `routeTable` inside every static route.
+   Nothing in this product sets them, so an exact comparison never matches and
+   the list is rewritten every pass. → merge on the fields we own.
+2. kube-ovn drops an empty `namespaces` instead of storing it, so rendering `[]`
+   unconditionally never matches. → write it only when non-empty.
+3. (envtest) `SetAnnotations` with an empty map on an object that had none counts
+   as a change, and the API server stores nil again — one extra write per
+   reconcile on every isolated network. → touch annotations only when they differ.
+
+### Live cycle
+
+- **Adoption of an existing UI-built network is a byte-identical no-op.**
+  `uat-net-vm`: resourceVersion and generation unchanged on both objects, full
+  JSON diff empty, conditions Ready/Attached true, `Via 10.199.4.254` read from
+  the external Subnet.
+- **A CRD-created network equals a UI-created one.** `opnet1` (CRD) against
+  `uinet1` (POST /api/v1/vpcs), names and addresses normalised: Vpc identical,
+  Subnet identical apart from `acls`, which the other writer owns.
+
+### Two mistakes worth keeping
+
+**I adopted a live network while the backend still owned the create path.** Same
+two-writer condition as the underlay, one slice later. Corrected by removing the
+CR — safe here precisely because this controller sets no ownerReferences, and
+verified as such: `uat-net-vm` still at rv=170864, no deletionTimestamp, VMs
+running. Comparisons now run on throwaway networks only.
+
+**The first comparison was against a differently configured product.** It
+reported the UI writing a VPC with no external plane at all. The cause was mine:
+`-f docker-compose.yml -f docker-compose.opdev.yml` does not load
+`docker-compose.override.yml`, so the harness had no `B3_*` variables and
+`b3_enabled()` was false. The B3 configuration now lives in the opdev harness,
+copied from the in-cluster Deployment — the authority on what this site's
+product configuration is.
+
+And the reason that got noticed at all: the normalisation `sed` failed on the
+slashes in a CIDR, wrote two empty files, and `diff` called them identical. A
+comparison that passes on empty inputs is not a comparison. Byte counts are now
+printed alongside every diff in this log's live checks.

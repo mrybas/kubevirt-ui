@@ -187,6 +187,23 @@ type ManagedNetworkStatus struct {
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // ManagedNetwork is a tenant network.
+//
+// Its children carry no ownerReferences, and that is the opposite of the choice
+// ManagedUnderlay makes. The two are worth reading together, because deleting
+// one of these objects is safe and deleting one of those takes an external
+// subnet and every gateway on it.
+//
+// The difference is adoption. A network is very often written down after it
+// already exists and already carries workloads, so describing one must be
+// reversible: writing the CR must change nothing, and removing it again must
+// change nothing. Ownership would make the second half false — the description
+// would have quietly become the thing described, and `kubectl delete` on a note
+// would delete a running network. An underlay is the other way round: it is
+// built by the object, and a ProviderNetwork with nothing behind it is fabric
+// nobody is keeping up.
+//
+// The cost is stated rather than hidden: deleting a ManagedNetwork leaves the
+// Vpc and Subnet behind. Removing a network is a separate, deliberate act.
 type ManagedNetwork struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
