@@ -88,7 +88,6 @@ from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.api.v1.tenants_capi import (
     _create_capi_resources,
     _detach_tenant_ns_from_vpc_subnet,
-    _remove_cp_vpc_publication,
     tenant_vpc_name,
 )
 from app.api.v1.tenants_addons import (
@@ -1747,7 +1746,6 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             # Subnet, so without this the subnet would carry a stale entry
             # for an aborted tenant.
             await _detach_tenant_ns_from_vpc_subnet(k8s, req.name)
-            await _remove_cp_vpc_publication(k8s, req.name)
         except Exception:
             pass
         try:
@@ -1865,7 +1863,6 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
     #    and left the tenant fully alive behind a 5xx.
     for label, cleanup in (
         ("detach tenant ns from the VPC subnet", _detach_tenant_ns_from_vpc_subnet),
-        ("drop the control-plane SwitchLBRule", _remove_cp_vpc_publication),
         ("delete the CSI ClusterRoleBinding", delete_csi_cluster_role_binding),
         ("release the CP demux ports", release_cp_ports),
         ("drop the transit EIP/SNAT and its ACLs", _release_tenant_transit),

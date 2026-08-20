@@ -2547,3 +2547,23 @@ right. The right line is: **the test may be the cluster; the operator may not.**
 With the line drawn there the suite is green, which is the useful answer: the
 role already grants everything the controllers actually do. From here a missing
 verb fails in the suite instead of on the stand.
+
+## M12d: the publication that never published
+
+`_ensure_cp_reachable_in_vpc` built a SwitchLBRule to expose a tenant's
+control-plane ClusterIP inside its own VPC. It has had **no callers** since the
+address model changed, and kube-ovn rejects the rule anyway — the VIP is outside
+the subnet the rule lives on. 119 lines, plus its name helper and its plural
+constant.
+
+The removal half was still wired in, though, in two places: the create-failure
+cleanup and the teardown list. Deleting a cleanup is only safe if there is
+nothing left to clean, so that was measured rather than assumed — the stand
+carries nine SwitchLBRules and **all nine are kube-ovn's own vpc-dns rules**,
+not one tenant control-plane rule among them. Nothing is orphaned by taking the
+cleanup out with the thing it cleaned up after.
+
+Gone with them: the tests that exercised the dead path, and the two rows in the
+chart's RBAC contract that granted create/patch/delete on `switch-lb-rules`.
+That last one is the part worth noticing — the permission outlived the caller,
+which is how a role ends up wider than the code that justified it.
