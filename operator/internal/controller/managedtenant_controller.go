@@ -116,7 +116,8 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=talosconfigtemplates,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=kubevirtclusters;kubevirtmachinetemplates,verbs=get;list;watch;create;update;patch
-// +kubebuilder:rbac:groups=kubeovn.io,resources=subnets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kubeovn.io,resources=subnets;vpcs,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=kubeovn.io,resources=ovn-eips;ovn-snat-rules,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile brings the tenant's namespace into line with the declaration.
 func (r *ManagedTenantReconciler) Reconcile(
@@ -300,6 +301,23 @@ func (r *ManagedTenantReconciler) Reconcile(
 	apimeta.SetStatusCondition(&obj.Status.Conditions,
 		controlPlaneCondition(cpReady, cpReason, cpMessage))
 	pending = pending || !cpReady
+
+	// Before the workers: their config names the address they will dial, and
+	// this is what makes that address reachable from inside the VPC.
+	transitReady, transitReason, transitMessage, err := r.reconcileTransit(
+		ctx, obj, obj.Status.ControlPlaneVIP)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			transitCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if obj.Spec.Network != "" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			transitCondition(transitReady, transitReason, transitMessage))
+		pending = pending || !transitReady
+	}
 
 	// After the control plane: the worker config carries the Kubernetes CA that
 	// Kamaji only mints once the control plane exists.

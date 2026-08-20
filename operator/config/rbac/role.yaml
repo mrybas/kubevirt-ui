@@ -214,13 +214,7 @@ rules:
   - kubeovn.io
   resources:
   - ovn-eips
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - kubeovn.io
-  resources:
+  - ovn-snat-rules
   - provider-networks
   - subnets
   - vlans

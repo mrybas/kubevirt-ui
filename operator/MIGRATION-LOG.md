@@ -2373,3 +2373,49 @@ which both suites now assert:
 The second is the one that would have gone unnoticed: a single reserved address
 decomposes into seven prefixes, and any of them being off by one bit is a hole
 or a locked-out tenant. Mutating one entry in the table turns both suites red.
+
+## M12d (third slice, part two) — the wiring, and the deny that would have taken two tenants down
+
+Three parts, in one order that matters. The VPC gets a port on the plane **and
+the policy route protecting it in the same write** — policy routes beat static
+ones, so a gateway's catch-all swallows the packets going one hop to the control
+plane, and a VPC attached without the guard has a leg it cannot use for the one
+thing the leg is for. Then the tenant's subnet gets an address on that plane to
+leave under. Then the guard ACLs let that address, and only it, reach that VIP
+on those ports.
+
+The SNAT slot is decided on the **whole set** of rules claiming the subnet,
+sorted by name, never on the first match: OVN keeps one NAT per logical IP, so
+two rules cannot both be in force and the loser reports `ready: true` about a
+NAT the router does not have. A rule on another network holding the slot is
+**reported, not absorbed** — inheriting it writes the guard for an address on
+the wrong plane, which looks configured and works for nothing. A rule wedged by
+a missing address gets its finalizer released, but only in that exact state.
+
+### The baseline deny, and why it is withheld
+
+A reviewer stopped this before it reached the stand, and the measurement was
+worse than the guess: `cp-transit` carries **no ACLs at all**, while two live
+tenants hold `nat` addresses inside the allocatable range. The reference writes
+a deny plus per-tenant allows there; on this cluster it is simply absent —
+either a rollback artefact or it was never written, and it contradicts the
+earlier stand where the guard was a TCP-only whitelist. Recorded as a fact, not
+explained.
+
+What matters is what my first pass would have done: added the deny and allows
+for the tenant it was reconciling, and **taken both live control planes down in
+one patch**, silently, because a deny is the baseline everyone else's allow
+punches through and nobody else had one.
+
+So the deny goes in only when every `nat` address on the plane already has an
+allow. Withholding leaves the plane exactly as open as it already is — not a
+regression — and the tenant's condition says so out loud rather than leaving an
+open transit plane to be discovered from an ACL listing. Three related edges
+came with it: router-port addresses are not tenant addresses (counting them
+keeps an allow alive after its owner is gone), an allow whose source cannot be
+read is left alone (not understanding a rule is not a reason to delete it), and
+when the live set cannot be read at all nothing is pruned.
+
+The fixture is modelled on the live plane: two foreign `nat` addresses, empty
+ACLs. Mutating the withholding away turns it red with "it wrote the baseline and
+took the stranger's control plane with it".

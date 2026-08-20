@@ -231,6 +231,14 @@ const (
 	// can be answering perfectly while every worker sits waiting for a
 	// certificate, and reporting one number for both hides exactly that.
 	ConditionWorkersReady = "WorkersReady"
+
+	// ConditionTransitReady is the tenant's path to its own control plane.
+	//
+	// Separate from everything else because it fails on its own and silently:
+	// the cluster comes up, the internet works, and only the control plane is
+	// unreachable. It is also where a conflict over the one SNAT slot a subnet
+	// has gets reported, which is not something that heals itself.
+	ConditionTransitReady = "TransitReady"
 )
 
 // TenantReservation is what this tenant asks of its folder.
