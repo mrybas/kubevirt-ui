@@ -106,8 +106,9 @@ rules:
   # by construction. It surfaced only when the deployed backend was asked to
   # read a ManagedUnderlay and answered 403.
   #
-  # The verbs are not maintained by hand. tests/test_backend_rbac_covers_the_
-  # operator_paths.py derives them from the call sites and fails if this drifts.
+  # These rows are not kept by memory. tests/test_helm_rbac_contract.py reads
+  # the *_custom_object(plural=...) call sites out of the backend and fails when
+  # its REQUIRED list — and therefore this block — falls behind them.
   - apiGroups: ["platform.kubevirt-ui.io"]
     resources:
       - managedvms
