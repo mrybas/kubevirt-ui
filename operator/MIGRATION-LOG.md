@@ -2458,3 +2458,61 @@ exactly what putting it on this plane is meant to fix, and it is target design
 (the lab plan's T13: a private per-VPC URL, `VIP:6444` with `tls-server-name`),
 not something to port. Named here so the gap is a decision rather than a
 discovery.
+
+### Live: the plane closed, and the leg proved by removing the alternative
+
+The operator's first pass over a tenant did the whole thing on the stand:
+
+```
+cp-transit acls: 0 -> 13
+  3000 drop          ip4.src == {10.199.1.0/24, 10.199.2.0/23}
+  3200 allow-related .1.24 -> .0.104   6443 8132 50001 tcp, 123 udp   (cmp3)
+  3200 allow-related .1.4  -> .0.100   6443 8132 50001 tcp, 123 udp   (uat-t1, backfilled)
+  3200 allow-related .1.5  -> .0.101   6443 8132 50001 tcp, 123 udp   (uat-t2, backfilled)
+```
+
+Both live tenants kept their nodes throughout — the point of writing their
+permissions in the same patch as the baseline. And the datapath was checked in
+the router rather than in the CRs, which is where a rule that reports ready can
+still be absent:
+
+```
+lr-nat-list cmp-net     snat 10.199.1.24  10.200.16.0/22
+lr-policy-list cmp-net  30000  ip4.dst == 10.199.0.0/22  allow
+```
+
+**Then the acceptance that matters, done by removing the alternative rather than
+observing survival.** A tenant prefix is announced to the border, so a control
+plane reached "successfully" proves nothing while a gateway path exists — the
+reply can come back that way, which is exactly the dependency this plane is
+meant to remove. So the external leg was taken off `cmp-net` entirely: no
+default route, and the `cmp-net-external` router port gone. From a pod inside
+the VPC:
+
+```
+own VIP    10.199.0.104:6443   open
+own VIP    10.199.0.104:8132   open
+other VIP  10.199.0.100:6443   closed   <- the deny is in force
+own VIP    10.199.0.104:9999   closed   <- only the ports it was given
+internet   1.1.1.1:443         closed   <- there is no gateway path at all
+```
+
+The third line is the one that proves the source: the deny only matches traffic
+from `10.199.1.0/24`, so a refusal on the neighbour's VIP means the packets are
+arriving as `10.199.1.24` — the transit address — and not as the pod's own. The
+fourth says the permission is scoped to the ports it was written for, and the
+fifth says none of this is riding a gateway. The leg was put back afterwards and
+the internet returned.
+
+### A gap this found: the network can be attached but not detached
+
+Setting `externalPlane.attachments` back to one entry did nothing to the VPC.
+The renderer merges — additively, on purpose, so adopting a network the product
+already built is a no-op — and nothing removes a leg or a route it no longer
+declares. The A/B was done by editing the Vpc by hand, which is not a way to run
+a fabric.
+
+It is the same "on but not off" shape as the teardown gaps: every switch in this
+migration has been easier to turn on than off, and each time the missing half
+has only shown up when somebody needed it. Logged as the next thing owed to the
+network controller rather than folded in here.
