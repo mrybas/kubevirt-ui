@@ -99,7 +99,8 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
-// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machinehealthchecks,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machinehealthchecks;machinedeployments,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=talosconfigtemplates,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=kubevirtclusters;kubevirtmachinetemplates,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=kubeovn.io,resources=subnets,verbs=get;list;watch
@@ -286,6 +287,21 @@ func (r *ManagedTenantReconciler) Reconcile(
 	apimeta.SetStatusCondition(&obj.Status.Conditions,
 		controlPlaneCondition(cpReady, cpReason, cpMessage))
 	pending = pending || !cpReady
+
+	// After the control plane: the worker config carries the Kubernetes CA that
+	// Kamaji only mints once the control plane exists.
+	workersReady, workersReason, workersMessage, err := r.reconcileWorkers(
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP, release, addressNeeded)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			workersCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	apimeta.SetStatusCondition(&obj.Status.Conditions,
+		workersCondition(workersReady, workersReason, workersMessage))
+	pending = pending || !workersReady
 
 	// After the namespace, because the clone grant names it as its subject.
 	goldenReady, goldenMessage, err := r.reconcileGolden(ctx, obj, namespace, release)

@@ -206,6 +206,13 @@ const (
 	// can reach the endpoint the workers were given, is a different question
 	// and the only one a worker cares about.
 	ConditionControlPlaneReady = "ControlPlaneReady"
+
+	// ConditionWorkersReady is how many of the declared workers have joined.
+	//
+	// Separate from the control plane because they fail apart: a control plane
+	// can be answering perfectly while every worker sits waiting for a
+	// certificate, and reporting one number for both hides exactly that.
+	ConditionWorkersReady = "WorkersReady"
 )
 
 // TenantReservation is what this tenant asks of its folder.

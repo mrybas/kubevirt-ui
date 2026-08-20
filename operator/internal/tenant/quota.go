@@ -170,3 +170,25 @@ func bytesOf(quantity string) (int64, error) {
 	}
 	return parsed.Value(), nil
 }
+
+// LargerSize is the bigger of two Kubernetes quantities, falling back to the
+// second when either cannot be read.
+//
+// The fallback direction matters: this decides a clone's size against the image
+// it is cloned from, and CDI refuses a clone smaller than its source at
+// admission — which would fail every worker with an error nobody would connect
+// to a disk-size field.
+func LargerSize(asked, floor string) string {
+	askedQ, err := resource.ParseQuantity(asked)
+	if err != nil {
+		return floor
+	}
+	floorQ, err := resource.ParseQuantity(floor)
+	if err != nil {
+		return floor
+	}
+	if askedQ.Cmp(floorQ) >= 0 {
+		return asked
+	}
+	return floor
+}

@@ -2048,3 +2048,67 @@ literal.
 
 This is also the first thing found by reading a foreign CRD instead of the code
 that writes to it — worth repeating for the other three kinds in this phase.
+
+## M12d (second slice) — the worker pool
+
+Four objects: the machine config a node boots with, the VM shape CAPK stamps
+out, the MachineDeployment that scales them, and the health check that replaces
+one whose node stops answering.
+
+### Waiting is the design, not an inconvenience
+
+The bootstrap template is **immutable**: whatever is written is what every
+worker of this tenant gets for as long as it lives. Kamaji mints the Kubernetes
+CA while the config is being assembled, and the two used to race — measured to
+the second: a read at 09:41:30 that missed a secret created at 09:41:31, and a
+tenant that then failed every boot with `secrets.KubeletController: missing
+accepted Kubernetes CAs` twelve seconds in, before any network, so it read as a
+mystery rather than a race.
+
+The product waited inside the creating request, up to two minutes. Here there is
+nothing to wait in: the tenant reports which certificate is missing and comes
+back. Both CAs are required and they are different certificates — the machine CA
+is Talos's own, the cluster CA is what the kubelet must trust to talk to the
+tenant apiserver — and the test proves one is not enough by supplying only the
+first and watching nothing be written.
+
+That also makes N7 nearly redundant for tenants the operator builds: the repair
+exists because the product could write a CA-less template, and this cannot. It
+stays for the tenants the product already made.
+
+### Two facts that only a cluster taught
+
+`base64` in both directions: Kubernetes stores secret data encoded, the Python
+client hands it back still encoded, and Talos wants it that way — but client-go
+decodes it first, so the Go port has to encode it again. Silently wrong
+otherwise, in a field nothing validates.
+
+And the kubelet image is pinned to the tenant's Kubernetes version rather than
+left to the Talos image. Talos ships whatever kubelet matches *its* release; on
+a control plane several minors older, the node boots, apid and the kubelet both
+report healthy, and it never registers.
+
+### What the health check is worth
+
+`maxUnhealthy: 100%`, because a one-worker tenant is the common case and the
+usual guard would refuse to remediate the only worker — exactly when the tenant
+is fully down. The unhealthy window is three times the measured three-minute
+return, so it moves when the measurement does; the cost is stated rather than
+hidden, a genuinely dead worker detected about five minutes later. And a drain
+timeout, because a node that is gone cannot be drained: it stopped on a
+disruption budget needing a healthy pod it no longer had, and with no timeout
+CAPI retried forever while the replacement never arrived.
+
+### Named gap: cloud-init
+
+The operator builds Talos workers only, and says so on the condition rather than
+half-building a pool. The cloud-init path is a KubeadmConfigTemplate carrying a
+page of shell — a resolv.conf that survives DHCP, a disk moved under `/var/lib`
+because a containerDisk overlay reports zero capacity, a kubelet-config filter
+for fields a newer control plane emits, and a postmortem script that is
+debugging scaffolding rather than product. Porting it, and deciding which of it
+is worth keeping, is a slice of its own.
+
+Also not carried over: the per-tenant DNS overrides the product's request object
+has (`dns_mode`, `dns_servers`). The CRD has no field for them, and inventing
+one here would be a second place to configure the same thing.

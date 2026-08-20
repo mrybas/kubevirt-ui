@@ -138,19 +138,10 @@ rules:
   - cluster.x-k8s.io
   resources:
   - clusters
+  - machinedeployments
   - machinehealthchecks
   verbs:
   - create
-  - get
-  - list
-  - patch
-  - update
-  - watch
-- apiGroups:
-  - cluster.x-k8s.io
-  resources:
-  - machinedeployments
-  verbs:
   - get
   - list
   - patch
