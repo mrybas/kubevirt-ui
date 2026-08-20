@@ -272,3 +272,51 @@ func TestIsolationDefaultsToClosed(t *testing.T) {
 		t.Error("an explicit no must be honoured")
 	}
 }
+
+// TestWithdrawTakesBackOnlyWhatWasOurs.
+//
+// "Live minus wanted" would delete another writer's work, which is what the
+// merge exists to protect. Not being asked for is not the same as being ours to
+// remove — so the record of what was applied last time is the third input.
+func TestWithdrawTakesBackOnlyWhatWasOurs(t *testing.T) {
+	live := []string{"cp-transit", "external", "somebody-elses"}
+	got, changed := Withdraw(live, []string{"cp-transit"}, []string{"cp-transit", "external"})
+	if !changed {
+		t.Fatal("it kept a leg it had added and no longer declares")
+	}
+	if len(got) != 2 || got[0] != "cp-transit" || got[1] != "somebody-elses" {
+		t.Errorf("got %v — the foreign entry must survive", got)
+	}
+}
+
+// TestAnAdoptedNetworkLosesNothing. Its record is empty, so nothing on it is
+// ours until this operator has written it once itself.
+func TestAnAdoptedNetworkLosesNothing(t *testing.T) {
+	live := []string{"cp-transit", "external"}
+	got, changed := Withdraw(live, nil, nil)
+	if changed || len(got) != 2 {
+		t.Errorf("adoption removed %v -> %v", live, got)
+	}
+}
+
+func TestWithdrawRouteMatchesTheHopItWroteWith(t *testing.T) {
+	live := []any{
+		map[string]any{"cidr": "0.0.0.0/0", "nextHopIP": "10.199.4.254"},
+		map[string]any{"cidr": "0.0.0.0/0", "nextHopIP": "10.199.4.9"},
+		map[string]any{"cidr": "10.0.0.0/8", "nextHopIP": "10.199.4.254"},
+	}
+	got, changed := WithdrawRoute(live, "10.199.4.254")
+	if !changed || len(got) != 2 {
+		t.Fatalf("got %v", got)
+	}
+	for _, raw := range got {
+		route, _ := raw.(map[string]any)
+		if route["cidr"] == "0.0.0.0/0" && route["nextHopIP"] == "10.199.4.254" {
+			t.Error("it kept the route it had written")
+		}
+	}
+	// Nothing recorded means nothing withdrawn.
+	if _, changed := WithdrawRoute(live, ""); changed {
+		t.Error("it removed a route it had no record of writing")
+	}
+}

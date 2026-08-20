@@ -2567,3 +2567,39 @@ Gone with them: the tests that exercised the dead path, and the two rows in the
 chart's RBAC contract that granted create/patch/delete on `switch-lb-rules`.
 That last one is the part worth noticing — the permission outlived the caller,
 which is how a role ends up wider than the code that justified it.
+
+## M12d: a network can now be detached, and one leg cannot
+
+The gap the live A/B found: `externalPlane.attachments` could add a leg and
+never remove one, so detaching meant editing the Vpc by hand. The renderer
+merges on purpose — adopting a network the product built has to write nothing —
+so "live minus wanted" is not the answer: it would delete another writer's work,
+which is the thing the merge exists to prevent.
+
+The third input is the record of what was applied last time, which the status
+already keeps. An entry goes only when it **was ours and is no longer wanted**;
+a network adopted from the product has an empty record, so nothing of its is
+touched until this operator has written it once itself. The default route is
+withdrawn the same way, matched on the next hop it was written with, so somebody
+else's default route through another gateway stays.
+
+### The leg that cannot be withdrawn
+
+A reviewer caught what this would otherwise have created: the tenant controller
+**attaches** the control-plane leg, because a tenant's workers reach their
+control plane over it. Give the network controller the power to withdraw it and
+one leg has two writers with opposite intentions — the flap landing on the one
+path that must not flap.
+
+So a leg a live tenant is living behind is not this object's to take back,
+however the declaration reads. Scoped deliberately: only the control-plane leg,
+and only while a tenant declares this network. An egress leg *can* be taken away
+from a tenant — that is a deliberate loss of internet, which is the entire point
+of the two planes being separate — but losing the other one is losing the
+cluster.
+
+Both directions are tested, and mutating the hold away turns the second red with
+"it took the control-plane leg from under a tenant". A third thing fell out of
+writing the test: a declaration naming an egress subnet it no longer attaches
+contradicts itself, and the controller already refuses it — the test was wrong,
+not the code.

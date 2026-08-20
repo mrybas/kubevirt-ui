@@ -338,6 +338,7 @@ func main() {
 			ServiceCIDR:    serviceCIDRFlag,
 			TenantSupernet: tenantSupernetFlag,
 			MgmtCIDRs:      splitList(mgmtCIDRFlag),
+			TransitSubnet:  os.Getenv("TENANTS_CP_TRANSIT_SUBNET"),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "managednetwork")
 			os.Exit(1)

@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -69,6 +70,13 @@ type ManagedNetworkReconciler struct {
 
 	// KubeOVNNamespace is where kube-ovn runs. Empty means find it.
 	KubeOVNNamespace string
+
+	// TransitSubnet is the control-plane leg. Named here only so it can be
+	// refused: a tenant's workers reach their control plane over it, and the
+	// tenant controller attaches it. Withdrawing it from under a live tenant
+	// would be two writers with opposite intentions flapping the one leg that
+	// must not flap.
+	TransitSubnet string
 
 	// TenantSupernet is the aggregate every tenant network is carved from, and
 	// what the isolation floor is scoped to. Empty means no isolation is
@@ -140,7 +148,11 @@ func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	net.Status.DefaultRouteVia = nextHop
 	net.Status.Attachments = network.Attachments(net)
 
-	if err := r.ensureVPC(ctx, net, nextHop); err != nil {
+	// What was applied on the last pass, read before this one overwrites it:
+	// it is the record of which legs and which route are this operator's to
+	// take back when they stop being declared.
+	if err := r.ensureVPC(ctx, net, nextHop,
+		before.Status.Attachments, before.Status.DefaultRouteVia); err != nil {
 		if errors.Is(err, errObjectGoing) {
 			return r.standDown(ctx, net, before, "Vpc/"+net.Name)
 		}
@@ -240,7 +252,17 @@ func (r *ManagedNetworkReconciler) egressNextHop(
 // ensureVPC writes the router.
 func (r *ManagedNetworkReconciler) ensureVPC(
 	ctx context.Context, net *platformv1alpha1.ManagedNetwork, nextHop string,
+	appliedAttachments []string, appliedNextHop string,
 ) error {
+	// A leg a live tenant is using is not this object's to take back, however
+	// the declaration reads. The tenant controller attaches the control-plane
+	// leg because its workers reach their control plane over it; withdrawing it
+	// here would give one leg two writers with opposite intentions, and the
+	// flap would land on the path that must not flap.
+	held, heldErr := r.legsHeldByTenants(ctx, net)
+	if heldErr != nil {
+		return heldErr
+	}
 	want := network.VPCSpec(net)
 	live := &unstructured.Unstructured{}
 	live.SetGroupVersionKind(vpcGVK)
@@ -279,10 +301,30 @@ func (r *ManagedNetworkReconciler) ensureVPC(
 			spec["staticRoutes"] = merged
 		}
 
-		if wanted := network.Attachments(net); len(wanted) > 0 {
-			liveAttached, _, _ := unstructured.NestedStringSlice(spec, "extraExternalSubnets")
+		wanted := network.Attachments(net)
+		liveAttached, _, _ := unstructured.NestedStringSlice(spec, "extraExternalSubnets")
+		if len(wanted) > 0 {
 			if merged, changed := network.MergeStrings(liveAttached, wanted); changed {
+				liveAttached = merged
 				spec["extraExternalSubnets"] = toAnySlice(merged)
+			}
+		}
+		// And the other direction, which was missing: a leg this operator
+		// attached and no longer declares is taken back. Only ours — the record
+		// of the last pass is what says which those are, because "live minus
+		// wanted" would delete another writer's work, and the merge above
+		// exists precisely to protect it.
+		if kept, changed := network.Withdraw(
+			liveAttached, append(wanted, held...), appliedAttachments); changed {
+			spec["extraExternalSubnets"] = toAnySlice(kept)
+		}
+		if nextHop == "" {
+			// The default route goes with the leg it left through, matched on
+			// the hop it was written with so somebody else's default route
+			// through another gateway stays where it is.
+			routes, _, _ := unstructured.NestedSlice(spec, "staticRoutes")
+			if kept, changed := network.WithdrawRoute(routes, appliedNextHop); changed {
+				spec["staticRoutes"] = kept
 			}
 		}
 		return unstructured.SetNestedMap(live.Object, spec, "spec")
@@ -291,6 +333,38 @@ func (r *ManagedNetworkReconciler) ensureVPC(
 		return fmt.Errorf("Vpc/%s: %w", net.Name, err)
 	}
 	return nil
+}
+
+// legsHeldByTenants is the attachments this network must keep because somebody
+// is living behind them.
+//
+// Only the control-plane leg, and only while a tenant declares this network:
+// an egress leg can be taken away from a tenant — that is a deliberate loss of
+// internet, which is the whole point of the plane being separate — but the
+// control-plane leg cannot, because losing it is losing the cluster.
+func (r *ManagedNetworkReconciler) legsHeldByTenants(
+	ctx context.Context, net *platformv1alpha1.ManagedNetwork,
+) ([]string, error) {
+	transit := r.TransitSubnet
+	if transit == "" {
+		transit = os.Getenv("TENANTS_CP_TRANSIT_SUBNET")
+	}
+	if transit == "" {
+		return nil, nil
+	}
+	tenants := &platformv1alpha1.ManagedTenantList{}
+	if err := r.List(ctx, tenants); err != nil {
+		if apimeta.IsNoMatchError(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("reading the tenants of %s: %w", net.Name, err)
+	}
+	for i := range tenants.Items {
+		if tenants.Items[i].Spec.Network == net.Name {
+			return []string{transit}, nil
+		}
+	}
+	return nil, nil
 }
 
 // ensureSubnet writes the default subnet.

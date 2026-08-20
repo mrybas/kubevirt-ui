@@ -42,6 +42,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
+// liveVPCObject reads the kube-ovn Vpc a network wrote.
+func liveVPCObject(name string) (*unstructured.Unstructured, error) {
+	vpc := &unstructured.Unstructured{}
+	vpc.SetGroupVersionKind(vpcGVK)
+	err := k8sReader.Get(testCtx, types.NamespacedName{Name: name}, vpc)
+	return vpc, err
+}
+
 func mustNetwork(t *testing.T, net *platformv1alpha1.ManagedNetwork) *platformv1alpha1.ManagedNetwork {
 	t.Helper()
 	if err := k8sClient.Create(testCtx, net); err != nil {
@@ -1538,5 +1546,172 @@ func TestTheAllowOutlivesTheRoutes(t *testing.T) {
 			return fmt.Errorf("still open after the peering is gone")
 		}
 		return nil
+	})
+}
+
+// TestALegIsTakenBackWhenItStopsBeingDeclared.
+//
+// The missing half, and it cost a live A/B: setting `attachments` back to one
+// entry did nothing to the VPC, because the renderer merges and never removes.
+// Detaching had to be done by editing the Vpc by hand, which is not a way to
+// run a fabric — and it is the same "on but not off" shape as every other
+// switch in this migration.
+func TestALegIsTakenBackWhenItStopsBeingDeclared(t *testing.T) {
+	mustExternalSubnet(t, "wd-transit", "10.199.20.0/22", "10.199.20.254")
+	mustExternalSubnet(t, "wd-external", "10.199.21.0/22", "10.199.21.254")
+
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netwd"},
+		Spec: platformv1alpha1.ManagedNetworkSpec{
+			CIDR: "10.200.72.0/22", Folder: "poc", Environment: "dev",
+			ExternalPlane: &platformv1alpha1.ExternalPlane{
+				Attachments:  []string{"wd-transit", "wd-external"},
+				EgressSubnet: "wd-external",
+			},
+		},
+	})
+
+	eventually(t, "both legs", func() error {
+		vpc, err := liveVPCObject("netwd")
+		if err != nil {
+			return err
+		}
+		attached, _, _ := unstructured.NestedStringSlice(vpc.Object, "spec", "extraExternalSubnets")
+		if len(attached) != 2 {
+			return fmt.Errorf("attachments = %v", attached)
+		}
+		return nil
+	})
+	eventually(t, "the record of what was applied", func() error {
+		if len(getNetwork(t, "netwd").Status.Attachments) != 2 {
+			return fmt.Errorf("status has not caught up")
+		}
+		return nil
+	})
+
+	// Somebody else's leg, on the same object.
+	vpc, err := liveVPCObject("netwd")
+	if err != nil {
+		t.Fatalf("reading the vpc: %v", err)
+	}
+	_ = unstructured.SetNestedStringSlice(vpc.Object,
+		[]string{"wd-transit", "wd-external", "somebody-elses"},
+		"spec", "extraExternalSubnets")
+	if err := k8sClient.Update(testCtx, vpc); err != nil {
+		t.Fatalf("planting a foreign leg: %v", err)
+	}
+
+	declare(t, "netwd", []string{"wd-transit"})
+
+	eventually(t, "the leg to be taken back", func() error {
+		vpc, err := liveVPCObject("netwd")
+		if err != nil {
+			return err
+		}
+		attached, _, _ := unstructured.NestedStringSlice(vpc.Object, "spec", "extraExternalSubnets")
+		for _, name := range attached {
+			if name == "wd-external" {
+				return fmt.Errorf("the leg it added is still there: %v", attached)
+			}
+		}
+		// And what it never claimed is untouched.
+		for _, name := range attached {
+			if name == "somebody-elses" {
+				return nil
+			}
+		}
+		return fmt.Errorf("it took somebody else's leg with it: %v", attached)
+	})
+}
+
+// TestTheControlPlaneLegIsNotTakenFromUnderATenant.
+//
+// The tenant controller attaches it, because a tenant's workers reach their
+// control plane over it. If this controller could withdraw it on a declaration
+// change, one leg would have two writers with opposite intentions and the flap
+// would land on the path that must not flap. An egress leg can be taken away —
+// that is a deliberate loss of internet, which is the point of the two planes
+// being separate — but this one cannot.
+func TestTheControlPlaneLegIsNotTakenFromUnderATenant(t *testing.T) {
+	mustExternalSubnet(t, "hold-transit", "10.199.22.0/22", "10.199.22.254")
+	mustExternalSubnet(t, "hold-external", "10.199.23.0/22", "10.199.23.254")
+	networkReconciler.TransitSubnet = "hold-transit"
+	t.Cleanup(func() { networkReconciler.TransitSubnet = "" })
+
+	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "nethold"},
+		Spec: platformv1alpha1.ManagedNetworkSpec{
+			CIDR: "10.200.76.0/22", Folder: "poc", Environment: "dev",
+			ExternalPlane: &platformv1alpha1.ExternalPlane{
+				Attachments:  []string{"hold-transit", "hold-external"},
+				EgressSubnet: "hold-external",
+			},
+		},
+	})
+	eventually(t, "the record of what was applied", func() error {
+		if len(getNetwork(t, "nethold").Status.Attachments) != 2 {
+			return fmt.Errorf("status has not caught up")
+		}
+		return nil
+	})
+
+	tenant := plainTenant("tenhold")
+	tenant.Spec.Network = "nethold"
+	mustTenant(t, tenant)
+
+	// Both legs dropped from the declaration.
+	declare(t, "nethold", nil)
+
+	eventually(t, "the egress leg to go", func() error {
+		vpc, err := liveVPCObject("nethold")
+		if err != nil {
+			return err
+		}
+		attached, _, _ := unstructured.NestedStringSlice(vpc.Object, "spec", "extraExternalSubnets")
+		for _, name := range attached {
+			if name == "hold-external" {
+				return fmt.Errorf("still attached: %v", attached)
+			}
+		}
+		return nil
+	})
+
+	consistently(t, "the control-plane leg to stay", 5*time.Second, func() error {
+		vpc, err := liveVPCObject("nethold")
+		if err != nil {
+			return err
+		}
+		attached, _, _ := unstructured.NestedStringSlice(vpc.Object, "spec", "extraExternalSubnets")
+		for _, name := range attached {
+			if name == "hold-transit" {
+				return nil
+			}
+		}
+		return fmt.Errorf("it took the control-plane leg from under a tenant: %v", attached)
+	})
+}
+
+// declare rewrites a network's attachments, retrying the conflict the
+// controller's own status writes cause.
+func declare(t *testing.T, name string, attachments []string) {
+	t.Helper()
+	eventually(t, "the declaration to be accepted", func() error {
+		live := &platformv1alpha1.ManagedNetwork{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Name: name}, live); err != nil {
+			return err
+		}
+		live.Spec.ExternalPlane.Attachments = attachments
+		// An egress subnet that is no longer attached is a declaration that
+		// contradicts itself, and the controller refuses it — rightly.
+		attached := false
+		for _, name := range attachments {
+			if name == live.Spec.ExternalPlane.EgressSubnet {
+				attached = true
+			}
+		}
+		if !attached {
+			live.Spec.ExternalPlane.EgressSubnet = ""
+		}
+		return k8sClient.Update(testCtx, live)
 	})
 }

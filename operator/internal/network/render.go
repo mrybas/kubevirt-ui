@@ -291,3 +291,57 @@ func toAny(in []string) []any {
 	}
 	return out
 }
+
+// Withdraw removes what this operator put here and no longer declares.
+//
+// The counterpart to MergeStrings, and it needs a third input for a reason:
+// "live minus wanted" would delete another writer's work, which is exactly what
+// the merge exists to protect. What was applied on the last pass is the record
+// of what is ours — anything else on the list was put there by somebody, and
+// not being asked for is not the same as being ours to remove.
+//
+// So an entry goes only when it was ours and is no longer wanted. A network
+// adopted from the product has an empty record, so nothing of its is touched
+// until this operator has written it once itself.
+func Withdraw(live, wanted, applied []string) ([]string, bool) {
+	wantedSet := map[string]bool{}
+	for _, name := range wanted {
+		wantedSet[name] = true
+	}
+	appliedSet := map[string]bool{}
+	for _, name := range applied {
+		appliedSet[name] = true
+	}
+
+	out := make([]string, 0, len(live))
+	changed := false
+	for _, name := range live {
+		if appliedSet[name] && !wantedSet[name] {
+			changed = true
+			continue
+		}
+		out = append(out, name)
+	}
+	return out, changed
+}
+
+// WithdrawRoute removes a default route this operator put here and no longer
+// declares. Matched on the next hop it was written with, so a default route
+// somebody else wrote — through a different gateway — is left where it is.
+func WithdrawRoute(liveRoutes []any, appliedNextHop string) ([]any, bool) {
+	if appliedNextHop == "" {
+		return liveRoutes, false
+	}
+	out := make([]any, 0, len(liveRoutes))
+	changed := false
+	for _, raw := range liveRoutes {
+		route, _ := raw.(map[string]any)
+		if route != nil && route["cidr"] == "0.0.0.0/0" &&
+			route["nextHopIP"] == appliedNextHop {
+			changed = true
+			continue
+		}
+		out = append(out, raw)
+	}
+	return out, changed
+}
