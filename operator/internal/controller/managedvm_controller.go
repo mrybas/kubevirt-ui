@@ -373,6 +373,16 @@ func (r *ManagedVMReconciler) reconcileExistingVM(
 
 	overridden := existing.Spec.RunStrategy != nil && *existing.Spec.RunStrategy != wantRunStrategy
 
+	// Compute is reconciled, unlike the disk arrays. Nobody else writes cores
+	// and memory, and leaving them alone would make editing them a silent
+	// no-op — the precise defect this API exists to remove. Admission refuses
+	// the edit while the machine is running, so by the time it lands here the
+	// machine is stopped and will come up with the new size.
+	desired, err := kubevirt.VirtualMachine(in)
+	if err != nil {
+		return fmt.Errorf("rendering VirtualMachine for comparison: %w", err)
+	}
+
 	patched := existing.DeepCopy()
 	res, err := kube.Ensure(ctx, r.Client, vmControllerName, patched, func() error {
 		if patched.Labels == nil {
@@ -388,6 +398,11 @@ func (r *ManagedVMReconciler) reconcileExistingVM(
 			patched.Annotations[k] = v
 		}
 		patched.Spec.RunStrategy = &wantRunStrategy
+		if patched.Spec.Template != nil && desired.Spec.Template != nil {
+			patched.Spec.Template.Spec.Domain.CPU = desired.Spec.Template.Spec.Domain.CPU
+			patched.Spec.Template.Spec.Domain.Memory = desired.Spec.Template.Spec.Domain.Memory
+			patched.Spec.Template.Spec.Domain.Resources = desired.Spec.Template.Spec.Domain.Resources
+		}
 		return nil
 	})
 	if err != nil {

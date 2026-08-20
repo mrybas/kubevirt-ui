@@ -41,6 +41,7 @@ import (
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 	"github.com/mrybas/kubevirt-ui/operator/internal/controller"
 	"github.com/mrybas/kubevirt-ui/operator/internal/domains"
+	webhookv1alpha1 "github.com/mrybas/kubevirt-ui/operator/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -214,6 +215,21 @@ func main() {
 			KubeOVNNamespace: func() string { return os.Getenv("KUBE_OVN_NAMESPACE") },
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "managedvm")
+			os.Exit(1)
+		}
+	}
+	// Webhooks belong to the same domain as the controllers they guard: a
+	// process running only the network domain must not answer for VM admission,
+	// or turning that domain off would leave a webhook configuration pointing
+	// at a service with no endpoints and block every VM in the cluster.
+	// nolint:goconst
+	if enabled.Has(domains.VM) && os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupManagedVMWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "ManagedVM")
+			os.Exit(1)
+		}
+		if err := webhookv1alpha1.SetupRawVMGuardWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "RawVirtualMachineGuard")
 			os.Exit(1)
 		}
 	}
