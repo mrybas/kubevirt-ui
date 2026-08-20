@@ -182,6 +182,7 @@ rules:
   resources:
   - announcementpolicies
   - managedimages
+  - managednetworkpeerings
   - managednetworks
   - managedunderlays
   - managedvmoperations
@@ -200,6 +201,7 @@ rules:
   resources:
   - announcementpolicies/status
   - managedimages/status
+  - managednetworkpeerings/status
   - managednetworks/status
   - managedunderlays/status
   - managedvmoperations/status

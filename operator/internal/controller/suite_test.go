@@ -139,6 +139,14 @@ func runSuite(m *testing.M) (int, error) {
 		return 0, fmt.Errorf("wiring network controller: %w", err)
 	}
 
+	if err := (&ManagedNetworkPeeringReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("managednetworkpeering"),
+	}).SetupWithManager(mgr); err != nil {
+		return 0, fmt.Errorf("wiring peering controller: %w", err)
+	}
+
 	if err := (&ManagedUnderlayReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),

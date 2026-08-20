@@ -302,15 +302,23 @@ func main() {
 			os.Exit(1)
 		}
 		if err := (&controller.ManagedNetworkReconciler{
-			Client:      mgr.GetClient(),
-			Scheme:      mgr.GetScheme(),
-			Recorder:    mgr.GetEventRecorderFor("managednetwork"),
+			Client:         mgr.GetClient(),
+			Scheme:         mgr.GetScheme(),
+			Recorder:       mgr.GetEventRecorderFor("managednetwork"),
 			APIReader:      mgr.GetAPIReader(),
 			ServiceCIDR:    serviceCIDRFlag,
 			TenantSupernet: tenantSupernetFlag,
 			MgmtCIDRs:      splitList(mgmtCIDRFlag),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "managednetwork")
+			os.Exit(1)
+		}
+		if err := (&controller.ManagedNetworkPeeringReconciler{
+			Client:   mgr.GetClient(),
+			Scheme:   mgr.GetScheme(),
+			Recorder: mgr.GetEventRecorderFor("managednetworkpeering"),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "managednetworkpeering")
 			os.Exit(1)
 		}
 		if err := (&controller.ManagedUnderlayReconciler{
