@@ -1511,3 +1511,60 @@ And an ordinary project namespace is untouched — `poc-transit-dev` still answe
 
 Applied to the stand: three ClusterRoles created, six RoleBindings repointed
 across the two live tenants.
+
+## M12c (first slice) — N7, the worker template with no Kubernetes CA
+
+Without `cluster.ca` in its machine config a Talos worker boots, runs a kubelet,
+and never joins: nothing files its CSR, so the node does not exist as far as the
+cluster is concerned while the VM looks perfectly healthy.
+
+The repair is a port — a new template, because the CRD is immutable, and a
+MachineDeployment repointed at it. What moved is where it runs. It was a call in
+`reconcile_loop` inside the request-serving backend: a timer, no watch, no
+leader election. Two replicas did it twice, one replica did it never after a
+restart, and a template broken a second after a pass stayed broken until the
+next one. Now a write to the template, the MachineDeployment **or the CA secret**
+wakes it — the last one matters, because the CA arriving is the event that makes
+a repair possible at all.
+
+### Two things it deliberately does not do
+
+It reads `cluster.ca`, never `machine.ca`. The latter is the Talos CA and is
+always present; checking it would report every template as healthy. And it will
+not write a replacement while the CA is absent: baking a CA-less config into a
+second immutable object makes the defect permanent twice over.
+
+### Two vacuous tests, found by mutation
+
+The lookalike-namespace test passed for the wrong reason — there was no CA
+secret there, so nothing was written regardless of the label, and removing the
+guard changed nothing. It now has everything a repair needs, so only the label
+stops it.
+
+Then a second: the guard could have lived only in the watch predicate, which is
+wiring another Watch can widen — and here three other watches map by namespace
+with no label filter of their own. So there is now a test that calls Reconcile
+directly, with no predicate in the way, and asserts nothing is written; it also
+calls it on a labelled namespace, so it cannot pass by the invocation doing
+nothing at all.
+
+### Cutover, then the deliberate breakage
+
+The backend loop still ran the same repair, so: `OPERATOR_TENANT_BOOTSTRAP_ENABLED`
+on the backend first (writers 1 → 0), then the operator's tenant domain (0 → 1).
+The running pod was checked by image and by environment before the second half,
+not the Deployment spec.
+
+Then the acceptance the plan asks for, in a throwaway namespace rather than on a
+live tenant — breaking a real one means rolling its workers:
+
+```
+template with no cluster.ca applied
+repair after 12s
+configRef -> brkprobe-workers-ca
+cluster.ca present in the replacement
+original intact
+```
+
+And the two live tenants were untouched: `uat-t1-workers` and `uat-t2-workers`
+still the only templates in their namespaces, both carrying their CA.
