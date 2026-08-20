@@ -1,0 +1,245 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: managedtenants.platform.kubevirt-ui.io
+spec:
+  group: platform.kubevirt-ui.io
+  names:
+    kind: ManagedTenant
+    listKind: ManagedTenantList
+    plural: managedtenants
+    shortNames:
+    - mten
+    singular: managedtenant
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.folder
+      name: Folder
+      type: string
+    - jsonPath: .spec.environment
+      name: Env
+      type: string
+    - jsonPath: .spec.kubernetesVersion
+      name: K8s
+      type: string
+    - jsonPath: .spec.workers.count
+      name: Workers
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ManagedTenant is a tenant Kubernetes cluster.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ManagedTenantSpec is a tenant Kubernetes cluster.
+            properties:
+              controlPlaneReplicas:
+                default: 2
+                format: int32
+                maximum: 3
+                minimum: 1
+                type: integer
+              displayName:
+                maxLength: 128
+                minLength: 1
+                type: string
+              environment:
+                minLength: 1
+                type: string
+              folder:
+                description: |-
+                  Folder and Environment are what the tenant is scoped to, and they are
+                  required: a tenant outside them takes no part in folder authorisation and
+                  spends nobody's quota.
+                minLength: 1
+                type: string
+              kubernetesVersion:
+                default: v1.30.1
+                type: string
+              network:
+                description: |-
+                  Network is the VPC the tenant's machines live in. Empty means the
+                  cluster's default overlay.
+                type: string
+              podCIDR:
+                default: 10.244.0.0/16
+                type: string
+              serviceCIDR:
+                default: 10.112.0.0/12
+                description: |-
+                  ServiceCIDR is deliberately not the host cluster's own 10.96.0.0/12.
+
+                  A tenant sharing it makes its kube-proxy hijack the host's DNS address
+                  for the tenant's own CoreDNS, and its nodes lose name resolution the
+                  moment kube-proxy starts — after they have already joined. 10.112.0.0/12
+                  is the adjacent block, disjoint from it, and the host's actual ranges are
+                  still checked because a cluster may of course use 10.112 itself.
+                type: string
+              workers:
+                description: TenantWorkers is the shape of the worker pool.
+                properties:
+                  count:
+                    default: 2
+                    format: int32
+                    maximum: 20
+                    minimum: 1
+                    type: integer
+                  disk:
+                    default: 20Gi
+                    type: string
+                  memory:
+                    default: 2Gi
+                    type: string
+                  os:
+                    default: cloud-init
+                    description: |-
+                      OS decides how a worker is bootstrapped, and they are different
+                      mechanisms rather than different images. `cloud-init` boots a CAPK
+                      container-disk through a KubeadmConfigTemplate; `talos` swaps the
+                      bootstrap provider and brings its own per-tenant objects — a CSR signer
+                      with its own PKI, stable machine secrets, a bootstrap token. A Talos node
+                      cannot be bootstrapped the cloud-init way at all: it asks a trustd signer
+                      for a certificate instead.
+                    enum:
+                    - cloud-init
+                    - talos
+                    type: string
+                  talosVersion:
+                    description: |-
+                      TalosVersion picks the release to build Talos workers from. Empty means
+                      the catalogue's default. Validated against the same compatibility the
+                      wizard renders its list from, so the two cannot offer and refuse
+                      different things.
+                    type: string
+                  vcpu:
+                    default: 2
+                    format: int32
+                    maximum: 32
+                    minimum: 1
+                    type: integer
+                type: object
+            required:
+            - displayName
+            - environment
+            - folder
+            type: object
+          status:
+            description: ManagedTenantStatus is what the tenant actually is.
+            properties:
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              namespace:
+                description: Namespace the tenant's objects live in.
+                type: string
+              observedGeneration:
+                format: int64
+                type: integer
+              reservation:
+                description: Reservation is what was sized from the request, before
+                  any of it exists.
+                properties:
+                  cpu:
+                    type: string
+                  memory:
+                    type: string
+                  storage:
+                    type: string
+                type: object
+              talosRelease:
+                description: |-
+                  TalosRelease is the release resolved from the catalogue, published
+                  because "the default" is otherwise invisible and it decides which golden
+                  image the workers clone.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

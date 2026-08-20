@@ -277,6 +277,10 @@ func main() {
 	// at a service with no endpoints and block every VM in the cluster.
 	// nolint:goconst
 	if enabled.Has(domains.VM) && os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupManagedTenantWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "ManagedTenant")
+			os.Exit(1)
+		}
 		if err := webhookv1alpha1.SetupManagedVMWebhookWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create webhook", "webhook", "ManagedVM")
 			os.Exit(1)

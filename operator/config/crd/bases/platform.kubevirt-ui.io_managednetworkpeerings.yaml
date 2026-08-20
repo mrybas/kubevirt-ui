@@ -23,8 +23,14 @@ spec:
     - jsonPath: .status.linkCIDR
       name: Link
       type: string
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
     - jsonPath: .status.conditions[?(@.type=="Established")].status
       name: Established
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="TrafficAllowed")].status
+      name: Traffic
       type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age

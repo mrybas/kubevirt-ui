@@ -10,6 +10,7 @@ resources:
 - bases/platform.kubevirt-ui.io_managedunderlays.yaml
 - bases/platform.kubevirt-ui.io_managednetworks.yaml
 - bases/platform.kubevirt-ui.io_managednetworkpeerings.yaml
+- bases/platform.kubevirt-ui.io_managedtenants.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

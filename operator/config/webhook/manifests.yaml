@@ -29,6 +29,26 @@ webhooks:
     service:
       name: webhook-service
       namespace: system
+      path: /validate-platform-kubevirt-ui-io-v1alpha1-managedtenant
+  failurePolicy: Fail
+  name: vmanagedtenant-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - platform.kubevirt-ui.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - managedtenants
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
       path: /validate-platform-kubevirt-ui-io-v1alpha1-managedvm
   failurePolicy: Fail
   name: vmanagedvm-v1alpha1.kb.io
