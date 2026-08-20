@@ -1670,3 +1670,49 @@ conflict today because nothing in production creates a ManagedTenant yet — the
 operator's golden runs only for CRs written by hand. When the backend starts
 creating ManagedTenants (M12d/M12e), the golden call has to come out of the
 backend in the same change, not after it.
+
+### Live: H2, and one grant that the lab could not have refused
+
+On the stand, where the golden already existed because the product built it:
+
+```
+first tenant   image talos-golden-1-13-8 Ready
+               dv uid 4bce6b88… phase Succeeded  (adopted: labels stamped,
+                                                  rv 142136 -> 1065491)
+               rolebinding talos-golden-cloner-tenant-gld1 created
+second tenant  images 1, DataVolumes named talos-golden-1-13-8: 1
+               dv uid unchanged, rv unchanged (1065491 -> 1065491)
+               image rv unchanged (1065494 -> 1065494)
+               rolebinding talos-golden-cloner-tenant-gld2 created
+both           GoldenReady=True
+```
+
+The adoption is the interesting half: the operator took over a disk the product
+imported, without re-importing it and without touching its spec. Only labels
+moved, once.
+
+**The grant would have been refused, and no test in this repository could have
+said so.** Kubernetes will not let a writer create a Role conferring permissions
+it does not hold itself, and handing `datavolumes/source` to each tenant's
+ServiceAccount is exactly what this does. envtest runs as admin, so the check
+never fires there. Proven by A/B on the stand, with the controller's own
+ClusterRole from before and after the fix bound to two throwaway subjects:
+
+```
+old role -> Forbidden: attempting to grant RBAC permissions not currently held:
+            {APIGroups:["cdi.kubevirt.io"], Resources:["datavolumes/source"],
+             Verbs:["create"]}
+new role -> role.rbac.authorization.k8s.io/rbac-probe-cloner created
+```
+
+A measurement note worth keeping, because it nearly sent me the wrong way:
+`kubectl auth can-i create datavolumes/source` answers **yes** under both roles.
+It parses `source` as the object's *name*, not as a subresource. The forms that
+actually answer the question are `--subresource=source` (no under the old role,
+yes under the new one) and attempting the write itself, which is where the
+escalation check lives.
+
+Known gap, named rather than fixed here: deleting a ManagedTenant leaves its
+clone grant behind. Tenant teardown does not exist yet — the controller returns
+on a deletionTimestamp and nothing is reclaimed — so this belongs with that
+slice, not this one.
