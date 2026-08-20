@@ -709,6 +709,9 @@ async def _ensure_daemonset(k8s, body: dict[str, Any]) -> UnderlayObject:
 
 UNDERLAY_PLURAL = "managedunderlays"
 
+# Set during a cutover to make the operator a no-op without detaching anything.
+PAUSED_ANNOTATION = "platform.kubevirt-ui.io/paused"
+
 
 def underlay_cr_name(data: VpcUnderlayRequest) -> str:
     """The custom resource is named after the subnet it builds.
@@ -789,7 +792,9 @@ def response_from_cr(cr: dict[str, Any]) -> VpcUnderlayResponse:
     """
     spec = cr.get("spec") or {}
     status = cr.get("status") or {}
+    meta = cr.get("metadata") or {}
     kubeovn_ns = spec.get("kubeOVNNamespace") or ""
+    paused = (meta.get("annotations") or {}).get(PAUSED_ANNOTATION) == "true"
 
     fabric_cond = _condition(cr, "FabricReady")
     fabric_ok = fabric_cond.get("status") == "True"
@@ -848,6 +853,28 @@ def response_from_cr(cr: dict[str, Any]) -> VpcUnderlayResponse:
             namespace=entry.get("namespace", ""),
             state=state, workaround=True, detail=entry.get("detail", ""),
         ))
+
+    if paused:
+        # A paused underlay keeps its last verdict forever, and a frozen status
+        # reads exactly like a healthy one. That is the failure this whole path
+        # was moved to close, so it does not get to reappear in the report of
+        # the thing that closed it.
+        objects.insert(0, UnderlayObject(
+            kind="ManagedUnderlay", name=meta.get("name", ""), state="skipped",
+            detail=(
+                f"reconciliation is paused ({PAUSED_ANNOTATION}=true). Everything "
+                "below is the last verdict the operator reached and may be any "
+                "age; nothing is keeping the fabric or the gateway label in line "
+                "while this is set."
+            ),
+        ))
+        return VpcUnderlayResponse(
+            objects=objects, ready=False,
+            detail=(
+                f"ManagedUnderlay/{meta.get('name', '')} is paused — the status "
+                "shown is frozen, not current."
+            ),
+        )
 
     ready = fabric_ok and label_cond.get("status") == "True"
     if ready:

@@ -46,6 +46,7 @@ def _cr(
     daemon_sets: list[dict[str, Any]] | None = None,
     generation: int = 1,
     observed: int | None = 1,
+    paused: bool = False,
 ) -> dict[str, Any]:
     status: dict[str, Any] = {
         "conditions": [
@@ -66,8 +67,11 @@ def _cr(
     }
     if observed is not None:
         status["observedGeneration"] = observed
+    metadata: dict[str, Any] = {"name": "external", "generation": generation}
+    if paused:
+        metadata["annotations"] = {"platform.kubevirt-ui.io/paused": "true"}
     return {
-        "metadata": {"name": "external", "generation": generation},
+        "metadata": metadata,
         "spec": {
             "interface": "eth0.310",
             "providerNetworkName": "extnet",
@@ -326,3 +330,25 @@ async def test_a_stale_status_is_not_reported_as_this_request_s_answer():
     # as this one's; the last read is still returned, so the caller gets the
     # object's current state and not an empty answer.
     assert result.objects
+
+
+@pytest.mark.asyncio
+async def test_a_paused_underlay_does_not_read_as_healthy():
+    """A frozen status looks exactly like a current one, which is the bug.
+
+    Pausing is how the operator is switched off during a cutover without
+    detaching anything. While it is set, the conditions keep saying whatever
+    they last said — so a reader that repeated them would report a fabric as
+    ready long after nobody was keeping it that way. That is the same shape as a
+    DaemonSet at 0/0 desired reporting a successful rollout, and it does not get
+    to reappear in the report of the thing built to close it.
+    """
+    from app.api.v1.vpc_underlay import response_from_cr
+
+    result = response_from_cr(_cr(paused=True))
+
+    assert result.ready is False
+    assert "paused" in result.detail
+    note = [o for o in result.objects if o.kind == "ManagedUnderlay"]
+    assert len(note) == 1
+    assert "platform.kubevirt-ui.io/paused" in note[0].detail

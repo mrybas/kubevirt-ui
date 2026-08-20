@@ -10,6 +10,10 @@ services:
       - AUTH_TYPE=none
       - OPERATOR_IMAGE_ENABLED=true
       - OPERATOR_VM_ENABLED=true
+      # Phase 1 of the underlay cutover: with this on the backend stops
+      # building the fabric and stops healing the gateway label on read, so the
+      # operator can be unpaused without two writers ever overlapping.
+      - OPERATOR_UNDERLAY_ENABLED=true
   frontend:
     environment:
       - VITE_API_URL=http://localhost:8888
