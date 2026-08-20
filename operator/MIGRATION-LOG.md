@@ -1115,3 +1115,78 @@ moment never came, and the subnet had to be freed by hand.
 The contrast with the stuck `uinet1` earlier in this log is the point: same
 cluster, same kube-ovn, and the difference is that the router outlived its
 subnets.
+
+## M10b — the ACL composer
+
+Decision written first, in `docs/acl-composition.md`: deny the tenant supernet
+once and carve the exceptions above it, instead of enumerating every other
+tenant. The enumeration is `2·(N−1)` rows per subnet and `2·N·(N−1)` across the
+cluster — about 320 000 rows and 400 read-modify-writes per create at the scale
+this is aimed at. Not address sets: kube-ovn exposes none, and a rule set that
+does not enumerate its peers has nothing to hoist.
+
+### The evaluator, and what it found
+
+Replacing five enumerated drops with one aggregate rewrites every line, so
+comparing lines proves nothing. The acceptance is an evaluator — highest
+priority wins, no match means allowed — comparing the two sets by what they do.
+
+It immediately showed the property does not hold both ways, and should not.
+Against the stand's own live list, two probes are **allowed** under the
+enumeration and **denied** under the aggregate:
+
+- `10.200.24.9` — a network created since the last isolation pass;
+- `10.203.255.1` — an address inside the supernet nobody has been given yet.
+
+That is the hole the enumeration has by construction. So the assertion is
+one-sided: nothing denied may become allowed, and anything newly denied must be
+inside the tenant aggregate — never the internet.
+
+The evaluator then caught a bug in itself. A mutation putting the peering allow
+at the same priority as the drop failed nothing, because the evaluator resolved
+the tie by sort order. OVN does not; it picks one, unspecified. Equal-priority
+allow-and-drop is now `Conflicted` and an invariant says no rendered set
+produces it.
+
+### Three corrections on the way to durable isolation
+
+Each was wrong for a reason worth keeping:
+
+1. **wait for the subnet, then isolate** — waits expire;
+2. **check afterwards and undo** — if the process dies there is nobody left to
+   check;
+3. **let the operator converge** — durable, but the subnet was created open and
+   closed a moment later, and kube-ovn realises a subnet the instant it exists.
+
+The rules now ship in the Subnet's create payload.
+
+### Live
+
+| check | result |
+|---|---|
+| operator-created network | first `ADDED` event: `generation 1, acls 10, owner=operator` — the subnet never existed open |
+| the rules | six mgmt `/32`s from the real nodes, two own-subnet allows, one aggregate floor per direction |
+| a UI-built list (22 rules, enumerated) | **not adopted**; the condition names the 14 rules the composer cannot reproduce; list unchanged, ownership unclaimed |
+
+`generation` alone was not enough live evidence: a static read showed 2, because
+kube-ovn writes its own defaults into the spec a moment after creation. The
+watch from the moment of creation is what actually settles it, and envtest —
+where nothing else writes the object — keeps the `generation == 1` assertion.
+
+### An open product defect, not mine
+
+Deleting a VPC through the UI leaves its subnet in Terminating on kube-ovn's
+finalizer, indefinitely. Reproduced twice, on `uinet1` and on `uinet2` — the
+second with a name never used before, which retires the "name reuse" theory from
+the M10a notes entirely.
+
+What is measured: the delete is enqueued once, the pod addresses are released,
+and after that the controller never mentions the subnet again. No events after
+creation. Nothing references it. Deleting the Vpc afterwards does not release it
+— tested on both. Freed by hand each time.
+
+The 409 the endpoint returns says "retry in a moment", and the moment does not
+come. The operator's cascade did not reproduce it in three teardowns
+(`opnet1`, `opnet3`, and `opnet2/4/5`), which is evidence but not an
+explanation; the difference between the two paths has not been established and
+this log does not claim one.
