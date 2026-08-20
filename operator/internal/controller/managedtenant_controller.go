@@ -204,7 +204,8 @@ func (r *ManagedTenantReconciler) Reconcile(
 	obj.Status.RedundantQuotas = redundant
 
 	// After the namespace, because the Service lives in it.
-	vip, addressReady, addressMessage, err := r.reconcileAddress(ctx, obj, namespace)
+	vip, addressNeeded, addressReady, addressMessage, err := r.reconcileAddress(
+		ctx, obj, namespace)
 	if err != nil {
 		apimeta.SetStatusCondition(&obj.Status.Conditions,
 			addressCondition(false, err.Error()))
@@ -217,8 +218,10 @@ func (r *ManagedTenantReconciler) Reconcile(
 	if vip != "" {
 		obj.Status.ControlPlaneVIP = vip
 	}
-	apimeta.SetStatusCondition(&obj.Status.Conditions,
-		addressCondition(addressReady, addressMessage))
+	if addressNeeded {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			addressCondition(addressReady, addressMessage))
+	}
 
 	// Two of the things below are waited for rather than watched: cert-manager
 	// writes the signer's secret, and the image controller finishes an import.
@@ -229,7 +232,7 @@ func (r *ManagedTenantReconciler) Reconcile(
 
 	// After the address, which the signer's certificate carries as an IP SAN.
 	pkiReady, pkiReason, pkiMessage, err := r.reconcilePKI(
-		ctx, obj, namespace, obj.Status.ControlPlaneVIP)
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP, addressNeeded)
 	if err != nil {
 		apimeta.SetStatusCondition(&obj.Status.Conditions,
 			pkiCondition(false, "WriteFailed", err.Error()))
@@ -245,8 +248,11 @@ func (r *ManagedTenantReconciler) Reconcile(
 
 	// On the same address as the API server, which is what makes it reachable
 	// from a VPC with no egress at all.
-	timeReady, timeReason, timeMessage, err := r.reconcileTime(
-		ctx, obj, obj.Status.ControlPlaneVIP)
+	timeReady, timeReason, timeMessage := false, "", ""
+	if addressNeeded {
+		timeReady, timeReason, timeMessage, err = r.reconcileTime(
+			ctx, obj, obj.Status.ControlPlaneVIP)
+	}
 	if err != nil {
 		apimeta.SetStatusCondition(&obj.Status.Conditions,
 			timeCondition(false, "WriteFailed", err.Error()))
@@ -254,9 +260,14 @@ func (r *ManagedTenantReconciler) Reconcile(
 		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
 		return ctrl.Result{}, err
 	}
-	apimeta.SetStatusCondition(&obj.Status.Conditions,
-		timeCondition(timeReady, timeReason, timeMessage))
-	pending = pending || !timeReady
+	if addressNeeded {
+		// Only a tenant with an address of its own has anywhere to serve the
+		// time. On the default overlay a worker reaches the public servers the
+		// same way it reaches everything else.
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			timeCondition(timeReady, timeReason, timeMessage))
+		pending = pending || !timeReady
+	}
 
 	// After the namespace, because the clone grant names it as its subject.
 	goldenReady, goldenMessage, err := r.reconcileGolden(ctx, obj, namespace, release)

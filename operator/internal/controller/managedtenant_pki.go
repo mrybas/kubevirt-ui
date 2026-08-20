@@ -84,13 +84,14 @@ func signerDNSNames(name, namespace string) []string {
 // SNI, and a DNS-only certificate fails the handshake before trustd is asked
 // anything at all.
 func (r *ManagedTenantReconciler) reconcilePKI(
-	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace, vip string,
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
+	namespace, vip string, wantsAddress bool,
 ) (ready bool, reason, message string, err error) {
 	if obj.Spec.Workers.OS != "talos" {
 		// Nothing signs CSRs for a cloud-init tenant; it joins with a token.
 		return true, "", "", nil
 	}
-	if vip == "" {
+	if vip == "" && wantsAddress {
 		return false, "WaitingForAddress", "waiting for the tenant's address: " +
 			"the signer's certificate needs it as an IP SAN, and a worker " +
 			"dialling the address sends no SNI for a DNS name to match", nil
@@ -141,7 +142,11 @@ func (r *ManagedTenantReconciler) reconcilePKI(
 			"renewBefore": "720h",
 			"privateKey":  map[string]any{"algorithm": "Ed25519"},
 			"dnsNames":    dnsNames,
-			"ipAddresses": []any{vip},
+			// Only where there is one. A tenant on the default overlay reaches
+			// its control plane by name, so the certificate answers for the
+			// name — adding an empty address here would make cert-manager
+			// refuse the whole certificate.
+			"ipAddresses": ipSANs(vip),
 			"issuerRef": map[string]any{
 				"name": obj.Name + "-talos-ca-issuer",
 				"kind": "Issuer", "group": certManagerGroup,
@@ -206,8 +211,20 @@ func (r *ManagedTenantReconciler) reconcilePKI(
 		"signer certificate answers for %s and %v", vip, wanted), nil
 }
 
+// ipSANs is the address list for the signer certificate: the tenant's own
+// address, or none at all on the default overlay.
+func ipSANs(vip string) []any {
+	if vip == "" {
+		return nil
+	}
+	return []any{vip}
+}
+
 // certificateMisses says what a signer certificate does not cover, or "" when
 // it covers everything the worker will present.
+//
+// With no address — a tenant on the default overlay — only the names are
+// checked, because only the names are dialled.
 func certificateMisses(pemBytes []byte, vip string, dnsNames []string) string {
 	if len(pemBytes) == 0 {
 		return "carries no certificate"
@@ -221,6 +238,9 @@ func certificateMisses(pemBytes []byte, vip string, dnsNames []string) string {
 		return "does not parse as a certificate: " + err.Error()
 	}
 
+	if vip == "" {
+		return missingName(parsed, dnsNames)
+	}
 	address, err := netip.ParseAddr(vip)
 	if err != nil {
 		// Not the certificate's fault, and not something re-issuing fixes.
@@ -237,6 +257,10 @@ func certificateMisses(pemBytes []byte, vip string, dnsNames []string) string {
 		return fmt.Sprintf("does not carry %s as an IP SAN (it has %v)",
 			vip, parsed.IPAddresses)
 	}
+	return missingName(parsed, dnsNames)
+}
+
+func missingName(parsed *x509.Certificate, dnsNames []string) string {
 	for _, wanted := range dnsNames {
 		found := false
 		for _, name := range parsed.DNSNames {

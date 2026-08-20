@@ -42,7 +42,7 @@ func certManagerObject(kind, namespace, name string) (*unstructured.Unstructured
 // so this chain is the difference between a node that joins and a VM that looks
 // healthy while the cluster has never heard of it.
 func TestTheSignerChainIsWrittenOnceTheAddressExists(t *testing.T) {
-	mustTenant(t, talosTenant("tpki"))
+	mustTenant(t, vpcTalosTenant("tpki"))
 
 	// Before the address there is deliberately nothing: the certificate carries
 	// the address as an IP SAN and is read once, at the signer's startup.
@@ -199,7 +199,7 @@ func putSignerSecret(t *testing.T, namespace, name string, pemBytes []byte) {
 // secret in place until cert-manager re-issues. A signer started in that window
 // reads its certificate once and never sees the replacement.
 func TestASignerCertificateWithoutTheAddressIsNotReady(t *testing.T) {
-	mustTenant(t, talosTenant("tpks"))
+	mustTenant(t, vpcTalosTenant("tpks"))
 	eventually(t, "the request for an address", func() error {
 		_, err := cpService("tpks")
 		return err

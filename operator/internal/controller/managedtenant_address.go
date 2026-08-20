@@ -126,15 +126,23 @@ func cpPorts(obj *platformv1alpha1.ManagedTenant) []corev1.ServicePort {
 // says so instead of timing out somebody's API call.
 func (r *ManagedTenantReconciler) reconcileAddress(
 	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace string,
-) (vip string, ready bool, message string, err error) {
+) (vip string, needed, ready bool, message string, err error) {
+	if obj.Spec.Network == "" {
+		// A tenant on the default overlay does not need one. Its control plane
+		// is reached by the Kamaji Service's ClusterIP, which is natively
+		// routable there — and the pool is small enough that handing addresses
+		// to tenants that will never dial them is how it runs out.
+		return "", false, false, "", nil
+	}
+
 	pool := r.pool()
 
 	if refusal, err := r.poolOverlapsSubnet(ctx, pool); err != nil {
-		return "", false, "", err
+		return "", true, false, "", err
 	} else if refusal != "" {
 		// Refused before the Service exists, because the damage is done by the
 		// address being handed out, not by asking for one.
-		return "", false, refusal, nil
+		return "", true, false, refusal, nil
 	}
 
 	service := &corev1.Service{}
@@ -161,15 +169,15 @@ func (r *ManagedTenantReconciler) reconcileAddress(
 		// here is how two tenants end up asking for the same one.
 		return nil
 	}); err != nil {
-		return "", false, "", fmt.Errorf("asking for %s's address: %w", obj.Name, err)
+		return "", true, false, "", fmt.Errorf("asking for %s's address: %w", obj.Name, err)
 	}
 
 	for _, ingress := range service.Status.LoadBalancer.Ingress {
 		if ingress.IP != "" {
-			return ingress.IP, true, fmt.Sprintf("%s, from pool %q", ingress.IP, pool), nil
+			return ingress.IP, true, true, fmt.Sprintf("%s, from pool %q", ingress.IP, pool), nil
 		}
 	}
-	return "", false, fmt.Sprintf(
+	return "", true, false, fmt.Sprintf(
 		"%s/%s has no address yet. The usual cause is an exhausted pool %q: "+
 			"every address in it is held by another tenant. Append a range to "+
 			"the IPAddressPool — append, never resize a range in use.",

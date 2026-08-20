@@ -1956,3 +1956,25 @@ Open, and recorded rather than smoothed over: one full run of the controller
 suite failed while this slice was being finished, and the output was not kept —
 three runs since have passed. If it is real it will show in CI, where the suite
 runs on every push; if it does, the run that catches it will name it.
+
+### Correction: only a tenant in a VPC needs an address of its own
+
+The address slice handed every tenant a MetalLB address. The product does not:
+`acquire_tenant_vip` is called only for a tenant in a VPC, because on the
+default overlay the control plane is reached by the Kamaji Service's ClusterIP,
+which is natively routable there. The pool on this lab is twenty addresses;
+giving one to every tenant that will never dial it is how it runs out.
+
+Caught while reading `_build_cluster_cr` for the next slice, before anything was
+built on top of it — which is the only reason it was cheap. Three things follow
+from the same fact and all of them had to move together:
+
+* no cp-lb Service, and no `AddressAssigned` condition, on the default overlay —
+  a condition about something the tenant does not have is noise, the same
+  argument as `GoldenReady` on a cloud-init tenant;
+* no time Service either. A worker there reaches the public servers the way it
+  reaches everything else;
+* **the signer certificate gets names and no address.** Not cosmetic:
+  cert-manager refuses a certificate with an empty `ipAddresses`, so the whole
+  chain would fail to issue. Readiness follows — with no address, only the names
+  are checked, because only the names are dialled.

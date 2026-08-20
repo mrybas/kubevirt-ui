@@ -24,6 +24,21 @@ func talosTenant(name string) *platformv1alpha1.ManagedTenant {
 	return obj
 }
 
+// vpcTenant is a tenant in a network of its own, which is what makes it need an
+// address of its own: on the default overlay the control plane is reached by
+// the Kamaji Service's ClusterIP and no VIP is handed out at all.
+func vpcTenant(name string) *platformv1alpha1.ManagedTenant {
+	obj := plainTenant(name)
+	obj.Spec.Network = "net-" + name
+	return obj
+}
+
+func vpcTalosTenant(name string) *platformv1alpha1.ManagedTenant {
+	obj := vpcTenant(name)
+	obj.Spec.Workers.OS = "talos"
+	return obj
+}
+
 func goldenImages(t *testing.T) []platformv1alpha1.ManagedImage {
 	t.Helper()
 	images := &platformv1alpha1.ManagedImageList{}

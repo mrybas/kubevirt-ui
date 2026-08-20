@@ -99,6 +99,9 @@ func (r *ManagedTenantReconciler) reconcileTime(
 	ctx context.Context, obj *platformv1alpha1.ManagedTenant, vip string,
 ) (ready bool, reason, message string, err error) {
 	if vip == "" {
+		// Either the tenant is on the default overlay, where egress and public
+		// time servers are not in question, or its address has not arrived yet.
+		// The caller knows which; here there is simply nowhere to publish.
 		return false, "WaitingForAddress",
 			"waiting for the tenant's address: the time is served on it", nil
 	}

@@ -51,7 +51,7 @@ func assignAddress(t *testing.T, tenantName, ip string) {
 // controller: pending is a condition with a reason, and the address appears in
 // status when it appears at all.
 func TestTheTenantAsksForAnAddressAndPublishesTheOneItGets(t *testing.T) {
-	mustTenant(t, plainTenant("tad"))
+	mustTenant(t, vpcTenant("tad"))
 
 	eventually(t, "the request for an address", func() error {
 		service, err := cpService("tad")
@@ -129,7 +129,7 @@ func TestTheTenantAsksForAnAddressAndPublishesTheOneItGets(t *testing.T) {
 // control-plane endpoint and dials :50001 there. The port is not configurable,
 // which is the whole reason each tenant needs an address of its own.
 func TestATalosTenantPublishesTrustd(t *testing.T) {
-	mustTenant(t, talosTenant("tadt"))
+	mustTenant(t, vpcTalosTenant("tadt"))
 
 	eventually(t, "trustd on the tenant's own address", func() error {
 		service, err := cpService("tadt")
@@ -166,8 +166,8 @@ func TestAPoolTheSubnetDoesNotExcludeIsRefusedBeforeAnAddressIsHandedOut(t *test
 		MetalLBNamespace: "kubevirt-ui-system",
 		TransitSubnet:    "transit-bad",
 	}
-	obj := plainTenant("tadx")
-	vip, ready, message, err := reconciler.reconcileAddress(testCtx, obj, "tenant-tadx")
+	obj := vpcTenant("tadx")
+	vip, _, ready, message, err := reconciler.reconcileAddress(testCtx, obj, "tenant-tadx")
 	if err != nil {
 		t.Fatalf("reconcileAddress: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestAPoolTheSubnetDoesNotExcludeIsRefusedBeforeAnAddressIsHandedOut(t *test
 	// so the refusal above is the check working rather than the call failing.
 	mustExcludingSubnet(t, "transit-good", "10.199.9.0/24", []string{"10.199.9.1..10.199.9.255"})
 	reconciler.TransitSubnet = "transit-good"
-	if _, _, _, err := reconciler.reconcileAddress(testCtx, obj, "tenant-tadx"); err != nil {
+	if _, _, _, _, err := reconciler.reconcileAddress(testCtx, obj, "tenant-tadx"); err != nil {
 		t.Fatalf("reconcileAddress against a well-excluded pool: %v", err)
 	}
 	if err := k8sClient.Get(testCtx, types.NamespacedName{
@@ -257,5 +257,75 @@ func mustExcludingSubnet(t *testing.T, name, cidr string, exclude []string) {
 		if err := k8sClient.Update(testCtx, live); err != nil {
 			t.Fatalf("updating subnet %s: %v", name, err)
 		}
+	}
+}
+
+// TestATenantOnTheDefaultOverlayAsksForNoAddress.
+//
+// Its control plane is reached by the Kamaji Service's ClusterIP, which is
+// natively routable there. The pool is twenty addresses on this lab; handing
+// one to every tenant that will never dial it is how it runs out.
+func TestATenantOnTheDefaultOverlayAsksForNoAddress(t *testing.T) {
+	mustTenant(t, plainTenant("tadd"))
+
+	eventually(t, "the tenant to settle", func() error {
+		if tenantCondition(getTenant(t, "tadd"),
+			platformv1alpha1.ConditionNamespaceReady) == nil {
+			return fmt.Errorf("not reconciled yet")
+		}
+		return nil
+	})
+
+	if _, err := cpService("tadd"); err == nil {
+		t.Error("an address was asked for on the default overlay")
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("reading the Service: %v", err)
+	}
+	obj := getTenant(t, "tadd")
+	for _, kind := range []string{
+		platformv1alpha1.ConditionAddressAssigned,
+		platformv1alpha1.ConditionTimeServed,
+	} {
+		if got := tenantCondition(obj, kind); got != nil {
+			t.Errorf("it reports %s = %+v about something it does not have",
+				kind, got)
+		}
+	}
+	// And no time Service either: on the default overlay a worker reaches the
+	// public servers the same way it reaches everything else.
+	service := &corev1.Service{}
+	err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "kubevirt-ui-system", Name: "tadd-ntp",
+	}, service)
+	if err == nil {
+		t.Error("a time Service was published for a tenant with no address")
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("reading the time Service: %v", err)
+	}
+}
+
+// TestATalosTenantOnTheDefaultOverlayGetsANamedCertificate.
+//
+// No address means no IP SAN — and cert-manager refuses a certificate with an
+// empty one, so this is not a cosmetic difference. The worker there dials the
+// Service by name and the name is what has to be answered for.
+func TestATalosTenantOnTheDefaultOverlayGetsANamedCertificate(t *testing.T) {
+	mustTenant(t, talosTenant("tadn"))
+
+	eventually(t, "the signer certificate", func() error {
+		_, err := certManagerObject("Certificate", "tenant-tadn", "tadn-talos-signer")
+		return err
+	})
+	signer, err := certManagerObject("Certificate", "tenant-tadn", "tadn-talos-signer")
+	if err != nil {
+		t.Fatalf("reading the signer certificate: %v", err)
+	}
+	if addresses, found, _ := unstructured.NestedSlice(
+		signer.Object, "spec", "ipAddresses"); found && len(addresses) > 0 {
+		t.Errorf("ipAddresses = %v on a tenant that has no address", addresses)
+	}
+	names, _, _ := unstructured.NestedStringSlice(signer.Object, "spec", "dnsNames")
+	if len(names) != 2 {
+		t.Errorf("dnsNames = %v", names)
 	}
 }

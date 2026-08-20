@@ -60,7 +60,7 @@ func servingEndpoints(t *testing.T, service string, ready bool) {
 // address and no endpoints. Every query timed out, which looks exactly like a
 // server refusing to answer.
 func TestAnAddressThatServesNothingIsNotReady(t *testing.T) {
-	mustTenant(t, talosTenant("tntp"))
+	mustTenant(t, vpcTalosTenant("tntp"))
 	eventually(t, "the request for an address", func() error {
 		_, err := cpService("tntp")
 		return err
@@ -140,7 +140,7 @@ func TestAnAddressThatServesNothingIsNotReady(t *testing.T) {
 // Service pending forever when the key does not match, and a pending address
 // presents as a worker that cannot get the time.
 func TestAnUnsharedAddressIsReportedRatherThanIgnored(t *testing.T) {
-	mustTenant(t, talosTenant("tnts"))
+	mustTenant(t, vpcTalosTenant("tnts"))
 	eventually(t, "the request for an address", func() error {
 		_, err := cpService("tnts")
 		return err
@@ -175,7 +175,7 @@ func TestTheTimeServerIsOneForTheWholeCluster(t *testing.T) {
 	// A tenant of its own, so the test does not depend on one its neighbours
 	// happened to leave behind: chrony is written when a tenant with an address
 	// reconciles, and running this alone would otherwise find nothing.
-	mustTenant(t, talosTenant("tntc"))
+	mustTenant(t, vpcTalosTenant("tntc"))
 	eventually(t, "the request for an address", func() error {
 		_, err := cpService("tntc")
 		return err
