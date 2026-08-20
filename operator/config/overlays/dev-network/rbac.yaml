@@ -19,6 +19,8 @@ roleRef:
   kind: ClusterRole
   name: kubevirt-ui-operator-manager-role
 subjects:
+  # Named before the prefix is applied, so kustomize rewrites it along with the
+  # account itself.
   - kind: ServiceAccount
-    name: kubevirt-ui-operator-network-controller-manager
-    namespace: kubevirt-ui-operator-dev
+    name: controller-manager
+    namespace: system

@@ -329,3 +329,68 @@ func TestARejectedReloadIsReportedNotSwallowed(t *testing.T) {
 		return nil
 	})
 }
+
+// A handover has to be provable before it happens, and the way to prove it is
+// not a second FRRConfiguration: frr-k8s merges every configuration in its
+// namespace into the node's FRR, so a "shadow" object is applied to the
+// dataplane beside the real one — two router bgp blocks over one session.
+// A dry run publishes what would be written and writes nothing.
+func TestADryRunPublishesWhatItWouldWriteAndWritesNothing(t *testing.T) {
+	ns := "frr-dryrun"
+	mustNamespace(t, ns, "")
+	mustWorkerNode(t, "dry-worker-1", false)
+	mustSubnetWithVPC(t, "external", "ovn-cluster", "10.199.4.0/22")
+	mustVPCWithDefaultRoute(t, "dry-vpc", "10.199.4.254")
+	mustSubnetWithVPC(t, "dry-vpc-default", "dry-vpc", "10.200.40.0/22")
+	mustRouterLeg(t, "dry-vpc-external", "external", "10.199.4.40")
+
+	policy := &platformv1alpha1.AnnouncementPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "default"},
+		Spec: platformv1alpha1.AnnouncementPolicySpec{
+			BorderPeer:      "10.198.175.254",
+			LocalASN:        65030,
+			PeerASN:         65000,
+			TargetNamespace: ns,
+			DryRun:          true,
+		},
+	}
+	if err := k8sClient.Create(testCtx, policy); err != nil {
+		t.Fatalf("creating policy: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(testCtx, policy) })
+
+	eventually(t, "the rendered configuration to be published", func() error {
+		got := &platformv1alpha1.AnnouncementPolicy{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Name: "default"}, got); err != nil {
+			return err
+		}
+		if got.Status.RenderedConfiguration == "" {
+			return fmt.Errorf("nothing rendered yet")
+		}
+		if !strings.Contains(got.Status.RenderedConfiguration, "network 10.200.40.0/22") {
+			return fmt.Errorf("the render does not carry the prefix:\n%s",
+				got.Status.RenderedConfiguration)
+		}
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, platformv1alpha1.ConditionAccepted)
+		if cond == nil || cond.Reason != "DryRun" {
+			return fmt.Errorf("a dry run claims to be accepted: %+v", cond)
+		}
+		return nil
+	})
+
+	consistently(t, "no configuration to be written at all", 4*time.Second, func() error {
+		cfg := &unstructured.Unstructured{}
+		cfg.SetGroupVersionKind(frrConfigGVK)
+		err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: ns, Name: defaultFRRConfigName,
+		}, cfg)
+		if err == nil {
+			return fmt.Errorf("a dry run wrote an FRRConfiguration; " +
+				"frr-k8s would have merged it into the dataplane")
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+}

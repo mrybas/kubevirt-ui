@@ -75,14 +75,26 @@ spec:
               configurationName:
                 default: kubevirt-ui-b3
                 description: |-
-                  ConfigurationName is the FRRConfiguration to write.
+                  ConfigurationName is the FRRConfiguration this policy owns.
 
-                  Configurable so a handover can be proved before it happens: point a new
-                  controller at a second name, compare what it renders against what the
-                  current writer produces, and only then take the real object over. Two
-                  writers of one BGP configuration is an outage with extra steps, so the
-                  swap has to be a single step with evidence behind it.
+                  Note what this is *not* for: pointing it at a second name does not
+                  produce a passive copy. frr-k8s merges every configuration it finds in
+                  its namespace into the node's FRR, so a second object is applied to the
+                  dataplane alongside the first — two `router bgp` blocks fighting over one
+                  session. To compare a new renderer against the current one, use dryRun.
                 type: string
+              dryRun:
+                default: false
+                description: |-
+                  DryRun renders everything and writes no FRRConfiguration.
+
+                  This is how ownership is handed over safely. While something else still
+                  writes the live object, a dry run publishes what this controller *would*
+                  produce in status, so the two can be compared byte for byte before the
+                  swap. The swap itself has to be one step — the old writer off and the new
+                  one on — because two writers of one BGP configuration is an outage with
+                  extra steps.
+                type: boolean
               externalSubnet:
                 default: external
                 description: |-
@@ -246,6 +258,12 @@ spec:
                   - node
                   type: object
                 type: array
+              renderedConfiguration:
+                description: |-
+                  RenderedConfiguration is what this controller would write, published so a
+                  handover can be compared against the current writer before it happens.
+                  Only set on a dry run.
+                type: string
             type: object
         required:
         - spec

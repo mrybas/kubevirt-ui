@@ -108,6 +108,25 @@ func (r *AnnouncementPolicyReconciler) Reconcile(ctx context.Context, req ctrl.R
 		return ctrl.Result{}, kube.UpdateStatus(ctx, r.Client, announceControllerName, policy, before)
 	}
 
+	rendered := announce.RenderRawConfig(
+		announcements, policy.Spec.BorderPeer, policy.Spec.LocalASN, policy.Spec.PeerASN)
+
+	if policy.Spec.DryRun {
+		// Nothing is written. A second FRRConfiguration would not be a passive
+		// copy: frr-k8s merges every configuration in its namespace into the
+		// node's FRR, so a "shadow" object goes straight into the dataplane
+		// beside the real one.
+		policy.Status.Announced = toAnnouncedPrefixes(announcements)
+		policy.Status.Nodes = nodes
+		policy.Status.RenderedConfiguration = rendered
+		policy.Status.ReloadFailures = nil
+		policy.Status.ObservedGeneration = policy.Generation
+		r.setAccepted(policy, false, "DryRun",
+			fmt.Sprintf("nothing written; this is what would be advertised — "+
+				"%d prefix(es) from %s", len(announcements), strings.Join(nodes, ", ")))
+		return ctrl.Result{}, kube.UpdateStatus(ctx, r.Client, announceControllerName, policy, before)
+	}
+
 	if err := r.writeConfiguration(ctx, policy, announcements, nodes); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -120,6 +139,7 @@ func (r *AnnouncementPolicyReconciler) Reconcile(ctx context.Context, req ctrl.R
 	policy.Status.Announced = toAnnouncedPrefixes(announcements)
 	policy.Status.Nodes = nodes
 	policy.Status.ReloadFailures = failures
+	policy.Status.RenderedConfiguration = ""
 	policy.Status.ObservedGeneration = policy.Generation
 	if len(failures) == 0 {
 		r.setAccepted(policy, true, "Reloaded",
