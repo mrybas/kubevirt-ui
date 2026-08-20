@@ -1073,3 +1073,45 @@ meant, creating a stray top-level `config/` directory. Moved. Six other files
 carried whitespace-only `gofmt` changes swept in after `make test` ran
 `go fmt ./...` — checked, harmless, left alone. Paths are named explicitly from
 here.
+
+## M10a (third slice) — deletion, opt-in, with the router going last
+
+`spec.deletionPolicy` decides what deleting the object means, and defaults to
+`Retain`.
+
+That default is not caution for its own sake: it is the property that already
+mattered. With `Retain` there is no finalizer and no ownership, so a network
+written down after it already exists and already carries workloads can be
+described and un-described freely. When an adoption CR had to be withdrawn from
+a live network on this stand, that is what made it a non-event.
+
+`Delete` opts into the cascade, in the order kube-ovn requires — resolver,
+subnets, then the router — and the router only once the subnets are *read back*
+as gone. Every subnet is finalized against that router; remove it first and they
+are stranded permanently, with kube-ovn looping on `not found logical router`
+and the finalizer never coming off.
+
+While it waits it says what it waits for and comes back in five seconds. The
+endpoint this replaces answered 409 with the same list and the words "retry in a
+moment" — and this session watched exactly that happen: nobody retried, the
+moment never came, and the subnet had to be freed by hand.
+
+### Mutations
+
+- delete the router without waiting for the subnets (the measured damage) →
+  fails;
+- take the finalizer unconditionally → fails, because it turns every description
+  into an owner.
+
+### Live
+
+| check | result |
+|---|---|
+| `Retain`, CR deleted | Vpc `rv=665032` before and after — untouched; Subnet still there |
+| `Delete`, fresh network `opnet3` | finalizer claimed; after `kubectl delete`: 5 s draining, gone at 10 s |
+| stranded objects afterwards | none — no orphan Subnet, no orphan VpcDns |
+| adopt-then-cascade on `opnet1` | adopted with `Delete`, removed cleanly in 5 s |
+
+The contrast with the stuck `uinet1` earlier in this log is the point: same
+cluster, same kube-ovn, and the difference is that the router outlived its
+subnets.
