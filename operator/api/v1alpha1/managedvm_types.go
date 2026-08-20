@@ -97,6 +97,25 @@ type NetworkAttachment struct {
 	StaticIP string `json:"staticIP,omitempty"`
 }
 
+// DiskAttachment is an existing claim attached to the machine.
+//
+// The root disk is not one of these: it is created with the machine and is
+// described by rootDisk. These are disks that exist on their own and are
+// plugged in — which is why they are matched by claim rather than rendered,
+// and why the machine's own root entry is never touched by this list.
+type DiskAttachment struct {
+	// Claim is the DataVolume or PersistentVolumeClaim to attach, in this
+	// namespace.
+	// +kubebuilder:validation:MinLength=1
+	Claim string `json:"claim"`
+
+	// Bus the guest sees the disk on.
+	// +kubebuilder:validation:Enum=virtio;scsi;sata
+	// +kubebuilder:default=virtio
+	// +optional
+	Bus string `json:"bus,omitempty"`
+}
+
 // SSHSpec carries the keys to install in the guest.
 //
 // The keys are explicit. The UI injects the requesting user's profile keys when
@@ -173,6 +192,18 @@ type ManagedVMSpec struct {
 	// RootDisk overrides the template's default, and is required without one.
 	// +optional
 	RootDisk *RootDiskSpec `json:"rootDisk,omitempty"`
+
+	// Disks attached to the machine, beyond its own root disk.
+	//
+	// Declarative, so that what is attached is visible in one place and
+	// survives whatever happens to the process that attached it. A claim marked
+	// persistent may be listed by exactly one machine — admission checks that,
+	// because two machines writing one disk corrupts it and neither of them
+	// finds out.
+	// +optional
+	// +listType=map
+	// +listMapKey=claim
+	Disks []DiskAttachment `json:"disks,omitempty"`
 
 	// Networks in order. The first is the primary NIC.
 	//
@@ -259,6 +290,14 @@ type ManagedVMStatus struct {
 	// to make an exception.
 	// +optional
 	OperationInProgress string `json:"operationInProgress,omitempty"`
+
+	// AttachedDisks lists the claims this controller has plugged in.
+	//
+	// Kept so that removing a disk from the spec detaches exactly what was
+	// attached from it, and nothing else. A disk plugged in by some other route
+	// is left alone rather than reclaimed and then removed as unrecognised.
+	// +optional
+	AttachedDisks []string `json:"attachedDisks,omitempty"`
 
 	// RootDiskEpoch counts how many times the root disk has been provisioned.
 	// It appears in the disk's name so that a replacement cannot collide with a

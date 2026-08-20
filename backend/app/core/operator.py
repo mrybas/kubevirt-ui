@@ -79,6 +79,32 @@ def operation_name(action: str, vm_name: str) -> str:
     return f"{vm_name}-{action.lower()}-{int(time.time())}"
 
 
+async def patch_managed_disks(
+    custom_api, namespace: str, owner: str, claim: str, attach: bool,
+) -> None:
+    """Add or remove a disk on the machine's declared list.
+
+    Read-modify-write on one field of one object: the list is small, it belongs
+    to one owner, and the alternative — a strategic merge on a list of maps —
+    silently drops entries the client did not know about.
+    """
+    vm = await custom_api.get_namespaced_custom_object(
+        group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+        namespace=namespace, plural="managedvms", name=owner,
+    )
+    disks = list((vm.get("spec", {}) or {}).get("disks") or [])
+    disks = [d for d in disks if d.get("claim") != claim]
+    if attach:
+        disks.append({"claim": claim})
+
+    await custom_api.patch_namespaced_custom_object(
+        group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+        namespace=namespace, plural="managedvms", name=owner,
+        body={"spec": {"disks": disks}},
+        _content_type="application/merge-patch+json",
+    )
+
+
 def managed_owner(obj: dict, kind: str) -> str | None:
     """Name of the custom resource that owns this object, if any.
 

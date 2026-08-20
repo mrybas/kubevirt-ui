@@ -113,6 +113,45 @@ spec:
                     description: VNC attaches a graphics device.
                     type: boolean
                 type: object
+              disks:
+                description: |-
+                  Disks attached to the machine, beyond its own root disk.
+
+                  Declarative, so that what is attached is visible in one place and
+                  survives whatever happens to the process that attached it. A claim marked
+                  persistent may be listed by exactly one machine — admission checks that,
+                  because two machines writing one disk corrupts it and neither of them
+                  finds out.
+                items:
+                  description: |-
+                    DiskAttachment is an existing claim attached to the machine.
+
+                    The root disk is not one of these: it is created with the machine and is
+                    described by rootDisk. These are disks that exist on their own and are
+                    plugged in — which is why they are matched by claim rather than rendered,
+                    and why the machine's own root entry is never touched by this list.
+                  properties:
+                    bus:
+                      default: virtio
+                      description: Bus the guest sees the disk on.
+                      enum:
+                      - virtio
+                      - scsi
+                      - sata
+                      type: string
+                    claim:
+                      description: |-
+                        Claim is the DataVolume or PersistentVolumeClaim to attach, in this
+                        namespace.
+                      minLength: 1
+                      type: string
+                  required:
+                  - claim
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - claim
+                x-kubernetes-list-type: map
               displayName:
                 description: DisplayName is the human-facing name.
                 maxLength: 100
@@ -259,6 +298,16 @@ spec:
               write every time a guest breathes, multiplied by every VM on the cluster,
               to reproduce data the UI can already watch at the source.
             properties:
+              attachedDisks:
+                description: |-
+                  AttachedDisks lists the claims this controller has plugged in.
+
+                  Kept so that removing a disk from the spec detaches exactly what was
+                  attached from it, and nothing else. A disk plugged in by some other route
+                  is left alone rather than reclaimed and then removed as unrecognised.
+                items:
+                  type: string
+                type: array
               conditions:
                 description: Conditions carry the reasons.
                 items:

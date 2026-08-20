@@ -186,6 +186,9 @@ func (r *ManagedVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err := r.reconcileExistingVM(ctx, vm, existing, in); err != nil {
 			return ctrl.Result{}, err
 		}
+		if err := r.syncDisks(ctx, vm, existing); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	vm.Status.VirtualMachineName = existing.Name
@@ -248,6 +251,9 @@ func (r *ManagedVMReconciler) reconcileDelete(
 	}
 
 	if err := r.deleteOwnedPasswordSecret(ctx, vm); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.releaseDisks(ctx, vm); err != nil {
 		return ctrl.Result{}, err
 	}
 

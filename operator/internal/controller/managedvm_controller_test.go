@@ -816,3 +816,210 @@ func TestAMachineTheResourceDoesNotOwnIsLeftAlone(t *testing.T) {
 }
 
 func ptrTo[T any](v T) *T { return &v }
+
+func mustDataVolume(t *testing.T, ns, name string) {
+	t.Helper()
+	dv := &cdiv1.DataVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels:    map[string]string{"kubevirt-ui.io/managed": "true", "kubevirt-ui.io/persistent": "true"},
+		},
+		Spec: cdiv1.DataVolumeSpec{
+			Source:  &cdiv1.DataVolumeSource{Blank: &cdiv1.DataVolumeBlankImage{}},
+			Storage: &cdiv1.StorageSpec{},
+		},
+	}
+	if err := k8sClient.Create(testCtx, dv); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating disk %s: %v", name, err)
+	}
+}
+
+func volumeNames(vm *kubevirtv1.VirtualMachine) []string {
+	var out []string
+	for _, v := range vm.Spec.Template.Spec.Volumes {
+		out = append(out, v.Name)
+	}
+	return out
+}
+
+// Attaching is declarative: what is plugged in is visible in one place and
+// outlives whatever attached it.
+func TestDisksAreAttachedAndDetachedFromTheSpec(t *testing.T) {
+	ns := "vm-disks"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+	mustDataVolume(t, ns, "data-one")
+
+	vm := newManagedVM(ns, "with-disks", "ubuntu")
+	vm.Spec.Disks = []platformv1alpha1.DiskAttachment{{Claim: "data-one", Bus: "virtio"}}
+	if err := k8sClient.Create(testCtx, vm); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+
+	eventually(t, "the disk to be attached and recorded", func() error {
+		kvm, err := getKubeVirtVM(ns, "with-disks")
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, v := range kvm.Spec.Template.Spec.Volumes {
+			if v.Name == "data-one" {
+				found = true
+				if v.DataVolume == nil || !v.DataVolume.Hotpluggable {
+					return fmt.Errorf("attached, but not as a hot-pluggable disk")
+				}
+			}
+		}
+		if !found {
+			return fmt.Errorf("volumes = %v", volumeNames(kvm))
+		}
+		got := getVM(t, ns, "with-disks")
+		if len(got.Status.AttachedDisks) != 1 || got.Status.AttachedDisks[0] != "data-one" {
+			return fmt.Errorf("status.attachedDisks = %v", got.Status.AttachedDisks)
+		}
+		// The disks page reads this label to say who holds what.
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "data-one"}, dv); err != nil {
+			return err
+		}
+		if dv.Labels[attachedToLabel] != "with-disks" {
+			return fmt.Errorf("attached-to = %q", dv.Labels[attachedToLabel])
+		}
+		return nil
+	})
+
+	// The machine's own disks are untouched by any of this.
+	kvm, err := getKubeVirtVM(ns, "with-disks")
+	if err != nil {
+		t.Fatalf("reading machine: %v", err)
+	}
+	names := volumeNames(kvm)
+	for _, want := range []string{"rootdisk", "cloudinit"} {
+		found := false
+		for _, n := range names {
+			if n == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("attaching a disk removed %s; volumes = %v", want, names)
+		}
+	}
+
+	// Removing it from the spec detaches it and releases the label.
+	touched := getVM(t, ns, "with-disks")
+	touched.Spec.Disks = nil
+	if err := k8sClient.Update(testCtx, touched); err != nil {
+		t.Fatalf("detaching: %v", err)
+	}
+
+	eventually(t, "the disk to be detached and released", func() error {
+		kvm, err := getKubeVirtVM(ns, "with-disks")
+		if err != nil {
+			return err
+		}
+		for _, v := range kvm.Spec.Template.Spec.Volumes {
+			if v.Name == "data-one" {
+				return fmt.Errorf("still attached")
+			}
+		}
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "data-one"}, dv); err != nil {
+			return err
+		}
+		if _, held := dv.Labels[attachedToLabel]; held {
+			return fmt.Errorf("the disk is still marked as held by %q", dv.Labels[attachedToLabel])
+		}
+		return nil
+	})
+}
+
+// A disk plugged in by some other route is not this controller's to reclaim,
+// and therefore not its to remove either.
+func TestADiskAttachedElsewhereIsLeftAlone(t *testing.T) {
+	ns := "vm-foreign-disk"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+
+	if err := k8sClient.Create(testCtx, newManagedVM(ns, "tolerant", "ubuntu")); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+	eventually(t, "the machine to exist", func() error {
+		_, err := getKubeVirtVM(ns, "tolerant")
+		return err
+	})
+
+	eventually(t, "a disk to be plugged in from outside", func() error {
+		kvm, err := getKubeVirtVM(ns, "tolerant")
+		if err != nil {
+			return err
+		}
+		for _, v := range kvm.Spec.Template.Spec.Volumes {
+			if v.Name == "outside-disk" {
+				return nil
+			}
+		}
+		kvm.Spec.Template.Spec.Volumes = append(kvm.Spec.Template.Spec.Volumes, kubevirtv1.Volume{
+			Name:         "outside-disk",
+			VolumeSource: kubevirtv1.VolumeSource{DataVolume: &kubevirtv1.DataVolumeSource{Name: "outside-disk"}},
+		})
+		return k8sClient.Update(testCtx, kvm)
+	})
+
+	touchVM(t, ns, "tolerant", "Tolerant renamed")
+
+	consistently(t, "the foreign disk to survive", 5*time.Second, func() error {
+		kvm, err := getKubeVirtVM(ns, "tolerant")
+		if err != nil {
+			return err
+		}
+		for _, v := range kvm.Spec.Template.Spec.Volumes {
+			if v.Name == "outside-disk" {
+				return nil
+			}
+		}
+		return fmt.Errorf("the controller removed a disk it did not attach")
+	})
+}
+
+// A machine that goes away must release its disks, or they stay unattachable:
+// the attach path reads the holder label before it scans, and the label names a
+// machine that no longer exists.
+func TestDeletingAMachineReleasesItsDisks(t *testing.T) {
+	ns := "vm-disk-release"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+	mustDataVolume(t, ns, "shared-later")
+
+	vm := newManagedVM(ns, "temporary", "ubuntu")
+	vm.Spec.Disks = []platformv1alpha1.DiskAttachment{{Claim: "shared-later"}}
+	if err := k8sClient.Create(testCtx, vm); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+	eventually(t, "the disk to be held", func() error {
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "shared-later"}, dv); err != nil {
+			return err
+		}
+		if dv.Labels[attachedToLabel] != "temporary" {
+			return fmt.Errorf("attached-to = %q", dv.Labels[attachedToLabel])
+		}
+		return nil
+	})
+
+	if err := k8sClient.Delete(testCtx, getVM(t, ns, "temporary")); err != nil {
+		t.Fatalf("deleting: %v", err)
+	}
+
+	eventually(t, "the disk to be released", func() error {
+		dv := &cdiv1.DataVolume{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "shared-later"}, dv); err != nil {
+			return err
+		}
+		if _, held := dv.Labels[attachedToLabel]; held {
+			return fmt.Errorf("still held by %q", dv.Labels[attachedToLabel])
+		}
+		return nil
+	})
+}

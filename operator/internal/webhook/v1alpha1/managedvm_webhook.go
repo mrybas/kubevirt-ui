@@ -73,7 +73,10 @@ func (v *ManagedVMCustomValidator) ValidateCreate(
 	ctx context.Context, obj *platformv1alpha1.ManagedVM,
 ) (admission.Warnings, error) {
 	managedvmlog.V(1).Info("validating create", "name", obj.GetName())
-	return nil, v.validateNetworks(ctx, obj)
+	if err := v.validateNetworks(ctx, obj); err != nil {
+		return nil, err
+	}
+	return nil, v.validateDisksAreNotShared(ctx, obj)
 }
 
 // ValidateUpdate additionally refuses changes the running machine cannot take.
@@ -87,6 +90,10 @@ func (v *ManagedVMCustomValidator) ValidateUpdate(
 	// straight past — which is how a VM ends up with a second VPC interface
 	// that nothing serves.
 	if err := v.validateNetworks(ctx, newObj); err != nil {
+		return nil, err
+	}
+
+	if err := v.validateDisksAreNotShared(ctx, newObj); err != nil {
 		return nil, err
 	}
 
@@ -112,6 +119,45 @@ func computeChanged(oldObj, newObj *platformv1alpha1.ManagedVM) bool {
 		return a != b
 	}
 	return *a != *b
+}
+
+// validateDisksAreNotShared refuses to attach a disk another machine holds.
+//
+// Two machines writing one filesystem corrupts it, and neither of them finds
+// out. The path this replaces checked the same thing, but only on its own
+// endpoint: anything else that attached a disk — a manifest, a script, the
+// hot-plug path on a second machine — went straight past it.
+func (v *ManagedVMCustomValidator) validateDisksAreNotShared(
+	ctx context.Context, vm *platformv1alpha1.ManagedVM,
+) error {
+	if len(vm.Spec.Disks) == 0 {
+		return nil
+	}
+
+	others := &platformv1alpha1.ManagedVMList{}
+	if err := v.List(ctx, others, client.InNamespace(vm.Namespace)); err != nil {
+		return fmt.Errorf("listing machines in %s: %w", vm.Namespace, err)
+	}
+
+	holders := map[string]string{}
+	for i := range others.Items {
+		other := &others.Items[i]
+		if other.Name == vm.Name || !other.DeletionTimestamp.IsZero() {
+			continue
+		}
+		for _, disk := range other.Spec.Disks {
+			holders[disk.Claim] = other.Name
+		}
+	}
+
+	for _, disk := range vm.Spec.Disks {
+		if holder, taken := holders[disk.Claim]; taken {
+			return fmt.Errorf(
+				"disk %q is already attached to %q; a disk written by two machines is "+
+					"corrupted by both", disk.Claim, holder)
+		}
+	}
+	return nil
 }
 
 // validateNetworks refuses what will never become valid: a subnet belonging to
