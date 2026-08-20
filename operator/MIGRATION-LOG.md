@@ -2723,3 +2723,23 @@ API server would be testing controller-runtime. Removing `auth-extra-groups`
 from the port turns it red: without that group the CSR is filed by somebody the
 auto-approvers do not recognise, which is the same invisible failure one step
 along.
+
+### The bound on somebody else's API server
+
+Everything in that phase talks to a different cluster, and a control plane that
+accepts connections and never answers is neither an error nor a refusal — it is
+silence. Without a bound, one tenant in that state holds this controller's pass,
+and with it every other tenant's, for as long as it stays that way. A rolling
+control plane and a cut VIP path both look like it.
+
+Bounded twice, because the two cover different things: `context.WithTimeout`
+around the calls, and `Timeout` on the client itself, since a request that never
+gets a response header is not covered by anything the caller passes. Ten
+seconds — nothing here is urgent, the credential is placed once and the pass
+returns every ten seconds anyway.
+
+The mutation is the nicest demonstration in this log: taking the deadline out
+does not turn the test red, it makes it **hang** — `panic: test timed out after
+5m0s` — which is exactly what the silent tenant would do to the controller. It
+also showed that `hack/mutate.sh` had no bound of its own, so a mutant that
+hangs hung the script; it passes `-timeout` now.

@@ -44,4 +44,5 @@ echo "мутація застосована у $work"
 docker run --rm -v "$work:/work" -w /work/operator \
 	-e KUBEBUILDER_ASSETS=/work/operator/bin/k8s/1.36.0-linux-arm64 \
 	--entrypoint go "$(docker inspect -f '{{.Config.Image}}' kvbuild)" \
-	test ./internal/... -count=1 "$@" 2>&1 | grep -E "^(---|ok|FAIL|\s+\S+_test\.go:)" | head -20
+	test ./internal/... -count=1 -timeout 300s "$@" 2>&1 \
+	| grep -E "^(---|ok|FAIL|panic|\s+\S+_test\.go:)" | head -20

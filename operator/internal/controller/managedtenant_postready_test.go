@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -189,4 +190,53 @@ func TestACloudInitTenantNeedsNothingPlaced(t *testing.T) {
 		t.Error("it dialled a tenant that needs nothing")
 	}
 	_ = platformv1alpha1.ConditionTenantBootstrapped
+}
+
+// blockingClient is a tenant API that accepts the call and never answers —
+// the shape that has no timeout of its own and is not a network error either.
+type blockingClient struct{ client.Client }
+
+func (b blockingClient) Get(ctx context.Context, _ client.ObjectKey, _ client.Object,
+	_ ...client.GetOption) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestOneSilentTenantDoesNotHoldTheRest.
+//
+// Everything in this phase talks to somebody else's API server. A control plane
+// that accepts connections and never replies is not an error and not a refusal;
+// without a bound it is a controller that stops reconciling every other tenant
+// for as long as that one stays that way.
+func TestOneSilentTenantDoesNotHoldTheRest(t *testing.T) {
+	mustNamespace(t, "tenant-tin5", "")
+	mustMachineSecrets(t, "tenant-tin5", "tin5", "abcdef.0123456789abcdef")
+	mustAdminKubeconfig(t, "tenant-tin5", "tin5", "super-admin.svc")
+
+	silent := &tenantCluster{client: blockingClient{
+		Client: fake.NewClientBuilder().WithScheme(k8sClient.Scheme()).Build(),
+	}}
+	reconciler := &ManagedTenantReconciler{
+		Client: k8sClient, Scheme: k8sClient.Scheme(), APIReader: k8sReader,
+		TenantClient: silent.open,
+	}
+
+	start := time.Now()
+	ready, reason, message, err := reconciler.reconcileInsideTheTenant(
+		testCtx, talosTenant("tin5"), "tenant-tin5")
+	waited := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("a silent tenant was reported as our error: %v", err)
+	}
+	if ready {
+		t.Fatal("it claimed the credential was placed")
+	}
+	if reason != "TenantUnreachable" {
+		t.Errorf("reason = %q (%s)", reason, message)
+	}
+	if waited > insideTenantTimeout+5*time.Second {
+		t.Errorf("it waited %s — the bound is %s, and the whole point is that "+
+			"one tenant cannot hold the pass", waited, insideTenantTimeout)
+	}
 }

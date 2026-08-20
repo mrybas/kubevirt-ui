@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -70,6 +71,14 @@ func (r *ManagedTenantReconciler) reconcileInsideTheTenant(
 				"credential can be derived from it", nil
 	}
 
+	// Bounded, and bounded here rather than trusted to the callee: everything
+	// below talks to somebody else's API server, and one tenant whose control
+	// plane accepts connections and never answers would otherwise hold this
+	// controller's pass — and with it every other tenant's — for as long as it
+	// stays that way.
+	ctx, cancel := context.WithTimeout(ctx, insideTenantTimeout)
+	defer cancel()
+
 	tenantClient, reason, message, err := r.clientForTenant(ctx, obj, namespace)
 	if err != nil {
 		return false, "", "", err
@@ -99,7 +108,7 @@ func (r *ManagedTenantReconciler) reconcileInsideTheTenant(
 	}
 	if !apierrors.IsNotFound(err) {
 		return false, "TenantUnreachable", fmt.Sprintf(
-			"the tenant's API did not answer: %v", err), nil
+			"the tenant's API did not answer within %s: %v", insideTenantTimeout, err), nil
 	}
 
 	placed := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
@@ -169,11 +178,23 @@ func (r *ManagedTenantReconciler) clientForTenant(
 	return tenantClient, "", "", nil
 }
 
+// insideTenantTimeout is how long the tenant's own API server gets to answer.
+//
+// Short on purpose. Nothing here is urgent — the credential is placed once and
+// the pass comes back every ten seconds — while the cost of no bound is a
+// controller that stops reconciling every other tenant because one of them is
+// accepting connections and not replying.
+const insideTenantTimeout = 10 * time.Second
+
 func defaultTenantClient(_ context.Context, kubeconfig []byte) (client.Client, error) {
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
 		return nil, fmt.Errorf("the kubeconfig is not readable: %w", err)
 	}
+	// The context bounds each call; this bounds the client itself, because a
+	// request that never gets a response header is not covered by anything the
+	// caller passes.
+	config.Timeout = insideTenantTimeout
 	return client.New(config, client.Options{})
 }
 
