@@ -1,6 +1,6 @@
 # Local harness for the operator migration: the backend built from this branch,
-# pointed at the live dev cluster, with the image path routed through the
-# operator. Kept separate from docker-compose.override.yml so the existing
+# pointed at the live dev cluster, with the image and VM paths routed through
+# the operator. Kept separate from docker-compose.override.yml so the existing
 # harness there is left alone; run it explicitly:
 #
 #   docker compose -f docker-compose.yml -f docker-compose.opdev.yml up -d
@@ -9,6 +9,7 @@ services:
     environment:
       - AUTH_TYPE=none
       - OPERATOR_IMAGE_ENABLED=true
+      - OPERATOR_VM_ENABLED=true
   frontend:
     environment:
       - VITE_API_URL=http://localhost:8888

@@ -39,6 +39,15 @@ backend:
     # Turning the flag back off does not orphan anything: ownership is stamped
     # on the disk, so images the operator owns keep being deleted through it.
     OPERATOR_IMAGE_ENABLED: ""
+    # -- Route VM creation through the operator: the backend writes a ManagedVM
+    # and the operator renders the KubeVirt VirtualMachine, its root disk, the
+    # cloud-init and the network annotations. Empty/false → the backend renders
+    # the machine itself, exactly as before.
+    #
+    # Independent of OPERATOR_IMAGE_ENABLED; either can be on alone. As with
+    # images, deletion and power actions follow ownership rather than the flag,
+    # so machines created while it was on keep working after it is turned off.
+    OPERATOR_VM_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as

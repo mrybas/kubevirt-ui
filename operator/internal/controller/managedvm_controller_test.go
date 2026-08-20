@@ -711,3 +711,108 @@ func TestOnlyThePrimaryNICMayBeAVPCOverlay(t *testing.T) {
 		return nil
 	})
 }
+
+// Deleting a VM in the UI means the machine, not the paperwork. The cascade is
+// a finalizer rather than an ownerReference so it stays the controller's
+// decision — strip the finalizer and the machine outlives the resource, which
+// is what a migration rollback needs.
+func TestDeletingTheResourceDeletesTheMachine(t *testing.T) {
+	ns := "vm-cascade"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+
+	if err := k8sClient.Create(testCtx, newManagedVM(ns, "doomed", "ubuntu")); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+	eventually(t, "the VirtualMachine to exist", func() error {
+		_, err := getKubeVirtVM(ns, "doomed")
+		return err
+	})
+
+	if err := k8sClient.Delete(testCtx, getVM(t, ns, "doomed")); err != nil {
+		t.Fatalf("deleting: %v", err)
+	}
+
+	eventually(t, "the machine to go with it", func() error {
+		if _, err := getKubeVirtVM(ns, "doomed"); err == nil {
+			return fmt.Errorf("the VirtualMachine outlived its resource")
+		} else if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+
+	eventually(t, "the resource itself to be released", func() error {
+		vm := &platformv1alpha1.ManagedVM{}
+		err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "doomed"}, vm)
+		if err == nil {
+			return fmt.Errorf("still held by finalizers %v", vm.Finalizers)
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+}
+
+// A machine that merely shares the name — adopted from before the migration, or
+// put there by someone else — is not this resource's to delete.
+func TestAMachineTheResourceDoesNotOwnIsLeftAlone(t *testing.T) {
+	ns := "vm-not-mine"
+	mustNamespace(t, ns, "opdev")
+
+	stranger := &kubevirtv1.VirtualMachine{
+		ObjectMeta: metav1.ObjectMeta{Name: "stranger", Namespace: ns},
+		Spec: kubevirtv1.VirtualMachineSpec{
+			RunStrategy: ptrTo(kubevirtv1.RunStrategyHalted),
+			Template: &kubevirtv1.VirtualMachineInstanceTemplateSpec{
+				Spec: kubevirtv1.VirtualMachineInstanceSpec{},
+			},
+		},
+	}
+	if err := k8sClient.Create(testCtx, stranger); err != nil {
+		t.Fatalf("creating the stranger: %v", err)
+	}
+
+	readyImage(t, ns, "ubuntu")
+	vm := newManagedVM(ns, "stranger", "ubuntu")
+	if err := k8sClient.Create(testCtx, vm); err != nil {
+		t.Fatalf("creating resource: %v", err)
+	}
+	eventually(t, "the collision to be reported rather than taken over", func() error {
+		got := getVM(t, ns, "stranger")
+		if len(got.Finalizers) == 0 {
+			return fmt.Errorf("no finalizer yet")
+		}
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, platformv1alpha1.ConditionProvisioned)
+		if cond == nil || cond.Reason != "VirtualMachineConflict" {
+			return fmt.Errorf("condition = %+v, want reason VirtualMachineConflict", cond)
+		}
+		if !strings.Contains(cond.Message, naming.AdoptAnnotation) {
+			return fmt.Errorf("the refusal does not say how to adopt: %q", cond.Message)
+		}
+		return nil
+	})
+
+	if err := k8sClient.Delete(testCtx, getVM(t, ns, "stranger")); err != nil {
+		t.Fatalf("deleting: %v", err)
+	}
+
+	eventually(t, "the resource to be released", func() error {
+		got := &platformv1alpha1.ManagedVM{}
+		err := k8sClient.Get(testCtx, types.NamespacedName{Namespace: ns, Name: "stranger"}, got)
+		if err == nil {
+			return fmt.Errorf("still held")
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+
+	if _, err := getKubeVirtVM(ns, "stranger"); err != nil {
+		t.Fatalf("a machine this resource never created was deleted with it: %v", err)
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }

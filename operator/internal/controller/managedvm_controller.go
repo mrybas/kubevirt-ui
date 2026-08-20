@@ -46,6 +46,14 @@ import (
 const (
 	vmControllerName = "managedvm"
 
+	// vmFinalizer makes deleting the description delete the machine.
+	//
+	// It is a finalizer rather than an ownerReference so that the cascade stays
+	// this controller's decision: removing the CRD during a rollback must not
+	// take live workloads with it, and the documented escape hatch — strip the
+	// finalizers, then delete — leaves every machine running.
+	vmFinalizer = "platform.kubevirt-ui.io/managedvm"
+
 	// blockedVMRequeue is the backstop for states that clear themselves when
 	// something else in the cluster changes. The watches are the mechanism;
 	// this only covers what we do not watch.
@@ -76,10 +84,10 @@ func (r *ManagedVMReconciler) kubeOVNNamespaces() []string {
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedvms,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedvms/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedvms/finalizers,verbs=update
-// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeovn.io,resources=subnets;vpcs,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
 
 // Reconcile renders one ManagedVM.
 func (r *ManagedVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -94,14 +102,18 @@ func (r *ManagedVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, nil
 	}
 	if !vm.DeletionTimestamp.IsZero() {
-		// Deleting a ManagedVM deliberately leaves the VirtualMachine running.
-		// Until the lifecycle controllers arrive, removing the description of a
-		// machine must not remove the machine — that is a decision for whoever
-		// deletes the workload, not a side effect of a migration step.
-		return ctrl.Result{}, nil
+		return r.reconcileDelete(ctx, vm)
 	}
 
 	before := vm.DeepCopy()
+
+	if !controllerutil.ContainsFinalizer(vm, vmFinalizer) {
+		controllerutil.AddFinalizer(vm, vmFinalizer)
+		if err := r.Update(ctx, vm); err != nil {
+			return ctrl.Result{}, fmt.Errorf("adding finalizer: %w", err)
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
 
 	existing, err := r.existingVM(ctx, vm)
 	if err != nil {
@@ -131,6 +143,27 @@ func (r *ManagedVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		}
 		existing = created
 	} else {
+		// A machine that shares the name but not the ownership stamp was put
+		// there by someone else — an install that predates the migration, or a
+		// person. Taking it over silently would mean this resource later
+		// deletes a machine it never created. Adoption is a deliberate act.
+		owner := existing.Labels[naming.OwnerUIDLabel]
+		if owner != string(vm.UID) && vm.Annotations[naming.AdoptAnnotation] != existing.Name {
+			r.setBlocked(vm, &blocked{
+				Reason: "VirtualMachineConflict",
+				Message: fmt.Sprintf(
+					"VirtualMachine %s/%s already exists and was not created by this resource; "+
+						"annotate with %s: %s to adopt it",
+					vm.Namespace, existing.Name, naming.AdoptAnnotation, existing.Name),
+				Fatal: true,
+			})
+			r.event(vm, corev1.EventTypeWarning, "VirtualMachineConflict",
+				fmt.Sprintf("VirtualMachine %s exists and is not owned by this resource", existing.Name))
+			if err := kube.UpdateStatus(ctx, r.Client, vmControllerName, vm, before); err != nil {
+				return ctrl.Result{}, fmt.Errorf("updating conflict status: %w", err)
+			}
+			return ctrl.Result{}, nil
+		}
 		if err := r.reconcileExistingVM(ctx, vm, existing, in); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -163,6 +196,72 @@ func (r *ManagedVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 	}
 	return ctrl.Result{}, nil
+}
+
+// reconcileDelete removes the machine this resource describes.
+//
+// A person deleting a VM in the UI means the machine, not the paperwork. The
+// cascade runs here rather than through an ownerReference so that it is the
+// controller's decision and can be opted out of: strip the finalizer and the
+// machine outlives the resource, which is what a migration rollback needs.
+//
+// Only objects carrying this resource's ownership stamp are removed. A machine
+// that merely shares the name — adopted from before the migration, or recreated
+// by someone else — is left alone.
+func (r *ManagedVMReconciler) reconcileDelete(
+	ctx context.Context, vm *platformv1alpha1.ManagedVM,
+) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(vm, vmFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	existing, err := r.existingVM(ctx, vm)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if existing != nil && existing.Labels[naming.OwnerUIDLabel] == string(vm.UID) {
+		if err := kube.Delete(ctx, r.Client, vmControllerName, existing); err != nil {
+			return ctrl.Result{}, fmt.Errorf("deleting VirtualMachine %s/%s: %w",
+				vm.Namespace, existing.Name, err)
+		}
+		r.event(vm, corev1.EventTypeNormal, "VirtualMachineDeleted",
+			fmt.Sprintf("Deleted VirtualMachine %s", existing.Name))
+	}
+
+	if err := r.deleteOwnedPasswordSecret(ctx, vm); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	controllerutil.RemoveFinalizer(vm, vmFinalizer)
+	if err := r.Update(ctx, vm); err != nil {
+		return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
+	}
+	return ctrl.Result{}, nil
+}
+
+// deleteOwnedPasswordSecret removes the first-boot password once the machine it
+// was for is gone. The secret is created by whoever translated the request, and
+// cleaned up here so there is one owner of the cleanup rather than two.
+func (r *ManagedVMReconciler) deleteOwnedPasswordSecret(
+	ctx context.Context, vm *platformv1alpha1.ManagedVM,
+) error {
+	ref := vm.Spec.InitialPasswordSecretRef
+	if ref == nil {
+		return nil
+	}
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: vm.Namespace, Name: ref.Name}, secret)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("reading password secret: %w", err)
+	}
+	if secret.Labels[naming.OwnerNameLabel] != vm.Name {
+		// Someone else's secret that this resource merely points at.
+		return nil
+	}
+	return kube.Delete(ctx, r.Client, vmControllerName, secret)
 }
 
 func (r *ManagedVMReconciler) existingVM(

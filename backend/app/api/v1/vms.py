@@ -15,6 +15,12 @@ from pydantic import BaseModel, Field
 from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.groups import get_user_namespaces
 from app.core.kubevirt import get_hotplug_mode
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    managed_owner,
+    vm_path_enabled,
+)
 from app.core.naming import (
     DISPLAY_NAME_ANNOTATION,
     SLUG_LABEL,
@@ -1268,6 +1274,190 @@ async def create_vm(
         )
 
 
+async def _create_managed_vm(
+    *,
+    k8s_client: Any,
+    request: Request,
+    vm_request: VMFromTemplateRequest,
+    namespace: str,
+    user: User,
+    slug: str,
+) -> VMResponse:
+    """Create the VM as a ManagedVM and let the operator render the machine.
+
+    The response keeps the shape the UI already handles, so the wizard cannot
+    tell which side of the flag it is on. Naming keeps the same rule too:
+    generateName sits on our own resource, so the machine still ends up called
+    ``<slug>-xxxxx``.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+
+    # SSH keys stay a question about a person, so they are resolved here, where
+    # there is a person, and written into the resource explicitly.
+    from app.api.v1.profile import get_user_ssh_keys
+
+    ssh_keys: list[str] = list(await get_user_ssh_keys(k8s_client, user))
+    if vm_request.ssh_key:
+        ssh_keys.append(vm_request.ssh_key)
+
+    spec: dict[str, Any] = {
+        "displayName": vm_request.display_name,
+        "templateRef": {"name": vm_request.template_name},
+        "running": bool(vm_request.start),
+        "networkBinding": vm_request.network_binding,
+    }
+
+    compute: dict[str, Any] = {}
+    if vm_request.cpu_cores:
+        compute["cores"] = vm_request.cpu_cores
+    if vm_request.memory:
+        compute["memory"] = vm_request.memory
+    if compute:
+        # Cores and memory travel together: a resource carrying half of a
+        # compute block would be refused by the schema, and silently dropping
+        # the half that was given is worse than saying so.
+        compute.setdefault("cores", 0)
+        compute.setdefault("memory", "")
+        if compute["cores"] and compute["memory"]:
+            spec["compute"] = compute
+
+    root_disk: dict[str, Any] = {}
+    if vm_request.disk_size:
+        root_disk["size"] = vm_request.disk_size
+    if vm_request.storage_class:
+        root_disk["storageClass"] = vm_request.storage_class
+    if root_disk.get("size"):
+        spec["rootDisk"] = root_disk
+
+    if ssh_keys:
+        spec["ssh"] = {"authorizedKeys": ssh_keys}
+    if vm_request.user_data:
+        spec["cloudInit"] = {"userData": vm_request.user_data}
+
+    nics = vm_request.networks or ([vm_request.network] if vm_request.network else [])
+    networks = [
+        {"subnet": n.subnet, **({"staticIP": n.static_ip} if n.static_ip else {})}
+        for n in nics
+        if n
+    ]
+    if networks:
+        spec["networks"] = networks
+
+    # The password does not travel in the resource. This object lands in etcd
+    # and, for anything managed as code, in a state file.
+    secret_name: str | None = None
+    if vm_request.password:
+        secret_name = await _create_initial_password_secret(
+            k8s_client, namespace, slug, vm_request.password,
+        )
+        spec["initialPasswordSecretRef"] = {"name": secret_name, "key": "password"}
+
+    body = {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedVM",
+        "metadata": {
+            "generateName": f"{slug}-",
+            "namespace": namespace,
+            "annotations": {"kubevirt-ui.io/owner": user.email or user.username},
+        },
+        "spec": spec,
+    }
+
+    try:
+        created = await custom_api.create_namespaced_custom_object(
+            group=OPERATOR_GROUP,
+            version=OPERATOR_VERSION,
+            namespace=namespace,
+            plural="managedvms",
+            body=body,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "VM creation is routed to the operator (OPERATOR_VM_ENABLED), "
+                    "but the ManagedVM CRD is not installed in this cluster"
+                ),
+            )
+        # Admission refusals carry the reason the operator would otherwise have
+        # reported as a condition; pass it through rather than flattening it.
+        raise HTTPException(
+            status_code=e.status or status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_admission_detail(e),
+        )
+
+    name = created["metadata"]["name"]
+    if secret_name:
+        await _label_secret_owner(k8s_client, namespace, secret_name, name)
+
+    logger.info(
+        f"User {user.username} created ManagedVM {namespace}/{name} "
+        f"(display_name={vm_request.display_name!r}, template={vm_request.template_name})"
+    )
+
+    return VMResponse(
+        name=name,
+        namespace=namespace,
+        display_name=vm_request.display_name,
+        status="Provisioning",
+        ready=False,
+        created=created["metadata"].get("creationTimestamp"),
+    )
+
+
+def _admission_detail(e: ApiException) -> str:
+    """The message an admission webhook produced, or a plain reason."""
+    body = getattr(e, "body", None)
+    if body:
+        try:
+            import json as _json
+
+            parsed = _json.loads(body)
+            if isinstance(parsed, dict) and parsed.get("message"):
+                return str(parsed["message"])
+        except Exception:
+            pass
+    return f"Failed to create VM: {e.reason}"
+
+
+async def _create_initial_password_secret(
+    k8s_client: Any, namespace: str, slug: str, password: str,
+) -> str:
+    """Store the first-boot password so the resource can point at it."""
+    secret = client.V1Secret(
+        metadata=client.V1ObjectMeta(
+            generate_name=f"{slug}-initpw-",
+            namespace=namespace,
+            labels={"kubevirt-ui.io/managed": "true"},
+        ),
+        string_data={"password": password},
+        type="Opaque",
+    )
+    created = await k8s_client.core_api.create_namespaced_secret(
+        namespace=namespace, body=secret,
+    )
+    return created.metadata.name
+
+
+async def _label_secret_owner(
+    k8s_client: Any, namespace: str, secret_name: str, vm_name: str,
+) -> None:
+    """Tie the password secret to its VM so deletion can find it.
+
+    Best-effort on purpose: the VM exists by now, and failing the create over a
+    label would leave a machine nobody asked to lose.
+    """
+    try:
+        await k8s_client.core_api.patch_namespaced_secret(
+            name=secret_name,
+            namespace=namespace,
+            body={"metadata": {"labels": {"platform.kubevirt-ui.io/owner-name": vm_name}}},
+        )
+    except Exception as e:
+        logger.warning(f"Could not tie secret {secret_name} to VM {vm_name}: {e}")
+
+
 @router.post("/from-template", response_model=VMResponse, status_code=status.HTTP_201_CREATED)
 async def create_vm_from_template(
     request: Request,
@@ -1330,6 +1520,21 @@ async def create_vm_from_template(
                 detail="Template has no golden image configured",
             )
         
+        # With the operator owning VMs, the backend stops rendering the machine
+        # and writes the intent. Everything that used to be added silently here
+        # — the profile's SSH keys, the owner annotation, the display name — is
+        # made explicit in the resource, because a controller reconciling a
+        # stored object cannot ask who is holding the mouse.
+        if vm_path_enabled():
+            return await _create_managed_vm(
+                k8s_client=k8s_client,
+                request=request,
+                vm_request=vm_request,
+                namespace=namespace,
+                user=user,
+                slug=sanitize_display_name(vm_request.display_name),
+            )
+
         # 3. Build DataVolume spec for dataVolumeTemplates
         # DV name must be literal (volumes[].dataVolume.name references it by exact
         # match), so we can't use K8s generateName for the DV. Use a client-side
@@ -1718,6 +1923,20 @@ async def create_vm_from_template(
         )
 
 
+async def _managed_vm_owner(custom_api: Any, namespace: str, name: str) -> str | None:
+    """Name of the ManagedVM behind this machine, or None if nothing owns it."""
+    try:
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    return managed_owner(vm, "ManagedVM")
+
+
 @router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_vm(
     request: Request,
@@ -1753,8 +1972,23 @@ async def delete_vm(
         except ApiException:
             pass  # Snapshot CRD may not exist
 
-        # 2. Delete the VM
-        await k8s_client.delete_virtual_machine(name=name, namespace=namespace)
+        # 2. Delete the VM.
+        #
+        # A machine the operator owns is released by deleting its ManagedVM.
+        # Deleting the VirtualMachine directly would only make the controller
+        # render it again, and the user would watch a deleted VM reappear.
+        # Ownership lives on the object, so this stays right after the flag is
+        # turned off.
+        owner = await _managed_vm_owner(custom_api, namespace, name)
+        if owner:
+            # The operator's finalizer removes the machine and the first-boot
+            # password secret with it, so this is the whole deletion.
+            await custom_api.delete_namespaced_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                namespace=namespace, plural="managedvms", name=owner,
+            )
+        else:
+            await k8s_client.delete_virtual_machine(name=name, namespace=namespace)
 
     except ApiException as e:
         if e.status == 404:

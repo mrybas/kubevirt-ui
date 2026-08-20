@@ -32,6 +32,17 @@ def image_path_enabled() -> bool:
     return _enabled("OPERATOR_IMAGE_ENABLED")
 
 
+def vm_path_enabled() -> bool:
+    """True when VMs are written as ManagedVM custom resources.
+
+    Off: the backend renders the KubeVirt VirtualMachine itself.
+    On: the backend writes intent and the operator renders the machine, which
+    is also what makes the same rules apply to anything else writing the
+    resource — a Terraform module, a pipeline, a person with kubectl.
+    """
+    return _enabled("OPERATOR_VM_ENABLED")
+
+
 # The group the operator's custom resources live in.
 OPERATOR_GROUP = "platform.kubevirt-ui.io"
 OPERATOR_VERSION = "v1alpha1"
@@ -41,3 +52,17 @@ OPERATOR_VERSION = "v1alpha1"
 # guessing from names.
 OWNER_KIND_LABEL = "platform.kubevirt-ui.io/owner-kind"
 OWNER_NAME_LABEL = "platform.kubevirt-ui.io/owner-name"
+
+
+def managed_owner(obj: dict, kind: str) -> str | None:
+    """Name of the custom resource that owns this object, if any.
+
+    Ownership is a property of the object, not of a feature flag: an object
+    created while the operator owned that path keeps being the operator's after
+    the flag goes off, and writing to it directly would be undone on the next
+    reconcile.
+    """
+    labels = ((obj or {}).get("metadata", {}) or {}).get("labels", {}) or {}
+    if labels.get(OWNER_KIND_LABEL) != kind:
+        return None
+    return labels.get(OWNER_NAME_LABEL) or None

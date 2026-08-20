@@ -11,6 +11,11 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    managed_owner,
+)
 from app.core.auth import User, require_auth, require_env_member
 from app.core.groups import is_env_member, load_folder, resolve_env
 from app.core.kubevirt import kubevirt_subresource_call
@@ -53,6 +58,38 @@ class ResizeVMRequest(BaseModel):
     memory: str | None = Field(None, pattern=r"^\d+[MGT]i$", description="Memory (e.g. '4Gi')")
 
 
+async def _set_managed_running(
+    k8s_client: Any, namespace: str, name: str, running: bool,
+) -> bool:
+    """Set the declared power state, if this machine is described by a resource.
+
+    Returns True when the resource was patched, False when the machine is not
+    operator-owned and the caller should use the old path.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    try:
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        raise
+
+    owner = managed_owner(vm, "ManagedVM")
+    if not owner:
+        return False
+
+    await custom_api.patch_namespaced_custom_object(
+        group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+        namespace=namespace, plural="managedvms", name=owner,
+        body={"spec": {"running": running}},
+        _content_type="application/merge-patch+json",
+    )
+    return True
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
@@ -67,6 +104,13 @@ async def start_vm(
     k8s_client = request.app.state.k8s_client
 
     try:
+        # A machine the operator owns takes its power state from the resource.
+        # Patching runStrategy directly would be reverted on the next
+        # reconcile — with an event, but reverted — so the button would appear
+        # to work and then undo itself.
+        if await _set_managed_running(k8s_client, namespace, name, True):
+            return VMStatusResponse(name=name, namespace=namespace, action="start", success=True)
+
         patch = {"spec": {"runStrategy": "Always"}}
         await k8s_client.patch_virtual_machine(name=name, namespace=namespace, body=patch)
         return VMStatusResponse(name=name, namespace=namespace, action="start", success=True)
@@ -99,6 +143,10 @@ async def stop_vm(
     k8s_client = request.app.state.k8s_client
 
     try:
+        if await _set_managed_running(k8s_client, namespace, name, False):
+            action = "force_stop" if stop_request.force else "stop"
+            return VMStatusResponse(name=name, namespace=namespace, action=action, success=True)
+
         body: dict[str, Any] = {}
         if stop_request.force:
             body["gracePeriod"] = 0
