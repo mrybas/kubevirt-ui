@@ -1239,3 +1239,82 @@ The two original wedges remain unexplained as such. Both happened before those
 fixes; one had a ManagedNetwork in play, which fix 2 and 3 address, and the
 other reused a name, where the two-UIDs evidence stands. Neither is claimed as
 the cause of the other.
+
+## M10c — ManagedNetworkPeering
+
+One object, both ends. A peering is half an entry in each of two foreign specs
+plus a point-to-point link, so two objects would be two things that have to
+agree — the shape that produces peerings written on one side only.
+
+### What the live cycle found that the tests could not
+
+**The policy priority was below the thing it has to beat.** 29000, where the
+egress gateway's catch-all reroute sits at 29100. Every unit test passed,
+because they all compared the renderer against its own constant. What caught it
+was rendering a peering both ways on the stand — one through the UI, one through
+the CRD — and diffing the two routers with names, addresses and prefixes
+normalised: one line. The product writes 31001. The test now checks the number
+against 29100 rather than against itself.
+
+**And then the peering routed nothing.** Both ends written, `Established` true,
+the normalised diff identical — and ping failing in both directions. Isolation
+still dropped the peer's prefix, and lifting it belongs to whatever owns those
+lists. That is the failure the product has already shipped once: peered on both
+routers, reporting Active, carrying nothing.
+
+### Four corrections, each from the previous one being not quite enough
+
+1. **Report it.** A second condition that evaluates each side's rule list the
+   way OVN does, against an address from the other side's range — not "did
+   something write an allow" but "would a packet get through".
+2. **Do not create it.** Reporting a routed black hole is better than hiding
+   one and still worse than not making one. If a side's rules drop the peer and
+   that list is not the composer's, the allow is never coming: refuse, write
+   nothing.
+3. **Order it.** A composer-owned drop lifts itself, but "a few seconds,
+   fail-closed" is still an avoidable interval. It was only unavoidable because
+   the composer derived allows from `Vpc.spec.vpcPeerings` — the peering waiting
+   for the allow, the allow waiting for the peering entry. The composer now
+   reads the *declaration*, so the allow goes in first and the routes follow.
+4. **Do not trust the declaration.** A CR is something anybody who can create an
+   object can write. Trusting the spec would let one naming two networks open an
+   allow between them with no route ever laid — a hole in the isolation with
+   nothing going through it. The peering controller publishes `Accepted` after
+   checking both endpoints, and the composer honours only that.
+
+### The ordering claim that was false
+
+I wrote that the finalizer gave route-first, allow-last for free. It did not:
+the composer skipped any peering carrying a deletionTimestamp, so the allow came
+off the moment the object was *marked*, while the finalizer was still pulling
+routes off the routers. The same black hole from the other end.
+
+Found by trying to *observe* the ordering on the stand instead of asserting it.
+The teardown was faster than the sampling could resolve, and looking at why led
+back to the code. A peering being deleted now counts until the object is
+actually gone.
+
+### Live, at `dev-78eff7f`
+
+| check | result |
+|---|---|
+| normalised diff, UI peering vs CRD peering | identical on both routers |
+| two ManagedNetworks, isolated | ping fails both ways |
+| + a ManagedNetworkPeering | Accepted / Established / Traffic all true in 4 s, **ping works both ways** |
+| control, unpeered network | still unreachable |
+| the legacy-ACL pair from earlier | now `Accepted=False`, legs rolled back — the routed black hole is refused |
+| delete the peering | routes gone, allow gone, ping fails again |
+
+### A third stranded subnet, and this one has a cause
+
+Cleaning up, four test subnets stuck in Terminating — and they were exactly the
+four deleted with `kubectl delete vpc` and `kubectl delete subnet` at the same
+moment. That is precisely what the drain in both the endpoint and the operator
+exists to prevent: the router has to outlive everything finalized against it.
+The controller's own cascade deleted `crdnet1`/`crdnet2` cleanly in the same
+minute.
+
+Same silent signature as the earlier two: the delete is processed once, the pod
+addresses are released, and the controller never mentions the subnet again. No
+`not found logical router` in the log this time either. The mechanism inside
+kube-ovn is still not established; what is established is one way to provoke it.
