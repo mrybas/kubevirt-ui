@@ -115,21 +115,35 @@ func Reserve(s Sizing) (Quota, error) {
 	if err != nil {
 		return Quota{}, fmt.Errorf("worker memory: %w", err)
 	}
-	diskPerWorker, err := bytesOf(s.Disk)
-	if err != nil {
+	// Parsed for its own sake: nothing below spends it directly any more, but
+	// a disk size that cannot be read is a broken request and should be
+	// refused here rather than surfacing later as a disk nobody can create.
+	if _, err := bytesOf(s.Disk); err != nil {
 		return Quota{}, fmt.Errorf("worker disk: %w", err)
 	}
 
 	cpuMilli := surge*int64(s.VCPU)*1000 + int64(s.CPReplicas)*cpPerReplicaMilliCPU
 	memory := surge*(memoryPerWorker+VMIMemoryOverhead(memoryPerWorker, s.VCPU)) +
 		int64(s.CPReplicas)*cpPerReplicaMemory
-	storage := surge * diskPerWorker
+	// Storage here is **PVC** storage, and a worker's `data` disk is not one:
+	// it is an `emptyDisk`, a qcow2 on the launcher pod's ephemeral storage. A
+	// cloud-init root is a `containerDisk`, which is the same. Counting them
+	// reserved capacity that could never be allocated — measured on the stand,
+	// a two-worker Talos tenant whose 120Gi quota was half phantom: two 20Gi
+	// root PVCs, one 1Gi tenant volume, `used` 41Gi.
+	//
+	// What the `data` disks really consume is the node's ephemeral storage,
+	// which no quota here governs. Named rather than quietly dropped: it is a
+	// real resource with no ceiling on it, and putting one on
+	// `requests.ephemeral-storage` would make that request mandatory for every
+	// pod in the namespace — the trap the LimitRange exists to avoid.
+	storage := int64(0)
 
 	if s.TalosWorkers {
 		// Each Talos worker clones its own root from the shared golden image,
-		// and both are real PVCs. Counting only the worker disk left the quota
-		// one clone short of the cluster it was provisioning, which reads as a
-		// storage failure and is arithmetic.
+		// and that clone is a real PVC. Counting only the worker disk left the
+		// quota one clone short of the cluster it was provisioning, which reads
+		// as a storage failure and is arithmetic.
 		//
 		// The golden image itself is deliberately *not* counted: it lives in a
 		// shared namespace, and reserving 20Gi against a tenant for something

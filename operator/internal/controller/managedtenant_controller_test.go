@@ -178,7 +178,10 @@ func TestTheQuotaCapsRequestsAndNeverLimits(t *testing.T) {
 // for both: measured on the stand as a tenant charged 220Gi and able to use
 // 100. One object, summed, makes the charge and the permission agree.
 func TestOneObjectHoldsBothStorageIntents(t *testing.T) {
-	mustTenant(t, plainTenant("tsum"))
+	// Talos, so the machines cost storage at all: a cloud-init pool boots a
+	// containerDisk onto an emptyDisk and asks for no PVC storage, which would
+	// make "summed" and "allowance only" the same number.
+	mustTenant(t, talosTenant("tsum"))
 
 	eventually(t, "the summed quota", func() error {
 		quota, err := readQuota("tenant-tsum-quota", "tenant-tsum")
@@ -186,7 +189,7 @@ func TestOneObjectHoldsBothStorageIntents(t *testing.T) {
 			return err
 		}
 		storage := quota.Spec.Hard[corev1.ResourceRequestsStorage]
-		// Three worker slots of 20Gi, plus the 100Gi allowance.
+		// Three root clones of 20Gi, plus the 100Gi allowance.
 		want := resource.NewQuantity(3*int64(20<<30)+int64(100<<30), resource.BinarySI)
 		if storage.Cmp(*want) != 0 {
 			return fmt.Errorf("storage = %s, want %s", storage.String(), want.String())
@@ -218,7 +221,7 @@ func TestOneObjectHoldsBothStorageIntents(t *testing.T) {
 // other object still binds at its own number. So this writes the machines only
 // and says what is wrong, rather than making it worse.
 func TestAnotherWritersQuotaIsNotMadeWorse(t *testing.T) {
-	mustTenant(t, plainTenant("tother"))
+	mustTenant(t, talosTenant("tother"))
 
 	eventually(t, "the namespace", func() error {
 		ns := &corev1.Namespace{}

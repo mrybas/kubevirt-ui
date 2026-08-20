@@ -173,26 +173,38 @@ class TestTheQuotaCountsTheDisksTheTenantProvisionsForItself:
     is a broken build — and it presents as a storage problem.
     """
 
-    def test_talos_storage_covers_the_roots(self) -> None:
-        """The golden was counted here while it was imported into the tenant
-        namespace. T2 moved it to a shared one, so reserving 20Gi for it now
-        would charge a tenant for something that is not in its namespace —
-        a96df69's defect with the sign reversed."""
+    def test_talos_storage_counts_the_roots_and_nothing_else(self) -> None:
+        """Only the root clones are PVCs.
+
+        The `data` disk is an `emptyDisk` — a qcow2 on the launcher pod's
+        ephemeral storage — so it belongs in no `requests.storage` at all.
+        Counting it reserved half of every Talos tenant's quota for capacity
+        that could never be allocated: measured on the stand, a two-worker
+        tenant with a 120Gi quota whose namespace holds two 20Gi roots and one
+        1Gi volume, `used` 41Gi.
+
+        The golden is not counted either. It was, while it was imported into
+        the tenant namespace; T2 moved it to a shared one, and charging a
+        tenant for something outside its namespace is a96df69's defect with
+        the sign reversed.
+        """
         from app.api.v1.tenants_crud import _tenant_quota
 
         q = _tenant_quota(_req(worker_count=2, worker_disk="20Gi"))
 
-        # data 3x20 + roots 3x20  (surge = workers + 1), no golden
-        assert int(q["storage"]) == (3 * 20 + 3 * 20) * 2**30
+        # roots only: surge (workers + 1) x 20Gi
+        assert int(q["storage"]) == 3 * 20 * 2**30
 
-    def test_cloud_init_is_unchanged(self) -> None:
-        """They boot a containerDisk — no DataVolume, nothing to count."""
+    def test_a_cloud_init_tenant_reserves_no_pvc_storage(self) -> None:
+        """It boots a containerDisk and writes to an emptyDisk, and neither is
+        a PVC — which the previous version of this test said in its own
+        docstring while asserting three worker disks' worth."""
         from app.api.v1.tenants_crud import _tenant_quota
 
         q = _tenant_quota(_req(worker_os="cloud-init", worker_count=2,
                                worker_disk="20Gi"))
 
-        assert int(q["storage"]) == 3 * 20 * 2**30
+        assert int(q["storage"]) == 0
 
     def test_the_surge_covers_a_replacement_clone(self) -> None:
         """Sized to exactly `worker_count`, the quota would refuse every
@@ -203,12 +215,12 @@ class TestTheQuotaCountsTheDisksTheTenantProvisionsForItself:
         one = int(_tenant_quota(_req(worker_count=1))["storage"])
         two = int(_tenant_quota(_req(worker_count=2))["storage"])
 
-        # One more worker costs one data disk and one root, not just one disk.
-        assert two - one == (20 + 20) * 2**30
+        # One more worker costs one more root, and only that.
+        assert two - one == 20 * 2**30
 
-    def test_a_bigger_worker_disk_raises_both_halves(self) -> None:
+    def test_a_bigger_worker_disk_raises_the_root(self) -> None:
         from app.api.v1.tenants_crud import _tenant_quota
 
         q = _tenant_quota(_req(worker_count=1, worker_disk="40Gi"))
 
-        assert int(q["storage"]) == (2 * 40 + 2 * 40) * 2**30
+        assert int(q["storage"]) == 2 * 40 * 2**30

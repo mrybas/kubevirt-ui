@@ -1284,9 +1284,22 @@ def _tenant_quota(req: Any) -> dict[str, str]:
         )
         + req.control_plane_replicas * _CP_MEMORY
     )
-    storage = surge * (parse_quantity(req.worker_disk) or 0)
-    # Talos workers each clone their own root from the tenant's golden image,
-    # and both are real PVCs in this namespace. Counting only `worker_disk`
+    # Storage here is **PVC** storage, and a worker's `data` disk is not one:
+    # it is an `emptyDisk`, a qcow2 on the launcher pod's ephemeral storage. A
+    # cloud-init root is a `containerDisk`, which is the same. So neither of
+    # them belongs in `requests.storage`, and counting them reserved capacity
+    # that could never be allocated — measured on this stand, a two-worker
+    # Talos tenant whose 120Gi quota was half phantom: its namespace holds two
+    # 20Gi root PVCs and one 1Gi tenant volume, and `used` says 41Gi.
+    #
+    # What the `data` disks really consume is the node's ephemeral storage,
+    # which no quota here governs. Named rather than silently dropped: it is a
+    # real resource with no ceiling on it, and putting one on
+    # `requests.ephemeral-storage` would make that request mandatory for every
+    # pod in the namespace — the same trap the LimitRange story is about.
+    storage = 0
+    # Talos workers each clone their own root from the shared golden image, and
+    # that clone is a real PVC. Counting only `worker_disk`
     # left the quota one clone short of the cluster it was provisioning:
     # measured on a two-worker tenant, the first root bound and the second
     # stopped at

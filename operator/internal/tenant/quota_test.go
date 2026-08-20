@@ -33,15 +33,16 @@ func TestTheReservationMatchesTheProduct(t *testing.T) {
 		{
 			name:   "the defaults",
 			sizing: Sizing{Workers: 2, VCPU: 2, Memory: "2Gi", Disk: "20Gi", CPReplicas: 2},
-			// cpu "7", memory 9651617792, storage 64424509440
-			cpuMilli: 7000, memory: 9651617792, storage: 64424509440,
+			// A cloud-init pool: its root is a containerDisk and its data disk
+			// an emptyDisk, so it asks for no PVC storage at all.
+			cpuMilli: 7000, memory: 9651617792, storage: 0,
 		},
 		{
 			name: "a larger cloud-init tenant",
 			sizing: Sizing{
 				Workers: 4, VCPU: 4, Memory: "8Gi", Disk: "40Gi", CPReplicas: 3,
 			},
-			cpuMilli: 21500, memory: 48123871232, storage: 214748364800,
+			cpuMilli: 21500, memory: 48123871232, storage: 0,
 		},
 		{
 			name: "talos, disk under the golden floor",
@@ -49,7 +50,8 @@ func TestTheReservationMatchesTheProduct(t *testing.T) {
 				Workers: 2, VCPU: 2, Memory: "2Gi", Disk: "10Gi", CPReplicas: 2,
 				TalosWorkers: true,
 			},
-			cpuMilli: 7000, memory: 9651617792, storage: 96636764160,
+			// Three root clones raised to the golden floor.
+			cpuMilli: 7000, memory: 9651617792, storage: 64424509440,
 		},
 		{
 			name: "talos, disk above it",
@@ -57,7 +59,8 @@ func TestTheReservationMatchesTheProduct(t *testing.T) {
 				Workers: 1, VCPU: 8, Memory: "32Gi", Disk: "60Gi", CPReplicas: 1,
 				TalosWorkers: true,
 			},
-			cpuMilli: 16500, memory: 70784122880, storage: 257698037760,
+			// Two root clones of 60Gi.
+			cpuMilli: 16500, memory: 70784122880, storage: 128849018880,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,11 +119,13 @@ func TestTheOverheadScalesWithMemory(t *testing.T) {
 // refused every replacement: remediation creates the new Machine while the old
 // one is still there.
 func TestTheSurgeCoversAReplacement(t *testing.T) {
-	two, err := Reserve(Sizing{Workers: 2, VCPU: 2, Memory: "2Gi", Disk: "20Gi", CPReplicas: 1})
+	two, err := Reserve(Sizing{Workers: 2, VCPU: 2, Memory: "2Gi", Disk: "20Gi",
+		CPReplicas: 1, TalosWorkers: true})
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
-	three, err := Reserve(Sizing{Workers: 3, VCPU: 2, Memory: "2Gi", Disk: "20Gi", CPReplicas: 1})
+	three, err := Reserve(Sizing{Workers: 3, VCPU: 2, Memory: "2Gi", Disk: "20Gi",
+		CPReplicas: 1, TalosWorkers: true})
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
@@ -144,8 +149,8 @@ func TestTheGoldenFloorIsNotUndercut(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reserve: %v", err)
 	}
-	// Two slots of the 5Gi disk, plus two slots of the 20Gi floor.
-	want := int64(2*(5<<30) + 2*(20<<30))
+	// Two root clones, each raised from the 5Gi asked for to the 20Gi floor.
+	want := int64(2 * (20 << 30))
 	if small.Storage.Value() != want {
 		t.Errorf("storage = %d, want %d", small.Storage.Value(), want)
 	}
@@ -161,7 +166,8 @@ func TestTheGoldenImageIsNotChargedToTheTenant(t *testing.T) {
 		Workers: 2, VCPU: 2, Memory: "2Gi", Disk: "20Gi", CPReplicas: 1,
 		TalosWorkers: true})
 
-	// Exactly the root clones — three slots — and not one image more.
+	// Exactly the root clones — three slots — and not one image more. The
+	// cloud-init side is zero: neither of its disks is a PVC.
 	extra := talos.Storage.Value() - cloudInit.Storage.Value()
 	if extra != 3*int64(20<<30) {
 		t.Errorf("talos adds %d, want exactly the three root clones (%d)",

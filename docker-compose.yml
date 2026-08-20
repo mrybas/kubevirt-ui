@@ -53,6 +53,10 @@ services:
       # The RBAC contract test reads the chart to check that it grants what
       # the backend calls — a mismatch is a runtime 403 no unit test can see.
       - ./helm:/helm:ro
+      # One table of expected tenant reservations, asserted by this suite and
+      # by the operator's. Two arithmetics decide that number while the
+      # migration runs, and the failure worth catching is them disagreeing.
+      - ./test:/test:ro
     environment:
       - KUBECONFIG=/app/kubeconfig
       - LOG_LEVEL=DEBUG

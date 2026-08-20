@@ -1,0 +1,61 @@
+{
+  "_why": "One statement of the tenant reservation, asserted by both implementations. Neither generates it: if either arithmetic moves, its own suite goes red against this file and the disagreement is visible before it reaches a cluster. Sizes are given in Gi for legibility; the expectations are exact bytes and milli-CPU.",
+  "cases": [
+    {
+      "name": "two talos workers, the shape the lab runs",
+      "workers": 2,
+      "vcpu": 2,
+      "memoryGi": 2,
+      "diskGi": 20,
+      "controlPlaneReplicas": 2,
+      "talos": true,
+      "expected": {
+        "cpuMilli": 7000,
+        "memoryBytes": 9651617792,
+        "storageBytes": 64424509440
+      }
+    },
+    {
+      "name": "a cloud-init tenant reserves no PVC storage at all",
+      "workers": 1,
+      "vcpu": 2,
+      "memoryGi": 2,
+      "diskGi": 20,
+      "controlPlaneReplicas": 1,
+      "talos": false,
+      "expected": {
+        "cpuMilli": 4500,
+        "memoryBytes": 6076497920,
+        "storageBytes": 0
+      }
+    },
+    {
+      "name": "a disk under the golden floor is raised to it",
+      "workers": 1,
+      "vcpu": 4,
+      "memoryGi": 8,
+      "diskGi": 10,
+      "controlPlaneReplicas": 1,
+      "talos": true,
+      "expected": {
+        "cpuMilli": 8500,
+        "memoryBytes": 19034800128,
+        "storageBytes": 42949672960
+      }
+    },
+    {
+      "name": "a large tenant",
+      "workers": 3,
+      "vcpu": 8,
+      "memoryGi": 32,
+      "diskGi": 100,
+      "controlPlaneReplicas": 3,
+      "talos": true,
+      "expected": {
+        "cpuMilli": 33500,
+        "memoryBytes": 142641987584,
+        "storageBytes": 429496729600
+      }
+    }
+  ]
+}
