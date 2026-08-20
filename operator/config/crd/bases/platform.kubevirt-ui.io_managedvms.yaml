@@ -1,0 +1,351 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: managedvms.platform.kubevirt-ui.io
+spec:
+  group: platform.kubevirt-ui.io
+  names:
+    kind: ManagedVM
+    listKind: ManagedVMList
+    plural: managedvms
+    shortNames:
+    - mvm
+    singular: managedvm
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.running
+      name: Running
+      type: boolean
+    - jsonPath: .status.virtualMachineName
+      name: VM
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Provisioned")].status
+      name: Provisioned
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="ImageReady")].reason
+      name: Image
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ManagedVM is a virtual machine the platform owns.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ManagedVMSpec is a virtual machine as the product describes one.
+
+              It is deliberately not a KubeVirt VirtualMachine with extra fields: the
+              point is that a caller says what they want and the controller renders the
+              dataVolumeTemplates, the cloud-init, the overcommit arithmetic, the network
+              annotations and the VPC resolver — the parts that were previously spelled out
+              only inside one HTTP handler and therefore did not exist for anyone writing
+              manifests directly.
+            properties:
+              cloudInit:
+                description: CloudInit is merged with the template's user-data.
+                properties:
+                  userData:
+                    description: 'UserData is a #cloud-config document.'
+                    type: string
+                type: object
+              compute:
+                description: Compute overrides the template's defaults, and is required
+                  without one.
+                properties:
+                  cores:
+                    description: Cores visible to the guest.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  memory:
+                    description: Memory for the guest, e.g. 4Gi.
+                    pattern: ^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|K|M|G|T|P|k|m)?$
+                    type: string
+                  sockets:
+                    default: 1
+                    description: Sockets, defaulting to one.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  threads:
+                    default: 1
+                    description: Threads per core, defaulting to one.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                required:
+                - cores
+                - memory
+                type: object
+              console:
+                description: Console devices.
+                properties:
+                  serial:
+                    default: false
+                    description: Serial attaches a serial console.
+                    type: boolean
+                  vnc:
+                    default: true
+                    description: VNC attaches a graphics device.
+                    type: boolean
+                type: object
+              displayName:
+                description: DisplayName is the human-facing name.
+                maxLength: 100
+                type: string
+              imageRef:
+                description: |-
+                  ImageRef clones straight from an image, with no template in between.
+                  Mutually exclusive with templateRef.
+                properties:
+                  name:
+                    description: Name of the ManagedImage.
+                    minLength: 1
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace of the ManagedImage. Empty means this VM's own namespace.
+
+                      A foreign namespace is allowed only when the image's scope says so and
+                      both namespaces belong to the same project or folder. That check is not a
+                      formality: measured on the cluster, KubeVirt's admission does not stop a
+                      cross-namespace clone, and the clone itself succeeds as long as a Role
+                      exists — so this scope rule, not RBAC, is what keeps one team's disk out
+                      of another team's VM.
+                    type: string
+                required:
+                - name
+                type: object
+              initialPasswordSecretRef:
+                description: |-
+                  InitialPasswordSecretRef names a Secret holding the first-boot password.
+
+                  A reference rather than the password itself: this object ends up in etcd
+                  and, for anything managed as code, in a state file.
+                properties:
+                  key:
+                    default: password
+                    description: Key inside the Secret.
+                    type: string
+                  name:
+                    description: Name of the Secret, in this VM's namespace.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+              networkBinding:
+                default: bridge
+                description: |-
+                  NetworkBinding for a VPC-attached primary NIC.
+
+                  bridge lets the guest report its real overlay address; masquerade is the
+                  legacy alternative and breaks multicast.
+                enum:
+                - bridge
+                - masquerade
+                type: string
+              networks:
+                description: |-
+                  Networks in order. The first is the primary NIC.
+
+                  Only the primary may be a VPC subnet: a secondary VPC NIC would need a
+                  per-subnet attachment definition wrapping the OVN CNI, which does not
+                  exist here. Additional NICs must be VLAN-backed.
+                items:
+                  description: NetworkAttachment is one NIC.
+                  properties:
+                    staticIP:
+                      description: StaticIP pins the address instead of taking one
+                        from IPAM.
+                      type: string
+                    subnet:
+                      description: Subnet is the kube-ovn subnet to attach to.
+                      minLength: 1
+                      type: string
+                  required:
+                  - subnet
+                  type: object
+                type: array
+              rootDisk:
+                description: RootDisk overrides the template's default, and is required
+                  without one.
+                properties:
+                  size:
+                    description: |-
+                      Size of the root disk. Must be at least the size of the image it is
+                      cloned from — CDI refuses a smaller target.
+                    pattern: ^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|K|M|G|T|P|k|m)?$
+                    type: string
+                  storageClass:
+                    default: ""
+                    description: |-
+                      StorageClass for the root disk. Empty means the cluster default.
+
+                      It is deliberately not inherited from the image: images sit on a cheap
+                      erasure-coded class and VM disks belong on the replicated one, and
+                      inheriting sent every write a VM made to erasure coding.
+                    type: string
+                required:
+                - size
+                type: object
+              running:
+                default: true
+                description: |-
+                  Running asks for the VM to be on.
+
+                  The controller owns runStrategy on the rendered VirtualMachine, so a
+                  `virtctl start/stop` against a managed VM is reverted — with an event, never
+                  silently. Infrastructure-as-code should ignore changes to this field.
+                type: boolean
+              ssh:
+                description: SSH keys to install in the guest.
+                properties:
+                  authorizedKeys:
+                    description: AuthorizedKeys to write into the guest.
+                    items:
+                      type: string
+                    type: array
+                type: object
+              templateRef:
+                description: |-
+                  TemplateRef takes defaults from a template. Mutually exclusive with
+                  imageRef.
+                properties:
+                  name:
+                    description: Name of the template.
+                    minLength: 1
+                    type: string
+                required:
+                - name
+                type: object
+            type: object
+            x-kubernetes-validations:
+            - message: set exactly one of templateRef or imageRef
+              rule: has(self.templateRef) != has(self.imageRef)
+            - message: 'compute and rootDisk are required when imageRef is used: there
+                is no template to take defaults from'
+              rule: '!has(self.imageRef) || (has(self.compute) && has(self.rootDisk))'
+          status:
+            description: |-
+              ManagedVMStatus is the derived state, kept deliberately small.
+
+              The fast-moving facts of a running guest — address, node, guest-agent
+              details, VMI phase — are not mirrored here. Copying them would mean an etcd
+              write every time a guest breathes, multiplied by every VM on the cluster,
+              to reproduce data the UI can already watch at the source.
+            properties:
+              conditions:
+                description: Conditions carry the reasons.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              observedGeneration:
+                description: ObservedGeneration is the spec generation this status
+                  was computed from.
+                format: int64
+                type: integer
+              rootDiskEpoch:
+                description: |-
+                  RootDiskEpoch counts how many times the root disk has been provisioned.
+                  It appears in the disk's name so that a replacement cannot collide with a
+                  predecessor that is still terminating.
+                format: int32
+                type: integer
+              rootDiskName:
+                description: RootDiskName is the DataVolume holding this VM's root
+                  disk.
+                type: string
+              virtualMachineName:
+                description: |-
+                  VirtualMachineName is the KubeVirt VirtualMachine backing this VM. It
+                  equals metadata.name; it is published so that code reads it instead of
+                  assuming the rule.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

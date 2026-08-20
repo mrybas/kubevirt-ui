@@ -142,6 +142,13 @@ func KindOf(scheme *runtime.Scheme, obj client.Object) string {
 	return t.Name()
 }
 
+// CountWrite records a write issued outside the helpers above — a plain Create
+// where CreateOrUpdate would be wrong because the object must never be updated
+// once it exists.
+func CountWrite(scheme *runtime.Scheme, obj client.Object, controller, op string) {
+	count(scheme, obj, controller, op)
+}
+
 func count(scheme *runtime.Scheme, obj client.Object, controller, op string) {
 	metrics.PatchesTotal.WithLabelValues(KindOf(scheme, obj), controller, op).Inc()
 }

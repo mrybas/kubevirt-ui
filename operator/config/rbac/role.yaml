@@ -7,18 +7,20 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - events
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - ""
-  resources:
+  - configmaps
   - namespaces
+  - secrets
   verbs:
   - get
   - list
   - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
 - apiGroups:
   - cdi.kubevirt.io
   resources:
@@ -33,9 +35,29 @@ rules:
   - update
   - watch
 - apiGroups:
+  - kubeovn.io
+  resources:
+  - subnets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachines
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - platform.kubevirt-ui.io
   resources:
   - managedimages
+  - managedvms
   verbs:
   - create
   - delete
@@ -48,12 +70,14 @@ rules:
   - platform.kubevirt-ui.io
   resources:
   - managedimages/finalizers
+  - managedvms/finalizers
   verbs:
   - update
 - apiGroups:
   - platform.kubevirt-ui.io
   resources:
   - managedimages/status
+  - managedvms/status
   verbs:
   - get
   - patch

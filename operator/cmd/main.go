@@ -35,6 +35,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	kubevirtv1 "kubevirt.io/api/core/v1"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
@@ -55,6 +56,7 @@ func init() {
 	// CDI objects are written by the image controller and read by everything
 	// downstream of it.
 	utilruntime.Must(cdiv1.AddToScheme(scheme))
+	utilruntime.Must(kubevirtv1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -203,6 +205,15 @@ func main() {
 			Recorder: mgr.GetEventRecorderFor("managedimage"),
 		}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "Failed to create controller", "controller", "managedimage")
+			os.Exit(1)
+		}
+		if err := (&controller.ManagedVMReconciler{
+			Client:           mgr.GetClient(),
+			Scheme:           mgr.GetScheme(),
+			Recorder:         mgr.GetEventRecorderFor("managedvm"),
+			KubeOVNNamespace: func() string { return os.Getenv("KUBE_OVN_NAMESPACE") },
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "managedvm")
 			os.Exit(1)
 		}
 	}

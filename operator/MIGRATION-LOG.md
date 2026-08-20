@@ -107,3 +107,51 @@ live — it needs a real VM cloning from the image, which arrives with M2.
 - **Frontend Dockerfile** installed `@rollup/rollup-linux-x64-musl`
   unconditionally, so the dev image could not be built on an arm64 workstation
   at all. Now it installs the binary for the architecture being built.
+
+---
+
+## M2 research — the CDI clone gate in the VM path (measured, settles an open question)
+
+The plan carried this as an assumption to be measured before writing the VM
+controller: a cross-namespace clone needs `create datavolumes` with subresource
+`source` in the *source* namespace, and it was unclear which subject is checked
+when the DataVolume is materialised by KubeVirt from `dataVolumeTemplates`
+rather than created by us. Guessed wrong is expensive here, because a lab
+running as cluster-admin hides the entire class.
+
+Measured on the stand (KubeVirt v1.9.0, CDI v1.66.0):
+
+1. **virt-api does not reject the VM.** A subject with no rights in the source
+   namespace created the VirtualMachine successfully — admission is clean.
+2. **The DataVolume is then never created**, and the only trace is a Warning
+   event on the VM: `UnauthorizedDataVolumeCreate — User
+   system:serviceaccount:opdev-tgt:default has insufficient permissions in
+   clone source namespace opdev-dev`.
+3. **So the checked subject is the `default` ServiceAccount of the VM's own
+   namespace** — not the VM's creator, and not virt-controller (which does hold
+   the permission cluster-wide: `can-i create datavolumes --subresource=source`
+   answers yes for `kubevirt-controller`, no for every namespace `default`).
+4. **Same-namespace clones are not gated at all.** A VM in `opdev-dev` cloning
+   `opdev-dev/ubuntu-2404-crd` reached `Succeeded` in 26 seconds with no
+   permission granted and no warning event.
+
+Consequences, all now facts rather than guesses:
+
+- The common case (image and VM in one namespace) needs nothing.
+- Cross-namespace `imageRef` needs a Role in the **source** namespace bound to
+  `ServiceAccount/<vm-namespace>/default`. That is exactly the shape the tenant
+  path already uses — `talos-golden-cloner` in `kubevirt-ui-system`, bound to
+  `ServiceAccount/tenant-uat-t1/default`. The plan expected a *different*
+  subject here; measured, it is the same one, so the existing pattern is
+  reusable rather than re-derived.
+- **The failure mode is silence.** The VM is admitted, exists, looks healthy,
+  and simply never provisions. The controller must find the reason where it
+  actually lives — a field-selected Warning event — and report
+  `ImageAccessDenied`, or every cross-namespace mistake becomes a support
+  ticket that starts with "the VM is stuck in Pending".
+- **Security consequence worth stating plainly:** because the gate is skipped
+  within a namespace and satisfied by a Role we would grant across namespaces,
+  RBAC is *not* what stops one team reading another team's disk through a VM.
+  The scope/ancestry check in our webhook is. That moves it from a product
+  nicety to the actual access control, and it is why the guard on raw
+  `kubevirt.io/VirtualMachine` creation is load-bearing rather than tidy.
