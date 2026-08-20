@@ -612,3 +612,22 @@ through on a read that failed would send an operator-owned machine down the old,
 destructive path on the strength of a question nobody managed to answer. The
 probe now reports the failure, which is both what the tests assert and what
 production should do.
+
+## M8 (fifth slice) — the network list stops filling with dead entries
+
+Detaching a NIC marks the interface `state: absent`, which is how KubeVirt is
+asked to unplug it, and nothing ever removed the matching entry from `networks`.
+The litter accumulates, and because a network name must be unique, attaching a
+NIC with the same name again is refused — the machine still lists a network for
+an interface that has been gone for months.
+
+The sweep removes only what is provably dead, and never adds or reorders
+anything: a network with no interface at all, or an interface marked absent
+whose unplug has finished. An interface marked absent on a machine that still
+reports it is mid-unplug and left alone — taking the entries away then would
+withdraw the request before KubeVirt has acted on it. Both cases are tests.
+
+With this the VM track's own defects are closed. What the plan still lists for
+later — a fully declarative `spec.networks` with hot-plug through it — is a
+feature, not a defect: today's NIC attach remains imperative and now cleans up
+after itself.

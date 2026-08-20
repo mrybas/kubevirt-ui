@@ -189,6 +189,9 @@ func (r *ManagedVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err := r.syncDisks(ctx, vm, existing); err != nil {
 			return ctrl.Result{}, err
 		}
+		if err := r.sweepDetachedNICs(ctx, vm, existing); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	vm.Status.VirtualMachineName = existing.Name

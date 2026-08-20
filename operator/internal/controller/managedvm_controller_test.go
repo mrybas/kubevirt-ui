@@ -1487,3 +1487,137 @@ func TestAClaimantWithAStaleReadLosesOnConflict(t *testing.T) {
 		t.Fatalf("holder reported as %q, want machine-b", holder)
 	}
 }
+
+// Detaching a NIC marks the interface absent, which is how KubeVirt is asked to
+// unplug it — but nothing removed the matching network entry. The litter
+// accumulates, and since network names must be unique, attaching a NIC with the
+// same name again is refused: the machine still lists a network for an
+// interface that has been gone for months.
+func TestDetachedInterfacesStopLitteringTheNetworkList(t *testing.T) {
+	ns := "vm-nic-litter"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+
+	if err := k8sClient.Create(testCtx, newManagedVM(ns, "unplugged", "ubuntu")); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+	eventually(t, "the machine to exist", func() error {
+		_, err := getKubeVirtVM(ns, "unplugged")
+		return err
+	})
+
+	// A second NIC is attached and then detached, exactly as the imperative
+	// path does it: the interface is marked absent, the network entry stays.
+	eventually(t, "a detached NIC to be left behind", func() error {
+		kvm, err := getKubeVirtVM(ns, "unplugged")
+		if err != nil {
+			return err
+		}
+		kvm.Spec.Template.Spec.Networks = append(kvm.Spec.Template.Spec.Networks,
+			kubevirtv1.Network{
+				Name:          "extra-nic",
+				NetworkSource: kubevirtv1.NetworkSource{Multus: &kubevirtv1.MultusNetwork{NetworkName: ns + "/vlan-300"}},
+			})
+		kvm.Spec.Template.Spec.Domain.Devices.Interfaces = append(
+			kvm.Spec.Template.Spec.Domain.Devices.Interfaces,
+			kubevirtv1.Interface{
+				Name:                   "extra-nic",
+				State:                  kubevirtv1.InterfaceStateAbsent,
+				InterfaceBindingMethod: kubevirtv1.InterfaceBindingMethod{Bridge: &kubevirtv1.InterfaceBridge{}},
+			})
+		return k8sClient.Update(testCtx, kvm)
+	})
+
+	touchVM(t, ns, "unplugged", "Unplugged renamed")
+
+	eventually(t, "both halves of the dead NIC to be swept", func() error {
+		kvm, err := getKubeVirtVM(ns, "unplugged")
+		if err != nil {
+			return err
+		}
+		for _, n := range kvm.Spec.Template.Spec.Networks {
+			if n.Name == "extra-nic" {
+				return fmt.Errorf("the network entry is still there")
+			}
+		}
+		for _, i := range kvm.Spec.Template.Spec.Domain.Devices.Interfaces {
+			if i.Name == "extra-nic" {
+				return fmt.Errorf("the interface entry is still there")
+			}
+		}
+		// And the machine's own NIC is untouched.
+		if len(kvm.Spec.Template.Spec.Networks) == 0 {
+			return fmt.Errorf("the sweep took the machine's own network with it")
+		}
+		return nil
+	})
+}
+
+// An unplug that has not finished is a request in flight. Taking the entries
+// away then would withdraw it before KubeVirt has acted.
+func TestAnUnplugInProgressIsLeftAlone(t *testing.T) {
+	ns := "vm-nic-inflight"
+	mustNamespace(t, ns, "opdev")
+	readyImage(t, ns, "ubuntu")
+
+	if err := k8sClient.Create(testCtx, newManagedVM(ns, "unplugging", "ubuntu")); err != nil {
+		t.Fatalf("creating vm: %v", err)
+	}
+	eventually(t, "the machine to exist", func() error {
+		_, err := getKubeVirtVM(ns, "unplugging")
+		return err
+	})
+
+	// The guest still reports the interface, so the unplug is in progress.
+	vmi := &kubevirtv1.VirtualMachineInstance{
+		ObjectMeta: metav1.ObjectMeta{Name: "unplugging", Namespace: ns},
+		Spec:       kubevirtv1.VirtualMachineInstanceSpec{},
+	}
+	if err := k8sClient.Create(testCtx, vmi); err != nil {
+		t.Fatalf("creating vmi: %v", err)
+	}
+	vmi.Status.Interfaces = []kubevirtv1.VirtualMachineInstanceNetworkInterface{{Name: "going-away"}}
+	if err := k8sClient.Update(testCtx, vmi); err != nil {
+		t.Fatalf("setting the guest's interfaces: %v", err)
+	}
+
+	eventually(t, "the in-flight unplug to be set up", func() error {
+		kvm, err := getKubeVirtVM(ns, "unplugging")
+		if err != nil {
+			return err
+		}
+		for _, n := range kvm.Spec.Template.Spec.Networks {
+			if n.Name == "going-away" {
+				return nil
+			}
+		}
+		kvm.Spec.Template.Spec.Networks = append(kvm.Spec.Template.Spec.Networks,
+			kubevirtv1.Network{
+				Name:          "going-away",
+				NetworkSource: kubevirtv1.NetworkSource{Multus: &kubevirtv1.MultusNetwork{NetworkName: ns + "/vlan-300"}},
+			})
+		kvm.Spec.Template.Spec.Domain.Devices.Interfaces = append(
+			kvm.Spec.Template.Spec.Domain.Devices.Interfaces,
+			kubevirtv1.Interface{
+				Name:                   "going-away",
+				State:                  kubevirtv1.InterfaceStateAbsent,
+				InterfaceBindingMethod: kubevirtv1.InterfaceBindingMethod{Bridge: &kubevirtv1.InterfaceBridge{}},
+			})
+		return k8sClient.Update(testCtx, kvm)
+	})
+
+	touchVM(t, ns, "unplugging", "Unplugging renamed")
+
+	consistently(t, "the request in flight to survive", 5*time.Second, func() error {
+		kvm, err := getKubeVirtVM(ns, "unplugging")
+		if err != nil {
+			return err
+		}
+		for _, i := range kvm.Spec.Template.Spec.Domain.Devices.Interfaces {
+			if i.Name == "going-away" {
+				return nil
+			}
+		}
+		return fmt.Errorf("the sweep withdrew an unplug before KubeVirt acted on it")
+	})
+}
