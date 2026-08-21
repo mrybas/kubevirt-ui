@@ -81,9 +81,18 @@ def network_path_enabled() -> bool:
     time, and only a person calling the recreate endpoint ever applied it again.
 
     What does *not* move with this flag: the CIDR allocator, namespace
-    validation, VPC peering, and the isolation ACLs. The last one matters most —
-    `Subnet.spec.acls` keeps its single writer here until the composer can adopt
-    it with a provable no-op.
+    validation, and VPC peering. Peering is the notable one, because it looks
+    migrated and is not: the CRD exists and the operator's controller writes
+    both ends of a link or neither — but nothing writes the objects, so every
+    peering is still `Vpc.spec.vpcPeerings` written from here. The receiving
+    half is built; the handover is not, and it is a separate decision whether it
+    rides this flag or gets its own.
+
+    Isolation ACLs used to be on that list and are not any more. `Subnet.spec.acls`
+    moves per subnet rather than per flag: a subnet the composer created carries
+    `platform.kubevirt-ui.io/acl-owner: operator`, and the census here leaves
+    those lists alone — ownership is read off the object, so it stays true after
+    the flag goes off.
     """
     return _enabled("OPERATOR_NETWORK_ENABLED")
 
