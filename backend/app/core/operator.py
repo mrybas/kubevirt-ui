@@ -81,12 +81,9 @@ def network_path_enabled() -> bool:
     time, and only a person calling the recreate endpoint ever applied it again.
 
     What does *not* move with this flag: the CIDR allocator, namespace
-    validation, and VPC peering. Peering is the notable one, because it looks
-    migrated and is not: the CRD exists and the operator's controller writes
-    both ends of a link or neither — but nothing writes the objects, so every
-    peering is still `Vpc.spec.vpcPeerings` written from here. The receiving
-    half is built; the handover is not, and it is a separate decision whether it
-    rides this flag or gets its own.
+    validation, and VPC peering. Peering has its own —
+    `OPERATOR_PEERING_ENABLED` — deliberately: an upgrade must not change the
+    meaning of a flag somebody already turned on.
 
     Isolation ACLs used to be on that list and are not any more. `Subnet.spec.acls`
     moves per subnet rather than per flag: a subnet the composer created carries
@@ -159,6 +156,34 @@ def underlay_path_enabled() -> bool:
     reported success.
     """
     return _enabled("OPERATOR_UNDERLAY_ENABLED")
+
+
+def peering_path_enabled() -> bool:
+    """True when a new VPC peering is written as a ManagedNetworkPeering.
+
+    Off: the endpoint patches both routers itself.
+    On: it writes one object and the operator writes both ends — or neither,
+    which is the difference that matters. The endpoint holds the list of applied
+    ends in a local variable and undoes them in an `except`; a process that
+    stops between the two writes leaves a peering configured on one side only,
+    which is a black hole with nothing anywhere remembering to undo it. The
+    controller records each end in status before attempting it.
+
+    The larger reason is drift rather than crashes. A peering is desired state
+    held on two routers, and today nothing reconciles it: an entry removed by
+    hand, or lost by kube-ovn, stays lost. A REST call has nowhere to notice.
+
+    **Only new peerings.** The ones that exist stay exactly as they are and stay
+    the product's: ownership is the ManagedNetworkPeering object itself — a pair
+    belongs to the operator when an object claims it — so turning this off
+    orphans nothing and turning it on rewrites nothing. There is no cutover day.
+
+    The operator refuses to take over a pair that is already written unless it
+    is told to, because `Vpc.spec.vpcPeerings` is what the isolation pass reads
+    to decide what to allow: a second writer there does not break a peering, it
+    breaks the isolation of both neighbours.
+    """
+    return _enabled("OPERATOR_PEERING_ENABLED")
 
 
 # The group the operator's custom resources live in.

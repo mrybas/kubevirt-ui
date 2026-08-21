@@ -3349,3 +3349,70 @@ silently, on the release nobody remembers.
 
 A test now asserts every rendered CRD carries the annotation, because the whole
 choice rests on it. Removing it from the generator turns that test red.
+
+## Peering: the writer, not the controller
+
+The controller was built in M10c and has been sitting with nothing to reconcile —
+zero `ManagedNetworkPeering` objects on a stand where two VPCs are peered. That
+reads like an unmigrated path, and it is, but the missing half is the writer.
+
+Why move it at all, given the pair works: not crashes, drift. A peering is
+desired state held on two routers, and today nothing holds it. An entry removed
+by hand, or lost by kube-ovn, stays lost; a process that dies between the two
+writes leaves one side configured, which is a black hole with nothing anywhere
+remembering to undo it. A REST call has nowhere to notice any of that. The
+controller records each end in status before attempting it, and goes on looking.
+
+The seam is also worse than it looks from outside. On one `Vpc` today: the
+subnet's ACLs are the operator's, `vpcPeerings` is the product's, and
+`staticRoutes` is **both** — the operator merges its default route into the same
+list the peering writes, and its own comment says why it merges rather than
+sets. A seam through one field is worse than either side of it.
+
+### Measured before touching anything
+
+The split is functionally whole right now, which is the thing to establish
+before calling it a migration rather than a repair. The isolation pass reads
+`spec.vpcPeerings` off the live router (`managednetwork_acls.go:361`), so a
+product-written peering gets its allows from the operator's own guard:
+
+```
+op-net-a-default 10.200.12.0/22      op-net-b-default 10.200.16.0/22
+  3200 allow own                       3200 allow own
+  3100 allow 10.200.16.0/22            3100 allow 10.200.12.0/22
+  3000 drop  10.200.0.0/14             3000 drop  10.200.0.0/14
+```
+
+The allow sits above the supernet drop on both sides, with zero
+`ManagedNetworkPeering` objects. That is the T20 first-run failure not
+happening, and the reason is the same rule: the guard reads the datapath, not a
+label.
+
+### The shape of the handover
+
+A flag decides who writes **new** peerings. Ownership of the existing ones is
+the object itself — a pair belongs to the operator when a `ManagedNetworkPeering`
+claims it. So there is no cutover day: turning it on rewrites nothing, turning
+it off orphans nothing.
+
+Ownership could not be a marker on the thing owned, which is how the ACL move
+worked. A peering is not an object on the routers; it is two entries in two
+lists, and a list element cannot be annotated. The object is the register.
+
+Its own flag rather than `OPERATOR_NETWORK_ENABLED`, because an upgrade must not
+change the meaning of a flag somebody already turned on.
+
+**And the operator refuses to take over a pair that is already written**, unless
+annotated to. This is the guard that matters, and not for the reason it first
+looks: two writers into `vpcPeerings` would not break the peering — they would
+break the isolation of both neighbours, because that field is what the composer
+reads to decide what to allow. The refusal names who holds it and how to adopt
+it. It fires only before the first leg is attempted; after that the entries are
+the object's own, and `status.Legs` is what says so — without that
+discriminator the guard refuses its own work on the second pass, which is the
+first thing it did.
+
+The product's delete paths let go rather than take off: an owned peering is
+removed by deleting its object, because removing the ends from here is a second
+writer taking away what the first still believes it holds — and the first puts
+it back, pointing at a router that is being deleted.

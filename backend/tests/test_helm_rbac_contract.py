@@ -151,6 +151,17 @@ REQUIRED: list[tuple[str, str, str, str]] = [
      "vpcs._create_managed_network"),
     ("platform.kubevirt-ui.io", "managednetworks", "delete",
      "vpcs.delete_vpc (the operator cascades)"),
+    # Peering under OPERATOR_PEERING_ENABLED: the endpoint describes the link
+    # and the operator writes both ends. List, because deleting a VPC has to
+    # know which of its peerings the operator holds.
+    ("platform.kubevirt-ui.io", "managednetworkpeerings", "get",
+     "vpcs._peering_cr"),
+    ("platform.kubevirt-ui.io", "managednetworkpeerings", "list",
+     "vpcs._claimed_remotes"),
+    ("platform.kubevirt-ui.io", "managednetworkpeerings", "create",
+     "vpcs._describe_peering"),
+    ("platform.kubevirt-ui.io", "managednetworkpeerings", "delete",
+     "vpcs.delete_vpc_peering"),
     # Enabling an addon edits the tenant's description rather than writing a
     # second HelmRelease — see tests/test_addons_have_one_writer.py.
     ("platform.kubevirt-ui.io", "managedtenants", "get",

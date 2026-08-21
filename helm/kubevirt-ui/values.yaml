@@ -152,6 +152,15 @@ backend:
     # release is missing, which is the state a fresh tenant is in, which is
     # exactly when omitting it wedges.
     OPERATOR_TENANT_ADDONS_ENABLED: ""
+    # -- Route new VPC peerings through the operator: the endpoint writes one
+    # object and the controller writes both ends, or neither, and goes on
+    # holding them. Empty/false → the endpoint patches both routers itself and
+    # then forgets, which is where the drift comes from.
+    #
+    # Only new ones. The peerings that exist stay the product's — ownership is
+    # the ManagedNetworkPeering object, so turning this on rewrites nothing and
+    # turning it off orphans nothing.
+    OPERATOR_PEERING_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as

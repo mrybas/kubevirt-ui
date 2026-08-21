@@ -535,3 +535,133 @@ func TestNothingIsRoutedUntilThePrefixIsOpen(t *testing.T) {
 		return nil
 	})
 }
+
+// writePeeringByHand is the product's write: an entry on one router's list,
+// which is all it takes for the two to be peered as far as everything that
+// reads the datapath is concerned.
+func writePeeringByHand(t *testing.T, local, remote string) {
+	t.Helper()
+	vpc := &unstructured.Unstructured{}
+	vpc.SetGroupVersionKind(vpcGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: local}, vpc); err != nil {
+		t.Fatalf("reading Vpc/%s: %v", local, err)
+	}
+	entries, _, _ := unstructured.NestedSlice(vpc.Object, "spec", "vpcPeerings")
+	entries = append(entries, map[string]any{
+		"remoteVpc": remote, "localConnectIP": "169.254.101.9/30",
+	})
+	if err := unstructured.SetNestedSlice(vpc.Object, entries, "spec", "vpcPeerings"); err != nil {
+		t.Fatalf("setting the list: %v", err)
+	}
+	if err := k8sClient.Update(testCtx, vpc); err != nil {
+		t.Fatalf("writing the peering by hand: %v", err)
+	}
+}
+
+// TestAPeeringTheProductAlreadyWroteIsNotTakenOverSilently.
+//
+// The product writes peerings into `Vpc.spec.vpcPeerings` and will keep doing
+// so until that path is handed over. The isolation pass reads that same field
+// off the live router to decide what to allow, so a second writer into it does
+// not break a peering — it breaks the isolation of both neighbours, and the
+// symptom is somebody else's traffic passing.
+//
+// So an object describing a pair that already exists is refused, with the
+// reason and with what to do about it. Adoption stays possible and stays a
+// decision.
+func TestAPeeringTheProductAlreadyWroteIsNotTakenOverSilently(t *testing.T) {
+	mustPeeredNetwork(t, "pgu-a", "10.201.0.0/22")
+	mustPeeredNetwork(t, "pgu-b", "10.201.4.0/22")
+	writePeeringByHand(t, "pgu-a", "pgu-b")
+
+	mustPeering(t, "pgu-a-pgu-b", "pgu-a", "pgu-b")
+
+	eventually(t, "the refusal", func() error {
+		link := getPeering(t, "pgu-a-pgu-b")
+		accepted := apimeta.FindStatusCondition(link.Status.Conditions,
+			platformv1alpha1.ConditionPeeringAccepted)
+		if accepted == nil {
+			return fmt.Errorf("no verdict yet")
+		}
+		if accepted.Status != metav1.ConditionFalse ||
+			accepted.Reason != "AlreadyPeered" {
+			return fmt.Errorf("accepted = %s/%s", accepted.Status, accepted.Reason)
+		}
+		if !strings.Contains(accepted.Message, "Vpc/pgu-a") {
+			return fmt.Errorf("it does not say who holds it: %s", accepted.Message)
+		}
+		return nil
+	})
+
+	// And nothing was written on the far side, which is the harm being avoided.
+	if got := peeringEntriesOf(t, "pgu-b"); len(got) != 0 {
+		t.Errorf("Vpc/pgu-b gained %v while the pair was refused", got)
+	}
+}
+
+// TestAnAdoptedPeeringIsTakenOver.
+func TestAnAdoptedPeeringIsTakenOver(t *testing.T) {
+	mustPeeredNetwork(t, "pga-a", "10.201.8.0/22")
+	mustPeeredNetwork(t, "pga-b", "10.201.12.0/22")
+	writePeeringByHand(t, "pga-a", "pga-b")
+
+	link := &platformv1alpha1.ManagedNetworkPeering{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "pga-a-pga-b",
+			Annotations: map[string]string{adoptAnnotation: "true"},
+		},
+		Spec: platformv1alpha1.ManagedNetworkPeeringSpec{
+			Networks: []string{"pga-a", "pga-b"},
+		},
+	}
+	if err := k8sClient.Create(testCtx, link); err != nil {
+		t.Fatalf("creating the peering: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(testCtx, link) })
+
+	eventually(t, "both ends", func() error {
+		for _, pair := range [][2]string{{"pga-a", "pga-b"}, {"pga-b", "pga-a"}} {
+			found := false
+			for _, remote := range peeringEntriesOf(t, pair[0]) {
+				if remote == pair[1] {
+					found = true
+				}
+			}
+			if !found {
+				return fmt.Errorf("Vpc/%s does not point at %s", pair[0], pair[1])
+			}
+		}
+		return nil
+	})
+}
+
+// TestTheGuardDoesNotRefuseItsOwnWork.
+//
+// The entries on the routers after the first pass are this object's own, and
+// status.Legs — written before each end precisely so a crash leaves a record —
+// is what says so. Without that discriminator the guard fires on its own work
+// and a healthy peering flaps into AlreadyPeered.
+func TestTheGuardDoesNotRefuseItsOwnWork(t *testing.T) {
+	mustPeeredNetwork(t, "pgo-a", "10.201.16.0/22")
+	mustPeeredNetwork(t, "pgo-b", "10.201.20.0/22")
+	mustPeering(t, "pgo-a-pgo-b", "pgo-a", "pgo-b")
+
+	eventually(t, "the peering to be up", func() error {
+		link := getPeering(t, "pgo-a-pgo-b")
+		peered := apimeta.FindStatusCondition(link.Status.Conditions,
+			platformv1alpha1.ConditionEstablished)
+		if peered == nil || peered.Status != metav1.ConditionTrue {
+			return fmt.Errorf("not peered yet: %+v", peered)
+		}
+		return nil
+	})
+
+	// Long enough for several passes over an object that is already written.
+	time.Sleep(3 * time.Second)
+	link := getPeering(t, "pgo-a-pgo-b")
+	accepted := apimeta.FindStatusCondition(link.Status.Conditions,
+		platformv1alpha1.ConditionPeeringAccepted)
+	if accepted != nil && accepted.Reason == "AlreadyPeered" {
+		t.Fatalf("it refused the peering it wrote itself: %s", accepted.Message)
+	}
+}

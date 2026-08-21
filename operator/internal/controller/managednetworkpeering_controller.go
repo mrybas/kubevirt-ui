@@ -50,6 +50,17 @@ const (
 	// Unlike a network, a peering owns no addresses and nothing runs on it, so
 	// removing it on delete is unambiguously the right thing.
 	peeringFinalizer = "platform.kubevirt-ui.io/peering"
+
+	// adoptAnnotation lets a peering the product already wrote become this
+	// controller's, on purpose.
+	//
+	// Ownership of a peering cannot be a label on the thing owned: a peering is
+	// not an object, it is two entries in two lists on two routers, and a list
+	// element cannot be annotated. So the record of ownership is this object —
+	// a pair belongs here when a ManagedNetworkPeering claims it — and the one
+	// case that needs a human decision is the pair that already exists without
+	// one. Taking it over silently is how two writers begin.
+	adoptAnnotation = "platform.kubevirt-ui.io/adopt"
 )
 
 // ManagedNetworkPeeringReconciler writes both ends of a peering, or neither.
@@ -125,6 +136,31 @@ func (r *ManagedNetworkPeeringReconciler) Reconcile(
 			r.setPeeringCondition(link, false, "NetworkGoing",
 				fmt.Sprintf("Vpc/%s is being deleted; a peering onto it would "+
 					"outlive the thing it points at", name))
+			link.Status.ObservedGeneration = link.Generation
+			return ctrl.Result{RequeueAfter: drainRetry},
+				kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before)
+		}
+	}
+
+	// A pair the product already wrote is not taken over by the appearance of
+	// an object describing it. The isolation pass reads `spec.vpcPeerings` off
+	// the live router to decide what to allow, so a second writer into that
+	// field does not break a peering — it breaks the isolation of both
+	// neighbours, and the symptom is somebody else's traffic.
+	//
+	// Refused with the reason and how to proceed. Adoption stays possible and
+	// stays a decision.
+	// Only before the first leg is attempted. After that the entries on the
+	// routers are this object's own, and status.Legs — written before each end
+	// precisely so a crash leaves a record — is what says so.
+	if link.Annotations[adoptAnnotation] != "true" && len(link.Status.Legs) == 0 {
+		if held, err := r.pairAlreadyWritten(ctx, a, b); err != nil {
+			return ctrl.Result{}, err
+		} else if held != "" {
+			r.setAcceptedCondition(link, false, "AlreadyPeered", held)
+			r.setPeeringCondition(link, false, "AlreadyPeered", held+
+				" Nothing was written. Annotate this object with "+
+				adoptAnnotation+"=true to take it over.")
 			link.Status.ObservedGeneration = link.Generation
 			return ctrl.Result{RequeueAfter: drainRetry},
 				kube.UpdateStatus(ctx, r.Client, peeringControllerName, link, before)
@@ -866,4 +902,48 @@ func withoutMatches(existing any, cidrs map[string]bool) []any {
 		out = append(out, raw)
 	}
 	return out
+}
+
+// pairAlreadyWritten reports whoever wrote this pair before this object did, or
+// "" when the routers say nothing about each other.
+//
+// Read from the routers rather than from a marker, for the same reason the
+// isolation pass does: what is on the datapath is the fact, and a label saying
+// otherwise is a claim.
+func (r *ManagedNetworkPeeringReconciler) pairAlreadyWritten(
+	ctx context.Context, a, b string,
+) (string, error) {
+	written := map[string]bool{}
+	for _, side := range []struct{ local, remote string }{{a, b}, {b, a}} {
+		vpc := &unstructured.Unstructured{}
+		vpc.SetGroupVersionKind(vpcGVK)
+		if err := r.Get(ctx, types.NamespacedName{Name: side.local}, vpc); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return "", fmt.Errorf("reading Vpc/%s: %w", side.local, err)
+		}
+		entries, _, _ := unstructured.NestedSlice(vpc.Object, "spec", "vpcPeerings")
+		for _, raw := range entries {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if remote, _ := entry["remoteVpc"].(string); remote == side.remote {
+				written[side.local] = true
+			}
+		}
+	}
+	if len(written) == 0 {
+		return "", nil
+	}
+	var where []string
+	for name := range written {
+		where = append(where, "Vpc/"+name)
+	}
+	sort.Strings(where)
+	return fmt.Sprintf(
+		"%s and %s are already peered — %s carries the entry, written by "+
+			"something other than this object.",
+		a, b, strings.Join(where, " and ")), nil
 }

@@ -139,6 +139,14 @@ rules:
       - managednetworks
     verbs: ["get", "create", "delete"]
 
+  # A peering is described here and written by the operator. No patch: the
+  # declaration is created or removed, never edited in place — changing which
+  # networks a link joins is a different link.
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managednetworkpeerings
+    verbs: ["get", "list", "create", "delete"]
+
   # A tenant's addons are described, not written: the Enable button edits this
   # object and the operator renders the releases. No create — a tenant becomes
   # described by being adopted, which is a deliberate act, not a side effect of
@@ -310,6 +318,19 @@ rules:
       # (bgp.py — BGPCONF_PLURAL).
       - bgp-confs
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # FRR's own verdict on the config we generated. Cluster-scoped, so it cannot
+  # live in the namespaced -b3 Role below next to `frrconfigurations` — and
+  # that is exactly how it was missed: the write permission was granted, the
+  # read of the result was not, and `reload_failures` swallows the 403 and
+  # returns "no failures". FRR keeps the last good config when it refuses one,
+  # so the session stays up and only VPCs attached after the break go
+  # unannounced — the failure this tier exists to catch is the one it was
+  # blind to (b3_announce.reload_failures).
+  - apiGroups: ["frrk8s.metallb.io"]
+    resources:
+      - frrnodestates
+    verbs: ["get", "list", "watch"]
 
   - apiGroups: ["k8s.cni.cncf.io"]
     resources:
@@ -674,6 +695,14 @@ rules:
   - apiGroups: ["frrk8s.metallb.io"]
     resources: ["frrconfigurations"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # The session state the page reports. Namespaced, alongside the config it
+  # describes. Without it `GET /bgp/routed-egress` returns `sessions: []` and
+  # the page says "No session state reported yet" while the session has been
+  # Established for hours — the same shape of lie the speaker used to tell,
+  # arriving by a different route (bgp.get_routed_egress).
+  - apiGroups: ["frrk8s.metallb.io"]
+    resources: ["bgpsessionstates"]
+    verbs: ["get", "list", "watch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

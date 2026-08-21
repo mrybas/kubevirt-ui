@@ -218,6 +218,7 @@ from app.core.operator import (  # noqa: E402  (kept beside the constants it ser
     OPERATOR_GROUP,
     OPERATOR_VERSION,
     network_path_enabled,
+    peering_path_enabled,
 )
 
 # Marks a subnet whose ACL list the operator's composer writes. Set by the
@@ -2296,15 +2297,7 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
     # Peerings live in `Vpc.spec.vpcPeerings` on *both* routers — there is no
     # `vpc-peerings` object to delete, and deleting this VPC leaves the other
     # side pointing at a router that no longer exists.
-    peerings = await _get_vpc_peerings(k8s, name)
-    for peering in peerings:
-        remote = peering.remote_vpc
-        if not remote:
-            continue
-        try:
-            await _remove_peering_side(k8s, remote, name)
-        except Exception as e:
-            logger.warning(f"Failed to remove peering {remote}→{name}: {e}")
+    released = await _release_peerings(k8s, name)
 
     # Delete subnets.
     #
@@ -2364,7 +2357,7 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
         "status": "deleted",
         "name": name,
         "subnets_deleted": len(subnets),
-        "peerings_deleted": len(peerings),
+        "peerings_deleted": released,
     }
 
 
@@ -2432,6 +2425,144 @@ def _peering_side_patch(
     return {"vpcPeerings": peerings, "staticRoutes": routes, "policyRoutes": policies}
 
 
+PEERING_PLURAL = "managednetworkpeerings"
+
+
+def peering_cr_name(a: str, b: str) -> str:
+    """One name for a pair, whichever side asked.
+
+    A peering is symmetric and the endpoint takes a local and a remote, so
+    without an ordering the same link asked for twice from opposite sides is two
+    objects racing to write the same two routers.
+    """
+    return "-".join(sorted((a, b)))
+
+
+async def _peering_cr(k8s, a: str, b: str) -> dict[str, Any] | None:
+    """The object claiming this pair, if there is one.
+
+    The record of ownership. A peering is not an object on the routers — it is
+    two entries in two lists — so ownership cannot be a label on the thing
+    owned; it is the existence of this.
+    """
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=PEERING_PLURAL, name=peering_cr_name(a, b),
+        )
+    except ApiException as e:
+        if e.status in (403, 404):
+            return None
+        raise
+
+
+async def _claimed_remotes(k8s, vpc_name: str) -> set[str]:
+    """Remotes of `vpc_name` whose peering belongs to the operator.
+
+    Read before this module rewrites `spec.vpcPeerings` wholesale: an entry the
+    operator owns must survive a write from here, or the first peering made the
+    old way erases one made the new way.
+    """
+    try:
+        listing = await k8s.custom_api.list_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION, plural=PEERING_PLURAL,
+        )
+    except ApiException as e:
+        if e.status in (403, 404):
+            return set()
+        raise
+    out: set[str] = set()
+    for item in listing.get("items", []) or []:
+        networks = (item.get("spec", {}) or {}).get("networks") or []
+        if len(networks) == 2 and vpc_name in networks:
+            out.add(networks[0] if networks[1] == vpc_name else networks[1])
+    return out
+
+
+async def _release_peerings(k8s, name: str) -> int:
+    """Take this VPC out of every peering it is in, from whichever side owns it.
+
+    A peering the operator holds goes by removing its object — the controller
+    takes both ends off under a finalizer. Removing the far side from here
+    instead is a second writer taking away what the first still believes it
+    holds, and the first puts it back: the deleted VPC's router is gone, so the
+    entry it writes points at nothing.
+    """
+    peerings = await _get_vpc_peerings(k8s, name)
+    claimed = await _claimed_remotes(k8s, name)
+    for peering in peerings:
+        remote = peering.remote_vpc
+        if not remote:
+            continue
+        if remote in claimed:
+            try:
+                await k8s.custom_api.delete_cluster_custom_object(
+                    group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                    plural=PEERING_PLURAL, name=peering_cr_name(name, remote),
+                )
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(
+                        "Failed to remove peering object %s: %s",
+                        peering_cr_name(name, remote), e,
+                    )
+            continue
+        try:
+            await _remove_peering_side(k8s, remote, name)
+        except Exception as e:
+            logger.warning(f"Failed to remove peering {remote}→{name}: {e}")
+    return len(peerings)
+
+
+async def _describe_peering(
+    k8s, local: str, remote: str, link_cidr: str | None,
+) -> VpcPeeringInfo:
+    """Ask for the peering; the operator makes it and keeps it.
+
+    Deliberately not followed by an isolation reconcile. The composer derives
+    the allow from the routers' own peering list in the same pass it writes the
+    drops, so calling it here would run before the operator has written
+    anything and prove nothing — the older, applied path still calls it because
+    there the routers are already written when it returns.
+    """
+    body: dict[str, Any] = {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedNetworkPeering",
+        "metadata": {
+            "name": peering_cr_name(local, remote),
+            "labels": {"kubevirt-ui.io/managed": "true"},
+        },
+        "spec": {"networks": sorted((local, remote))},
+    }
+    if link_cidr:
+        body["spec"]["linkCIDR"] = link_cidr
+
+    try:
+        await k8s.custom_api.create_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=PEERING_PLURAL, body=body,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Peering is routed to the operator (OPERATOR_PEERING_ENABLED), "
+                    "but the ManagedNetworkPeering CRD is not installed"
+                ),
+            )
+        if e.status == 409:
+            raise HTTPException(
+                status_code=409,
+                detail=f"'{local}' and '{remote}' are already peered",
+            )
+        raise k8s_error_to_http(e, "describing the peering")
+
+    return VpcPeeringInfo(
+        name=peering_cr_name(local, remote), local_vpc=local, remote_vpc=remote,
+    )
+
+
 @router.post("/{name}/peerings", response_model=VpcPeeringInfo, status_code=201)
 async def create_vpc_peering(
     request: Request, name: str, data: VpcPeeringCreateRequest,
@@ -2454,6 +2585,13 @@ async def create_vpc_peering(
     anyway and the peering looks broken for no visible reason.
     """
     k8s = request.app.state.k8s_client
+
+    if peering_path_enabled():
+        # Described rather than applied: the operator writes both ends or
+        # neither, and goes on holding them. This endpoint writes twice and
+        # then forgets — a leg removed by hand, or lost by kube-ovn, stays lost.
+        return await _describe_peering(k8s, name, data.remote_vpc, data.link_cidr)
+
     result = await _create_peering_pair(k8s, name, data.remote_vpc, data.link_cidr)
     # The routes alone are not the peering. Isolation still drops the peer's
     # prefix, so without this the pair is written on both routers, shows
@@ -2669,6 +2807,23 @@ async def delete_vpc_peering(request: Request, name: str, remote_vpc: str, user:
     leaves and is silently dropped.
     """
     k8s = request.app.state.k8s_client
+
+    # A peering the operator owns is torn down by removing its object: the
+    # controller takes both ends off under a finalizer. Taking the ends off from
+    # here instead would be a second writer removing what the first still
+    # believes it holds, and the first would put them back.
+    described = await _peering_cr(k8s, name, remote_vpc)
+    if described is not None:
+        await k8s.custom_api.delete_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=PEERING_PLURAL, name=peering_cr_name(name, remote_vpc),
+        )
+        logger.info("Removed peering object for %r <-> %r", name, remote_vpc)
+        return {
+            "status": "deleted",
+            "peering": peering_cr_name(name, remote_vpc),
+            "vpcs_updated": sorted((name, remote_vpc)),
+        }
 
     removed: list[str] = []
     for local, remote in ((name, remote_vpc), (remote_vpc, name)):
