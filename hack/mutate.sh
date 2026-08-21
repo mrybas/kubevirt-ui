@@ -19,6 +19,10 @@
 #     's/if len(unprotected) == 0 && !hasDeny/if !hasDeny/' \
 #     -run TestTheBaselineIsWithheld
 #
+#   hack/mutate.sh frontend/src/components/vm/CreateVMWizard.tsx \\
+#     "s/reason: error instanceof Error ? error.message : String(error)/reason: ''/" \\
+#     src/components/vm/__tests__/BatchFailureReason.test.tsx
+#
 #   hack/mutate.sh backend/app/api/v1/tenants_crud.py \
 #     's/if resource_version:/if False and resource_version:/' \
 #     tests/test_addons_have_one_writer.py
@@ -41,12 +45,15 @@ trap 'rm -rf "$work"' EXIT
 # minute and leaves a directory nothing can delete.
 case "$target" in
 backend/*)         trees="backend" ;;
+frontend/*)        trees="frontend" ;;
 hack/*|helm/*)     trees="operator test hack helm" ;;
 *)                 trees="operator test" ;;
 esac
 # shellcheck disable=SC2086
+# node_modules is excluded and supplied from the image instead: copying it costs
+# a minute and leaves a directory that is awkward to delete.
 tar -C "$repo" --exclude .git --exclude .mutation --exclude __pycache__ \
-	-cf - $trees | tar -C "$work" -xf -
+	--exclude node_modules -cf - $trees | tar -C "$work" -xf -
 
 before="$(md5 -q "$work/$target" 2>/dev/null || md5sum "$work/$target" | cut -d' ' -f1)"
 sed -i.orig "$expression" "$work/$target"
@@ -62,6 +69,17 @@ if [ "$before" = "$after" ]; then
 	exit 2
 fi
 echo "мутація застосована у $work"
+
+if [ "$trees" = "frontend" ]; then
+	# The compose service bind-mounts frontend/ too, so a `sed -i` "in the
+	# container" is a `sed -i` in the working tree — the same door the backend
+	# case was added for, and a hand-rolled cp/restore around it is the habit
+	# wearing gloves. The anonymous volume seeds node_modules from the image,
+	# which is what compose does.
+	docker run --rm -v "$work/frontend:/app" -v /app/node_modules -w /app \
+		kubevirt-ui-frontend npx vitest run "$@" 2>&1 | tail -12
+	exit 0
+fi
 
 if [ "$trees" = "backend" ]; then
 	# The same image the compose service uses, but mounted read-write at the
