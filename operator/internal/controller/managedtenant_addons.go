@@ -89,7 +89,7 @@ func (r *ManagedTenantReconciler) reconcileAddons(
 			// while it writes them back is a loop with nothing changing.
 			existing, _, _ := unstructured.NestedMap(live.Object, "spec")
 			return unstructured.SetNestedMap(live.Object,
-				addons.MergeSpec(existing, spec), "spec")
+				kube.MergeSpec(existing, spec), "spec")
 		}); err != nil {
 			return false, "", "", fmt.Errorf("writing %s: %w", release.Name, err)
 		}

@@ -206,7 +206,8 @@ func (r *ManagedTenantReconciler) ensureCluster(
 			// port advertised in cluster-info.
 			network["apiServerPort"] = port
 		}
-		return unstructured.SetNestedMap(live.Object, map[string]any{
+		existing, _, _ := unstructured.NestedMap(live.Object, "spec")
+		return unstructured.SetNestedMap(live.Object, kube.MergeSpec(existing, map[string]any{
 			"controlPlaneEndpoint": map[string]any{"host": host, "port": port},
 			"clusterNetwork":       network,
 			// Same namespace, and it must stay that way: the CAPI webhook
@@ -221,7 +222,7 @@ func (r *ManagedTenantReconciler) ensureCluster(
 				"kind":       kubevirtClusterGVK.Kind,
 				"name":       obj.Name,
 			},
-		}, "spec")
+		}), "spec")
 	})
 	if err != nil {
 		return fmt.Errorf("declaring the Cluster %s/%s: %w", namespace, obj.Name, err)
@@ -365,7 +366,14 @@ func (r *ManagedTenantReconciler) ensureKamajiControlPlane(
 		if args := oidcArgs(obj); len(args) > 0 {
 			spec["apiServer"] = map[string]any{"extraArgs": args}
 		}
-		return unstructured.SetNestedMap(live.Object, spec, "spec")
+		// Laid over what is there. Kamaji writes five fields of its own into
+		// this object — the endpoint it settled on, kine, the registry, the
+		// controller manager, the scheduler — and none of them is rendered
+		// here. Replacing the spec strips them, Kamaji writes them back, and a
+		// live control plane is rewritten on every pass for no reason.
+		existing, _, _ := unstructured.NestedMap(live.Object, "spec")
+		return unstructured.SetNestedMap(live.Object,
+			kube.MergeSpec(existing, spec), "spec")
 	})
 	if err != nil {
 		return fmt.Errorf("declaring the KamajiControlPlane %s/%s: %w",

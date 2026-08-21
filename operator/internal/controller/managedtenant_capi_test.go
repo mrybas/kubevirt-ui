@@ -382,3 +382,72 @@ func TestTheApiserverTakesTheIdentityProviderOnlyWhenAsked(t *testing.T) {
 		t.Errorf("an http issuer was accepted: %v", args)
 	}
 }
+
+// TestTheControlPlaneKamajiWroteAboutItselfSurvives.
+//
+// Kamaji writes five fields of its own into this object — the endpoint it
+// settled on, kine, the registry, the controller manager, the scheduler — and
+// none is rendered here. Replacing the spec strips them, Kamaji writes them
+// back, and a live control plane is rewritten on every pass for no reason.
+//
+// Found by predicting an adoption against the stand: the live object carries
+// thirteen spec fields and this renders eight.
+func TestTheControlPlaneKamajiWroteAboutItselfSurvives(t *testing.T) {
+	// Paused, so the only writer in this test is the call under test. The
+	// running manager reconciling the same tenant would be a second one, and
+	// "resourceVersion did not move" cannot be asserted with two.
+	obj := vpcTalosTenant("tcp8")
+	obj.Annotations = map[string]string{"platform.kubevirt-ui.io/paused": "true"}
+	mustTenant(t, obj)
+	mustNamespace(t, "tenant-tcp8", "")
+
+	reconciler := &ManagedTenantReconciler{
+		Client: k8sClient, Scheme: k8sClient.Scheme(), APIReader: k8sReader,
+	}
+	if err := reconciler.ensureKamajiControlPlane(
+		testCtx, obj, "tenant-tcp8", "10.199.0.119", true); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	// Kamaji's part.
+	cp, err := capiObject(kamajiControlPlaneGVK, "tenant-tcp8", "tcp8")
+	if err != nil {
+		t.Fatalf("reading the control plane: %v", err)
+	}
+	_ = unstructured.SetNestedMap(cp.Object, map[string]any{
+		"host": "10.103.184.143", "port": int64(6443),
+	}, "spec", "controlPlaneEndpoint")
+	// `kine.extraArgs`, because `kine.image` is not in the schema and the API
+	// server prunes it — which the first version of this test discovered by
+	// asserting on a field that had never been stored.
+	_ = unstructured.SetNestedStringSlice(cp.Object,
+		[]string{"--metrics-bind-address=0"}, "spec", "kine", "extraArgs")
+	if err := k8sClient.Update(testCtx, cp); err != nil {
+		t.Fatalf("writing Kamaji's own fields: %v", err)
+	}
+	settled := cp.GetResourceVersion()
+
+	for pass := 1; pass <= 3; pass++ {
+		if err := reconciler.ensureKamajiControlPlane(
+			testCtx, obj, "tenant-tcp8", "10.199.0.119", true); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+
+	after, err := capiObject(kamajiControlPlaneGVK, "tenant-tcp8", "tcp8")
+	if err != nil {
+		t.Fatalf("reading it back: %v", err)
+	}
+	if host, _, _ := unstructured.NestedString(after.Object,
+		"spec", "controlPlaneEndpoint", "host"); host != "10.103.184.143" {
+		t.Errorf("it stripped the endpoint Kamaji settled on: %q", host)
+	}
+	if args, _, _ := unstructured.NestedStringSlice(after.Object,
+		"spec", "kine", "extraArgs"); len(args) != 1 {
+		t.Errorf("it stripped a defaulted field: %v", args)
+	}
+	if after.GetResourceVersion() != settled {
+		t.Errorf("three passes moved resourceVersion %s -> %s over an object "+
+			"nothing asked it to change", settled, after.GetResourceVersion())
+	}
+}

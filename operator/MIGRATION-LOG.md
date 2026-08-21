@@ -2900,3 +2900,31 @@ So the generic retry is reverted, with the reason written where somebody would
 otherwise add it again, and the counter is incremented against a fresh read by
 the controller that owns it. A count is not a fact: a fact can be recomputed
 from the world on the next pass, and a count cannot.
+
+## Preparing the adoption: the same lesson, on the object that matters most
+
+The addon writer needed a merge because Flux defaults `reconcileStrategy` into
+a HelmRelease. Asking the same question of the other objects, before adopting
+anything, gave a worse answer.
+
+The live `KamajiControlPlane` carries thirteen spec fields. This renders eight.
+The five it does not — `controlPlaneEndpoint`, `controllerManager`, `kine`,
+`registry`, `scheduler` — are Kamaji's own, including the endpoint the control
+plane settled on. Writing the spec wholesale strips all five on the first
+adopted tenant.
+
+So the merge moved to `internal/kube`, where writing objects lives, and the
+control plane and the Cluster are laid over what is there. `KubevirtCluster`
+turned out safe by construction — that writer only touches labels and the
+managed-by annotation — which is worth knowing rather than assuming.
+
+Two smaller things fell out of writing the test, both of them the test being
+wrong rather than the code:
+
+* it asserted on `kine.image`, which is not in the CRD schema, so the API
+  server pruned it and the assertion was about a field that had never been
+  stored;
+* it drove the reconciler directly while the running manager reconciled the
+  same tenant — two writers, and "resourceVersion did not move" cannot be
+  asserted with two. The tenant is paused in that test now, so the call under
+  test is the only writer.
