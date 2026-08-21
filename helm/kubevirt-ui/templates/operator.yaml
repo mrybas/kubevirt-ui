@@ -27,6 +27,7 @@ one line of output, rather than in a cluster where it is an investigation.
       "OPERATOR_ANNOUNCE_ENABLED" "network"
       "OPERATOR_UNDERLAY_ENABLED" "network"
       "OPERATOR_PEERING_ENABLED" "network"
+      "OPERATOR_TENANT_ENABLED" "tenant"
       "OPERATOR_TENANT_BOOTSTRAP_ENABLED" "tenant"
       "OPERATOR_TENANT_TIME_ENABLED" "tenant"
       "OPERATOR_TENANT_ADDONS_ENABLED" "tenant" }}

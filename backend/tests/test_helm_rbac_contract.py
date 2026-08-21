@@ -168,6 +168,13 @@ REQUIRED: list[tuple[str, str, str, str]] = [
      "tenants_crud._described_tenant"),
     ("platform.kubevirt-ui.io", "managedtenants", "patch",
      "tenants_crud._write_described_addons"),
+    # Creating a tenant by describing it, under OPERATOR_TENANT_ENABLED.
+    ("platform.kubevirt-ui.io", "managedtenants", "create",
+     "tenants_crud._create_managed_tenant"),
+    # Not gated by that flag: a tenant the operator holds must stay deletable
+    # after it is turned off again.
+    ("platform.kubevirt-ui.io", "managedtenants", "delete",
+     "tenants_crud._delete_managed_tenant"),
 ]
 
 

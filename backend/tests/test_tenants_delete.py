@@ -32,6 +32,15 @@ def k8s() -> MagicMock:
     mock.core_api.read_namespace = AsyncMock(return_value=MagicMock())
     mock.core_api.delete_namespace = AsyncMock()
     mock.custom_api.delete_namespaced_custom_object = AsyncMock()
+    # A tenant this cluster's operator has no object for — the ordinary case
+    # while the handover is off, and the same 404 an installation without the
+    # CRD at all returns.
+    mock.custom_api.delete_cluster_custom_object = AsyncMock(
+        side_effect=ApiException(status=404, reason="Not Found"),
+    )
+    mock.custom_api.get_cluster_custom_object = AsyncMock(
+        side_effect=ApiException(status=404, reason="Not Found"),
+    )
     return mock
 
 
@@ -116,3 +125,54 @@ async def test_already_gone_namespace_is_not_an_error(
     )
 
     await tenants_crud.delete_tenant(request_obj, "demo", user=_admin_user())
+
+
+@pytest.mark.asyncio
+async def test_a_described_tenant_is_handed_to_its_finalizer_first(
+    request_obj: SimpleNamespace, k8s: MagicMock,
+) -> None:
+    """The operator's finalizer gives back what outlives a namespace — the
+    transit EIP and its ACLs, the demux ports. Deleting the namespace while
+    that is in flight is how a teardown wedges, so the description goes first
+    and the sweep below waits for it to be gone."""
+    gone: list[bool] = [False]
+
+    async def _delete_cr(**_kwargs: object) -> None:
+        gone[0] = True
+
+    async def _get_cr(**_kwargs: object) -> dict:
+        if gone[0]:
+            raise ApiException(status=404, reason="Not Found")
+        return {"metadata": {"name": "demo"}}
+
+    k8s.custom_api.delete_cluster_custom_object = AsyncMock(side_effect=_delete_cr)
+    k8s.custom_api.get_cluster_custom_object = AsyncMock(side_effect=_get_cr)
+
+    await tenants_crud.delete_tenant(request_obj, "demo", user=_admin_user())
+
+    k8s.custom_api.delete_cluster_custom_object.assert_awaited_once()
+    assert k8s.custom_api.delete_cluster_custom_object.await_args.kwargs["plural"] == (
+        "managedtenants"
+    )
+    # And the sweep still runs: it removes the same things and finds nothing,
+    # which is cheaper than two teardown paths kept in agreement by hand.
+    k8s.core_api.delete_namespace.assert_awaited_once_with(name="tenant-demo")
+
+
+@pytest.mark.asyncio
+async def test_a_described_tenant_is_deletable_with_no_namespace_left(
+    request_obj: SimpleNamespace, k8s: MagicMock,
+) -> None:
+    """Ownership is the object. A tenant whose namespace the operator has
+    already removed must not answer 404 to the button that removes it."""
+    k8s.core_api.read_namespace = AsyncMock(
+        side_effect=ApiException(status=404, reason="Not Found"),
+    )
+    k8s.custom_api.delete_cluster_custom_object = AsyncMock()
+    k8s.custom_api.get_cluster_custom_object = AsyncMock(
+        side_effect=ApiException(status=404, reason="Not Found"),
+    )
+
+    await tenants_crud.delete_tenant(request_obj, "demo", user=_admin_user())
+
+    k8s.custom_api.delete_cluster_custom_object.assert_awaited_once()

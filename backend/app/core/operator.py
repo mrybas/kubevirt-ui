@@ -94,6 +94,41 @@ def network_path_enabled() -> bool:
     return _enabled("OPERATOR_NETWORK_ENABLED")
 
 
+def tenant_path_enabled() -> bool:
+    """True when creating a tenant writes a ManagedTenant and stops there.
+
+    Off: the endpoint builds the tenant itself — namespace, quota, PKI, golden
+    image, CAPI objects, transit, addons — in one request handler, and whatever
+    it did not finish is not finished by anybody. That is not a theory: a tenant
+    created here lost the race with its own transit EIP getting an address, the
+    handler logged "ACLs deferred to the next reconcile", and there is no
+    reconcile — `_wire_tenant_to_transit` has exactly one caller and it is
+    create. The workers dialled a control plane an ACL was dropping, forever,
+    and every condition the product shows stayed green.
+    On: the same description goes into one object and the operator builds it,
+    every pass, from a watch. A step that loses a race is retried instead of
+    logged.
+
+    The three narrower tenant flags stay meaningful and are not implied by this
+    one. They decide who writes *parts* of a tenant that already exists — its
+    bootstrap CA, its clock, its addons — and a half-migrated cluster is exactly
+    the state they exist to make workable. This one decides who builds a new
+    one.
+
+    **New tenants only.** The ones that exist are untouched and stay the
+    product's: ownership is the ManagedTenant object, so a tenant the operator
+    has no object for is still built and repaired here. Turning this off orphans
+    nothing, turning it on rewrites nothing, and there is no cutover day.
+
+    What the object cannot say, this path refuses rather than drops. The wizard
+    collects more than `ManagedTenantSpec` has fields for — a worker image URL,
+    DNS servers, OIDC group names — and a request carrying one of them would
+    otherwise be accepted, described without it, and built into a tenant that
+    silently differs from what was asked for. See `_undescribable_fields`.
+    """
+    return _enabled("OPERATOR_TENANT_ENABLED")
+
+
 def tenant_bootstrap_path_enabled() -> bool:
     """True when the operator repairs worker bootstrap templates.
 

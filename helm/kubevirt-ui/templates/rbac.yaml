@@ -148,13 +148,20 @@ rules:
     verbs: ["get", "list", "create", "delete"]
 
   # A tenant's addons are described, not written: the Enable button edits this
-  # object and the operator renders the releases. No create — a tenant becomes
-  # described by being adopted, which is a deliberate act, not a side effect of
-  # pressing Enable on a tenant the operator has never seen.
+  # object and the operator renders the releases.
+  #
+  # `create` and `delete` are here for OPERATOR_TENANT_ENABLED, and only for
+  # it. The rule they replace had neither, on the reasoning that a tenant
+  # becomes described by being adopted and adoption is a deliberate act rather
+  # than a side effect of pressing Enable. That still holds for Enable — it
+  # patches, and patching a tenant that does not exist fails. What changed is
+  # that describing a *new* tenant became a deliberate act too, behind a flag
+  # that is off by default. `delete` is not gated by that flag at all: a tenant
+  # the operator holds must stay deletable after it is turned off again.
   - apiGroups: ["platform.kubevirt-ui.io"]
     resources:
       - managedtenants
-    verbs: ["get", "patch"]
+    verbs: ["get", "list", "create", "patch", "delete"]
 
   # -----------------------------------------------------------------------
   # Core resources

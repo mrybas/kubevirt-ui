@@ -131,6 +131,27 @@ backend:
     # Running it in both places is not dangerous (create-if-absent and a patch
     # to the same value) but it is two writers of one thing, so the order is the
     # usual one: this flag on first, then the operator's tenant domain.
+    # -- Create tenants by describing them: the endpoint writes one
+    # ManagedTenant and the operator builds it. Empty/false → the request
+    # handler builds the whole tenant itself, in one pass, and whatever it does
+    # not finish is not finished by anybody.
+    #
+    # That is the failure this moves. A tenant created by the handler lost the
+    # race with its own transit EIP getting an address; the handler logged
+    # "ACLs deferred to the next reconcile" and there is no reconcile — the
+    # transit wiring has exactly one caller and it is create. Its workers
+    # dialled a control plane an ACL was dropping, indefinitely, while every
+    # condition the product shows stayed green.
+    #
+    # New tenants only. The ones that exist are untouched and stay the
+    # product's — ownership is the ManagedTenant object — so turning this on
+    # rewrites nothing and turning it off orphans nothing.
+    #
+    # The wizard collects more than ManagedTenant has fields for (worker image,
+    # tenant DNS, OIDC group names). With this on, a request carrying one of
+    # them is refused and the field is named, rather than accepted and built
+    # without it.
+    OPERATOR_TENANT_ENABLED: ""
     OPERATOR_TENANT_BOOTSTRAP_ENABLED: ""
     # -- Hand the tenant's time source to the operator. Off, the backend writes
     # the shared chrony Deployment and ConfigMap and the per-tenant NTP Service
