@@ -211,9 +211,18 @@ jobs:
 
       - name: Backend suite
         working-directory: backend
+        # In a venv, because the runner ships its own copy of some of these and
+        # pip leaves a satisfied requirement alone. The first run of this job
+        # failed on two certificate tests for exactly that: the image installs
+        # cryptography 50 from a clean environment, the runner already had a
+        # version predating `not_valid_after_utc`, and nothing asked it to move.
+        # The suite has to run against what the image has, not what the machine
+        # happened to bring.
         run: |
-          python3 -m pip install --quiet -r requirements.txt -r requirements-dev.txt
-          python3 -m pytest -q
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -r requirements.txt -r requirements-dev.txt
+          .venv/bin/python -m pytest -q
 
   # ---------------------------------------------------------------------------
   # Package and push Helm chart to OCI registry
