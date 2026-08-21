@@ -65,17 +65,35 @@ type TenantWorkers struct {
 
 // TenantStorage is the allowance for workloads inside the tenant.
 type TenantStorage struct {
-	// +kubebuilder:validation:Minimum=1
+	// AllowanceGi is what the tenant's own workloads may provision, on top of
+	// the disks its machines need.
+	//
+	// **Zero means none**, and that is a real answer rather than a missing one:
+	// a tenant whose storage was never wired has no driver to create a volume
+	// with, and giving it an allowance charges its folder for capacity nothing
+	// can use. Found by adopting the second live tenant — the first had storage
+	// and never asked the question.
+	// A pointer, and that is the whole point: with a plain int32 and
+	// `omitempty`, zero is indistinguishable from absent and the API server
+	// applies the default — so "none" could not be said at all. Absent still
+	// means the default; zero now means zero.
+	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=10000
 	// +kubebuilder:default=100
 	// +optional
-	AllowanceGi int32 `json:"allowanceGi,omitempty"`
+	AllowanceGi *int32 `json:"allowanceGi,omitempty"`
 
-	// +kubebuilder:validation:Minimum=1
+	// PVCCount caps how many volumes the tenant's workloads may hold.
+	//
+	// Zero means no cap is written at all, which is not the same as a cap of
+	// zero: the workers' own root disks are claims in this namespace, and a cap
+	// of zero would refuse them and leave the tenant unable to replace a node.
+	// A pointer for the same reason as the allowance above.
+	// +kubebuilder:validation:Minimum=0
 	// +kubebuilder:validation:Maximum=200
 	// +kubebuilder:default=20
 	// +optional
-	PVCCount int32 `json:"pvcCount,omitempty"`
+	PVCCount *int32 `json:"pvcCount,omitempty"`
 
 	// ClassName is the StorageClass a worker's root clone lands on, and the one
 	// the tenant's own volumes use. Empty means the cluster default.

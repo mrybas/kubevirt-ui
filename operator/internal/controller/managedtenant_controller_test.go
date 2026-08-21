@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 	"github.com/mrybas/kubevirt-ui/operator/internal/tenant"
@@ -79,7 +80,7 @@ func plainTenant(name string) *platformv1alpha1.ManagedTenant {
 			Workers: platformv1alpha1.TenantWorkers{
 				Count: 2, VCPU: 2, Memory: "2Gi", Disk: "20Gi", OS: "cloud-init",
 			},
-			Storage: platformv1alpha1.TenantStorage{AllowanceGi: 100, PVCCount: 20},
+			Storage: platformv1alpha1.TenantStorage{AllowanceGi: ptr.To[int32](100), PVCCount: ptr.To[int32](20)},
 		},
 	}
 }
@@ -372,6 +373,40 @@ func TestANamespaceTheOldVersionPinnedIsHealed(t *testing.T) {
 		}
 		if live.Annotations["ovn.kubernetes.io/logical_switch"] != "ovn-default" {
 			return fmt.Errorf("annotations = %v", live.Annotations)
+		}
+		return nil
+	})
+}
+
+// TestATenantWithoutStorageIsChargedForNone.
+//
+// Found by adopting the second live tenant. The first had storage and never
+// asked the question; this one has no driver, no credential and no volumes, and
+// the field's default would have charged its folder for a hundred gigabytes
+// nothing could use.
+//
+// Zero is an answer. And a PVC cap of zero is not the way to say it — the
+// workers' root disks are claims in this namespace, so a cap of zero refuses
+// them and the tenant cannot replace a node.
+func TestATenantWithoutStorageIsChargedForNone(t *testing.T) {
+	obj := talosTenant("tnostore")
+	obj.Spec.Storage = platformv1alpha1.TenantStorage{AllowanceGi: ptr.To[int32](0), PVCCount: ptr.To[int32](0)}
+	mustTenant(t, obj)
+
+	eventually(t, "the quota", func() error {
+		quota, err := readQuota("tenant-tnostore-quota", "tenant-tnostore")
+		if err != nil {
+			return err
+		}
+		storage := quota.Spec.Hard[corev1.ResourceRequestsStorage]
+		// The root clones and nothing else.
+		want := resource.NewQuantity(3*int64(20<<30), resource.BinarySI)
+		if storage.Cmp(*want) != 0 {
+			return fmt.Errorf("storage = %s, want %s", storage.String(), want.String())
+		}
+		if _, capped := quota.Spec.Hard[corev1.ResourcePersistentVolumeClaims]; capped {
+			return fmt.Errorf("it wrote a claim cap of zero, which refuses the " +
+				"workers' own root disks")
 		}
 		return nil
 	})

@@ -551,9 +551,9 @@ func (r *ManagedTenantReconciler) ensureQuota(
 		// The PVC count lives here too, rather than in a second object — but
 		// only when there is no second object. Two caps on the same counter is
 		// the thing being undone, not something to add another instance of.
-		if ownsPVCCount {
+		if count := pvcCountOf(obj); ownsPVCCount && count > 0 {
 			live.Spec.Hard[corev1.ResourcePersistentVolumeClaims] =
-				*resource.NewQuantity(int64(pvcCountOf(obj)), resource.DecimalSI)
+				*resource.NewQuantity(int64(count), resource.DecimalSI)
 		}
 		return nil
 	})
@@ -593,20 +593,37 @@ func (r *ManagedTenantReconciler) redundantStorageQuotas(
 	return out, nil
 }
 
+// storageAllowanceOf is what the tenant's own workloads may provision.
+//
+// Zero is an answer, not a missing value: a tenant whose storage was never
+// wired has no driver to make a volume with, and an allowance charges its
+// folder for capacity nothing can use. The CRD defaults the field to 100, so
+// saying none takes writing it.
 func storageAllowanceOf(obj *platformv1alpha1.ManagedTenant) int64 {
-	allowance := obj.Spec.Storage.AllowanceGi
-	if allowance == 0 {
-		allowance = 100
+	if obj.Spec.Storage.AllowanceGi == nil {
+		return int64(defaultAllowanceGi) << 30
 	}
-	return int64(allowance) << 30
+	return int64(*obj.Spec.Storage.AllowanceGi) << 30
 }
 
+// pvcCountOf is the cap, and zero means write none at all.
+//
+// Not the same as a cap of zero, which would be a different and much worse
+// thing: the workers' root disks are claims in this namespace, and refusing
+// them leaves the tenant unable to replace a node.
 func pvcCountOf(obj *platformv1alpha1.ManagedTenant) int32 {
-	if obj.Spec.Storage.PVCCount == 0 {
-		return 20
+	if obj.Spec.Storage.PVCCount == nil {
+		return defaultPVCCount
 	}
-	return obj.Spec.Storage.PVCCount
+	return *obj.Spec.Storage.PVCCount
 }
+
+// The CRD carries these as defaults too; they are here for an object that
+// reached this process without passing through admission.
+const (
+	defaultAllowanceGi = 100
+	defaultPVCCount    = 20
+)
 
 func (r *ManagedTenantReconciler) setTenantCondition(
 	obj *platformv1alpha1.ManagedTenant, kind string, ok bool, reason, message string,

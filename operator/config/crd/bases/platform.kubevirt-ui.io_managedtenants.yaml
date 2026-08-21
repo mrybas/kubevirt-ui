@@ -155,9 +155,22 @@ spec:
                 properties:
                   allowanceGi:
                     default: 100
+                    description: |-
+                      AllowanceGi is what the tenant's own workloads may provision, on top of
+                      the disks its machines need.
+
+                      **Zero means none**, and that is a real answer rather than a missing one:
+                      a tenant whose storage was never wired has no driver to create a volume
+                      with, and giving it an allowance charges its folder for capacity nothing
+                      can use. Found by adopting the second live tenant — the first had storage
+                      and never asked the question.
+                      A pointer, and that is the whole point: with a plain int32 and
+                      `omitempty`, zero is indistinguishable from absent and the API server
+                      applies the default — so "none" could not be said at all. Absent still
+                      means the default; zero now means zero.
                     format: int32
                     maximum: 10000
-                    minimum: 1
+                    minimum: 0
                     type: integer
                   className:
                     description: |-
@@ -172,9 +185,16 @@ spec:
                     type: string
                   pvcCount:
                     default: 20
+                    description: |-
+                      PVCCount caps how many volumes the tenant's workloads may hold.
+
+                      Zero means no cap is written at all, which is not the same as a cap of
+                      zero: the workers' own root disks are claims in this namespace, and a cap
+                      of zero would refuse them and leave the tenant unable to replace a node.
+                      A pointer for the same reason as the allowance above.
                     format: int32
                     maximum: 200
-                    minimum: 1
+                    minimum: 0
                     type: integer
                 type: object
               workers:
