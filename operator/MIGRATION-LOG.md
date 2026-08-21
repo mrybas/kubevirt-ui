@@ -3281,3 +3281,40 @@ them. And the chart-sync guard was briefly written in pytest, where it passed
 vacuously — the backend's test container mounts only `backend/` and cannot see
 the chart at all. It is a Go package now, one implementation behind both the
 command that writes and the test that refuses a diff.
+
+## The chart, checked against a real API server
+
+`helm template` proves the chart renders; it does not prove a cluster will take
+it. So the seventeen operator objects went through the API server as a
+server-side dry-run apply, and all seventeen were accepted: nine CRDs, the
+manager ClusterRole and its binding, the leader-election Role and binding, the
+service account, and the three domain Deployments. Without the site facts the
+chart still refuses to render at all, by name and with the reason.
+
+### What the dry run found, none of it the operator's
+
+Two things stand between this particular cluster and `helm install`, and both
+are artefacts of how it got here rather than defects in the chart. A fresh
+cluster — the case the packaging is for — has neither.
+
+**Nine CRDs and three ClusterRoles that Helm may not touch.** The CRDs were
+applied by kustomize during the operator's dev cycle; the three
+`kubevirt-ui-tenant-*` roles were applied by hand from chart 0.1.0 and carry the
+Helm *labels*, which is what makes it confusing, but not the ownership
+annotations. Helm refuses to manage an object it did not create, and the refusal
+is the whole install — the first unadopted object stops everything.
+
+Worth stating plainly: **`helm upgrade` of the live release fails today**, before
+any of this work, for exactly that reason. It has presumably been true since
+somebody ran `kubectl apply` on those roles.
+
+`hack/adopt-into-helm.sh` writes the ownership metadata and nothing else, and
+prints what it would do unless asked to do it. Deleting the CRDs — the other way
+to make Helm happy — would cascade-delete every tenant, network and VM described
+by them.
+
+**And the chart is not published for a branch.** The CI job that packages it is
+deliberately skipped outside a release tag, with a comment saying why: the dev
+operator is deployed with kustomize, so a branch build must not publish a chart
+version. That is still right, and it means the rebuild waits on a release rather
+than on the packaging.
