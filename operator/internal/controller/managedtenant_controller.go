@@ -119,7 +119,10 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
-// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
+// The write half is new with the host-API publication: a Service with no
+// selector has no endpoints unless somebody writes them, and the somebody is
+// this controller mirroring the host apiserver's own record.
 // +kubebuilder:rbac:groups=helm.toolkit.fluxcd.io,resources=helmreleases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machinehealthchecks;machinedeployments,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=talosconfigtemplates,verbs=get;list;watch;create
@@ -314,7 +317,7 @@ func (r *ManagedTenantReconciler) Reconcile(
 	// Before the workers: their config names the address they will dial, and
 	// this is what makes that address reachable from inside the VPC.
 	transitReady, transitReason, transitMessage, err := r.reconcileTransit(
-		ctx, obj, obj.Status.ControlPlaneVIP)
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP)
 	if err != nil {
 		apimeta.SetStatusCondition(&obj.Status.Conditions,
 			transitCondition(false, "WriteFailed", err.Error()))
@@ -346,7 +349,7 @@ func (r *ManagedTenantReconciler) Reconcile(
 	// Last, and against a different API server: what goes here can only be
 	// placed once the tenant's own control plane answers.
 	insideReady, insideReason, insideMessage, err := r.reconcileInsideTheTenant(
-		ctx, obj, namespace)
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP)
 	if err != nil {
 		apimeta.SetStatusCondition(&obj.Status.Conditions,
 			insideCondition(false, "WriteFailed", err.Error()))

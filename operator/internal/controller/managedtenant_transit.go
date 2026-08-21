@@ -58,7 +58,7 @@ var ovnSnatGVK = schema.GroupVersionKind{
 // falling over takes the internet with it and leaves the control plane — and
 // the CSI path to the host API, which rides the same leg — untouched.
 func (r *ManagedTenantReconciler) reconcileTransit(
-	ctx context.Context, obj *platformv1alpha1.ManagedTenant, vip string,
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace, vip string,
 ) (ready bool, reason, message string, err error) {
 	if obj.Spec.Network == "" || vip == "" {
 		// A tenant on the default overlay reaches its control plane by
@@ -107,7 +107,18 @@ func (r *ManagedTenantReconciler) reconcileTransit(
 			"waiting for kube-ovn to give %s an address on %s", obj.Name, subnetName), nil
 	}
 
-	unprotected, err := r.ensureTransitACLs(ctx, obj, subnetName, transitCIDR, address, vip)
+	// Publish before the guard is written, so the port and the thing behind it
+	// arrive in one pass. The other order leaves a hole in the whitelist for a
+	// service that is not there yet, which is the harmless-looking half of
+	// "published but unreachable" — and its twin, an open port with nothing
+	// listening, is how a plane quietly stops meaning what it says.
+	hostAPI, hostAPIMessage, err := r.ensureHostAPI(ctx, obj, namespace, vip)
+	if err != nil {
+		return false, "", "", err
+	}
+
+	unprotected, err := r.ensureTransitACLs(
+		ctx, obj, namespace, subnetName, transitCIDR, address, vip)
 	if err != nil {
 		return false, "", "", err
 	}
@@ -120,7 +131,15 @@ func (r *ManagedTenantReconciler) reconcileTransit(
 				"addresses here with no allow, and writing it would drop them.",
 			obj.Name, address, subnetName, strings.Join(unprotected, ", ")), nil
 	}
-	return true, "Wired", fmt.Sprintf("%s leaves under %s on %s", obj.Name, address, subnetName), nil
+	wired := fmt.Sprintf("%s leaves under %s on %s", obj.Name, address, subnetName)
+	if hostAPI {
+		// Named in the status because it is the answer to "why can this tenant
+		// still attach a volume with the border down".
+		wired += fmt.Sprintf("; host API on %s", hostAPIMessage)
+	} else if hostAPIMessage != "" {
+		return true, "WiredWithoutStorage", wired + "; " + hostAPIMessage, nil
+	}
+	return true, "Wired", wired, nil
 }
 
 // attachToTransit gives the VPC a router port on the plane, with its guard.
@@ -480,11 +499,21 @@ func (r *ManagedTenantReconciler) deleteIfPresent(
 // inherits a permit to somebody else's control-plane ports.
 func (r *ManagedTenantReconciler) ensureTransitACLs(
 	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
-	subnetName, transitCIDR, address, vip string,
+	namespace, subnetName, transitCIDR, address, vip string,
 ) (unprotected []string, err error) {
 	tcp := []int{tenantAPIPort, tenantKonnPort}
 	if obj.Spec.Workers.OS == "talos" {
 		tcp = append(tcp, tenantTrustdPort)
+	}
+	// Opened only for a tenant that has the driver's credential, because the
+	// guard is a whitelist and every port in it is reach somebody has. The
+	// publication itself follows the same fact — see ensureHostAPI — so the
+	// port and the thing behind it appear and disappear together, rather than
+	// one outliving the other.
+	if published, err := r.hostAPIPublished(ctx, obj, namespace); err != nil {
+		return nil, err
+	} else if published {
+		tcp = append(tcp, hostAPIPort)
 	}
 	wanted := transit.Allows(address, vip, tcp, []int{ntpPort})
 

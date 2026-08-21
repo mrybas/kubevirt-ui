@@ -82,7 +82,7 @@ func TestTheKubeletCredentialIsPlacedInsideTheTenant(t *testing.T) {
 		TenantClient: cluster.open,
 	}
 	ready, reason, message, err := reconciler.reconcileInsideTheTenant(
-		testCtx, talosTenant("tin1"), "tenant-tin1")
+		testCtx, talosTenant("tin1"), "tenant-tin1", "")
 	if err != nil {
 		t.Fatalf("reconcileInsideTheTenant: %v", err)
 	}
@@ -112,7 +112,7 @@ func TestTheKubeletCredentialIsPlacedInsideTheTenant(t *testing.T) {
 	// the credential every worker already holds.
 	before := placed.ResourceVersion
 	if _, _, _, err := reconciler.reconcileInsideTheTenant(
-		testCtx, talosTenant("tin1"), "tenant-tin1"); err != nil {
+		testCtx, talosTenant("tin1"), "tenant-tin1", ""); err != nil {
 		t.Fatalf("second pass: %v", err)
 	}
 	after := &corev1.Secret{}
@@ -140,7 +140,7 @@ func TestAColdControlPlaneIsWaitedForRatherThanFailed(t *testing.T) {
 		TenantClient: cluster.open,
 	}
 	ready, reason, _, err := reconciler.reconcileInsideTheTenant(
-		testCtx, talosTenant("tin2"), "tenant-tin2")
+		testCtx, talosTenant("tin2"), "tenant-tin2", "")
 	if err != nil {
 		t.Fatalf("a cold control plane was reported as our error: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestAMalformedTokenIsRefusedRatherThanRetried(t *testing.T) {
 		TenantClient: cluster.open,
 	}
 	ready, reason, _, err := reconciler.reconcileInsideTheTenant(
-		testCtx, talosTenant("tin3"), "tenant-tin3")
+		testCtx, talosTenant("tin3"), "tenant-tin3", "")
 	if err != nil {
 		t.Fatalf("reconcileInsideTheTenant: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestACloudInitTenantNeedsNothingPlaced(t *testing.T) {
 		Client: k8sClient, Scheme: k8sClient.Scheme(), TenantClient: cluster.open,
 	}
 	ready, _, _, err := reconciler.reconcileInsideTheTenant(
-		testCtx, plainTenant("tin4"), "tenant-tin4")
+		testCtx, plainTenant("tin4"), "tenant-tin4", "")
 	if err != nil || !ready {
 		t.Fatalf("ready=%v err=%v", ready, err)
 	}
@@ -223,7 +223,7 @@ func TestOneSilentTenantDoesNotHoldTheRest(t *testing.T) {
 
 	start := time.Now()
 	ready, reason, message, err := reconciler.reconcileInsideTheTenant(
-		testCtx, talosTenant("tin5"), "tenant-tin5")
+		testCtx, talosTenant("tin5"), "tenant-tin5", "")
 	waited := time.Since(start)
 
 	if err != nil {
@@ -268,7 +268,7 @@ func TestTheStorageCredentialIsKeptInStepRatherThanWrittenOnce(t *testing.T) {
 		TenantClient: cluster.open,
 	}
 	if _, _, _, err := reconciler.reconcileInsideTheTenant(
-		testCtx, talosTenant("tin6"), "tenant-tin6"); err != nil {
+		testCtx, talosTenant("tin6"), "tenant-tin6", ""); err != nil {
 		t.Fatalf("reconcileInsideTheTenant: %v", err)
 	}
 
@@ -294,7 +294,7 @@ func TestTheStorageCredentialIsKeptInStepRatherThanWrittenOnce(t *testing.T) {
 		t.Fatalf("rotating it: %v", err)
 	}
 	if _, _, _, err := reconciler.reconcileInsideTheTenant(
-		testCtx, talosTenant("tin6"), "tenant-tin6"); err != nil {
+		testCtx, talosTenant("tin6"), "tenant-tin6", ""); err != nil {
 		t.Fatalf("second pass: %v", err)
 	}
 	if err := cluster.client.Get(testCtx, types.NamespacedName{
@@ -309,7 +309,7 @@ func TestTheStorageCredentialIsKeptInStepRatherThanWrittenOnce(t *testing.T) {
 	// Unchanged is not rewritten: this runs every pass.
 	before := copied.ResourceVersion
 	if _, _, _, err := reconciler.reconcileInsideTheTenant(
-		testCtx, talosTenant("tin6"), "tenant-tin6"); err != nil {
+		testCtx, talosTenant("tin6"), "tenant-tin6", ""); err != nil {
 		t.Fatalf("third pass: %v", err)
 	}
 	if err := cluster.client.Get(testCtx, types.NamespacedName{
@@ -335,7 +335,7 @@ func TestATenantWithoutStorageIsNotGivenACredential(t *testing.T) {
 		TenantClient: cluster.open,
 	}
 	ready, reason, message, err := reconciler.reconcileInsideTheTenant(
-		testCtx, talosTenant("tin7"), "tenant-tin7")
+		testCtx, talosTenant("tin7"), "tenant-tin7", "")
 	if err != nil || !ready {
 		t.Fatalf("ready=%v reason=%s %s err=%v", ready, reason, message, err)
 	}

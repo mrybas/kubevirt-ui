@@ -289,7 +289,7 @@ func TestTheGuardRulesLandOnTheTransitSubnet(t *testing.T) {
 
 	mustEIP(t, "cpt-eip-trd", "transit-d", "10.199.1.31")
 	for pass := 1; pass <= 2; pass++ {
-		if _, err := reconciler.ensureTransitACLs(testCtx, obj, "transit-d",
+		if _, err := reconciler.ensureTransitACLs(testCtx, obj, "tenant-trd", "transit-d",
 			"10.199.0.0/22", "10.199.1.31", "10.199.0.103"); err != nil {
 			t.Fatalf("pass %d: %v", pass, err)
 		}
@@ -409,7 +409,7 @@ func TestARuleWedgedByAMissingAddressIsReleased(t *testing.T) {
 // control plane is a ClusterIP.
 func TestATenantOnTheDefaultOverlayCrossesNoPlane(t *testing.T) {
 	ready, _, _, err := transitReconciler("transit-a").reconcileTransit(
-		testCtx, plainTenant("trf"), "")
+		testCtx, plainTenant("trf"), "tenant-trf", "")
 	if err != nil {
 		t.Fatalf("reconcileTransit: %v", err)
 	}
@@ -443,7 +443,7 @@ func TestTheBaselineIsWithheldWhileItWouldSilenceSomebody(t *testing.T) {
 	obj.Spec.Network = "net-trg"
 	reconciler := transitReconciler("transit-g")
 
-	unprotected, err := reconciler.ensureTransitACLs(testCtx, obj, "transit-g",
+	unprotected, err := reconciler.ensureTransitACLs(testCtx, obj, "tenant-trg", "transit-g",
 		"10.199.0.0/22", "10.199.1.41", "10.199.0.104")
 	if err != nil {
 		t.Fatalf("ensureTransitACLs: %v", err)
@@ -489,7 +489,7 @@ func TestTheBaselineIsWithheldWhileItWouldSilenceSomebody(t *testing.T) {
 		t.Fatalf("granting the stranger: %v", err)
 	}
 
-	unprotected, err = reconciler.ensureTransitACLs(testCtx, obj, "transit-g",
+	unprotected, err = reconciler.ensureTransitACLs(testCtx, obj, "tenant-trg", "transit-g",
 		"10.199.0.0/22", "10.199.1.41", "10.199.0.104")
 	if err != nil {
 		t.Fatalf("ensureTransitACLs: %v", err)
@@ -589,7 +589,7 @@ func TestAStrangerWithAServiceIsWrittenForRatherThanWaitedOn(t *testing.T) {
 	obj := vpcTalosTenant("tri")
 	obj.Spec.Network = "net-tri"
 	unprotected, err := transitReconciler("transit-i").ensureTransitACLs(
-		testCtx, obj, "transit-i", "10.199.0.0/22", "10.199.1.61", "10.199.0.202")
+		testCtx, obj, "tenant-tri", "transit-i", "10.199.0.0/22", "10.199.1.61", "10.199.0.202")
 	if err != nil {
 		t.Fatalf("ensureTransitACLs: %v", err)
 	}

@@ -46,7 +46,7 @@ type TenantClientFor func(ctx context.Context, kubeconfig []byte) (client.Client
 // is why it is a phase of its own rather than part of the create path. The
 // product does the same from a timer, for the same reason.
 func (r *ManagedTenantReconciler) reconcileInsideTheTenant(
-	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace string,
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace, vip string,
 ) (ready bool, reason, message string, err error) {
 	if obj.Spec.Workers.OS != "talos" {
 		// A cloud-init worker gets its bootstrap credential from kubeadm, which
@@ -98,7 +98,7 @@ func (r *ManagedTenantReconciler) reconcileInsideTheTenant(
 	// and the kubelet both report healthy, and the cluster has no node at all,
 	// because the kubelet's TLS bootstrap has nothing to authenticate with and
 	// never files a CSR.
-	if err := r.replicateCSICredential(ctx, obj, namespace, tenantClient); err != nil {
+	if err := r.replicateCSICredential(ctx, obj, namespace, vip, tenantClient); err != nil {
 		return false, "TenantUnreachable", fmt.Sprintf(
 			"could not put the storage credential in the tenant: %v", err), nil
 	}
@@ -155,7 +155,7 @@ func (r *ManagedTenantReconciler) reconcileInsideTheTenant(
 // has one, and the storage path creates it when there is storage to wire.
 func (r *ManagedTenantReconciler) replicateCSICredential(
 	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
-	namespace string, tenantClient client.Client,
+	namespace, vip string, tenantClient client.Client,
 ) error {
 	source := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{
@@ -170,9 +170,16 @@ func (r *ManagedTenantReconciler) replicateCSICredential(
 	if len(payload) == 0 {
 		return nil
 	}
+	// The copy inside the tenant reaches the host apiserver over the transit
+	// plane, not through the border — see managedtenant_hostapi.go. The host
+	// secret keeps its own address.
+	payload, err := throughTheTransitPlane(payload, vip)
+	if err != nil {
+		return err
+	}
 
 	copied := &corev1.Secret{}
-	err := tenantClient.Get(ctx, types.NamespacedName{
+	err = tenantClient.Get(ctx, types.NamespacedName{
 		Namespace: "kube-system", Name: csiCredentialSecret,
 	}, copied)
 	switch {
