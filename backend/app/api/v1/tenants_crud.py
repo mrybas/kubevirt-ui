@@ -1824,6 +1824,25 @@ async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
 async def create_tenant(request: Request, req: TenantCreateRequest, user: User = Depends(require_auth)) -> TenantResponse:
     """Create a new tenant cluster."""
     k8s = request.app.state.k8s_client
+
+    # One kind of worker is built now, and the wizard offers one. Refused here
+    # as well, because a choice taken off a screen is not a choice taken out of
+    # an API — and because the far end is patient about it: the operator answers
+    # `CloudInitNotMigrated` and waits, which presents as a tenant whose
+    # machines never join, with the reason on an object nobody is watching.
+    #
+    # The tenants that already run this way keep running: reading, scaling and
+    # deleting them all still know how. It is creating another that stops.
+    if req.worker_os != "talos":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"worker_os {req.worker_os!r} is no longer built. Talos workers "
+                f"are the only kind this deployment creates — the operator "
+                f"builds those, and a cloud-init pool would sit unbuilt. "
+                f"Existing cloud-init tenants are unaffected."
+            ),
+        )
     await _ensure_cluster_config(k8s)
     ns = _tenant_ns(req.name)
 
