@@ -543,3 +543,110 @@ def test_the_b3_role_and_the_backend_env_name_one_namespace() -> None:
         "the env must be skipped when backend.env already carries it, or the "
         "container gets two entries of the same name"
     )
+
+
+# ---------------------------------------------------------------------------
+# The other half: everything the code calls, not only what somebody remembered
+# ---------------------------------------------------------------------------
+#
+# REQUIRED is a curated list — each row says who calls it and why it matters.
+# The scan above closes the loop for the operator's own group, and only that
+# group, because it keys on the `managed` prefix in the plural.
+#
+# That blind spot is where a real hole lived: the BGP page reads
+# `bgpsessionstates` and `frrnodestates`, the chart granted neither, and both
+# refusals were swallowed — one `logger.debug`, one bare `continue` — so a 403
+# reached the user as "No session state reported yet", a fact about the cluster
+# rather than an error. The chart did grant `frrconfigurations`: permission to
+# write the config and none to read the result.
+#
+# This asks the whole question instead: for every custom-resource call in the
+# backend, is there a rule that allows it? No table to keep in step — the code
+# is the input.
+
+_GROUP_ARG = re.compile(
+    r"group\s*=\s*(?:\"(?P<literal>[a-z0-9.\-]+)\"|(?P<constant>[A-Za-z_][A-Za-z_0-9]*))"
+)
+
+# Call sites whose group or plural is computed at run time. Named one by one,
+# with the reason, because "the scan could not read it" and "the scan found
+# nothing to read" must not look the same.
+_DYNAMIC_CALL_SITES = {
+    ("?", "?"): "velero and cert-manager plurals chosen by the caller",
+    ("?", "virtualmachines"): "group from a module constant built per call",
+    ("cert-manager.io", "?"): "certificates and issuers through one helper",
+    ("kubeovn.io", "?"): "the underlay helper takes the plural as an argument",
+    ("velero.io", "?"): "backup and restore through one helper",
+}
+
+
+def _all_rbac_rules() -> list[dict]:
+    """Every rule the chart grants, from the ClusterRole and the Roles alike.
+
+    Both, because `bgpsessionstates` is namespaced and lives in a Role — read
+    only the ClusterRole and the hole this test exists for stays invisible.
+    """
+    rules: list[dict] = []
+    for doc in _chart_documents():
+        if doc.get("kind") in ("ClusterRole", "Role"):
+            rules.extend(doc.get("rules") or [])
+    return rules
+
+
+def _custom_resource_calls() -> set[tuple[str, str, str]]:
+    """(group, resource, verb) for every custom-object call in the backend."""
+    app = Path(__file__).resolve().parent.parent / "app"
+    sources = {path: path.read_text() for path in app.rglob("*.py")}
+
+    constants: dict[str, str] = {}
+    for text in sources.values():
+        for name, value in re.findall(
+            r"^([A-Z][A-Z_0-9]*)\s*=\s*\"([a-z0-9.\-]+)\"", text, re.M
+        ):
+            constants[name] = value
+
+    found: set[tuple[str, str, str]] = set()
+    for text in sources.values():
+        for call in _CUSTOM_CALL.finditer(text):
+            args = call.group("args")
+            plural = _PLURAL_ARG.search(args)
+            if plural is None:
+                continue
+            group_arg = _GROUP_ARG.search(args)
+            group = "?"
+            if group_arg is not None:
+                group = (group_arg.group("literal")
+                         or constants.get(group_arg.group("constant") or "", "?"))
+            resource = (plural.group("literal")
+                        or constants.get(plural.group("constant") or "", "?"))
+            found.add((group, resource, _VERB_OF[call.group("verb")]))
+    return found
+
+
+def test_the_chart_grants_every_custom_resource_call() -> None:
+    rules = _all_rbac_rules()
+    calls = _custom_resource_calls()
+    assert len(calls) > 100, f"the scan found only {len(calls)} calls — it is broken"
+
+    ungranted = sorted(
+        (group, resource, verb) for group, resource, verb in calls
+        if (group, resource) not in _DYNAMIC_CALL_SITES
+        and not _granted(rules, group, resource, verb)
+    )
+    assert not ungranted, (
+        "the backend makes these calls and the chart grants none of them — each "
+        "403s on a live cluster, and a swallowed 403 reads as an empty answer:\n  "
+        + "\n  ".join(f"{g}/{r}: {v}" for g, r, v in ungranted)
+    )
+
+
+def test_no_new_call_site_hides_behind_a_variable() -> None:
+    """A call whose group or plural the scan cannot read is not covered by the
+    test above, so the set of them is pinned. Growing it is a decision."""
+    calls = _custom_resource_calls()
+    unreadable = {(g, r) for g, r, _ in calls if g == "?" or r == "?"}
+    unexpected = unreadable - set(_DYNAMIC_CALL_SITES)
+    assert not unexpected, (
+        f"new call sites the scan cannot read: {sorted(unexpected)}. Either name "
+        "the group and plural literally, or add them above with the reason."
+    )

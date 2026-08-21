@@ -1252,15 +1252,11 @@ async def assert_cabpt_installed(k8s) -> None:
     """
     from fastapi import HTTPException
 
-    try:
-        await k8s.custom_api.list_cluster_custom_object(
-            group="apiextensions.k8s.io", version="v1", plural="customresourcedefinitions",
-            field_selector=f"metadata.name={CABPT_PLURAL}.{CABPT_GROUP}",
-        )
-    except ApiException:
-        # Listing CRDs may itself be forbidden; fall through to the direct
-        # probe below rather than failing on the diagnostic.
-        pass
+    # There was a CRD listing here that asked whether CABPT is installed and
+    # then threw the answer away — the result was never assigned, the failure
+    # was swallowed, and the probe below answers the same question two lines
+    # later. All it cost was a cluster-wide permission the chart never granted,
+    # so it 403'd on every call, invisibly. Found by the RBAC scan.
 
     try:
         await k8s.custom_api.list_namespaced_custom_object(

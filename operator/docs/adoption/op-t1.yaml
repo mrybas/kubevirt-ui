@@ -1,0 +1,34 @@
+# op-t1, described from the live objects.
+#
+# Adopted to unblock it: it was created through the product, lost the race with
+# its own transit EIP getting an address, and the message that said so —
+# "ACLs deferred to the next reconcile" — had no addressee. The product wires
+# transit exactly once, from create. The operator does it every pass.
+apiVersion: platform.kubevirt-ui.io/v1alpha1
+kind: ManagedTenant
+metadata:
+  name: op-t1
+spec:
+  displayName: Op T1
+  folder: poc-transit
+  environment: dev
+  kubernetesVersion: v1.33.5
+  controlPlaneReplicas: 2
+  network: op-net-b
+  podCIDR: 10.244.0.0/16
+  serviceCIDR: 10.112.0.0/12
+  enableOIDC: false
+  storage:
+    # The live root DataVolume names ceph-block, and a second quota
+    # (tenant-storage, 100Gi) already caps this namespace — so the machines-only
+    # rule applies and the allowance is what that other object grants, not this.
+    className: ceph-block
+    allowanceGi: 0
+    pvcCount: 0
+  workers:
+    count: 2
+    vcpu: 2
+    memory: 2Gi
+    disk: 20Gi
+    os: talos
+  addons: []
