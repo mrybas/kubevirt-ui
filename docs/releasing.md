@@ -51,8 +51,12 @@ helm install kubevirt-ui \
   --set operator.config.metallbNamespace=o0-metallb \
   --set operator.config.metallbPool=cp-transit-pool \
   --set operator.config.cpTransitSubnet=cp-transit \
-  --set operator.config.ingressDomain=tenants.lab.beardlabs.cc
+  --set operator.config.ingressDomain=tenants.lab.beardlabs.cc \
+  --set operator.config.tenantSupernet=10.200.0.0/14
 ```
+
+The supernet is the same fact the backend reads as `TENANT_SUPERNET`. Set it in
+one place; the chart refuses to render if both are set and disagree.
 
 On a **fresh** cluster that is the whole of it. On a cluster that ran the
 product before the chart carried the operator, Helm will refuse to manage

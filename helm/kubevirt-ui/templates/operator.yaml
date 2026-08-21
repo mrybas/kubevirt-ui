@@ -1,3 +1,48 @@
+{{- /*
+The tenant supernet is one fact with two readers: the backend has it as
+TENANT_SUPERNET and the operator takes it as a flag. Configured twice under two
+names, they drift, and the drift is silent on both sides — so the chart takes it
+once, accepts the backend's existing value as the source when only that is set,
+and refuses to render when the two are set and disagree.
+*/}}
+{{- $backendSupernet := get .Values.backend.env "TENANT_SUPERNET" | toString }}
+{{- $supernet := .Values.operator.config.tenantSupernet | default $backendSupernet }}
+{{- if and .Values.operator.config.tenantSupernet $backendSupernet }}
+{{- if ne .Values.operator.config.tenantSupernet $backendSupernet }}
+{{- fail (printf "operator.config.tenantSupernet is %q and backend.env.TENANT_SUPERNET is %q. One fact, two readers: they must agree, or the isolation the operator writes will not match the addresses the backend hands out." .Values.operator.config.tenantSupernet $backendSupernet) }}
+{{- end }}
+{{- end }}
+{{- /*
+A handover flag names a controller that has to be running. Turning one on while
+its domain is off — or while the operator is not installed at all — hands the
+work to nobody: the product stops writing, nothing takes over, and the symptom
+is a create that reports success and produces nothing. Refused here, where it is
+one line of output, rather than in a cluster where it is an investigation.
+*/}}
+{{- $needs := dict
+      "OPERATOR_IMAGE_ENABLED" "vm"
+      "OPERATOR_VM_ENABLED" "vm"
+      "OPERATOR_TEMPLATE_ENABLED" "vm"
+      "OPERATOR_NETWORK_ENABLED" "network"
+      "OPERATOR_ANNOUNCE_ENABLED" "network"
+      "OPERATOR_UNDERLAY_ENABLED" "network"
+      "OPERATOR_TENANT_BOOTSTRAP_ENABLED" "tenant"
+      "OPERATOR_TENANT_TIME_ENABLED" "tenant"
+      "OPERATOR_TENANT_ADDONS_ENABLED" "tenant" }}
+{{- range $flag, $domain := $needs }}
+{{- $asked := get $.Values.backend.env $flag | toString | lower }}
+{{- if or (eq $asked "true") (eq $asked "1") (eq $asked "yes") }}
+{{- if not $.Values.operator.enabled }}
+{{- fail (printf "%s is on and the operator is not installed. Set operator.enabled, or leave the path with the product." $flag) }}
+{{- end }}
+{{- if not (get $.Values.operator.domains $domain).enabled }}
+{{- fail (printf "%s hands its work to the %s domain, and operator.domains.%s.enabled is false. Nothing would take it over." $flag $domain $domain) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.operator.enabled .Values.operator.domains.network.enabled (not $supernet) }}
+{{- fail "operator.config.tenantSupernet is required by the network domain: without it no isolation is written at all, and a VPC comes up attached, routed, and open to every other tenant while the UI says it is isolated" }}
+{{- end }}
 {{- if .Values.operator.enabled }}
 {{- $top := . }}
 {{- $cfg := .Values.operator.config }}
@@ -96,6 +141,28 @@ spec:
             - --metrics-bind-address=:8080
             - --metrics-secure=false
             - --domains={{ $domain }}
+            {{- if eq $domain "network" }}
+            # The aggregate every tenant network is carved from. Empty means no
+            # isolation is written **at all** — one drop with nothing to scope it
+            # to would take the internet with it — so the network domain refuses
+            # to be installed without it rather than producing VPCs that report
+            # attached, route fine, and are open to every other tenant. That is
+            # what happened: the wizard's review said "Isolated: Yes" over a
+            # network whose own condition said NoSupernet.
+            - --tenant-supernet={{ $supernet }}
+            {{- if $cfg.mgmtCIDRs }}
+            # Optional: without it each node's own address is denied as a /32,
+            # which is right for a flat management network and too narrow for a
+            # routed one.
+            - --mgmt-cidr={{ join "," $cfg.mgmtCIDRs }}
+            {{- end }}
+            {{- if $cfg.serviceCIDR }}
+            # Optional: read from the cluster when absent. Needed where neither
+            # the kubeadm ConfigMap nor an apiserver pod can be read, which is
+            # every managed control plane.
+            - --service-cidr={{ $cfg.serviceCIDR }}
+            {{- end }}
+            {{- end }}
           env:
             # Admission belongs to one deployment or none. Two servers answering
             # for one webhook configuration is a coin toss.

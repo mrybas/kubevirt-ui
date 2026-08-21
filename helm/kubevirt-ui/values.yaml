@@ -672,6 +672,26 @@ operator:
     # The suffix a tenant apiserver is reached by from outside. Required by
     # tenant: without it the certificate carries no such SAN.
     ingressDomain: ""
+    # The aggregate every tenant network is carved from, e.g. 10.200.0.0/14.
+    # Required by the network domain, and for a reason worth the refusal: empty
+    # means no isolation is written at all, and the VPC that results is
+    # attached, routed, healthy-looking and open to every other tenant while the
+    # UI's review step says "Isolated: Yes".
+    #
+    # The same fact the backend reads as TENANT_SUPERNET. Set it in one place —
+    # either here or there — and the chart refuses to render if both are set and
+    # disagree.
+    tenantSupernet: ""
+    # Optional. Prefixes of the management plane, which must not open
+    # connections into a tenant. Empty means each node's own address as a /32,
+    # which is right for a flat management network and too narrow for a routed
+    # one.
+    mgmtCIDRs: []
+    # Optional. The cluster's service network. Read from the cluster when
+    # absent — the kubeadm ConfigMap, else the apiserver's own flag — and needed
+    # explicitly where neither is readable, which is every managed control
+    # plane.
+    serviceCIDR: ""
     # Optional. A tenant may opt into OIDC; if an issuer is set, so must be the
     # client id.
     oidcIssuer: ""

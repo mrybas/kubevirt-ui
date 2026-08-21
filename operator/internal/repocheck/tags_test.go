@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -187,7 +188,11 @@ func backendEnv(t *testing.T, operator bool, overrides map[string]string) map[st
 			"--set", "operator.config.metallbNamespace=m",
 			"--set", "operator.config.metallbPool=p",
 			"--set", "operator.config.cpTransitSubnet=c",
-			"--set", "operator.config.ingressDomain=d")
+			"--set", "operator.config.ingressDomain=d",
+			// Required by the network domain, which is on by default. The chart
+			// refuses without it, which is the point of the guard beside this
+			// one — so a test that renders a valid install has to supply it.
+			"--set", "operator.config.tenantSupernet=10.200.0.0/14")
 	}
 	for key, value := range overrides {
 		args = append(args, "--set", "backend.env."+key+"="+value)
@@ -212,4 +217,142 @@ func backendEnv(t *testing.T, operator bool, overrides map[string]string) map[st
 		env[name] = strings.Trim(value, `"`)
 	}
 	return env
+}
+
+// TestTheChartCanConfigureEverythingTheOperatorNeeds.
+//
+// A VPC created through the operator came up attached, routed and healthy —
+// and open to every other tenant, while the wizard's review step said
+// "Isolated: Yes". Its own condition said why: `NoSupernet`. The operator takes
+// the tenant supernet as a command-line flag, the developer's kustomize overlay
+// passed it, and the chart did not — so the chart could install a network
+// controller that cannot do the one thing the interface promises.
+//
+// One flag was noticed. Three were missing. This is the guard for the class: a
+// site fact the operator takes must be reachable from the chart, and a new one
+// added to main.go fails here until it is either wired or declared as something
+// the chart deliberately does not set.
+func TestTheChartCanConfigureEverythingTheOperatorNeeds(t *testing.T) {
+	root, err := filepath.Abs("../../..")
+	if err != nil {
+		t.Fatalf("locating the repository: %v", err)
+	}
+
+	// Flags that are about the process rather than the site. They are set by the
+	// chart's own template and are nobody's configuration.
+	plumbing := map[string]bool{
+		"leader-elect": true, "health-probe-bind-address": true,
+		"metrics-bind-address": true, "metrics-secure": true, "domains": true,
+		"metrics-cert-path": true, "metrics-cert-name": true, "metrics-cert-key": true,
+		"webhook-cert-path": true, "webhook-cert-name": true, "webhook-cert-key": true,
+		"enable-http2": true,
+	}
+
+	main, err := os.ReadFile(filepath.Join(root, "operator/cmd/main.go"))
+	if err != nil {
+		t.Fatalf("reading main.go: %v", err)
+	}
+	declared := regexp.MustCompile(`flag\.\w+Var\(&\w+, "([a-z0-9-]+)"`).
+		FindAllStringSubmatch(string(main), -1)
+
+	chart, err := os.ReadFile(filepath.Join(root,
+		"helm/kubevirt-ui/templates/operator.yaml"))
+	if err != nil {
+		t.Fatalf("reading the operator template: %v", err)
+	}
+
+	for _, match := range declared {
+		name := match[1]
+		if plumbing[name] {
+			continue
+		}
+		if !strings.Contains(string(chart), "--"+name+"=") {
+			t.Errorf("the operator takes --%s and the chart cannot set it: an "+
+				"install would run with it empty, and whatever that means "+
+				"happens silently", name)
+		}
+	}
+}
+
+// TestAFlagWithNoControllerBehindItIsRefused.
+//
+// A handover flag names a controller that has to be running. Turning one on
+// while its domain is off — or while the operator is not installed at all —
+// hands the work to nobody: the product stops writing, nothing takes over, and
+// the create reports success and produces nothing. It is the same shape as the
+// supernet: a flag on without the thing it needs, failing quietly at the far
+// end. Refused at render, where it is one line.
+func TestAFlagWithNoControllerBehindItIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		name, wants string
+		args        []string
+	}{{
+		name:  "the domain that would do the work is off",
+		wants: "operator.domains.network.enabled is false",
+		args: []string{"--set", "operator.enabled=true",
+			"--set", "operator.config.kubeOvnNamespace=k",
+			"--set", "operator.config.metallbNamespace=m",
+			"--set", "operator.config.metallbPool=p",
+			"--set", "operator.config.cpTransitSubnet=c",
+			"--set", "operator.config.ingressDomain=d",
+			"--set", "operator.config.tenantSupernet=10.200.0.0/14",
+			"--set", "operator.domains.network.enabled=false",
+			"--set", "backend.env.OPERATOR_NETWORK_ENABLED=true"},
+	}, {
+		name:  "there is no operator at all",
+		wants: "the operator is not installed",
+		args:  []string{"--set", "backend.env.OPERATOR_VM_ENABLED=true"},
+	}, {
+		name:  "the network domain without a supernet",
+		wants: "tenantSupernet is required",
+		args: []string{"--set", "operator.enabled=true",
+			"--set", "operator.config.kubeOvnNamespace=k",
+			"--set", "operator.config.metallbNamespace=m",
+			"--set", "operator.config.metallbPool=p",
+			"--set", "operator.config.cpTransitSubnet=c",
+			"--set", "operator.config.ingressDomain=d"},
+	}, {
+		name:  "one fact, two readers, disagreeing",
+		wants: "they must agree",
+		args: []string{"--set", "operator.enabled=true",
+			"--set", "operator.config.kubeOvnNamespace=k",
+			"--set", "operator.config.metallbNamespace=m",
+			"--set", "operator.config.metallbPool=p",
+			"--set", "operator.config.cpTransitSubnet=c",
+			"--set", "operator.config.ingressDomain=d",
+			"--set", "operator.config.tenantSupernet=10.200.0.0/14",
+			"--set", "backend.env.TENANT_SUPERNET=10.99.0.0/14"},
+	}} {
+		t.Run(c.name, func(t *testing.T) {
+			out, err := renderChart(t, c.args...)
+			if err == nil {
+				t.Fatalf("it rendered, and it should have refused:\n%s",
+					firstLines(out, 5))
+			}
+			if !strings.Contains(out, c.wants) {
+				t.Errorf("refused for the wrong reason — wanted %q in:\n%s",
+					c.wants, firstLines(out, 5))
+			}
+		})
+	}
+}
+
+func renderChart(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	root, err := filepath.Abs("../../..")
+	if err != nil {
+		t.Fatalf("locating the repository: %v", err)
+	}
+	full := append([]string{"template", "kubevirt-ui",
+		filepath.Join(root, "helm", "kubevirt-ui")}, args...)
+	out, err := exec.Command("helm", full...).CombinedOutput()
+	return string(out), err
+}
+
+func firstLines(text string, n int) string {
+	lines := strings.Split(text, "\n")
+	if len(lines) > n {
+		lines = lines[:n]
+	}
+	return strings.Join(lines, "\n")
 }
