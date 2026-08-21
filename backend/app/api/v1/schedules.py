@@ -294,6 +294,26 @@ async def create_scheduled_action(
     """Create a scheduled action (CronJob) for a VM."""
     k8s_client = request.app.state.k8s_client
 
+    # The authorization above is on `namespace`; the command inside the CronJob
+    # targets `vm_namespace` from the body, and it runs under a cluster-wide
+    # service account. Nothing tied the two together, so a member of one
+    # environment could schedule `kubectl delete vm` against another.
+    #
+    # Refused rather than authorised against both, because the mismatch has no
+    # legitimate caller: the UI sends the VM's own namespace, and the schedule
+    # is created beside the VM. It was already a degraded case here — an
+    # ownerReference cannot cross namespaces, so a mismatched schedule was
+    # silently left untied and outlived the machine it acts on.
+    if schedule_request.vm_namespace != namespace:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"A schedule lives beside the machine it acts on. This one is "
+                f"being created in '{namespace}' and targets a VM in "
+                f"'{schedule_request.vm_namespace}'."
+            ),
+        )
+
     try:
         batch_api = client.BatchV1Api(k8s_client._api_client)
 
@@ -423,6 +443,20 @@ async def trigger_scheduled_action(
 
         # Get the CronJob to extract job template
         cj = await batch_api.read_namespaced_cron_job(name=name, namespace=namespace)
+
+        # Creation refuses a cross-namespace target now, but schedules written
+        # before it does not know that. Running one on demand is the same act as
+        # creating it, so it is refused on the same terms — and the label is
+        # read off the object rather than trusted from the caller.
+        target = (cj.metadata.labels or {}).get(NS_LABEL)
+        if target and target != namespace:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Schedule '{name}' targets a VM in '{target}', not in "
+                    f"'{namespace}'. Delete it rather than running it."
+                ),
+            )
 
         # Create a Job from the CronJob template
         job_name = f"{name}-manual-{int(time.time())}"

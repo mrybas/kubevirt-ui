@@ -81,14 +81,39 @@ class TestSchedulesAreOwnedByTheirMachine:
         body = await _create_schedule()
         assert body["metadata"]["ownerReferences"][0]["blockOwnerDeletion"] is False
 
-    async def test_a_cross_namespace_schedule_is_left_untied(self) -> None:
-        """An ownerReference cannot cross namespaces.
+    async def test_a_cross_namespace_schedule_never_gets_this_far(self) -> None:
+        """This used to assert the degraded case, and the case is gone.
 
-        The garbage collector would read one as an owner that does not exist and
-        delete the schedule immediately — the opposite of the problem being
-        fixed.
+        An ownerReference cannot cross namespaces — the garbage collector would
+        read one as an owner that does not exist and delete the schedule at
+        once — so a mismatched schedule was created untied, which is exactly the
+        outliving-its-machine problem this file is about.
+
+        It turned out to be a security hole as well: authorization is on the
+        namespace the CronJob lives in, and the command inside it targets the
+        one from the body. Creation refuses the mismatch now, so the untied
+        schedule cannot be made at all. `_own_the_schedule` keeps its own check
+        below, unreachable through the endpoint and correct on its own terms.
         """
-        body = await _create_schedule(vm_namespace="somewhere-else")
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as e:
+            await _create_schedule(vm_namespace="somewhere-else")
+        assert e.value.status_code == 403
+
+    async def test_the_ownership_helper_still_refuses_to_cross_namespaces(
+        self,
+    ) -> None:
+        """Belt and braces: the helper is not the guard, but it must not be the
+        thing that creates a self-deleting object if it is ever called again."""
+        from app.api.v1 import schedules
+
+        body: dict[str, Any] = {"metadata": {}}
+        req = CreateScheduleRequest(
+            display_name="x", vm_name="web-01", vm_namespace="somewhere-else",
+            action="stop", schedule="0 22 * * *",
+        )
+        await schedules._own_the_schedule(MagicMock(), body, req, "opdev-dev")
         assert "ownerReferences" not in body["metadata"]
 
     async def test_a_schedule_is_still_created_when_the_machine_cannot_be_read(
