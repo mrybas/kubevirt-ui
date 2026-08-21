@@ -143,9 +143,38 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            # -- The paths the operator has taken over.
+            #
+            # These follow `operator.enabled` rather than sitting at off, and the
+            # reason is the failure they would otherwise produce: an install that
+            # asks for the operator, gets three healthy controllers, and hands
+            # them nothing — the product keeps writing and the operator watches.
+            # Nothing is broken, nothing is logged, and the only symptom is that
+            # none of it does anything. This deployment has hit that shape too
+            # many times to ship it as a default.
+            #
+            # Only the four that have been handed over. The rest name paths the
+            # product still owns, and they stay off until they are not.
+            #
+            # An explicit value in `backend.env` wins either way, including
+            # "false" — the point is a default, not a decision.
+            {{- $handover := list
+                  "OPERATOR_UNDERLAY_ENABLED"
+                  "OPERATOR_TENANT_BOOTSTRAP_ENABLED"
+                  "OPERATOR_TENANT_TIME_ENABLED"
+                  "OPERATOR_TENANT_ADDONS_ENABLED" }}
+            {{- range $key := $handover }}
+            {{- $explicit := get $.Values.backend.env $key | toString }}
+            {{- $value := $explicit }}
+            {{- if not $explicit }}
+            {{- $value = ternary "true" "false" $.Values.operator.enabled }}
+            {{- end }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
             # -- User-supplied env vars (empty-string values are skipped)
             {{- range $key, $value := .Values.backend.env }}
-            {{- if $value }}
+            {{- if and $value (not (has $key $handover)) }}
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}

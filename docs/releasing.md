@@ -72,16 +72,29 @@ them.
 ## Handover flags
 
 The operator takes work over from the product one path at a time, and the flags
-are the cutover. On a new install the four below belong on from the start;
-the rest name paths the product still owns.
+are the cutover. **They follow `operator.enabled`**, so an install that asks for
+the operator gets the four handed-over paths handed over:
+
+```
+OPERATOR_UNDERLAY_ENABLED         true
+OPERATOR_TENANT_BOOTSTRAP_ENABLED true
+OPERATOR_TENANT_TIME_ENABLED      true
+OPERATOR_TENANT_ADDONS_ENABLED    true
+```
+
+They used to default to off, which produced the worst kind of install: three
+healthy controllers and a product that keeps writing everything, with nothing
+broken, nothing logged, and no symptom except that none of it does anything.
+
+The rest — image, vm, template, announce, network — stay off. They name paths
+the product still owns.
+
+Any of them can be decided explicitly, and a decision wins:
 
 ```yaml
-kubevirt-ui:
+backend:
   env:
-    OPERATOR_UNDERLAY_ENABLED: "true"
-    OPERATOR_TENANT_BOOTSTRAP_ENABLED: "true"
-    OPERATOR_TENANT_TIME_ENABLED: "true"
-    OPERATOR_TENANT_ADDONS_ENABLED: "true"
+    OPERATOR_TENANT_TIME_ENABLED: "false"
 ```
 
 Setting a flag on an image that predates it is a cutover that looks done and is

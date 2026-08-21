@@ -40,9 +40,9 @@ trap 'rm -rf "$work"' EXIT
 # Only what the Go suite needs — copying the frontend's dependencies costs a
 # minute and leaves a directory nothing can delete.
 case "$target" in
-backend/*) trees="backend" ;;
-hack/*)    trees="operator test hack helm" ;;
-*)         trees="operator test" ;;
+backend/*)         trees="backend" ;;
+hack/*|helm/*)     trees="operator test hack helm" ;;
+*)                 trees="operator test" ;;
 esac
 # shellcheck disable=SC2086
 tar -C "$repo" --exclude .git --exclude .mutation --exclude __pycache__ \
@@ -50,6 +50,12 @@ tar -C "$repo" --exclude .git --exclude .mutation --exclude __pycache__ \
 
 before="$(md5 -q "$work/$target" 2>/dev/null || md5sum "$work/$target" | cut -d' ' -f1)"
 sed -i.orig "$expression" "$work/$target"
+# BSD sed needs a backup suffix, and the backup must not survive: dropped into
+# helm/kubevirt-ui/templates/ it is a second template, and Helm renders it. The
+# mutant then runs beside an unmutated copy of itself — measured, and it turned
+# a real kill into a confusing one: the assertions read the second copy's values
+# and passed, and only a count noticed anything was wrong.
+rm -f "$work/$target.orig"
 after="$(md5 -q "$work/$target" 2>/dev/null || md5sum "$work/$target" | cut -d' ' -f1)"
 if [ "$before" = "$after" ]; then
 	echo "мутація нічого не змінила — вираз не збігся; тест нічого не доводить" >&2
@@ -70,6 +76,6 @@ fi
 
 docker run --rm -v "$work:/work" -w /work/operator \
 	-e KUBEBUILDER_ASSETS=/work/operator/bin/k8s/1.36.0-linux-arm64 \
-	--entrypoint go "$(docker inspect -f '{{.Config.Image}}' kvbuild)" \
+	--entrypoint go "$("$(dirname "${BASH_SOURCE[0]}")/gotest-image.sh")" \
 	test ./internal/... -count=1 -timeout 300s "$@" 2>&1 \
 	| grep -E "^(---|ok|FAIL|panic|\s+\S+_test\.go:)" | head -20

@@ -19,7 +19,7 @@ out="$work/results"; mkdir -p "$out"
 tar -C "$repo" --exclude .git --exclude .mutation -cf - operator test | tar -C "$work" -xf -
 echo "знімок: $work"
 
-image="$(docker inspect -f '{{.Config.Image}}' kvbuild)"
+image="$("$(dirname "${BASH_SOURCE[0]}")/gotest-image.sh")"
 for i in $(seq 1 "$runs"); do
 	docker run --rm -v "$work:/work" -w /work/operator \
 		-e KUBEBUILDER_ASSETS=/work/operator/bin/k8s/1.36.0-linux-arm64 \

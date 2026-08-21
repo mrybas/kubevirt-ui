@@ -102,3 +102,114 @@ func TestEveryShapeOfPrereleaseIsOne(t *testing.T) {
 		}
 	}
 }
+
+// TestTheHandoverFollowsTheOperator.
+//
+// The chart can install the operator and hand it nothing: the flags that decide
+// who writes default to empty, empty means the product keeps writing, and the
+// symptom is three healthy controllers doing nothing at all. Nothing is broken,
+// nothing is logged. That shape — the change that did not reach the thing it was
+// for — is most of this migration's failures, so the four paths that have been
+// handed over follow `operator.enabled`.
+//
+// The other five stay off: they name paths the product still owns.
+func TestTheHandoverFollowsTheOperator(t *testing.T) {
+	handed := []string{
+		"OPERATOR_UNDERLAY_ENABLED",
+		"OPERATOR_TENANT_BOOTSTRAP_ENABLED",
+		"OPERATOR_TENANT_TIME_ENABLED",
+		"OPERATOR_TENANT_ADDONS_ENABLED",
+	}
+	notYet := []string{
+		"OPERATOR_IMAGE_ENABLED", "OPERATOR_VM_ENABLED",
+		"OPERATOR_TEMPLATE_ENABLED", "OPERATOR_ANNOUNCE_ENABLED",
+		"OPERATOR_NETWORK_ENABLED",
+	}
+
+	off := backendEnv(t, false, nil)
+	for _, name := range handed {
+		if off[name] == "true" {
+			t.Errorf("%s is on with no operator to hand to", name)
+		}
+	}
+
+	on := backendEnv(t, true, nil)
+	for _, name := range handed {
+		if on[name] != "true" {
+			t.Errorf("%s = %q with the operator installed", name, on[name])
+		}
+	}
+	for _, name := range notYet {
+		if on[name] == "true" {
+			t.Errorf("%s was turned on, and that path is not retired", name)
+		}
+	}
+
+	// A decision beats a default, including a decision to keep something.
+	kept := backendEnv(t, true,
+		map[string]string{"OPERATOR_TENANT_TIME_ENABLED": "false"})
+	if kept["OPERATOR_TENANT_TIME_ENABLED"] != "false" {
+		t.Errorf("an explicit false was overruled: %q",
+			kept["OPERATOR_TENANT_TIME_ENABLED"])
+	}
+	if kept["OPERATOR_TENANT_ADDONS_ENABLED"] != "true" {
+		t.Errorf("one override changed the others: %v", kept)
+	}
+	// And it appears once, not twice with the loop below writing it again.
+	if got := strings.Count(rendered, "OPERATOR_TENANT_TIME_ENABLED"); got != 1 {
+		t.Errorf("the variable is written %d times, want once — the override "+
+			"loop and the handover loop are both emitting it", got)
+	}
+}
+
+var rendered string
+
+// backendEnv renders the chart and reads the backend's environment out of it.
+func backendEnv(t *testing.T, operator bool, overrides map[string]string) map[string]string {
+	t.Helper()
+	root, err := filepath.Abs("../../..")
+	if err != nil {
+		t.Fatalf("locating the repository: %v", err)
+	}
+	if _, err := exec.LookPath("helm"); err != nil {
+		// Named rather than skipped: a guard that cannot run is not a guard,
+		// and the whole reason this package exists is that a check which
+		// quietly does nothing reads exactly like a check that passed.
+		t.Fatalf("helm is not installed in this environment, so this guard "+
+			"cannot run: %v", err)
+	}
+	args := []string{"template", "kubevirt-ui",
+		filepath.Join(root, "helm", "kubevirt-ui")}
+	if operator {
+		args = append(args,
+			"--set", "operator.enabled=true",
+			"--set", "operator.config.kubeOvnNamespace=k",
+			"--set", "operator.config.metallbNamespace=m",
+			"--set", "operator.config.metallbPool=p",
+			"--set", "operator.config.cpTransitSubnet=c",
+			"--set", "operator.config.ingressDomain=d")
+	}
+	for key, value := range overrides {
+		args = append(args, "--set", "backend.env."+key+"="+value)
+	}
+	out, err := exec.Command("helm", args...).Output()
+	if err != nil {
+		t.Fatalf("rendering the chart: %v", err)
+	}
+	rendered = string(out)
+
+	// Read the backend container's env without a YAML library: the block is
+	// `- name: X` / `value: "Y"` pairs, and pulling in a parser for four
+	// variables would be more machinery than the thing it inspects.
+	env := map[string]string{}
+	lines := strings.Split(rendered, "\n")
+	for i, line := range lines {
+		name := strings.TrimPrefix(strings.TrimSpace(line), "- name: ")
+		if !strings.HasPrefix(name, "OPERATOR_") || i+1 >= len(lines) {
+			continue
+		}
+		value := strings.TrimPrefix(strings.TrimSpace(lines[i+1]), "value: ")
+		env[name] = strings.Trim(value, `"`)
+	}
+	return env
+}
