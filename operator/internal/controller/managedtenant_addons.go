@@ -84,7 +84,12 @@ func (r *ManagedTenantReconciler) reconcileAddons(
 		labels := release.Labels
 		if _, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
 			mergeLabels(live, labels)
-			return unstructured.SetNestedMap(live.Object, spec, "spec")
+			// Laid over what is there rather than replacing it: Flux writes its
+			// own defaults into this object, and stripping them every pass
+			// while it writes them back is a loop with nothing changing.
+			existing, _, _ := unstructured.NestedMap(live.Object, "spec")
+			return unstructured.SetNestedMap(live.Object,
+				addons.MergeSpec(existing, spec), "spec")
 		}); err != nil {
 			return false, "", "", fmt.Errorf("writing %s: %w", release.Name, err)
 		}

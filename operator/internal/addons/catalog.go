@@ -340,3 +340,33 @@ func deepCopy(in map[string]any) map[string]any {
 	}
 	return out
 }
+
+// MergeSpec lays what this renders over what is already there, leaving
+// everything it does not render alone.
+//
+// Necessary because the API server and Flux write their own defaults back into
+// the object: a HelmRelease acquires `chart.spec.reconcileStrategy` that
+// nothing here sets, and replacing the spec wholesale would strip it on every
+// pass and write it back on every reconcile — the same loop kube-ovn's route
+// defaults produce, in a different object.
+//
+// Deep, because the defaults arrive inside nested maps rather than at the top.
+// Lists are replaced rather than merged: an addon's values are a statement of
+// what the release should be, and half of somebody else's list is not a value
+// anybody chose.
+func MergeSpec(live, want map[string]any) map[string]any {
+	out := map[string]any{}
+	for key, value := range live {
+		out[key] = value
+	}
+	for key, wanted := range want {
+		if nested, ok := wanted.(map[string]any); ok {
+			if existing, ok := out[key].(map[string]any); ok {
+				out[key] = MergeSpec(existing, nested)
+				continue
+			}
+		}
+		out[key] = wanted
+	}
+	return out
+}

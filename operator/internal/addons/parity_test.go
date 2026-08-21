@@ -89,3 +89,48 @@ func TestTheReleasesMatchTheProduct(t *testing.T) {
 		})
 	}
 }
+
+// TestMergeKeepsWhatFluxWroteBack.
+//
+// A HelmRelease acquires `chart.spec.reconcileStrategy` from Flux's own
+// defaulting. Replacing the spec strips it, Flux writes it back, and the two
+// rewrite each other for ever — with resourceVersion climbing and nothing
+// changing. Found by predicting an adoption against a live tenant rather than
+// by running one.
+func TestMergeKeepsWhatFluxWroteBack(t *testing.T) {
+	live := map[string]any{
+		"interval": "30m",
+		"chart": map[string]any{"spec": map[string]any{
+			"chart":             "./tenant-charts/core/namespaces",
+			"interval":          "12h",
+			"reconcileStrategy": "ChartVersion",
+			"sourceRef":         map[string]any{"kind": "GitRepository", "name": "flux-system"},
+		}},
+		"suspend": false,
+	}
+	want := map[string]any{
+		"interval": "30m",
+		"chart": map[string]any{"spec": map[string]any{
+			"chart":     "./tenant-charts/core/namespaces",
+			"interval":  "12h",
+			"sourceRef": map[string]any{"kind": "GitRepository", "name": "flux-system"},
+		}},
+	}
+
+	merged := MergeSpec(live, want)
+	chart, _ := merged["chart"].(map[string]any)
+	spec, _ := chart["spec"].(map[string]any)
+	if spec["reconcileStrategy"] != "ChartVersion" {
+		t.Errorf("it stripped what Flux wrote back: %v", spec)
+	}
+	if merged["suspend"] != false {
+		t.Errorf("it dropped a field it does not render: %v", merged["suspend"])
+	}
+
+	// And what it does render still wins.
+	want["interval"] = "1h"
+	if merged := MergeSpec(live, want); merged["interval"] != "1h" {
+		t.Errorf("interval = %v — the declaration has to win over what is there",
+			merged["interval"])
+	}
+}

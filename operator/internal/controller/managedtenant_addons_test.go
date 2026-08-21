@@ -324,3 +324,59 @@ func TestAReleaseNobodyHereWroteIsLeftAlone(t *testing.T) {
 		t.Error("it retired a release it did not write")
 	}
 }
+
+// TestARelease FluxHasDefaultedIsNotRewrittenForever.
+//
+// The live check that found this: a HelmRelease on the stand carries
+// `chart.spec.reconcileStrategy` that nothing here renders. Replacing the spec
+// strips it, Flux writes it back, and the two rewrite each other for ever with
+// nothing changing — visible only as a resourceVersion that never settles.
+func TestAReleaseFluxHasDefaultedIsNotRewrittenForever(t *testing.T) {
+	mustCatalog(t, "cat-f")
+	mustNamespace(t, "tenant-tad8", "")
+
+	obj := talosTenant("tad8")
+	reconciler := addonReconciler("cat-f")
+	if _, _, _, err := reconciler.reconcileAddons(testCtx, obj, "tenant-tad8"); err != nil {
+		t.Fatalf("reconcileAddons: %v", err)
+	}
+
+	// Flux's part.
+	release := &unstructured.Unstructured{}
+	release.SetGroupVersionKind(helmReleaseGVK)
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-tad8", Name: "tad8-calico",
+	}, release); err != nil {
+		t.Fatalf("reading the release: %v", err)
+	}
+	_ = unstructured.SetNestedField(release.Object, "ChartVersion",
+		"spec", "chart", "spec", "reconcileStrategy")
+	if err := k8sClient.Update(testCtx, release); err != nil {
+		t.Fatalf("defaulting it: %v", err)
+	}
+	settled := release.GetResourceVersion()
+
+	for pass := 1; pass <= 3; pass++ {
+		if _, _, _, err := reconciler.reconcileAddons(testCtx, obj, "tenant-tad8"); err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+	}
+
+	after := &unstructured.Unstructured{}
+	after.SetGroupVersionKind(helmReleaseGVK)
+	if err := k8sReader.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-tad8", Name: "tad8-calico",
+	}, after); err != nil {
+		t.Fatalf("reading it back: %v", err)
+	}
+	strategy, _, _ := unstructured.NestedString(after.Object,
+		"spec", "chart", "spec", "reconcileStrategy")
+	if strategy != "ChartVersion" {
+		t.Errorf("it stripped what Flux wrote back: %q", strategy)
+	}
+	if after.GetResourceVersion() != settled {
+		t.Errorf("three passes moved resourceVersion %s -> %s, so it is "+
+			"rewriting an object nothing asked it to change",
+			settled, after.GetResourceVersion())
+	}
+}

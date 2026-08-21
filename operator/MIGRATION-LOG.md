@@ -2834,3 +2834,37 @@ is no add-only path to leave anything behind. What needed saying out loud is the
 release: an addon no longer wanted has its release retired, and only ever ours,
 by the label this operator puts on them. A release in that namespace nobody here
 wrote belongs to somebody else.
+
+### Predicting an adoption, which found the defect before the cluster did
+
+Before adopting a live tenant, the useful question is what the operator *would*
+write to it. Asked read-only, against `uat-t1`: render what this operator would
+produce for its three releases and diff against what is there. Three kinds of
+answer came back, and only one of them was a surprise.
+
+**The sediment**, expected: the namespaces list loses `uat-t1-alloy`. That is the
+correction, not a regression.
+
+**A parameter**, expected once seen: the live CSI release carries
+`infraStorageClassName: ceph-block` where rendering from catalogue defaults
+gives `""`. Nothing is wrong with either — the tenant was created with that
+parameter, and an adopting CR has to carry it. That is a requirement of the
+adoption procedure rather than a defect, and it is the kind of thing that would
+otherwise be discovered as a storage class quietly becoming empty.
+
+**And one defect, mine**: every live release carries
+`chart.spec.reconcileStrategy: ChartVersion`, which Flux defaults in and nothing
+here renders. Writing the spec wholesale strips it, Flux writes it back, and the
+two rewrite each other for ever — a resourceVersion that never settles and
+nothing changing. Exactly the shape kube-ovn's route defaults produce, in a
+different object, and the reason `MergeRoutes` exists; the addon writer needed
+the same and did not have it.
+
+So the spec is now laid over what is there rather than replacing it — deep,
+because the defaults arrive nested; lists replaced, because half of somebody
+else's list is not a value anybody chose. The test drives three passes over a
+release Flux has defaulted and asserts resourceVersion does not move.
+
+Worth naming as method: this cost one read-only query and found a write loop
+that would have run on the first adopted tenant. The diff before the write is
+the cheapest thing in this migration.
