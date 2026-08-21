@@ -3165,3 +3165,33 @@ insists on the write.
 bind-mounts `backend/`, so a mutation applied "inside the container" is a
 mutation of the working tree — which is how that happened again, through a
 different door, after the first two were fixed.
+
+### The button, pressed
+
+Through the real UI, signed in as `kv-admin`, on `uat-t2`:
+
+| | before | after Enable | after Disable |
+|---|---|---|---|
+| `spec.addons` | `[]` | `[{"id":"alloy"}]` | `[]` |
+| releases | calico, namespaces | + `uat-t2-alloy` | calico, namespaces |
+| namespace list | default, tigera-operator | + alloy | **alloy kept** |
+
+The field manager is the part that settles it: `uat-t2-alloy` was written by
+`manager`, the operator's, while the two releases the product built years of
+stand-time ago still carry `OpenAPI-Generator`, the backend's Python client. One
+object, two writers, and now only one of them writes.
+
+`alloy` installed in the tenant (`alloy/alloy.v1`) and the card showed
+`Reconciled` before the disable — so the round trip is not just object shuffling.
+
+## M13a: not built, and the reason is the stand
+
+There is no `VpcEgressGateway` anywhere on this cluster, no hub VPC, and no
+transit-IP allocator. Every VPC leaves through its own external leg with BGP
+underneath — the B3 shape — which is what deprecated the hub in the first place.
+Building a controller for it would mean creating a hub through the old UI purely
+to have something to adopt, and then maintaining a migration of a path the
+product is moving off.
+
+Decided with the user: **skipped, B3 stays the default.** The plan's M13a section
+stands as a description of what the backend still contains, not as work queued.
