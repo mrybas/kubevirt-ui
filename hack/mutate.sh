@@ -41,6 +41,7 @@ trap 'rm -rf "$work"' EXIT
 # minute and leaves a directory nothing can delete.
 case "$target" in
 backend/*) trees="backend" ;;
+hack/*)    trees="operator test hack helm" ;;
 *)         trees="operator test" ;;
 esac
 # shellcheck disable=SC2086

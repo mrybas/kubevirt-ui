@@ -2,10 +2,14 @@
 # Triggered on CalVer tags (2026.01.0, etc.), on the operator-dev branch, or
 # manual dispatch.
 #
-# Two tagging worlds that must never mix: a CalVer tag is a release and also
-# moves `latest`; a branch build is a dev image tagged `dev-<sha7>` and moves
-# nothing. A dev image that could be pulled as `latest` would eventually be
-# deployed as one.
+# Three tagging worlds that must never mix: a CalVer tag is a release and also
+# moves `latest`; a **prerelease** tag (`2026.10.37-dev.1`) publishes the same
+# artefacts, chart included, under its own version and moves nothing; a branch
+# build is a dev image tagged `dev-<sha7>` and publishes no chart at all. An
+# image that could be pulled as `latest` would eventually be deployed as one.
+#
+# The rule itself is hack/image-tags.sh, so it can be run and tested rather than
+# only observed after a tag is pushed.
 
 name: Build Images
 
@@ -31,52 +35,27 @@ jobs:
       tags_operator: ${{ steps.meta.outputs.tags_operator }}
       version: ${{ steps.meta.outputs.version }}
       is_release: ${{ steps.meta.outputs.is_release }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Compute image metadata
         id: meta
         shell: bash
         run: |
-          REGISTRY="${{ env.REGISTRY }}"
-          REPO="${{ github.repository }}"
+          # The rule lives in hack/image-tags.sh so it can be run and tested off
+          # a laptop. It was a function in this file, which meant the one thing
+          # it protects — `latest` never pointing at something unreleased — was
+          # only ever exercised by tagging for real.
+          hack/image-tags.sh "${GITHUB_REF}" "${{ env.REGISTRY }}" \
+            "${{ github.repository }}" | tee -a "$GITHUB_OUTPUT"
 
-          BACKEND_IMAGE="${REGISTRY}/${REPO}/backend"
-          FRONTEND_IMAGE="${REGISTRY}/${REPO}/frontend"
-          OPERATOR_IMAGE="${REGISTRY}/${REPO}/operator"
-
-          TAGS_BACKEND=""
-          TAGS_FRONTEND=""
-          TAGS_OPERATOR=""
-
-          add_tag() {
-            TAGS_BACKEND="${TAGS_BACKEND:+${TAGS_BACKEND},}${BACKEND_IMAGE}:${1}"
-            TAGS_FRONTEND="${TAGS_FRONTEND:+${TAGS_FRONTEND},}${FRONTEND_IMAGE}:${1}"
-            TAGS_OPERATOR="${TAGS_OPERATOR:+${TAGS_OPERATOR},}${OPERATOR_IMAGE}:${1}"
-          }
-
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            IS_RELEASE="true"
-            VERSION="${GITHUB_REF#refs/tags/}"
-            add_tag "${VERSION}"
-            add_tag "latest"
-          else
-            # Dev build from a branch: never `latest`, never CalVer-shaped.
-            IS_RELEASE="false"
-            VERSION="dev-${GITHUB_SHA::7}"
-            add_tag "${VERSION}"
-          fi
-
-          echo "tags_backend=${TAGS_BACKEND}" >> "$GITHUB_OUTPUT"
-          echo "tags_frontend=${TAGS_FRONTEND}" >> "$GITHUB_OUTPUT"
-          echo "tags_operator=${TAGS_OPERATOR}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "is_release=${IS_RELEASE}" >> "$GITHUB_OUTPUT"
-
-          echo "### Image Tags" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Version:** ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Release:** ${IS_RELEASE}" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Backend:** ${TAGS_BACKEND}" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Frontend:** ${TAGS_FRONTEND}" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Operator:** ${TAGS_OPERATOR}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Image Tags"
+            hack/image-tags.sh "${GITHUB_REF}" "${{ env.REGISTRY }}" \
+              "${{ github.repository }}" | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # Build backend image
@@ -204,8 +183,11 @@ jobs:
   helm-package:
     runs-on: ubuntu-latest
     needs: prepare
-    # The dev operator is deployed with kustomize, deliberately bypassing the
-    # chart and Flux, so a branch build must not publish a chart version.
+    # A branch build publishes no chart: the dev operator is deployed with
+    # kustomize, deliberately bypassing the chart and Flux, so there is no
+    # version for it to claim. A prerelease tag does publish one, under its own
+    # prerelease version, which is how the whole product can be installed and
+    # tried without entering the line that means production.
     if: needs.prepare.outputs.is_release == 'true'
     permissions:
       contents: read
