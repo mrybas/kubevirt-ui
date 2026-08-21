@@ -2928,3 +2928,50 @@ wrong rather than the code:
   same tenant — two writers, and "resourceVersion did not move" cannot be
   asserted with two. The tenant is paused in that test now, so the call under
   test is the only writer.
+
+## M12e: a live tenant adopted
+
+`uat-t1` — two workers, a control plane, disks, a year of other people's writes
+on it — is now reconciled by the operator. All twelve conditions True, both
+nodes still theirs, and nothing moving sixty seconds later.
+
+### The order mattered, and it was chosen from the prediction
+
+Its namespace held two storage quotas: the machines one at 120Gi and a
+`csi-infra` one at 100Gi, both ours, from two different paths. The operator's
+rule is to write machines-only while another storage cap exists — so adopting
+first would have taken the effective ceiling from 100Gi down to 60Gi, with 41Gi
+in use. Not an outage, but a promise quietly broken.
+
+So the redundant quota came off first — our own object, superseded, not a
+foreign writer's — leaving the ceiling at 120Gi, and the adoption then wrote one
+quota at 160Gi. At no point was it lower than before. cpu and memory matched the
+existing numbers **byte for byte**, which is the useful signal that the two
+arithmetics are the same one.
+
+### What the first pass wrote, and what it did not
+
+Untouched: the MachineDeployment, the machine template, the health check, the
+Talos bootstrap template, and the CSI release. Five of ten objects, including
+every immutable one.
+
+Written once, then still: the quota (as predicted), the namespaces release
+(the sediment gone — `uat-t1-alloy` is no longer in the list), and three
+normalisations. Nothing moved in the following minute, so it converged rather
+than looping, which was the property in doubt.
+
+### The two things it cost, both mine, both found by doing it
+
+**The Cluster lost two annotations.** `worker-type` and `enable-oidc`, written
+by the product, still present on the tenant beside it, gone the moment this
+operator wrote the object — the writer replaced the annotation map instead of
+merging. Restoring them by hand while the old image ran was instructive: they
+vanished again within seconds, which is the two-writer loop in miniature. Fixed,
+deployed, restored, and they stay.
+
+**And `KUBE_OVN_NAMESPACE` was wrong.** Set to `kube-ovn`, where this stand runs
+it as `o0-kube-ovn`, so the adopted tenant sat at `WaitingForResolver` looking
+for a ConfigMap in an empty namespace. The tenant was fine throughout — its
+workers joined long ago and the template is immutable — but a *new* worker would
+have waited for ever. The wait is what made it visible, which is the argument
+for having it refuse rather than guess.

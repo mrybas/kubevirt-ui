@@ -40,8 +40,12 @@ spec:
             # Where kube-ovn states the resolver a VPC worker uses. Needed for
             # a VPC the product built, which has no ManagedNetwork to read it
             # from — the operator must not require the world to be its shape.
+            # o0-kube-ovn on this stand, not the upstream default. Set wrong
+            # the first time, and the tenant that found it was an adopted one
+            # waiting for a resolver that was being looked for in an empty
+            # namespace.
             - name: KUBE_OVN_NAMESPACE
-              value: kube-ovn
+              value: o0-kube-ovn
             # The external name a tenant's apiserver answers to. Without it the
             # certificate carries no such SAN and kubectl through the ingress
             # fails TLS — invisible from inside the cluster, which is where
