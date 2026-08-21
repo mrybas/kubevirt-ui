@@ -13,13 +13,14 @@ See folders.py for the new implementation.
 
 import json
 import logging
-from typing import Any
+from functools import cache
+from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from kubernetes_asyncio.client.rest import ApiException
 from kubernetes_asyncio.client import RbacAuthorizationV1Api
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_admin, require_auth
 from app.core.groups import get_known_teams, get_known_teams_async
 from app.models.project import (
     ProjectCreateRequest,
@@ -241,6 +242,92 @@ async def _get_project_access_summary(
 # Project CRUD
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Who may change a project
+# ---------------------------------------------------------------------------
+#
+# Authentication was fixed at the router; authorization was not. Every mutating
+# route here — create, rename, delete, add or remove an environment, and above
+# all grant or revoke access — took any session at all. A viewer could POST
+# themselves an admin RoleBinding on somebody else's project, in every namespace
+# that project owns, and the only trace would be the binding.
+#
+# Folders answer this with an access block in their own record. Projects have no
+# such block: their access *is* the set of managed RoleBindings, so that is what
+# is read. Being admin of one environment is not the same as being admin of the
+# project, so an environment-scoped binding does not carry the right to hand out
+# project-wide access.
+#
+# Reads stay at plain authentication, which is the product's existing posture
+# everywhere: members and viewers can see the shape of things and change none of
+# it.
+
+
+async def _is_project_admin(k8s_client: Any, user: User, project: str) -> bool:
+    from app.core.groups import is_admin
+
+    if is_admin(user.groups, user):
+        return True
+
+    admin_role = ROLE_TO_CLUSTERROLE["admin"]
+    subjects = {user.username, user.email, user.id, *(user.groups or [])}
+    subjects.discard(None)
+    subjects.discard("")
+
+    try:
+        namespaces = await k8s_client.core_api.list_namespace(
+            label_selector=f"{ENV_PROJECT_LABEL}={project}",
+        )
+    except ApiException:
+        return False
+
+    rbac_api = await _get_rbac_api(k8s_client)
+    for ns in namespaces.items:
+        try:
+            bindings = await rbac_api.list_namespaced_role_binding(
+                namespace=ns.metadata.name,
+                label_selector=(
+                    f"{ACCESS_MANAGED_LABEL}=true,{ACCESS_PROJECT_LABEL}={project}"
+                ),
+            )
+        except ApiException:
+            continue
+        for binding in bindings.items:
+            if binding.role_ref.name != admin_role:
+                continue
+            labels = binding.metadata.labels or {}
+            if labels.get(ACCESS_SCOPE_LABEL, "project") != "project":
+                continue
+            for subject in binding.subjects or []:
+                if subject.name in subjects:
+                    return True
+    return False
+
+
+@cache
+def require_project_admin() -> Callable:
+    """Dep: platform admin, or project-scope admin of `{name}`.
+
+    Cached so every call site shares one closure — otherwise
+    `dependency_overrides[require_project_admin()]` in a test matches nothing,
+    which is a test that passes while guarding an endpoint it never reached.
+    """
+
+    async def dep(
+        request: Request,
+        name: str,
+        user: User = Depends(require_auth),
+    ) -> User:
+        k8s_client = request.app.state.k8s_client
+        if not await _is_project_admin(k8s_client, user, name):
+            raise HTTPException(
+                status_code=403, detail="Project admin role required",
+            )
+        return user
+
+    return dep
+
+
 @router.get("", response_model=ProjectListResponse)
 async def list_projects(request: Request, user: User = Depends(require_auth)):
     """List all projects with their environments."""
@@ -308,7 +395,11 @@ async def list_projects(request: Request, user: User = Depends(require_auth)):
 
 
 @router.post("", response_model=ProjectResponse, status_code=201)
-async def create_project(request: Request, project: ProjectCreateRequest):
+async def create_project(
+    request: Request,
+    project: ProjectCreateRequest,
+    user: User = Depends(require_admin),
+):
     """Create a project (ConfigMap entry) with optional initial environments."""
     k8s_client = request.app.state.k8s_client
     user = getattr(request.state, "user", None)
@@ -398,7 +489,12 @@ async def get_project(request: Request, name: str):
 
 
 @router.patch("/{name}", response_model=ProjectResponse)
-async def update_project(request: Request, name: str, update: UpdateProjectRequest):
+async def update_project(
+    request: Request,
+    name: str,
+    update: UpdateProjectRequest,
+    user: User = Depends(require_project_admin()),
+):
     """Update project metadata (display name, description, quota)."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_projects_configmap(k8s_client)
@@ -427,7 +523,11 @@ async def update_project(request: Request, name: str, update: UpdateProjectReque
 
 
 @router.delete("/{name}", status_code=204)
-async def delete_project(request: Request, name: str):
+async def delete_project(
+    request: Request,
+    name: str,
+    user: User = Depends(require_project_admin()),
+):
     """Delete a project and all its environments."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_projects_configmap(k8s_client)
@@ -531,7 +631,12 @@ async def _create_environment_ns(
 
 
 @router.post("/{name}/environments", response_model=EnvironmentResponse, status_code=201)
-async def add_environment(request: Request, name: str, env: AddEnvironmentRequest):
+async def add_environment(
+    request: Request,
+    name: str,
+    env: AddEnvironmentRequest,
+    user: User = Depends(require_project_admin()),
+):
     """Add an environment (namespace) to a project."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_projects_configmap(k8s_client)
@@ -546,7 +651,12 @@ async def add_environment(request: Request, name: str, env: AddEnvironmentReques
 
 
 @router.delete("/{name}/environments/{environment}", status_code=204)
-async def remove_environment(request: Request, name: str, environment: str):
+async def remove_environment(
+    request: Request,
+    name: str,
+    environment: str,
+    user: User = Depends(require_project_admin()),
+):
     """Remove an environment (delete its namespace)."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_projects_configmap(k8s_client)
@@ -680,7 +790,12 @@ async def list_project_access(request: Request, name: str):
 
 
 @router.post("/{name}/access", response_model=AccessEntry, status_code=201)
-async def add_project_access(request: Request, name: str, access: AddAccessRequest):
+async def add_project_access(
+    request: Request,
+    name: str,
+    access: AddAccessRequest,
+    user: User = Depends(require_project_admin()),
+):
     """Add access to a project or specific environment."""
     k8s_client = request.app.state.k8s_client
     data = await _ensure_projects_configmap(k8s_client)
@@ -766,7 +881,12 @@ async def add_project_access(request: Request, name: str, access: AddAccessReque
 
 
 @router.delete("/{name}/access/{binding_id}", status_code=204)
-async def remove_project_access(request: Request, name: str, binding_id: str):
+async def remove_project_access(
+    request: Request,
+    name: str,
+    binding_id: str,
+    user: User = Depends(require_project_admin()),
+):
     """Remove access from a project (deletes binding from all environments if project-scope)."""
     k8s_client = request.app.state.k8s_client
     rbac_api = await _get_rbac_api(k8s_client)
