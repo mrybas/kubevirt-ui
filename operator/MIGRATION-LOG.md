@@ -2975,3 +2975,93 @@ for a ConfigMap in an empty namespace. The tenant was fine throughout — its
 workers joined long ago and the template is immutable — but a *new* worker would
 have waited for ever. The wait is what made it visible, which is the argument
 for having it refuse rather than guess.
+
+## A second live tenant, and the field that had no way to say "none"
+
+`uat-t2` is the same product as `uat-t1` with four things missing: no CSI
+driver, no storage class on its root disks, no OIDC, and no storage of its own.
+Adopting it second was the point — the first tenant answered every question the
+same way the defaults did.
+
+### Describing it broke the model before it touched the cluster
+
+`allowanceGi` had a minimum of 1 and a default of 100. A tenant with no CSI
+driver, no credential and no volumes cannot allocate a byte of that, and its
+folder pays for the reservation. There was no way to write the truth.
+
+The first attempt — lower the minimum to 0 — measured 160Gi where it wanted
+60Gi. `omitempty` on an `int32` makes zero indistinguishable from absent, so the
+API server applied the default: the field could accept zero and could not
+receive it. Both fields are pointers now. Absent still means the default; zero
+means zero.
+
+A claim cap of zero would be a different and much worse thing than no cap. The
+workers' own root disks are claims in this namespace, so a cap of zero refuses
+them and the tenant cannot replace a node. Zero there means the cap is not
+written at all.
+
+### The adoption
+
+Twelve conditions True on the first pass. Quota `120Gi → 60Gi`, which is the
+whole point of the field: 40Gi in use, one clone of surge headroom, and 60Gi of
+capacity nobody was pretending to sell. cpu and memory came out byte-identical
+to what the product had written, which is the signal that the two arithmetics
+are one.
+
+Six of fifteen objects untouched, and only two took a spec write at all —
+`KubevirtCluster` and `KamajiControlPlane`, generation 2, the same pair as on
+`uat-t1`. The machine template, the MachineDeployment, the health check and the
+Talos bootstrap template stayed at generation 1: both workers are still the
+Machines created on 20 August, and nothing rolled. Nothing moved in the
+following minute.
+
+The annotations survived this time — `worker-type` and `enable-oidc` are still
+on the Cluster — which is yesterday's fix measured on a second subject.
+
+## The namespace list is not a record, it is a delete
+
+`cmp3` was sitting at `AddonsReady: False`, and the message was worth reading
+rather than retrying:
+
+    Helm upgrade failed for release default/namespaces:
+    failed to delete resource kind=Namespace, name=kube-system:
+    namespaces "kube-system" is forbidden: this namespace may not be deleted
+
+The release renders one Namespace per entry in a list, **in the tenant's own
+cluster**. Helm prunes what a revision stops rendering. So shrinking that list
+does not tidy a record — it deletes a namespace and everything the tenant put
+in it, and when the namespace is one Kubernetes protects, the release wedges and
+everything that depends on it stops. Calico depends on it. `cmp3` had no CNI at
+all, and the release was on revision 14, so it had been failing every interval
+for hours.
+
+The entry came from the product: enabling an addon through the UI appends its
+namespace to that list and nothing ever removes it. This operator rendered the
+list whole from what the tenant wants — the same discipline that is right
+everywhere else here, and the reason `uat-t1-alloy` disappeared yesterday. That
+one succeeded. An empty namespace, probably; nobody looked, which is the part
+worth not repeating.
+
+So: two writers, one key, and the first time the disagreement lands in a
+different cluster than the one being reconciled.
+
+**The list now only ever grows.** Sediment is the cheaper of the two mistakes,
+and removing a namespace becomes something somebody does on purpose. The release
+is flagged in the renderer rather than recognised by name, because the writer
+needs to know which object it must not shrink and a name match stops being true
+quietly.
+
+The test that asserted the opposite was rewritten, not deleted. It recorded a
+belief about tidiness that the cluster overruled, and a test that says why it
+changed its mind is worth more than one that never held the wrong view.
+
+### The repair, and what it proves
+
+Putting `kube-system` back in the list let the upgrade succeed (`v14`), and
+calico installed for the first time (`v1`). Three tenants green, seven releases
+Ready.
+
+`OPERATOR_TENANT_ADDONS_ENABLED` is now on, so the product's reconciler no
+longer creates addons — the backend had to be rolled first, because the image on
+the stand predated the flag and setting an env var a process does not read is a
+cutover that looks done and is not.
