@@ -731,6 +731,17 @@ operator:
     # which is right for a flat management network and too narrow for a routed
     # one.
     mgmtCIDRs: []
+    # The address external-dns should publish for tenant API names. Optional
+    # only in the sense that the chart installs without it: external-dns cannot
+    # infer an address from an IngressRouteTCP, so with this empty the route is
+    # written, the name is in the certificate, and nothing resolves it. The
+    # tenant reports that as ExternallyReachable=False rather than looking
+    # healthy while its kubeconfig cannot be used.
+    externalDNSTarget: ""
+    # Traefik entry points, when this cluster names them differently. The
+    # defaults are Traefik's own `websecure` and a `trustd` listener on 50001.
+    traefikEntryPoint: ""
+    traefikTrustdEntryPoint: ""
     # Optional. The cluster's service network. Read from the cluster when
     # absent — the kubeadm ConfigMap, else the apiserver's own flag — and needed
     # explicitly where neither is readable, which is every managed control

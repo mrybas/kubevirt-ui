@@ -378,4 +378,16 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - traefik.io
+  resources:
+  - ingressroutetcps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 {{- end }}

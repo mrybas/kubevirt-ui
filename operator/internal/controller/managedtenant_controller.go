@@ -122,6 +122,7 @@ type ManagedTenantReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=traefik.io,resources=ingressroutetcps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
 // The write half is new with the host-API publication: a Service with no
 // selector has no endpoints unless somebody writes them, and the somebody is
@@ -348,6 +349,23 @@ func (r *ManagedTenantReconciler) Reconcile(
 	apimeta.SetStatusCondition(&obj.Status.Conditions,
 		workersCondition(workersReady, workersReason, workersMessage))
 	pending = pending || !workersReady
+
+	// The name the certificate already answers for, and the address the
+	// kubeconfig hands out: both were written before anything routed them.
+	routesReady, routesReason, routesMessage, err := r.reconcileExternalRoutes(
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			routesCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if routesReason != "" || routesMessage != "" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			routesCondition(routesReady, routesReason, routesMessage))
+		pending = pending || !routesReady
+	}
 
 	// Last, and against a different API server: what goes here can only be
 	// placed once the tenant's own control plane answers.

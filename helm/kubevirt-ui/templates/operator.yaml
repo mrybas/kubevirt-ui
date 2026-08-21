@@ -242,6 +242,23 @@ spec:
             # every test looks.
             - name: TENANTS_INGRESS_DOMAIN
               value: {{ required "operator.config.ingressDomain is required by the tenant domain — the suffix tenant apiservers are reached by" $cfg.ingressDomain | quote }}
+            {{- if $cfg.externalDNSTarget }}
+            # The address external-dns publishes for those names. It cannot read
+            # one off an IngressRouteTCP — there is no load-balancer status on
+            # it — so without this the route exists and the name does not
+            # resolve. The tenant says so in its own status rather than looking
+            # ready.
+            - name: TENANTS_EXTERNAL_DNS_TARGET
+              value: {{ $cfg.externalDNSTarget | quote }}
+            {{- end }}
+            {{- if $cfg.traefikEntryPoint }}
+            - name: TENANTS_TRAEFIK_ENTRYPOINT
+              value: {{ $cfg.traefikEntryPoint | quote }}
+            {{- end }}
+            {{- if $cfg.traefikTrustdEntryPoint }}
+            - name: TENANTS_TRAEFIK_TRUSTD_ENTRYPOINT
+              value: {{ $cfg.traefikTrustdEntryPoint | quote }}
+            {{- end }}
             {{- if $cfg.oidcIssuer }}
             # Optional: a tenant may opt into OIDC. Same values the backend
             # reads, for the same reason as above.

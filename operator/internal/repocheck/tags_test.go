@@ -579,3 +579,62 @@ func volumeSecret(t *testing.T, deployment map[string]any, path string) string {
 	t.Fatalf("no volume called %q", name)
 	return ""
 }
+
+// TestTheChartCanSetEverySiteEnvTheOperatorReads.
+//
+// The sibling test asks this about flags. Environment variables are the other
+// half and were not covered — which is how the operator came to read
+// `TENANTS_EXTERNAL_DNS_TARGET` while the chart had no way to set it, in the
+// same hour as fixing exactly that for `--tenant-supernet`.
+//
+// Only the site names: TENANTS_*, KUBE_OVN_NAMESPACE, OIDC_*. The process's own
+// switches (POD_NAMESPACE, ENABLE_WEBHOOKS) are the template's business.
+func TestTheChartCanSetEverySiteEnvTheOperatorReads(t *testing.T) {
+	root, err := filepath.Abs("../../..")
+	if err != nil {
+		t.Fatalf("locating the repository: %v", err)
+	}
+
+	read := map[string]bool{}
+	pattern := regexp.MustCompile(
+		`(?:os\.Getenv|envOr)\(\s*"((?:TENANTS_|OIDC_|KUBE_OVN_)[A-Z0-9_]+)"`)
+	err = filepath.Walk(filepath.Join(root, "operator"),
+		func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") ||
+				strings.HasSuffix(path, "_test.go") {
+				return err
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			for _, match := range pattern.FindAllStringSubmatch(string(body), -1) {
+				read[match[1]] = true
+			}
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("walking the operator: %v", err)
+	}
+	if len(read) < 4 {
+		t.Fatalf("only found %v — the scan is broken", read)
+	}
+
+	chart, err := os.ReadFile(filepath.Join(root,
+		"helm/kubevirt-ui/templates/operator.yaml"))
+	if err != nil {
+		t.Fatalf("reading the operator template: %v", err)
+	}
+	for name := range read {
+		// Anchored at the end of the line: a substring match passes for
+		// `TENANTS_EXTERNAL_DNS_TARGET_X`, which is a different variable and
+		// sets nothing. That mutant survived the first version of this test —
+		// the same blindness as the admission test an hour earlier.
+		if !regexp.MustCompile(`(?m)^\s*- name: ` + regexp.QuoteMeta(name) + `\s*$`).
+			MatchString(string(chart)) {
+			t.Errorf("the operator reads %s and the chart cannot set it: an "+
+				"install runs with it empty, and whatever that means happens "+
+				"quietly", name)
+		}
+	}
+}
