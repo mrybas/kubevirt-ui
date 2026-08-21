@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,8 +11,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 )
 
@@ -333,4 +336,42 @@ clusters:
 	if err != nil || string(same) != string(original) {
 		t.Errorf("a tenant on the default overlay was rewritten: %v %q", err, same)
 	}
+}
+
+// TestATenantThatNeverHadStorageIssuesNoDelete.
+//
+// The first version withdrew by deleting both objects unconditionally, and that
+// is not the no-op it reads as: authorization is decided before existence, so a
+// delete for an object that was never there still needs the right to delete.
+// The operator did not have it, and every tenant without storage — most of them
+// — failed its whole transit reconcile on a Forbidden. Two healthy tenants went
+// to WriteFailed within a minute of the deploy.
+func TestATenantThatNeverHadStorageIssuesNoDelete(t *testing.T) {
+	mustHostEndpoints(t, "10.198.160.1")
+	mustNamespace(t, "tenant-thnever", "")
+
+	obj := vpcTalosTenant("thnever")
+	obj.Spec.Network = "net-thnever"
+	reconciler := transitReconciler("transit-hnever")
+	// A client that refuses every delete, which is what the cluster was.
+	reconciler.Client = refusingDeletes{Client: k8sClient}
+
+	published, message, err := reconciler.ensureHostAPI(
+		testCtx, obj, "tenant-thnever", "10.199.0.214")
+	if err != nil {
+		t.Fatalf("withdrawing what was never published: %v", err)
+	}
+	if published || message != "" {
+		t.Errorf("published=%v message=%q", published, message)
+	}
+}
+
+type refusingDeletes struct{ client.Client }
+
+func (c refusingDeletes) Delete(
+	ctx context.Context, obj client.Object, opts ...client.DeleteOption,
+) error {
+	return apierrors.NewForbidden(
+		schema.GroupResource{Resource: "services"}, obj.GetName(),
+		fmt.Errorf("the operator has no delete on services"))
 }

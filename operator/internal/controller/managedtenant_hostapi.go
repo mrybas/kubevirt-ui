@@ -99,6 +99,20 @@ func (r *ManagedTenantReconciler) ensureHostAPI(
 
 	name := hostAPIServiceName(obj.Name)
 	if !wanted {
+		// Read before deleting, and this is not tidiness.
+		//
+		// The first version deleted both objects unconditionally, which is
+		// harmless right up until it is not: the operator's role had no delete
+		// on Services, so every tenant without storage — most of them — failed
+		// its whole transit reconcile on a Forbidden for an object that was
+		// never there. Authorization is decided before existence, so "delete
+		// what is not there" is not the no-op it reads as. Found on the stand
+		// within minutes of deploying, by two healthy tenants going to
+		// WriteFailed.
+		published, err := r.hostAPIPublished(ctx, obj, namespace)
+		if err != nil || !published {
+			return false, "", err
+		}
 		for _, object := range []client.Object{
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{
 				Namespace: namespace, Name: name}},

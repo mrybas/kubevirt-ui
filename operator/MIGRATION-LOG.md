@@ -3195,3 +3195,89 @@ product is moving off.
 
 Decided with the user: **skipped, B3 stays the default.** The plan's M13a section
 stands as a description of what the backend still contains, not as work queued.
+
+## The storage driver moves onto the transit plane
+
+The tenant's driver runs inside the tenant and creates the real volumes out
+here: a PVC asked for in there becomes a DataVolume in the tenant's namespace on
+the host, hot-plugged into the worker VM. So it needs the host apiserver, and
+the credential named the host's management address — `10.198.175.250:6443`.
+
+A tenant VPC has exactly one route:
+
+    0.0.0.0/0 -> 10.199.4.254   (external, VLAN 310, the border)
+
+So every attach, detach and expand left through the gateway, on the same path as
+the tenant's internet traffic, while the control plane beside it already rode
+the transit leg. A border outage leaves the VMs running and stops every new
+volume — and the two internal networks exist precisely so that does not happen.
+
+### What it took
+
+The host apiserver is published on the tenant's own VIP at **6444** — 6443 there
+is the tenant's own control plane, and port-disjointness on a shared address is
+a test rather than an assumption. A Service with no selector, because the
+backends are not pods it could ever select, and an EndpointSlice mirroring
+`default/kubernetes`: the cluster's own record of where its apiserver is, so a
+control plane rebuilt, scaled or replaced needs nothing here. Rebuilt every pass
+rather than added to — a list that only grows sends a share of every request to
+a node that has gone.
+
+**`tls-server-name` is the whole trick.** The VIP is in no SAN and cannot be:
+measured, the host certificate carries `kubernetes`, `kubernetes.default.svc`,
+the node's own address, the service IP and the management VIP — and each control
+plane node serves its own. A per-tenant address cannot be added to any of them.
+Every one carries `kubernetes.default.svc`, so the client verifies that name
+while connecting to the address. The one-line alternative was
+`insecure-skip-tls-verify`, and a transit plane where anyone can be the host
+apiserver.
+
+Only the copy inside the tenant is rewritten. The host-side secret is the
+product's and correct for a reader on the host network.
+
+### Measured from inside the VPC
+
+From a pod on `uat-net-t1-default`, address 10.200.4.9:
+
+```
+TCP  10.199.0.100:6444                      succeeded
+TLS  verified as kubernetes.default.svc     ssl_verify_result=0, HTTP 401
+```
+
+401 is the apiserver answering an unauthenticated caller, which is the proof
+that it is the apiserver. And the path, which is the point:
+
+```
+to 10.199.0.100   1  10.200.4.1     (the VPC router, then delivered)
+to 1.1.1.1        1  10.200.4.1
+                  2  10.199.4.254   (the border)
+                  3  206.252.237.2
+```
+
+The border appears in one of those and not the other.
+
+The tenant's credential, read from inside its own cluster:
+
+```
+server: https://10.199.0.100:6444
+tls-server-name: kubernetes.default.svc
+```
+
+### The defect this shipped with, found in four minutes
+
+Withdrawing the publication deleted both objects unconditionally, which reads as
+a no-op for a tenant that never had one. It is not: **authorization is decided
+before existence**, the operator's role had no `delete` on Services, and every
+tenant without storage failed its *entire* transit reconcile on a Forbidden for
+an object that was never there. Two healthy tenants went to `WriteFailed` within
+a minute of the deploy.
+
+Both halves fixed — the verb, and reading before deleting — and the test uses a
+client that refuses every delete, so the mutant that removes the check dies with
+the same Forbidden the cluster produced.
+
+Also caught here: the RBAC marker had EndpointSlices read-only, and this writes
+them. And the chart-sync guard was briefly written in pytest, where it passed
+vacuously — the backend's test container mounts only `backend/` and cannot see
+the chart at all. It is a Go package now, one implementation behind both the
+command that writes and the test that refuses a diff.

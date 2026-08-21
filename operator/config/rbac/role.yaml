@@ -11,7 +11,6 @@ rules:
   - limitranges
   - namespaces
   - resourcequotas
-  - services
   verbs:
   - create
   - get
@@ -53,6 +52,18 @@ rules:
   - delete
   - get
   - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - admissionregistration.k8s.io

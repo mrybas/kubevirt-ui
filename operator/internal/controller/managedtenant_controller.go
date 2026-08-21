@@ -109,7 +109,10 @@ type ManagedTenantReconciler struct {
 // in the lab could show this — envtest and the dev backend both run as admin,
 // where an escalation check never fires.
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes/source,verbs=create
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// Delete is for the host-API publication, which is withdrawn when a tenant
+// stops having storage. Without it the withdrawal fails on a Forbidden and
+// takes the whole transit reconcile with it.
 // +kubebuilder:rbac:groups=metallb.io,resources=ipaddresspools,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=issuers;certificates,verbs=get;list;watch;create;update;patch
 // The machine secrets are written here — once, and never rewritten — so this
