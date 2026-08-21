@@ -619,3 +619,68 @@ lldap:
     enabled: false
     size: "1Gi"
     storageClass: ""
+
+# ---------------------------------------------------------------------------
+# The operator
+# ---------------------------------------------------------------------------
+#
+# Its CRDs and its ClusterRole are generated from the operator's own sources by
+# hack/sync-operator-chart.py and checked by a test, so the chart cannot install
+# last year's schema while the code has moved on.
+#
+# The site facts below have no defaults on purpose. Every one of them has
+# already been wrong once, and each time the failure was silent: kube-ovn in a
+# namespace that was not "kube-ovn" left an adopted tenant waiting for a
+# ConfigMap for ever, and a transit-subnet variable spelled differently in two
+# places meant an invariant never ran while "no complaint" read as "checked".
+# A chart that guesses would reproduce both.
+operator:
+  enabled: false
+  image:
+    repository: ghcr.io/mrybas/kubevirt-ui/operator
+    # Defaults to the chart's appVersion, so the operator and the backend that
+    # hands work to it ship as one thing.
+    tag: ""
+    pullPolicy: IfNotPresent
+  crds:
+    # Templated rather than put in crds/, because Helm never upgrades what is in
+    # crds/ — the schema would silently stay at the version first installed.
+    # They carry resource-policy keep, so uninstalling the UI does not
+    # cascade-delete every tenant, network and VM described by them.
+    install: true
+  webhooks:
+    # Admission belongs to one deployment or none.
+    enabled: false
+  domains:
+    vm:
+      enabled: true
+      replicas: 1
+    network:
+      enabled: true
+      replicas: 1
+    tenant:
+      enabled: true
+      replicas: 1
+  config:
+    # The namespace kube-ovn actually runs in. Required by tenant and network.
+    kubeOvnNamespace: ""
+    # Where control-plane VIPs come from. Required by tenant.
+    metallbNamespace: ""
+    metallbPool: ""
+    # The transit subnet those VIPs must sit inside. Required by tenant.
+    cpTransitSubnet: ""
+    # The suffix a tenant apiserver is reached by from outside. Required by
+    # tenant: without it the certificate carries no such SAN.
+    ingressDomain: ""
+    # Optional. A tenant may opt into OIDC; if an issuer is set, so must be the
+    # client id.
+    oidcIssuer: ""
+    oidcClientId: ""
+  extraEnv: {}
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi
