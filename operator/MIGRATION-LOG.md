@@ -3065,3 +3065,52 @@ Ready.
 longer creates addons — the backend had to be rolled first, because the image on
 the stand predated the flag and setting an env var a process does not read is a
 cutover that looks done and is not.
+
+## M12e closed: the acceptances, run against the live stand
+
+**An addon enabled through the CR.** `alloy` on `uat-t2`, and the release Flux
+installed (`alloy/alloy.v1`) carries the same envelope, field for field, as the
+`kubevirt-csi-driver` release the product wrote on `uat-t1` before any of this
+existed: interval, timeout, the two remediation blocks, `crds: CreateReplace`,
+`disableWait`, the `super-admin.svc` kubeConfig, `storageNamespace`, and the
+chart block down to `reconcileStrategy`. Parity here is not an assertion in a
+test file — it is two objects in one cluster, written by two programs.
+
+One thing worth naming rather than fixing: this stand's catalogue gives `alloy`
+an empty `defaultValues`, so the remote-write URL a user types has nowhere to
+land. Both implementations drop it identically — the substitution edits a
+template that is not there — so it is the catalogue's content, not the
+renderer's behaviour. A parameter the UI collects and nothing consumes is still
+worth someone's attention.
+
+**Disabled again**, and both halves held: the release was retired, and the
+`alloy` entry stayed in the namespace list. One reorder-write, then generation
+stable and nothing moving.
+
+**A tenant with an addon that cannot install.** A catalogue entry pointing at a
+chart path that does not exist, enabled on `uat-t2`:
+
+    AddonFailed: will not install: uat-t2-broken-demo (SourceNotReady)
+
+Its two working releases stayed Ready, and both neighbouring tenants stayed True
+on every condition throughout. The catalogue was restored afterwards and
+compared parsed-to-parsed against the copy taken before — identical.
+
+The named limit: the condition says which release failed and that its source is
+not ready, and the sentence that explains *why* — `no such file or directory
+.../does-not-exist` — is one object further away, on the HelmChart. Following
+that hop would mean reading a fourth Flux kind across namespaces; the reason as
+it stands is enough to find it, and widening the operator's reach is a bigger
+decision than a better error string.
+
+**And the sediment was removed on purpose**, which is the workflow the
+never-shrink rule creates: a person edited the list, Helm deleted the `alloy`
+and `broken-demo` namespaces in the tenant's cluster, and the operator did not
+put the entries back. That is the same deletion that used to happen by itself —
+the difference is entirely in who asked for it.
+
+### What M12e leaves behind, said out loud
+
+The cloud-init worker path is still unimplemented — Talos only. CSI still talks
+to the host API through the in-cluster Service rather than the tenant's own VIP
+on 6444, which is the target design and not what the stand runs.
