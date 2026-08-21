@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -202,9 +203,13 @@ func setReleaseReady(t *testing.T, namespace, name, status, reason string) {
 	}, release); err != nil {
 		t.Fatalf("reading %s: %v", name, err)
 	}
+	// Stamped now, because how long a release has been saying this is part of
+	// what it means: "not yet" and "not ever" differ by time and by nothing
+	// else Flux reports. A fixed date here made every fixture look hours stale.
 	_ = unstructured.SetNestedSlice(release.Object, []any{map[string]any{
 		"type": "Ready", "status": status, "reason": reason,
-		"lastTransitionTime": "2026-08-21T00:00:00Z", "message": reason,
+		"lastTransitionTime": time.Now().UTC().Format(time.RFC3339),
+		"message":            reason,
 	}}, "status", "conditions")
 	if err := k8sClient.Status().Update(testCtx, release); err != nil {
 		t.Fatalf("setting %s ready=%s: %v", name, status, err)
@@ -428,5 +433,97 @@ func TestANamespaceSomebodyElseAddedIsNotPrunedAway(t *testing.T) {
 	// And what this operator does want is still there beside it.
 	if !strings.Contains(fmt.Sprint(after), "tigera-operator") {
 		t.Errorf("keeping the old entry lost the rendered ones: %v", after)
+	}
+}
+
+// TestWaitingIsNotFailing.
+//
+// A tenant thirty seconds old reported
+//
+//	AddonsReady False AddonFailed  will not install: test3-calico (DependencyNotReady)
+//
+// and installed forty-seven seconds later with nobody touching it. Calico was
+// queued behind namespaces — Flux's own dependsOn, ordinary ordering — and
+// every Ready=False was being read as failure.
+//
+// The cost is not the wording. Somebody reads a fresh tenant, sees a failure,
+// and goes looking for a break that is not there; and the day there is a real
+// InstallFailed it looks exactly like half a minute of normal operation.
+func TestWaitingIsNotFailing(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, c := range []struct {
+		reason, want string
+	}{
+		{"DependencyNotReady", "installing"},
+		{"Progressing", "installing"},
+		{"ArtifactFailed", "installing"},
+		{"SourceNotReady", "installing"},
+		{"InstallFailed", "failed"},
+		{"UpgradeFailed", "failed"},
+		{"RetriesExceeded", "failed"},
+	} {
+		release := &unstructured.Unstructured{Object: map[string]any{
+			"status": map[string]any{"conditions": []any{map[string]any{
+				"type": "Ready", "status": "False", "reason": c.reason,
+				"lastTransitionTime": now,
+			}}},
+		}}
+		if got, note := releaseState(release); got != c.want {
+			t.Errorf("%s → %s (%s), want %s", c.reason, got, note, c.want)
+		}
+	}
+}
+
+// TestNotYetBecomesNotEverEventually.
+//
+// A wrong chart path answers ArtifactFailed for ever and no reason string
+// separates that from a fetch in flight. The difference is time, so time is
+// what is measured — and it is reported as what it is rather than as a failure
+// Flux never declared.
+func TestNotYetBecomesNotEverEventually(t *testing.T) {
+	long := time.Now().Add(-2 * stuckAfter).UTC().Format(time.RFC3339)
+	release := &unstructured.Unstructured{Object: map[string]any{
+		"status": map[string]any{"conditions": []any{map[string]any{
+			"type": "Ready", "status": "False", "reason": "ArtifactFailed",
+			"lastTransitionTime": long,
+		}}},
+	}}
+	state, note := releaseState(release)
+	if state != "stuck" {
+		t.Fatalf("state = %s (%s)", state, note)
+	}
+	if !strings.Contains(note, "ArtifactFailed") || !strings.Contains(note, "for ") {
+		t.Errorf("the note says neither the reason nor how long: %q", note)
+	}
+}
+
+// TestATenantWaitingOnItsOwnOrderingIsNotCalledFailed.
+func TestATenantWaitingOnItsOwnOrderingIsNotCalledFailed(t *testing.T) {
+	mustCatalog(t, "cat-w")
+	mustNamespace(t, "tenant-tadw", "")
+
+	obj := talosTenant("tadw")
+	reconciler := addonReconciler("cat-w")
+	if _, _, _, err := reconciler.reconcileAddons(testCtx, obj, "tenant-tadw"); err != nil {
+		t.Fatalf("reconcileAddons: %v", err)
+	}
+	setReleaseReady(t, "tenant-tadw", "tadw-namespaces", "True", "InstallSucceeded")
+	setReleaseReady(t, "tenant-tadw", "tadw-calico", "False", "DependencyNotReady")
+
+	ready, reason, message, err := reconciler.addonState(testCtx, obj, "tenant-tadw")
+	if err != nil {
+		t.Fatalf("addonState: %v", err)
+	}
+	if ready {
+		t.Fatal("it called a queued release installed")
+	}
+	if reason != "Installing" {
+		t.Errorf("reason = %q, want Installing", reason)
+	}
+	if strings.Contains(message, "will not install") {
+		t.Errorf("it predicts a failure that has not happened: %q", message)
+	}
+	if !strings.Contains(message, "DependencyNotReady") {
+		t.Errorf("and it does not say what is being waited for: %q", message)
 	}
 }

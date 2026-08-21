@@ -22,6 +22,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -254,19 +255,26 @@ func (r *ManagedTenantReconciler) addonState(
 		return false, "", "", fmt.Errorf("reading the tenant's releases: %w", err)
 	}
 
-	var installing, failed []string
+	var installing, stuck, failed []string
 	for i := range releases.Items {
 		item := &releases.Items[i]
 		state, note := releaseState(item)
+		named := item.GetName()
+		if note != "" {
+			named += " (" + note + ")"
+		}
 		switch state {
 		case "ready":
 		case "failed":
-			failed = append(failed, item.GetName()+" ("+note+")")
+			failed = append(failed, named)
+		case "stuck":
+			stuck = append(stuck, named)
 		default:
-			installing = append(installing, item.GetName())
+			installing = append(installing, named)
 		}
 	}
 	sort.Strings(failed)
+	sort.Strings(stuck)
 	sort.Strings(installing)
 
 	switch {
@@ -274,6 +282,12 @@ func (r *ManagedTenantReconciler) addonState(
 		// Named rather than counted, and it does not stop the pass: the tenant
 		// beside this one has nothing to do with a chart that will not install.
 		return false, "AddonFailed", "will not install: " + strings.Join(failed, ", "), nil
+	case len(stuck) > 0:
+		// Not a failure Flux has declared, and not progress any more either.
+		// Said as what it is, so that the reason and the waiting are both
+		// visible rather than one being guessed from the other.
+		return false, "AddonStalled", "still not installed: " +
+			strings.Join(stuck, ", "), nil
 	case len(installing) > 0:
 		return false, "Installing", "installing: " + strings.Join(installing, ", "), nil
 	default:
@@ -282,6 +296,36 @@ func (r *ManagedTenantReconciler) addonState(
 }
 
 // releaseState reads Flux's own answer rather than guessing from the spec.
+// Reasons Flux gives that mean this will not finish on its own.
+//
+// Everything else it says with Ready=False means "not yet": a release waiting
+// for the one it depends on, a chart still being fetched, an install in
+// progress. Reading all of them as failure was a lie with a cost — a tenant
+// thirty seconds old reported
+//
+//	AddonFailed  will not install: test3-calico (DependencyNotReady)
+//
+// and installed forty-seven seconds later with no intervention. "Will not
+// install" is a prediction, and it was wrong; meanwhile a real InstallFailed
+// looked exactly like half a minute of normal operation, which is how it would
+// be missed.
+var terminalReleaseFailures = map[string]bool{
+	"InstallFailed":   true,
+	"UpgradeFailed":   true,
+	"RollbackFailed":  true,
+	"UninstallFailed": true,
+	"TestFailed":      true,
+	"RetriesExceeded": true,
+}
+
+// stuckAfter is how long "not yet" is allowed to stay "not yet".
+//
+// A wrong chart path answers `ArtifactFailed` for ever, and no reason string
+// distinguishes that from a fetch in flight — the difference is time, so time
+// is what is measured. Long enough that an ordinary dependency chain never
+// trips it: calico waits for namespaces, and the pair took under a minute.
+const stuckAfter = 10 * time.Minute
+
 func releaseState(release *unstructured.Unstructured) (state, note string) {
 	conditions, _, _ := unstructured.NestedSlice(release.Object, "status", "conditions")
 	for _, raw := range conditions {
@@ -297,10 +341,32 @@ func releaseState(release *unstructured.Unstructured) (state, note string) {
 			if reason == "" {
 				reason = "not ready"
 			}
-			return "failed", reason
+			if terminalReleaseFailures[reason] {
+				return "failed", reason
+			}
+			// Progress, unless it has been progressing for too long to be
+			// called that.
+			if since, ok := conditionAge(condition); ok && since > stuckAfter {
+				return "stuck", fmt.Sprintf("%s for %s", reason,
+					since.Round(time.Minute))
+			}
+			return "installing", reason
 		}
 	}
 	return "installing", ""
+}
+
+// conditionAge is how long this condition has said what it says.
+func conditionAge(condition map[string]any) (time.Duration, bool) {
+	stamp, _ := condition["lastTransitionTime"].(string)
+	if stamp == "" {
+		return 0, false
+	}
+	at, err := time.Parse(time.RFC3339, stamp)
+	if err != nil {
+		return 0, false
+	}
+	return time.Since(at), true
 }
 
 func (r *ManagedTenantReconciler) addonCatalog(

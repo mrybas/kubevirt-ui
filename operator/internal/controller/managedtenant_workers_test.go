@@ -12,6 +12,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
@@ -228,20 +229,7 @@ func TestEachWorkerClonesItsOwnRootFromTheSharedGolden(t *testing.T) {
 	issueCA(t, "tenant-twk3", "twk3-talos-ca", "tls.crt")
 	issueCA(t, "tenant-twk3", "twk3-ca", "ca.crt")
 
-	eventually(t, "the machine template", func() error {
-		template := &unstructured.Unstructured{}
-		template.SetGroupVersionKind(kubevirtMachineTemplateGVK)
-		return k8sReader.Get(testCtx, types.NamespacedName{
-			Namespace: "tenant-twk3", Name: "twk3-workers",
-		}, template)
-	})
-	template := &unstructured.Unstructured{}
-	template.SetGroupVersionKind(kubevirtMachineTemplateGVK)
-	if err := k8sClient.Get(testCtx, types.NamespacedName{
-		Namespace: "tenant-twk3", Name: "twk3-workers",
-	}, template); err != nil {
-		t.Fatalf("reading the machine template: %v", err)
-	}
+	template := theMachineTemplate(t, "tenant-twk3")
 
 	disks, found, _ := unstructured.NestedSlice(template.Object, "spec", "template",
 		"spec", "virtualMachineTemplate", "spec", "dataVolumeTemplates")
@@ -439,20 +427,25 @@ func TestTheRootClonesLandOnTheTenantsStorageClass(t *testing.T) {
 	issueCA(t, "tenant-twk7", "twk7-talos-ca", "tls.crt")
 	issueCA(t, "tenant-twk7", "twk7-ca", "ca.crt")
 
+	// By whatever name: the template's name carries a digest of the shape now,
+	// so that a resize rotates it and CAPI rolls the pool. Looking it up by a
+	// fixed name would tie this test to that naming rather than to the disk it
+	// is about.
+	var template *unstructured.Unstructured
 	eventually(t, "the machine template", func() error {
-		template := &unstructured.Unstructured{}
-		template.SetGroupVersionKind(kubevirtMachineTemplateGVK)
-		return k8sReader.Get(testCtx, types.NamespacedName{
-			Namespace: "tenant-twk7", Name: "twk7-workers",
-		}, template)
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(kubevirtMachineTemplateGVK.GroupVersion().
+			WithKind(kubevirtMachineTemplateGVK.Kind + "List"))
+		if err := k8sReader.List(testCtx, list,
+			client.InNamespace("tenant-twk7")); err != nil {
+			return err
+		}
+		if len(list.Items) != 1 {
+			return fmt.Errorf("%d templates", len(list.Items))
+		}
+		template = &list.Items[0]
+		return nil
 	})
-	template := &unstructured.Unstructured{}
-	template.SetGroupVersionKind(kubevirtMachineTemplateGVK)
-	if err := k8sClient.Get(testCtx, types.NamespacedName{
-		Namespace: "tenant-twk7", Name: "twk7-workers",
-	}, template); err != nil {
-		t.Fatalf("reading the machine template: %v", err)
-	}
 	disks, _, _ := unstructured.NestedSlice(template.Object, "spec", "template",
 		"spec", "virtualMachineTemplate", "spec", "dataVolumeTemplates")
 	if len(disks) != 1 {
@@ -463,5 +456,141 @@ func TestTheRootClonesLandOnTheTenantsStorageClass(t *testing.T) {
 	storage, _ := spec["storage"].(map[string]any)
 	if storage["storageClassName"] != "ceph-block" {
 		t.Errorf("storageClassName = %v", storage["storageClassName"])
+	}
+}
+
+// theMachineTemplate is the one template in a tenant's namespace, by whatever
+// name. The name carries a digest of the shape now — that is what makes a
+// resize roll the pool — so looking it up by a fixed string would tie these
+// tests to the naming rather than to what they are about.
+func theMachineTemplate(t *testing.T, namespace string) *unstructured.Unstructured {
+	t.Helper()
+	var found *unstructured.Unstructured
+	eventually(t, "the machine template", func() error {
+		list := &unstructured.UnstructuredList{}
+		list.SetGroupVersionKind(kubevirtMachineTemplateGVK.GroupVersion().
+			WithKind(kubevirtMachineTemplateGVK.Kind + "List"))
+		if err := k8sReader.List(testCtx, list,
+			client.InNamespace(namespace)); err != nil {
+			return err
+		}
+		if len(list.Items) != 1 {
+			return fmt.Errorf("%d templates in %s", len(list.Items), namespace)
+		}
+		found = &list.Items[0]
+		return nil
+	})
+	return found
+}
+
+// workerReconciler is the tenant reconciler with nothing site-specific set:
+// these tests are about the shape of what it writes.
+func workerReconciler() *ManagedTenantReconciler {
+	return &ManagedTenantReconciler{
+		Client: k8sClient, Scheme: k8sClient.Scheme(), APIReader: k8sReader,
+	}
+}
+
+// TestResizingTheWorkersRollsThem.
+//
+// Scaling and resizing did not work, and the resize failed in the way that is
+// hardest to see: the field accepted the patch and nothing happened. CAPI rolls
+// a MachineDeployment when its template *reference* changes, so editing the
+// template in place gives the new shape to the next worker created and none of
+// the ones running.
+func TestResizingTheWorkersRollsThem(t *testing.T) {
+	mustNamespace(t, "tenant-trs1", "")
+	obj := talosTenant("trs1")
+	obj.Spec.Workers.VCPU = 2
+	reconciler := workerReconciler()
+
+	first, err := reconciler.ensureMachineTemplate(testCtx, obj, "tenant-trs1", "1.13.8")
+	if err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+	if err := reconciler.ensureMachineDeployment(
+		testCtx, obj, "tenant-trs1", "trs1-workers", first); err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+
+	// Same shape, same name: adoption and every quiet pass depend on this.
+	again, err := reconciler.ensureMachineTemplate(testCtx, obj, "tenant-trs1", "1.13.8")
+	if err != nil || again != first {
+		t.Fatalf("an unchanged shape rotated the template: %q → %q (%v)",
+			first, again, err)
+	}
+
+	obj.Spec.Workers.VCPU = 4
+	resized, err := reconciler.ensureMachineTemplate(testCtx, obj, "tenant-trs1", "1.13.8")
+	if err != nil {
+		t.Fatalf("resize: %v", err)
+	}
+	if resized == first {
+		t.Fatal("the shape changed and the name did not, so nothing would roll")
+	}
+	if err := reconciler.ensureMachineDeployment(
+		testCtx, obj, "tenant-trs1", "trs1-workers", resized); err != nil {
+		t.Fatalf("pool after resize: %v", err)
+	}
+
+	pool := &unstructured.Unstructured{}
+	pool.SetGroupVersionKind(machineDeploymentObjectGVK)
+	if err := k8sReader.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-trs1", Name: "trs1-workers"}, pool); err != nil {
+		t.Fatalf("reading the pool: %v", err)
+	}
+	pointsAt, _, _ := unstructured.NestedString(pool.Object,
+		"spec", "template", "spec", "infrastructureRef", "name")
+	if pointsAt != resized {
+		t.Errorf("the pool still stamps from %q", pointsAt)
+	}
+
+	// And back: the previous shape lands on the object it already had.
+	obj.Spec.Workers.VCPU = 2
+	back, err := reconciler.ensureMachineTemplate(testCtx, obj, "tenant-trs1", "1.13.8")
+	if err != nil {
+		t.Fatalf("resize back: %v", err)
+	}
+	if back != first {
+		t.Errorf("going back minted a third template: %q, was %q", back, first)
+	}
+}
+
+// TestAdoptingATenantDoesNotRollItsWorkers.
+//
+// The pool a product built points at `<tenant>-workers`, which is not the name
+// this operator would choose. Renaming it on the first pass would roll every
+// worker of a tenant that was only being described.
+func TestAdoptingATenantDoesNotRollItsWorkers(t *testing.T) {
+	mustNamespace(t, "tenant-trs2", "")
+	obj := talosTenant("trs2")
+	reconciler := workerReconciler()
+
+	// What the operator would write, under the name the product uses.
+	want, err := reconciler.machineTemplateSpec(obj, "1.13.8")
+	if err != nil {
+		t.Fatalf("building the shape: %v", err)
+	}
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(kubevirtMachineTemplateGVK)
+	existing.SetName("trs2-workers")
+	existing.SetNamespace("tenant-trs2")
+	if err := unstructured.SetNestedMap(existing.Object, want, "spec"); err != nil {
+		t.Fatalf("setting the spec: %v", err)
+	}
+	if err := k8sClient.Create(testCtx, existing); err != nil {
+		t.Fatalf("creating the product's template: %v", err)
+	}
+	if err := reconciler.ensureMachineDeployment(
+		testCtx, obj, "tenant-trs2", "trs2-workers", "trs2-workers"); err != nil {
+		t.Fatalf("the product's pool: %v", err)
+	}
+
+	got, err := reconciler.ensureMachineTemplate(testCtx, obj, "tenant-trs2", "1.13.8")
+	if err != nil {
+		t.Fatalf("adopting: %v", err)
+	}
+	if got != "trs2-workers" {
+		t.Errorf("adoption renamed the template to %q, which rolls every worker", got)
 	}
 }

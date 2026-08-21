@@ -244,12 +244,31 @@ func (r *ManagedTenantReconciler) ensureKubevirtCluster(
 	live.SetGroupVersionKind(kubevirtClusterGVK)
 	live.SetName(obj.Name)
 	live.SetNamespace(namespace)
+	// Whether this tenant has storage is read here by more than CAPK. The
+	// product's own gate on "may this tenant install the CSI driver" is the
+	// presence of this reference, so a tenant the operator built could never
+	// have storage enabled from the UI — the button answered "recreate the
+	// tenant with storage enabled" for a tenant that had it.
+	//
+	// Written from the credential rather than from a field: the host side of
+	// storage is the product's to create, and its existence is the fact. A flag
+	// saying otherwise would be a claim.
+	credential := &corev1.Secret{}
+	hasStorage := r.Get(ctx, types.NamespacedName{
+		Namespace: namespace, Name: capkCredentialSecret,
+	}, credential) == nil
+
 	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
 		mergeLabels(live, map[string]string{"kubevirt-ui.io/tenant": obj.Name})
 		mergeAnnotations(live, map[string]string{
 			"cluster.x-k8s.io/managed-by": "kamaji",
 		})
-		return nil
+		if !hasStorage {
+			return nil
+		}
+		return unstructured.SetNestedMap(live.Object, map[string]any{
+			"name": capkCredentialSecret, "namespace": namespace,
+		}, "spec", "infraClusterSecretRef")
 	})
 	if err != nil {
 		return fmt.Errorf("declaring the KubevirtCluster %s/%s: %w",
@@ -257,6 +276,10 @@ func (r *ManagedTenantReconciler) ensureKubevirtCluster(
 	}
 	return nil
 }
+
+// capkCredentialSecret is CAPK's own identity in the host cluster, written by
+// the product's storage path beside the driver's.
+const capkCredentialSecret = "capk-infra-credentials"
 
 // ensureKamajiControlPlane writes the control plane itself.
 func (r *ManagedTenantReconciler) ensureKamajiControlPlane(

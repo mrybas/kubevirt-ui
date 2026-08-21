@@ -256,6 +256,35 @@ def _undescribable_fields(req: TenantCreateRequest) -> list[str]:
     return named
 
 
+def _described_addons(
+    req: TenantCreateRequest, storage_class: str | None,
+) -> list[dict[str, Any]]:
+    """What the tenant asks the operator to install.
+
+    Storage is a checkbox, not an addon, and the driver behind it has to be
+    asked for: the older path adds it when `enable_storage` is set, and this one
+    did not. A tenant created with storage ticked therefore got the host side —
+    a service account, a credential, a quota — and no driver, so every PVC in it
+    stayed Pending with nothing saying why. The checkbox and the thing it turns
+    on have to travel together.
+    """
+    asked = [
+        {"id": a.addon_id, "parameters": dict(a.parameters or {})}
+        for a in req.addons
+    ]
+    if not req.enable_storage:
+        return asked
+    if any(a["id"] == KUBEVIRT_CSI_ADDON_ID for a in asked):
+        return asked
+    parameters: dict[str, str] = {}
+    if storage_class:
+        # The class on the *host* — what the driver provisions from. Left out
+        # when unknown rather than sent empty, which makes the driver fall back
+        # to the host default and quietly land tenant volumes somewhere else.
+        parameters["INFRA_STORAGE_CLASS_NAME"] = storage_class
+    return asked + [{"id": KUBEVIRT_CSI_ADDON_ID, "parameters": parameters}]
+
+
 def _managed_tenant_body(
     req: TenantCreateRequest, storage_class: str | None,
 ) -> dict[str, Any]:
@@ -286,10 +315,7 @@ def _managed_tenant_body(
             "allowanceGi": req.storage_quota_gi,
             "pvcCount": req.storage_pvc_count,
         },
-        "addons": [
-            {"id": a.addon_id, "parameters": dict(a.parameters or {})}
-            for a in req.addons
-        ],
+        "addons": _described_addons(req, storage_class),
     }
     if req.talos_version:
         spec["workers"]["talosVersion"] = req.talos_version
@@ -2536,6 +2562,37 @@ async def _current_worker_shape(k8s, ns: str, md_name: str) -> dict[str, Any]:
     return shape
 
 
+async def _write_described_workers(
+    k8s, name: str, workers: dict[str, Any], resource_version: str | None,
+) -> None:
+    """Say what the pool should be, and let the operator make it so.
+
+    Carries the resourceVersion for the same reason the addon list does: two
+    people resizing at once each read the same shape, and the later write would
+    silently undo the earlier one.
+    """
+    body: dict[str, Any] = {"spec": {"workers": workers}}
+    if resource_version:
+        body["metadata"] = {"resourceVersion": resource_version}
+    try:
+        await k8s.custom_api.patch_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, name=name,
+            body=body,
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        if e.status == 409:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Tenant '{name}' was changed by someone else while this "
+                    f"resize was being applied. Nothing was written — try again."
+                ),
+            ) from e
+        raise
+
+
 @router.post("/{name}/scale", response_model=TenantResponse)
 async def scale_tenant(
     request: Request, name: str, scale: TenantScaleRequest,
@@ -2550,6 +2607,29 @@ async def scale_tenant(
     # Ask the folder ceiling before touching anything: a refusal must leave
     # the tenant exactly as it was.
     planned_quota = await _plan_tenant_quota(k8s, name, ns, scale)
+
+    # A described tenant is scaled by changing the description. Patching the
+    # MachineDeployment instead does nothing that lasts: the operator writes
+    # `replicas` from `spec.workers.count` on its next pass and puts it back,
+    # and the template rotation lands on an object the operator immediately
+    # replaces. Neither reports an error — the number moves and then returns.
+    described = await _described_tenant(k8s, name)
+    if described is not None:
+        workers = dict((described.get("spec") or {}).get("workers") or {})
+        workers["count"] = scale.worker_count
+        if scale.worker_vcpu:
+            workers["vcpu"] = scale.worker_vcpu
+        if scale.worker_memory:
+            workers["memory"] = scale.worker_memory
+        await _write_described_workers(
+            k8s, name, workers,
+            (described.get("metadata") or {}).get("resourceVersion"),
+        )
+        # The namespace quota still follows the shape from here: the operator
+        # writes it from the same description, but only on its next pass, and a
+        # scale-up that lands first would be refused pod by pod until then.
+        await _write_tenant_quota(k8s, ns, planned_quota)
+        return await get_tenant(request, name, user=user)
 
     try:
         # Resize first (rotate template), so the replica patch below lands on

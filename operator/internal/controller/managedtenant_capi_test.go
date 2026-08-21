@@ -514,3 +514,60 @@ func TestAdoptionDoesNotClearMetadataSomebodyElseWrote(t *testing.T) {
 		t.Errorf("labels = %v", after.GetLabels())
 	}
 }
+
+// TestATenantWithStorageSaysSoOnItsCluster.
+//
+// The product's gate on "may this tenant install the CSI driver" is
+// `KubevirtCluster.spec.infraClusterSecretRef`, and the operator never wrote
+// it. So a tenant the operator built could not have storage enabled from the
+// UI: the button answered "this tenant was created without storage — recreate
+// it with storage enabled" for a tenant whose host side was right there.
+//
+// Read from the credential rather than from a field on the description: the
+// host side of storage is the product's to create, and its existence is the
+// fact.
+func TestATenantWithStorageSaysSoOnItsCluster(t *testing.T) {
+	mustNamespace(t, "tenant-tcs1", "")
+	obj := talosTenant("tcs1")
+	reconciler := &ManagedTenantReconciler{
+		Client: k8sClient, Scheme: k8sClient.Scheme(), APIReader: k8sReader,
+	}
+
+	// No credential yet: nothing to point at, and saying otherwise would be a
+	// reference to a secret that is not there.
+	if err := reconciler.ensureKubevirtCluster(testCtx, obj, "tenant-tcs1"); err != nil {
+		t.Fatalf("without storage: %v", err)
+	}
+	cluster := &unstructured.Unstructured{}
+	cluster.SetGroupVersionKind(kubevirtClusterGVK)
+	if err := k8sReader.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-tcs1", Name: "tcs1"}, cluster); err != nil {
+		t.Fatalf("reading the cluster: %v", err)
+	}
+	if _, found, _ := unstructured.NestedMap(cluster.Object,
+		"spec", "infraClusterSecretRef"); found {
+		t.Error("it claimed storage with no credential to point at")
+	}
+
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "tenant-tcs1", Name: capkCredentialSecret}}
+	if err := k8sClient.Create(testCtx, secret); err != nil {
+		t.Fatalf("creating the credential: %v", err)
+	}
+
+	if err := reconciler.ensureKubevirtCluster(testCtx, obj, "tenant-tcs1"); err != nil {
+		t.Fatalf("with storage: %v", err)
+	}
+	if err := k8sReader.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-tcs1", Name: "tcs1"}, cluster); err != nil {
+		t.Fatalf("re-reading the cluster: %v", err)
+	}
+	ref, found, _ := unstructured.NestedMap(cluster.Object,
+		"spec", "infraClusterSecretRef")
+	if !found {
+		t.Fatal("the credential exists and the cluster does not say so")
+	}
+	if ref["name"] != capkCredentialSecret || ref["namespace"] != "tenant-tcs1" {
+		t.Errorf("ref = %v", ref)
+	}
+}

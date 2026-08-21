@@ -18,12 +18,16 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -110,10 +114,12 @@ func (r *ManagedTenantReconciler) reconcileWorkers(
 	if err != nil || bootstrap == "" {
 		return false, reason, message, err
 	}
-	if err := r.ensureMachineTemplate(ctx, obj, namespace, release); err != nil {
+	template, err := r.ensureMachineTemplate(ctx, obj, namespace, release)
+	if err != nil {
 		return false, "", "", err
 	}
-	if err := r.ensureMachineDeployment(ctx, obj, namespace, bootstrap); err != nil {
+	if err := r.ensureMachineDeployment(
+		ctx, obj, namespace, bootstrap, template); err != nil {
 		return false, "", "", err
 	}
 	if err := r.ensureMachineHealthCheck(ctx, obj, namespace); err != nil {
@@ -478,16 +484,99 @@ func (r *ManagedTenantReconciler) workerTimeServers(vip string) []string {
 	return append([]string{vip}, public...)
 }
 
-// ensureMachineTemplate is the VM shape CAPK stamps a worker out of.
+// ensureMachineTemplate is the VM shape CAPK stamps a worker out of, and its
+// name follows that shape.
+//
+// A resize has to reach the workers that already exist, and editing this object
+// does not: CAPI rolls a MachineDeployment when its template *reference*
+// changes, so a template patched in place gives the new shape to the next
+// worker created and none of the current ones. Measured: the field accepts the
+// patch, and nothing happens.
+//
+// So the name carries a digest of the shape. Same shape, same name, no write —
+// which is also what lets a tenant built by the product be adopted without
+// rolling every worker on the first pass: the template it already points at is
+// kept as long as it says what the description says.
 func (r *ManagedTenantReconciler) ensureMachineTemplate(
 	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace, release string,
-) error {
+) (string, error) {
+	want, err := r.machineTemplateSpec(obj, release)
+	if err != nil {
+		return "", err
+	}
+
+	// Whatever the pool points at now, kept if it already has this shape.
+	if current := r.currentTemplateName(ctx, obj, namespace); current != "" {
+		live := &unstructured.Unstructured{}
+		live.SetGroupVersionKind(kubevirtMachineTemplateGVK)
+		if err := r.Get(ctx, types.NamespacedName{
+			Namespace: namespace, Name: current,
+		}, live); err == nil {
+			spec, _, _ := unstructured.NestedMap(live.Object, "spec")
+			// Derivative rather than equal: the live object carries defaults
+			// nobody here sets, and comparing everything would rotate the
+			// template on every pass — a rolling update per reconcile.
+			if equality.Semantic.DeepDerivative(want, spec) {
+				return current, nil
+			}
+		}
+	}
+
+	name := fmt.Sprintf("%s-workers-%s", obj.Name, shapeDigest(want))
 	live := &unstructured.Unstructured{}
 	live.SetGroupVersionKind(kubevirtMachineTemplateGVK)
-	live.SetName(obj.Name + "-workers")
+	live.SetName(name)
 	live.SetNamespace(namespace)
-	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
+	if _, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
 		mergeLabels(live, map[string]string{"kubevirt-ui.io/tenant": obj.Name})
+		return unstructured.SetNestedMap(live.Object, want, "spec")
+	}); err != nil {
+		return "", fmt.Errorf("writing the worker template: %w", err)
+	}
+	return name, nil
+}
+
+// currentTemplateName is what the pool stamps workers from today, or "".
+func (r *ManagedTenantReconciler) currentTemplateName(
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace string,
+) string {
+	pool := &unstructured.Unstructured{}
+	pool.SetGroupVersionKind(machineDeploymentObjectGVK)
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: namespace, Name: obj.Name + "-workers",
+	}, pool); err != nil {
+		return ""
+	}
+	name, _, _ := unstructured.NestedString(pool.Object,
+		"spec", "template", "spec", "infrastructureRef", "name")
+	return name
+}
+
+// shapeDigest is eight hex characters of the shape itself.
+//
+// Deterministic on purpose: a random suffix, which is what the endpoint this
+// replaces used, would mint a new template on every pass and roll the pool for
+// ever. Rolling back to a previous shape lands on the previous name and reuses
+// the object that is already there.
+func shapeDigest(spec map[string]any) string {
+	encoded, err := json.Marshal(spec)
+	if err != nil {
+		// Cannot happen for a map this code built, and guessing a name would
+		// be worse than a stable one that never rotates.
+		return "0000000000"
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:5])
+}
+
+// machineTemplateSpec is the shape itself, without the object around it.
+func (r *ManagedTenantReconciler) machineTemplateSpec(
+	obj *platformv1alpha1.ManagedTenant, release string,
+) (map[string]any, error) {
+	// The map has to exist: this is built standalone rather than on an object
+	// read from the cluster, and SetNestedMap on a nil Object panics.
+	live := &unstructured.Unstructured{Object: map[string]any{}}
+	build := func() error {
 
 		podAnnotations := map[string]any{
 			// Bridge binding needs this to permit live migration on a
@@ -562,11 +651,15 @@ func (r *ManagedTenantReconciler) ensureMachineTemplate(
 			},
 			"virtualMachineTemplate": map[string]any{"spec": vmSpec},
 		}, "spec", "template", "spec")
-	})
-	if err != nil {
-		return fmt.Errorf("declaring the machine template: %w", err)
 	}
-	return nil
+	if err := build(); err != nil {
+		return nil, fmt.Errorf("declaring the machine template: %w", err)
+	}
+	spec, _, err := unstructured.NestedMap(live.Object, "spec")
+	if err != nil {
+		return nil, fmt.Errorf("reading back the machine template: %w", err)
+	}
+	return spec, nil
 }
 
 // workerRootDisk is the per-worker clone of the shared golden.
@@ -615,7 +708,8 @@ func (r *ManagedTenantReconciler) workerRootDisk(
 
 // ensureMachineDeployment scales the pool.
 func (r *ManagedTenantReconciler) ensureMachineDeployment(
-	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace, bootstrap string,
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
+	namespace, bootstrap, template string,
 ) error {
 	live := &unstructured.Unstructured{}
 	live.SetGroupVersionKind(machineDeploymentObjectGVK)
@@ -645,10 +739,13 @@ func (r *ManagedTenantReconciler) ensureMachineDeployment(
 					"kind":       talosConfigTemplateGVK.Kind,
 					"name":       bootstrap,
 				}},
+				// The pool points at whichever template carries the shape the
+				// description asks for. Changing this reference is what makes
+				// CAPI roll the workers that already exist.
 				"infrastructureRef": map[string]any{
 					"apiVersion": kubevirtMachineTemplateGVK.GroupVersion().String(),
 					"kind":       kubevirtMachineTemplateGVK.Kind,
-					"name":       obj.Name + "-workers",
+					"name":       template,
 				},
 			}},
 		}, "spec")
