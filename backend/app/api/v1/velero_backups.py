@@ -17,7 +17,7 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
-from app.core.auth import User, require_auth
+from app.core.auth import User, require_admin, require_auth
 from app.core.errors import k8s_error_to_http
 from app.core.groups import ENV_FOLDER_LABEL, ENV_ENVIRONMENT_LABEL
 from app.core.naming import VM_NAME_LABEL
@@ -189,6 +189,90 @@ async def _ensure_vm_name_labels(k8s_client: Any, namespace: str, names: list[st
             )
         except ApiException as e:
             logger.warning(f"Could not backfill {VM_NAME_LABEL} on {namespace}/{name}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Who may act on a backup
+# ---------------------------------------------------------------------------
+#
+# Every route here took a bare session. Any authenticated user could back up,
+# **restore**, or delete any namespace in the cluster, and manage the cluster's
+# BackupStorageLocations — a restore in particular writes other people's
+# namespaces from a snapshot they never agreed to.
+#
+# The rule is one sentence: you may act on a backup only if you are a member of
+# every namespace it covers. It is checked against the resolved spec rather than
+# the request fields, because the spec is what Velero acts on and the request
+# has three different ways of producing it.
+#
+# The empty case is the dangerous one. Velero reads "no includedNamespaces" as
+# *every* namespace, so a request with no folder, no environment and no explicit
+# list is a whole-cluster backup — which is exactly what an unprivileged caller
+# would send by accident and exactly what it must not get.
+
+
+async def _authorise_scope(
+    k8s_client: Any, user: User, namespaces: list[str], what: str,
+) -> None:
+    from app.core.groups import is_admin, is_env_member, load_folder, resolve_env
+
+    if is_admin(user.groups, user):
+        return
+
+    if not namespaces:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"This {what} covers every namespace in the cluster, which takes "
+                f"a platform admin. Name a folder and environment instead."
+            ),
+        )
+
+    for namespace in namespaces:
+        try:
+            folder, environment = await resolve_env(k8s_client, namespace)
+            meta = await load_folder(k8s_client, folder)
+        except HTTPException:
+            # Unreadable, unmanaged or missing: a namespace whose ownership
+            # cannot be established is not one an unprivileged caller may act
+            # on. Refused rather than reported, so this cannot be used to probe
+            # which namespaces exist.
+            raise HTTPException(
+                status_code=403,
+                detail=f"Not permitted to {what} namespace '{namespace}'",
+            ) from None
+        if not is_env_member(user, meta, environment):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Environment member role required for '{namespace}'",
+            )
+
+
+def _covered_namespaces(spec: dict[str, Any]) -> list[str]:
+    return list(spec.get("includedNamespaces") or [])
+
+
+async def _scope_of(
+    k8s_client: Any, velero_ns: str, plural: str, name: str,
+) -> list[str]:
+    """The namespaces an existing backup or schedule covers.
+
+    Read off the object rather than taken from the caller: the caller names only
+    which backup, and what that backup reaches is the object's business.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    try:
+        obj = await custom_api.get_namespaced_custom_object(
+            group=VELERO_GROUP, version=VELERO_VERSION,
+            namespace=velero_ns, plural=plural, name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(status_code=404, detail=f"'{name}' not found") from None
+        raise k8s_error_to_http(e, f"reading {plural}") from None
+    spec = obj.get("spec") or {}
+    template = spec.get("template") or {}
+    return _covered_namespaces(template or spec)
 
 
 async def _build_backup_template_spec(
@@ -368,6 +452,7 @@ async def create_velero_backup(
     velero_ns = await _find_velero_namespace(k8s_client)
 
     spec = await _build_backup_template_spec(k8s_client, backup_request)
+    await _authorise_scope(k8s_client, user, _covered_namespaces(spec), "back up")
 
     body = {
         "apiVersion": f"{VELERO_GROUP}/{VELERO_VERSION}",
@@ -402,6 +487,10 @@ async def delete_velero_backup(
     """Delete a Velero backup by creating a DeleteBackupRequest."""
     k8s_client = request.app.state.k8s_client
     velero_ns = await _find_velero_namespace(k8s_client)
+    await _authorise_scope(
+        k8s_client, user, await _scope_of(k8s_client, velero_ns, "backups", name),
+        "delete backups of",
+    )
 
     # Velero uses DeleteBackupRequest CRD to trigger backup deletion
     dbr_body = {
@@ -441,6 +530,15 @@ async def create_velero_restore(
     """Create a Velero Restore from a backup."""
     k8s_client = request.app.state.k8s_client
     velero_ns = await _find_velero_namespace(k8s_client)
+
+    # A restore writes namespaces from a snapshot, so it is authorised against
+    # both what the backup holds and what this restore asks to put back — the
+    # request can narrow the set, never widen it past the caller's own reach.
+    covered = await _scope_of(k8s_client, velero_ns, "backups", backup_name)
+    asked = list(restore_request.included_namespaces) if restore_request else []
+    await _authorise_scope(k8s_client, user, covered, "restore")
+    if asked:
+        await _authorise_scope(k8s_client, user, asked, "restore")
 
     restore_name = (
         (restore_request.name if restore_request and restore_request.name else None)
@@ -519,6 +617,7 @@ async def create_velero_schedule(
     velero_ns = await _find_velero_namespace(k8s_client)
 
     template = await _build_backup_template_spec(k8s_client, schedule_request)
+    await _authorise_scope(k8s_client, user, _covered_namespaces(template), "back up")
 
     body = {
         "apiVersion": f"{VELERO_GROUP}/{VELERO_VERSION}",
@@ -556,6 +655,10 @@ async def delete_velero_schedule(
     """Delete a Velero backup schedule."""
     k8s_client = request.app.state.k8s_client
     velero_ns = await _find_velero_namespace(k8s_client)
+    await _authorise_scope(
+        k8s_client, user, await _scope_of(k8s_client, velero_ns, "schedules", name),
+        "delete schedules of",
+    )
 
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
@@ -580,6 +683,10 @@ async def patch_velero_schedule(
     """Pause or unpause a Velero backup schedule."""
     k8s_client = request.app.state.k8s_client
     velero_ns = await _find_velero_namespace(k8s_client)
+    await _authorise_scope(
+        k8s_client, user, await _scope_of(k8s_client, velero_ns, "schedules", name),
+        "change schedules of",
+    )
 
     patch_body: dict[str, Any] = {"spec": {}}
     if patch_request.paused is not None:
@@ -630,7 +737,7 @@ async def list_velero_storage_locations(
 async def create_storage_location(
     request: Request,
     data: StorageLocationCreateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> dict[str, Any]:
     """Create a Velero BackupStorageLocation."""
     k8s_client = request.app.state.k8s_client
@@ -688,7 +795,7 @@ async def update_storage_location(
     request: Request,
     name: str,
     data: StorageLocationUpdateRequest,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> dict[str, Any]:
     """Update a Velero BackupStorageLocation."""
     k8s_client = request.app.state.k8s_client
@@ -728,7 +835,7 @@ async def update_storage_location(
 async def delete_storage_location(
     request: Request,
     name: str,
-    user: User = Depends(require_auth),
+    user: User = Depends(require_admin),
 ) -> None:
     """Delete a Velero BackupStorageLocation."""
     k8s_client = request.app.state.k8s_client
