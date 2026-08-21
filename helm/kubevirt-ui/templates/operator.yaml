@@ -42,6 +42,9 @@ one line of output, rather than in a cluster where it is an investigation.
 {{- end }}
 {{- end }}
 {{- end }}
+{{- if and .Values.operator.enabled .Values.operator.webhooks.enabled (not .Values.operator.domains.vm.enabled) }}
+{{- fail "operator.webhooks.enabled needs operator.domains.vm.enabled: the admission server runs in that deployment, and a webhook configuration pointing at a service with no endpoints rejects every write it guards — these fail closed" }}
+{{- end }}
 {{- if and .Values.operator.enabled .Values.operator.domains.network.enabled (not $supernet) }}
 {{- fail "operator.config.tenantSupernet is required by the network domain: without it no isolation is written at all, and a VPC comes up attached, routed, and open to every other tenant while the UI says it is isolated" }}
 {{- end }}
@@ -99,6 +102,49 @@ subjects:
   - kind: ServiceAccount
     name: {{ .Release.Name }}-operator
     namespace: {{ .Release.Namespace }}
+{{- if .Values.operator.webhooks.enabled }}
+---
+# The admission server, served by the vm deployment's pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-operator-webhook
+  namespace: {{ .Release.Namespace }}
+spec:
+  ports:
+    - port: 443
+      targetPort: 9443
+      protocol: TCP
+      name: https
+  selector:
+    app.kubernetes.io/name: kubevirt-ui-operator
+    platform.kubevirt-ui.io/domain: vm
+---
+# Self-signed, because this CA authenticates one server to one API server and
+# nothing else trusts it. cert-manager writes the CA into the webhook
+# configuration through the annotation the generator puts there.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ .Release.Name }}-operator-selfsigned
+  namespace: {{ .Release.Namespace }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Release.Name }}-operator-serving-cert
+  namespace: {{ .Release.Namespace }}
+spec:
+  dnsNames:
+    - {{ .Release.Name }}-operator-webhook.{{ .Release.Namespace }}.svc
+    - {{ .Release.Name }}-operator-webhook.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: {{ .Release.Name }}-operator-selfsigned
+  secretName: {{ .Release.Name }}-operator-webhook-cert
+{{- end }}
 {{- range $domain, $spec := .Values.operator.domains }}
 {{- if $spec.enabled }}
 ---
@@ -214,6 +260,10 @@ spec:
               containerPort: 8081
             - name: metrics
               containerPort: 8080
+            {{- if and (eq $domain "vm") $top.Values.operator.webhooks.enabled }}
+            - name: webhook
+              containerPort: 9443
+            {{- end }}
           securityContext:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
@@ -228,6 +278,20 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           resources: {{- toYaml $top.Values.operator.resources | nindent 12 }}
+          {{- if and (eq $domain "vm") $top.Values.operator.webhooks.enabled }}
+          volumeMounts:
+            # controller-runtime's default location, which is why no
+            # --webhook-cert-path is passed: one fewer thing to keep in step.
+            - name: webhook-cert
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+          {{- end }}
+      {{- if and (eq $domain "vm") $top.Values.operator.webhooks.enabled }}
+      volumes:
+        - name: webhook-cert
+          secret:
+            secretName: {{ $top.Release.Name }}-operator-webhook-cert
+      {{- end }}
 {{- end }}
 {{- end }}
 {{- end }}

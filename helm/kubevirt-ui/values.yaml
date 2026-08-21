@@ -679,7 +679,21 @@ operator:
     # cascade-delete every tenant, network and VM described by them.
     install: true
   webhooks:
-    # Admission belongs to one deployment or none.
+    # Admission belongs to one deployment or none: it is served by the vm
+    # deployment, and the chart refuses to render a configuration pointing at a
+    # service that domain would not provide.
+    #
+    # Off by default, and the reason is the failure mode rather than caution:
+    # two of the three webhooks are `failurePolicy: Fail`, so between the
+    # configuration existing and the certificate being issued, every
+    # ManagedTenant and ManagedVM write is rejected. On is right for a cluster
+    # that has cert-manager and wants the validation; the product's create
+    # endpoint passes the webhook's refusal through as a 400, and that message
+    # is the only sentence saying which field is wrong.
+    #
+    # Requires cert-manager: the certificate and the CA injection are its
+    # objects. There is no way to check that from a template, so it is said
+    # here instead.
     enabled: false
   domains:
     vm:

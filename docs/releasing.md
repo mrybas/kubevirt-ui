@@ -73,6 +73,26 @@ It writes ownership metadata and nothing else. Deleting the CRDs — the other w
 to make Helm happy — cascade-deletes every tenant, network and VM described by
 them.
 
+## Admission
+
+The operator validates `ManagedTenant` and `ManagedVM` before they are stored,
+and the product's create endpoint passes the refusal through as a 400 — that
+message is the only sentence saying which field is wrong. It is off by default
+and needs cert-manager:
+
+```
+--set operator.webhooks.enabled=true
+```
+
+Two of the three webhooks fail closed, so between the configuration existing and
+the certificate being issued nothing can be created. That is the trade: with it
+off, a description the operator cannot build is accepted and the reason appears
+later as a condition instead of in the answer.
+
+It is served by the vm deployment. Asking for it with that domain disabled is
+refused at render, because a configuration pointing at a service with no
+endpoints rejects every write it guards.
+
 ## Handover flags
 
 The operator takes work over from the product one path at a time, and the flags

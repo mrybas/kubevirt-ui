@@ -55,9 +55,14 @@ func Files(root string) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	webhooks, err := renderWebhooks(filepath.Join(root, "operator/config/webhook/manifests.yaml"))
+	if err != nil {
+		return nil, err
+	}
 	return map[string]string{
 		"helm/kubevirt-ui/templates/operator-crds.yaml":         crds,
 		"helm/kubevirt-ui/templates/operator-manager-role.yaml": role,
+		"helm/kubevirt-ui/templates/operator-webhooks.yaml":     webhooks,
 	}, nil
 }
 
@@ -161,4 +166,63 @@ func Drifted(root string, check bool) ([]string, error) {
 	}
 	sort.Strings(drifted)
 	return drifted, nil
+}
+
+// renderWebhooks turns kubebuilder's admission manifest into a chart template.
+//
+// The markers in the Go code decide which resources are guarded and how they
+// fail; a copy typed into the chart would be a second answer to that, and this
+// is the one place where the two disagreeing is not a cosmetic problem: a
+// webhook that names a path the binary does not serve rejects every write to
+// the resource it guards, because these fail closed.
+//
+// Only the addressing is templated — the release's own service and namespace,
+// and the annotation that makes cert-manager fill in the CA.
+func renderWebhooks(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("reading the webhook manifest: %w", err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return "", fmt.Errorf("reading the webhook manifest: %w", err)
+	}
+
+	doc["metadata"] = map[string]any{
+		"name": "{{ .Release.Name }}-operator",
+		"annotations": map[string]any{
+			// cert-manager writes the CA here once the certificate is issued.
+			// Without it every call fails TLS verification, which for
+			// failurePolicy: Fail means nothing can be created at all.
+			"cert-manager.io/inject-ca-from": "{{ .Release.Namespace }}/{{ .Release.Name }}-operator-serving-cert",
+		},
+	}
+	hooks, _ := doc["webhooks"].([]any)
+	for _, raw := range hooks {
+		hook, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		config, _ := hook["clientConfig"].(map[string]any)
+		if config == nil {
+			continue
+		}
+		service, _ := config["service"].(map[string]any)
+		if service == nil {
+			continue
+		}
+		service["name"] = "{{ .Release.Name }}-operator-webhook"
+		service["namespace"] = "{{ .Release.Namespace }}"
+	}
+
+	body, err := yaml.Marshal(doc)
+	if err != nil {
+		return "", err
+	}
+	var out strings.Builder
+	fmt.Fprintf(&out, banner, "operator/config/webhook/manifests.yaml")
+	out.WriteString("{{- if and .Values.operator.enabled .Values.operator.webhooks.enabled }}\n---\n")
+	out.Write(body)
+	out.WriteString("{{- end }}\n")
+	return out.String(), nil
 }

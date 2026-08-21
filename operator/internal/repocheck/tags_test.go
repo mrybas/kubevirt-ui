@@ -1,12 +1,15 @@
 package repocheck
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 )
 
 // `latest` must never point at something that was not released.
@@ -355,4 +358,203 @@ func firstLines(text string, n int) string {
 		lines = lines[:n]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// TestAdmissionIsWiredEndToEnd.
+//
+// Three things have to agree or the guard is worse than absent: the
+// configuration must name a service the chart creates, that service must select
+// the pods that actually serve 9443, and those pods must carry the certificate
+// the CA injection refers to. Two of the three webhooks are
+// `failurePolicy: Fail`, so a mismatch does not degrade validation — it rejects
+// every ManagedTenant and ManagedVM write in the cluster.
+//
+// Asserted by reading the objects, not by looking for strings in the render.
+// The first version of this test did the latter and two mutants walked through
+// it: pointing the volume at the wrong secret, and selecting the wrong domain.
+// Both left the same words on the page in some other object.
+func TestAdmissionIsWiredEndToEnd(t *testing.T) {
+	docs := renderObjects(t,
+		"--set", "operator.enabled=true",
+		"--set", "operator.webhooks.enabled=true",
+		"--set", "operator.config.kubeOvnNamespace=k",
+		"--set", "operator.config.metallbNamespace=m",
+		"--set", "operator.config.metallbPool=p",
+		"--set", "operator.config.cpTransitSubnet=c",
+		"--set", "operator.config.ingressDomain=d",
+		"--set", "operator.config.tenantSupernet=10.200.0.0/14")
+
+	config := one(t, docs, "ValidatingWebhookConfiguration", "")
+	service := one(t, docs, "Service", "kubevirt-ui-operator-webhook")
+	cert := one(t, docs, "Certificate", "")
+	vm := one(t, docs, "Deployment", "kubevirt-ui-operator-vm")
+
+	// The configuration names the service the chart creates.
+	for _, hook := range dig(config, "webhooks").([]any) {
+		named := dig(hook, "clientConfig", "service", "name")
+		if named != dig(service, "metadata", "name") {
+			t.Errorf("a webhook points at %v, and the chart creates %v",
+				named, dig(service, "metadata", "name"))
+		}
+	}
+
+	// The service selects the pods of the domain that serves admission, and
+	// they are the pods that open the port.
+	if got := dig(service, "spec", "selector", "platform.kubevirt-ui.io/domain"); got != "vm" {
+		t.Errorf("the webhook service selects domain %v, and only vm serves it", got)
+	}
+	container := dig(vm, "spec", "template", "spec", "containers").([]any)[0]
+	if !hasPort(container, 9443) {
+		t.Error("the vm deployment does not open 9443")
+	}
+
+	// The pods carry the certificate the injection refers to, and it is the one
+	// this certificate issues.
+	secret := dig(cert, "spec", "secretName")
+	mounted := volumeSecret(t, vm, "/tmp/k8s-webhook-server/serving-certs")
+	if mounted != secret {
+		t.Errorf("the pods mount %q and the certificate writes %q", mounted, secret)
+	}
+	injected := dig(config, "metadata", "annotations", "cert-manager.io/inject-ca-from")
+	want := fmt.Sprintf("%v/%v", dig(cert, "metadata", "namespace"),
+		dig(cert, "metadata", "name"))
+	if injected != want {
+		t.Errorf("the CA is injected from %v, and the certificate is %v", injected, want)
+	}
+}
+
+// TestAdmissionCannotBeAskedForWithoutTheDeploymentThatServesIt.
+func TestAdmissionCannotBeAskedForWithoutTheDeploymentThatServesIt(t *testing.T) {
+	out, err := renderChart(t,
+		"--set", "operator.enabled=true",
+		"--set", "operator.webhooks.enabled=true",
+		"--set", "operator.domains.vm.enabled=false",
+		"--set", "operator.config.kubeOvnNamespace=k",
+		"--set", "operator.config.metallbNamespace=m",
+		"--set", "operator.config.metallbPool=p",
+		"--set", "operator.config.cpTransitSubnet=c",
+		"--set", "operator.config.ingressDomain=d",
+		"--set", "operator.config.tenantSupernet=10.200.0.0/14")
+	if err == nil {
+		t.Fatal("it rendered a webhook configuration with nothing behind it")
+	}
+	if !strings.Contains(out, "needs operator.domains.vm.enabled") {
+		t.Errorf("refused for the wrong reason:\n%s", firstLines(out, 5))
+	}
+}
+
+// TestWithAdmissionOffNothingIsLeftBehind.
+//
+// Half of it would be worse than none: a configuration with no server, or a
+// server with no configuration and a certificate nobody uses.
+func TestWithAdmissionOffNothingIsLeftBehind(t *testing.T) {
+	out, err := renderChart(t,
+		"--set", "operator.enabled=true",
+		"--set", "operator.config.kubeOvnNamespace=k",
+		"--set", "operator.config.metallbNamespace=m",
+		"--set", "operator.config.metallbPool=p",
+		"--set", "operator.config.cpTransitSubnet=c",
+		"--set", "operator.config.ingressDomain=d",
+		"--set", "operator.config.tenantSupernet=10.200.0.0/14")
+	if err != nil {
+		t.Fatalf("rendering: %v", err)
+	}
+	for _, absent := range []string{
+		"ValidatingWebhookConfiguration", "kind: Certificate",
+		"containerPort: 9443", "serving-certs",
+	} {
+		if strings.Contains(out, absent) {
+			t.Errorf("%q is rendered with admission off", absent)
+		}
+	}
+	if !strings.Contains(out, "ENABLE_WEBHOOKS") {
+		t.Error("the binary is not told to keep its webhook server down")
+	}
+}
+
+// renderObjects renders the chart and parses what comes out.
+func renderObjects(t *testing.T, args ...string) []map[string]any {
+	t.Helper()
+	out, err := renderChart(t, args...)
+	if err != nil {
+		t.Fatalf("rendering: %v\n%s", err, firstLines(out, 5))
+	}
+	var docs []map[string]any
+	for _, part := range strings.Split(out, "\n---") {
+		var doc map[string]any
+		if err := yaml.Unmarshal([]byte(part), &doc); err != nil || doc == nil {
+			continue
+		}
+		docs = append(docs, doc)
+	}
+	if len(docs) < 5 {
+		t.Fatalf("only %d objects parsed — the split is wrong", len(docs))
+	}
+	return docs
+}
+
+// one is the single object of a kind, optionally by name.
+func one(t *testing.T, docs []map[string]any, kind, name string) map[string]any {
+	t.Helper()
+	var found []map[string]any
+	for _, doc := range docs {
+		if doc["kind"] != kind {
+			continue
+		}
+		if name != "" && dig(doc, "metadata", "name") != name {
+			continue
+		}
+		found = append(found, doc)
+	}
+	if len(found) != 1 {
+		t.Fatalf("wanted one %s %q, found %d", kind, name, len(found))
+	}
+	return found[0]
+}
+
+func dig(doc any, path ...string) any {
+	for _, key := range path {
+		asMap, ok := doc.(map[string]any)
+		if !ok {
+			return nil
+		}
+		doc = asMap[key]
+	}
+	return doc
+}
+
+func hasPort(container any, port int) bool {
+	ports, _ := dig(container, "ports").([]any)
+	for _, entry := range ports {
+		if value, ok := dig(entry, "containerPort").(float64); ok && int(value) == port {
+			return true
+		}
+	}
+	return false
+}
+
+// volumeSecret is the secret behind whatever is mounted at a path.
+func volumeSecret(t *testing.T, deployment map[string]any, path string) string {
+	t.Helper()
+	pod := dig(deployment, "spec", "template", "spec")
+	container := dig(pod, "containers").([]any)[0]
+	name := ""
+	mounts, _ := dig(container, "volumeMounts").([]any)
+	for _, mount := range mounts {
+		if dig(mount, "mountPath") == path {
+			name, _ = dig(mount, "name").(string)
+		}
+	}
+	if name == "" {
+		t.Fatalf("nothing is mounted at %s", path)
+	}
+	volumes, _ := dig(pod, "volumes").([]any)
+	for _, volume := range volumes {
+		if dig(volume, "name") == name {
+			secret, _ := dig(volume, "secret", "secretName").(string)
+			return secret
+		}
+	}
+	t.Fatalf("no volume called %q", name)
+	return ""
 }

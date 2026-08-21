@@ -1,0 +1,72 @@
+# Generated from operator/config/webhook/manifests.yaml by "go run ./cmd/chartsync".
+# Do not edit: the markers in the operator's Go code are the source, and a
+# hand-edit here is a second record of one fact that nothing compares.
+{{- if and .Values.operator.enabled .Values.operator.webhooks.enabled }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  annotations:
+    cert-manager.io/inject-ca-from: '{{ .Release.Namespace }}/{{ .Release.Name }}-operator-serving-cert'
+  name: '{{ .Release.Name }}-operator'
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: '{{ .Release.Name }}-operator-webhook'
+      namespace: '{{ .Release.Namespace }}'
+      path: /guard-kubevirt-io-v1-virtualmachine
+  failurePolicy: Ignore
+  name: guard-virtualmachine.kb.io
+  rules:
+  - apiGroups:
+    - kubevirt.io
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - virtualmachines
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: '{{ .Release.Name }}-operator-webhook'
+      namespace: '{{ .Release.Namespace }}'
+      path: /validate-platform-kubevirt-ui-io-v1alpha1-managedtenant
+  failurePolicy: Fail
+  name: vmanagedtenant-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - platform.kubevirt-ui.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - managedtenants
+  sideEffects: None
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: '{{ .Release.Name }}-operator-webhook'
+      namespace: '{{ .Release.Namespace }}'
+      path: /validate-platform-kubevirt-ui-io-v1alpha1-managedvm
+  failurePolicy: Fail
+  name: vmanagedvm-v1alpha1.kb.io
+  rules:
+  - apiGroups:
+    - platform.kubevirt-ui.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - managedvms
+  sideEffects: None
+{{- end }}
