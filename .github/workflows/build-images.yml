@@ -178,11 +178,52 @@ jobs:
             org.opencontainers.image.description=KubeVirt UI Operator
 
   # ---------------------------------------------------------------------------
+  # Checks: the guards, run where somebody other than their author will see them
+  # ---------------------------------------------------------------------------
+  #
+  # Nothing ran here before. Every contract test in this repository — the chart's
+  # RBAC rules against the calls the backend makes, the chart's copy of the
+  # operator's CRDs against the operator's own markers, the route tables, the
+  # 1700 backend tests, the operator's own suite — only ever ran when the person
+  # writing them chose to run them. A guard nobody runs is a comment.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Operator suite
+        working-directory: operator
+        # `make test` brings its own envtest binaries, so the controller suite —
+        # which is most of the value — runs here too.
+        run: make test
+
+      - name: Backend suite
+        working-directory: backend
+        run: |
+          python3 -m pip install --quiet -r requirements.txt -r requirements-dev.txt
+          python3 -m pytest -q
+
+  # ---------------------------------------------------------------------------
   # Package and push Helm chart to OCI registry
   # ---------------------------------------------------------------------------
   helm-package:
     runs-on: ubuntu-latest
-    needs: prepare
+    # The published chart waits on the guards. A branch image does not: it exists
+    # to be debugged with, and refusing to build one while a test is red takes
+    # away the thing you would debug with.
+    needs: [prepare, checks]
     # A branch build publishes no chart: the dev operator is deployed with
     # kustomize, deliberately bypassing the chart and Flux, so there is no
     # version for it to claim. A prerelease tag does publish one, under its own

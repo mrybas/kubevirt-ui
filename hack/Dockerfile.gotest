@@ -1,5 +1,11 @@
 # The environment the Go suite runs in.
 #
+# Two consumers: hack/soak.sh and hack/mutate.sh start throwaway containers from
+# it, and the long-lived `kvbuild` container used interactively is created from
+# it too. CI installs the same tools by name rather than using this image — see
+# the `checks` job — so the dependency is declared in both places and neither is
+# a machine somebody once set up by hand.
+#
 # It was an ad-hoc container called `kvbuild`, created by hand once and depended
 # on by name from two scripts. That worked until a test needed a tool the plain
 # Go image does not have: the interactive container had helm because it had been
