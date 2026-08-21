@@ -3114,3 +3114,54 @@ the difference is entirely in who asked for it.
 The cloud-init worker path is still unimplemented — Talos only. CSI still talks
 to the host API through the in-cluster Service rather than the tenant's own VIP
 on 6444, which is the target design and not what the stand runs.
+
+## The third writer: the button a person presses
+
+Retiring the product's addon reconciler left the endpoint behind `POST
+/tenants/{name}/addons` still writing HelmReleases directly, and that turned out
+to be the dangerous one.
+
+It writes the release with the same labels the operator's carries, and the
+operator deletes labelled releases the tenant's description does not mention.
+Measured, because the timing is the point: the release survived every poll for a
+full minute — nothing watches HelmReleases, so no event reaches the tenant
+controller — and then vanished within five seconds of the next reconcile of the
+ManagedTenant. The button works, and the addon disappears at some later moment
+nobody can connect to pressing it.
+
+It also appended `<tenant>-<namespace>` to the namespace list while the release
+installs into `<namespace>`. That is where `uat-t1-alloy` came from: not
+sediment from a disabled addon, but a namespace that was never right.
+
+Both endpoints now edit `spec.addons` when the tenant is described, and fall
+back to the old path when it is not — half a migration is the normal state.
+
+**The patch carries the resourceVersion it read.** Whole-list writes have lost
+data here twice already: two Enables read `[]`, each writes a list of one, the
+second erases the first, and both requests report success. The precondition
+makes the API server refuse the loser, and the 409 says what happened instead of
+retrying on a guess about what the other request wanted.
+
+### Two things the change turned up
+
+**The chart's RBAC contract test caught the new calls before the cluster
+could** — the exact class it was written for. Rows added, `get` and `patch`
+only; deliberately no `create`, because a tenant becomes described by being
+adopted, which is a decision, not a side effect of pressing Enable. And the live
+ClusterRole on the stand did not have the rule either, so the endpoint would
+have 403'd — patched there too, ahead of the chart's next release.
+
+**A red test on main, red since it was written.**
+`test_an_allow_for_a_departed_vpc_is_dropped` asserts a rule that only holds
+when `TENANT_SUPERNET` is set. It sets nothing, the default is empty, the stand
+runs `10.200.0.0/14` — so with no supernet every prefix reads as "outside", the
+pass takes the branch that only prunes drops, and the allow it expects to be
+gone is kept on purpose. Its sibling passed for exactly the same reason and
+proved nothing: the only assertion sits inside `if patched:`, and nothing was
+patched. Both now state the configuration they are about, and the sibling
+insists on the write.
+
+**And `hack/mutate.sh` learned about the backend.** The compose service
+bind-mounts `backend/`, so a mutation applied "inside the container" is a
+mutation of the working tree — which is how that happened again, through a
+different door, after the first two were fixed.
