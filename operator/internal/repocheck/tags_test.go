@@ -120,6 +120,15 @@ func TestEveryShapeOfPrereleaseIsOne(t *testing.T) {
 func TestTheHandoverFollowsTheOperator(t *testing.T) {
 	handed := []string{
 		"OPERATOR_UNDERLAY_ENABLED",
+		// The tenant flags move together. Three of them write *parts* of a
+		// tenant, and handing those over without the tenant itself gives them
+		// to a controller that has never heard of it: measured on the stand,
+		// `tenant-test2` came up with no CNI, the backend logging "missing
+		// required addons" every thirty seconds and deliberately doing nothing
+		// because the flag said the addons were not its job, the operator idle
+		// because nothing described the tenant, both workers NodeHealthy=False
+		// for ever.
+		"OPERATOR_TENANT_ENABLED",
 		"OPERATOR_TENANT_BOOTSTRAP_ENABLED",
 		"OPERATOR_TENANT_TIME_ENABLED",
 		"OPERATOR_TENANT_ADDONS_ENABLED",
@@ -127,7 +136,7 @@ func TestTheHandoverFollowsTheOperator(t *testing.T) {
 	notYet := []string{
 		"OPERATOR_IMAGE_ENABLED", "OPERATOR_VM_ENABLED",
 		"OPERATOR_TEMPLATE_ENABLED", "OPERATOR_ANNOUNCE_ENABLED",
-		"OPERATOR_NETWORK_ENABLED",
+		"OPERATOR_NETWORK_ENABLED", "OPERATOR_PEERING_ENABLED",
 	}
 
 	off := backendEnv(t, false, nil)
@@ -147,6 +156,18 @@ func TestTheHandoverFollowsTheOperator(t *testing.T) {
 		if on[name] == "true" {
 			t.Errorf("%s was turned on, and that path is not retired", name)
 		}
+	}
+
+	// The parts without the whole is a real configuration — every tenant
+	// adopted by hand — and saying so explicitly is how it stays meant.
+	partsOnly := backendEnv(t, true,
+		map[string]string{"OPERATOR_TENANT_ENABLED": "false"})
+	if partsOnly["OPERATOR_TENANT_ENABLED"] != "false" {
+		t.Errorf("an explicit false was overruled: %q",
+			partsOnly["OPERATOR_TENANT_ENABLED"])
+	}
+	if partsOnly["OPERATOR_TENANT_ADDONS_ENABLED"] != "true" {
+		t.Errorf("saying no to one tenant flag turned the others off: %v", partsOnly)
 	}
 
 	// A decision beats a default, including a decision to keep something.

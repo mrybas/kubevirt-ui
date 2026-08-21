@@ -101,10 +101,31 @@ the operator gets the four handed-over paths handed over:
 
 ```
 OPERATOR_UNDERLAY_ENABLED         true
+OPERATOR_TENANT_ENABLED           true
 OPERATOR_TENANT_BOOTSTRAP_ENABLED true
 OPERATOR_TENANT_TIME_ENABLED      true
 OPERATOR_TENANT_ADDONS_ENABLED    true
 ```
+
+The tenant flags move together. Three of them write parts of a tenant, and
+handing those over without the tenant itself gives them to a controller that has
+never heard of it — the backend stops writing the addons because the flag says
+they are not its job, and nothing else writes them. A tenant built that way
+comes up with no CNI and never recovers.
+
+A deployment that wants the parts without the whole — every tenant adopted by
+hand — says so:
+
+```yaml
+backend:
+  env:
+    OPERATOR_TENANT_ENABLED: "false"
+```
+
+**Setting a flag an image predates is not a handover.** The image must contain
+the path the flag names; `OPERATOR_TENANT_ENABLED` on a backend that has never
+heard of it leaves the endpoint building tenants itself while the parts are
+handed away, which is the same broken shape from the other direction.
 
 They used to default to off, which produced the worst kind of install: three
 healthy controllers and a product that keeps writing everything, with nothing
