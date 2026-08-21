@@ -67,6 +67,7 @@ async def _create_vm(
         return created
 
     api = MagicMock()
+    api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
     api.create_namespaced_custom_object = AsyncMock(side_effect=_create_custom)
 
     k8s = MagicMock()
@@ -301,6 +302,7 @@ def _operation_harness(owner: str | None):
 
     api = MagicMock()
     api.get_namespaced_custom_object = AsyncMock(side_effect=_get)
+    api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
     api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
     api.patch_namespaced_custom_object = AsyncMock(side_effect=_patch)
     return api, created

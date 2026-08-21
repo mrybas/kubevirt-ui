@@ -325,6 +325,7 @@ def test_create_vm_from_template_uses_generate_name(
         ),
     ):
         api = MagicMock()
+        api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
         api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
         api.patch_namespaced_custom_object = patch_mock
         api_cls.return_value = api
@@ -430,6 +431,7 @@ def test_create_vm_from_template_halted_when_start_false(
         ),
     ):
         api = MagicMock()
+        api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
         api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
         api_cls.return_value = api
 
@@ -463,6 +465,7 @@ def test_create_vm_snapshot_uses_generate_name(client: TestClient) -> None:
 
     with patch("app.api.v1.vm_snapshots.client.CustomObjectsApi") as api_cls:
         api = MagicMock()
+        api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
         api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
         api_cls.return_value = api
 
@@ -578,6 +581,7 @@ def test_clone_vm_uses_generate_name_and_renames_dvs(client: TestClient) -> None
     with patch("app.api.v1.vm_actions.client.CustomObjectsApi") as api_cls:
         api = MagicMock()
         api.get_namespaced_custom_object = AsyncMock(side_effect=_get)
+        api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
         api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
         api_cls.return_value = api
 

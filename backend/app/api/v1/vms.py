@@ -1473,25 +1473,21 @@ async def create_vm_from_template(
     k8s_client = request.app.state.k8s_client
     
     try:
-        # 1. Get the template
-        try:
-            cm = await k8s_client.core_api.read_namespaced_config_map(
-                name="kubevirt-ui-templates",
-                namespace="kubevirt-ui-system",
+        # 1. Get the template, from whichever store holds it.
+        #
+        # This used to read the ConfigMap and nothing else, while the list and
+        # the single-template read covered both. With OPERATOR_TEMPLATE_ENABLED
+        # on, a template was written as a ManagedVMTemplate, appeared in the
+        # list, was offered by the wizard, and answered 404 here — the last
+        # click of the flow, and the only one that told you.
+        from app.api.v1.templates import resolve_template
+
+        template = await resolve_template(k8s_client, vm_request.template_name)
+        if template is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Template {vm_request.template_name} not found",
             )
-            if not cm.data or vm_request.template_name not in cm.data:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Template {vm_request.template_name} not found",
-                )
-            template = json.loads(cm.data[vm_request.template_name])
-        except ApiException as e:
-            if e.status == 404:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Templates not configured",
-                )
-            raise
         
         # 2. Extract template values with overrides
         compute = template.get("compute", {})

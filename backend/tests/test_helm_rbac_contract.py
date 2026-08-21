@@ -131,6 +131,10 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     ("platform.kubevirt-ui.io", "managedvmtemplates", "create",
      "templates._create_template_cr"),
     ("platform.kubevirt-ui.io", "managedvmtemplates", "delete", "templates.delete"),
+    # Editing a template edits it where it lives, and for a CR-backed one that
+    # is a patch — see tests/test_template_readers_agree.py.
+    ("platform.kubevirt-ui.io", "managedvmtemplates", "patch",
+     "templates.update_template"),
     ("platform.kubevirt-ui.io", "managedimages", "get", "templates (image lookup)"),
     ("platform.kubevirt-ui.io", "managedimages", "create",
      "templates._create_managed_image"),

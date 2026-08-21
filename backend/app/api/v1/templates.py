@@ -244,6 +244,41 @@ async def list_templates(
         )
 
 
+async def resolve_template(k8s_client: Any, name: str) -> dict[str, Any] | None:
+    """A template by name, from whichever store holds it.
+
+    One owner for the question "what is this template", because the answer was
+    being worked out in three places and one of them only knew about the old
+    store. `GET /templates` merged both, `GET /templates/{name}` read both, and
+    `POST /vms/from-template` read the ConfigMap alone — so with
+    OPERATOR_TEMPLATE_ENABLED on, a template appeared in the list, the wizard
+    offered it, and creating a machine from it answered 404. The pairing of the
+    two flags was unusable, and looked fine until the last click.
+
+    Returns the plain-dict shape the ConfigMap has always held, because that is
+    what the create path reads; a resource is presented in the same shape rather
+    than the caller learning which store it came from.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    existing = await _find_template_cr(custom_api, name)
+    if existing is not None:
+        return _template_from_cr(existing).model_dump()
+
+    try:
+        cm = await k8s_client.core_api.read_namespaced_config_map(
+            name=TEMPLATE_CONFIGMAP_NAME, namespace=TEMPLATE_NAMESPACE,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    if not cm.data or name not in cm.data:
+        return None
+    template = json.loads(cm.data[name])
+    template["name"] = name
+    return template
+
+
 @router.get("/{name}", response_model=VMTemplate)
 async def get_template(
     name: str,
@@ -290,17 +325,12 @@ async def get_template(
         )
 
 
-async def _create_template_cr(k8s_client: Any, template: VMTemplateCreate) -> VMTemplate:
-    """Write the template as its own object, next to the image it names.
+def _template_spec(template: VMTemplateCreate) -> dict[str, Any]:
+    """The resource's spec, as the request describes it.
 
-    The namespace is the image's, because that is where the template is usable
-    from and where the picker looks. The old store had no namespace at all —
-    one cluster-wide map keyed by a user-chosen string, which is why a
-    collision could name a template the user was not allowed to see.
+    Shared by create and update so an edit writes the same shape a create does.
+    They were separate once and only one of them knew this store existed.
     """
-    custom_api = client.CustomObjectsApi(k8s_client._api_client)
-    namespace = template.golden_image_namespace
-
     spec: dict[str, Any] = {
         "displayName": template.display_name,
         "imageRef": {"name": template.golden_image_name},
@@ -322,6 +352,20 @@ async def _create_template_cr(k8s_client: Any, template: VMTemplateCreate) -> VM
         "vnc": template.console.vnc_enabled,
         "serial": template.console.serial_console_enabled,
     }
+    return spec
+
+
+async def _create_template_cr(k8s_client: Any, template: VMTemplateCreate) -> VMTemplate:
+    """Write the template as its own object, next to the image it names.
+
+    The namespace is the image's, because that is where the template is usable
+    from and where the picker looks. The old store had no namespace at all —
+    one cluster-wide map keyed by a user-chosen string, which is why a
+    collision could name a template the user was not allowed to see.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    namespace = template.golden_image_namespace
+    spec = _template_spec(template)
 
     body = {
         "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
@@ -490,9 +534,29 @@ async def update_template(
     request: Request,
     user: User = Depends(require_auth),
 ) -> VMTemplate:
-    """Update an existing VM template."""
+    """Update an existing VM template, in whichever store holds it.
+
+    A template that exists as its own object is edited as one, whatever the flag
+    says — the same rule delete already followed. Without it an edit read the
+    ConfigMap alone and answered 404 for a template the list had just shown,
+    which is how create-from-template failed too.
+    """
     k8s_client = request.app.state.k8s_client
-    
+
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    existing_cr = await _find_template_cr(custom_api, name)
+    if existing_cr is not None:
+        patched = await custom_api.patch_namespaced_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            namespace=existing_cr["metadata"]["namespace"],
+            plural="managedvmtemplates", name=name,
+            body={"spec": _template_spec(template)},
+            # A merge body sent as a JSON Patch answers 400, and the contract
+            # test upstairs exists because that has happened.
+            _content_type="application/merge-patch+json",
+        )
+        return _template_from_cr(patched)
+
     try:
         cm = await k8s_client.core_api.read_namespaced_config_map(
             name=TEMPLATE_CONFIGMAP_NAME,
