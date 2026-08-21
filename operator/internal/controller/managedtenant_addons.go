@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -69,7 +70,12 @@ func (r *ManagedTenantReconciler) reconcileAddons(
 		return true, "", "", nil
 	}
 
-	for _, release := range addons.Render(obj.Name, namespace, catalog, requested) {
+	rendered := addons.Render(obj.Name, namespace, catalog, requested)
+	if err := r.retireAddons(ctx, obj, namespace, rendered); err != nil {
+		return false, "", "", err
+	}
+
+	for _, release := range rendered {
 		live := &unstructured.Unstructured{}
 		live.SetGroupVersionKind(helmReleaseGVK)
 		live.SetName(release.Name)
@@ -85,6 +91,45 @@ func (r *ManagedTenantReconciler) reconcileAddons(
 	}
 
 	return r.addonState(ctx, obj, namespace)
+}
+
+// retireAddons removes the releases of addons the tenant no longer wants.
+//
+// The other half of writing them, and it is the half that goes missing: on the
+// stand a tenant still lists `uat-t1-alloy` among the namespaces its cluster
+// should have, months after the addon was disabled and its release deleted.
+// Nothing removed the entry, because the thing that added it only ever added.
+//
+// Here the namespace list is rendered whole from what is wanted, so it follows
+// by construction; what needs saying explicitly is the release itself. Only
+// ours — by the label this operator puts on them — because a HelmRelease in
+// this namespace that nobody here wrote belongs to somebody else.
+func (r *ManagedTenantReconciler) retireAddons(
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
+	namespace string, rendered []addons.Release,
+) error {
+	wanted := map[string]bool{}
+	for _, release := range rendered {
+		wanted[release.Name] = true
+	}
+
+	releases := &unstructured.UnstructuredList{}
+	releases.SetGroupVersionKind(helmReleaseGVK.GroupVersion().WithKind("HelmReleaseList"))
+	if err := r.List(ctx, releases, client.InNamespace(namespace),
+		client.MatchingLabels{"kubevirt-ui.io/tenant": obj.Name}); err != nil {
+		return fmt.Errorf("reading the tenant's releases: %w", err)
+	}
+	for i := range releases.Items {
+		item := &releases.Items[i]
+		if wanted[item.GetName()] || item.GetLabels()["kubevirt-ui.io/addon"] == "" {
+			continue
+		}
+		if err := r.Delete(ctx, item); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("retiring %s: %w", item.GetName(), err)
+		}
+		kube.CountWrite(r.Scheme, item, tenantControllerName, "deleted")
+	}
+	return nil
 }
 
 // wantedAddons is what the tenant asked for, plus what the catalogue says a

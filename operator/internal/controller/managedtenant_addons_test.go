@@ -235,3 +235,92 @@ func TestNoCatalogueIsSaidRatherThanGuessed(t *testing.T) {
 	}
 	_ = fmt.Sprint()
 }
+
+// TestAnAddonNoLongerWantedIsRetiredAndLeavesNoSediment.
+//
+// Measured on the stand: a tenant still lists `uat-t1-alloy` among the
+// namespaces its cluster should have, long after the addon was disabled and its
+// release deleted. Nothing removed the entry, because the thing that added it
+// only ever added — and the namespace it names is not even the one the addon
+// installed into, so the tenant carries an empty namespace named after
+// something it does not have.
+//
+// Rendering the whole set every pass makes the list follow by construction. The
+// release has to be said out loud.
+func TestAnAddonNoLongerWantedIsRetiredAndLeavesNoSediment(t *testing.T) {
+	mustCatalog(t, "cat-d")
+	mustNamespace(t, "tenant-tad6", "")
+
+	obj := talosTenant("tad6")
+	obj.Spec.Addons = []platformv1alpha1.TenantAddon{{ID: "alloy"}}
+	reconciler := addonReconciler("cat-d")
+	if _, _, _, err := reconciler.reconcileAddons(testCtx, obj, "tenant-tad6"); err != nil {
+		t.Fatalf("reconcileAddons: %v", err)
+	}
+	if _, found := releasesOf(t, "tenant-tad6", "tad6")["tad6-alloy"]; !found {
+		t.Fatal("alloy was not installed in the first place")
+	}
+	namespacesOf := func() string {
+		list, _, _ := unstructured.NestedSlice(
+			releasesOf(t, "tenant-tad6", "tad6")["tad6-namespaces"].Object,
+			"spec", "values", "namespaces")
+		return fmt.Sprint(list)
+	}
+	if !strings.Contains(namespacesOf(), "alloy") {
+		t.Fatalf("the namespace list does not mention alloy: %s", namespacesOf())
+	}
+
+	// Disabled.
+	obj.Spec.Addons = nil
+	if _, _, _, err := reconciler.reconcileAddons(testCtx, obj, "tenant-tad6"); err != nil {
+		t.Fatalf("reconcileAddons: %v", err)
+	}
+
+	eventually(t, "the release to be retired", func() error {
+		if _, found := releasesOf(t, "tenant-tad6", "tad6")["tad6-alloy"]; found {
+			return fmt.Errorf("it is still there")
+		}
+		return nil
+	})
+	// And the sediment with it: nothing asks the tenant's cluster for that
+	// namespace any more.
+	if strings.Contains(namespacesOf(), "alloy") {
+		t.Errorf("the namespace list still asks for it: %s", namespacesOf())
+	}
+	// What is required stays, disabled or not.
+	got := releasesOf(t, "tenant-tad6", "tad6")
+	if len(got) != 2 {
+		t.Errorf("releases = %v, want the two required ones", keysOf(got))
+	}
+}
+
+// TestARelease NobodyHereWroteIsLeftAlone.
+func TestAReleaseNobodyHereWroteIsLeftAlone(t *testing.T) {
+	mustCatalog(t, "cat-e")
+	mustNamespace(t, "tenant-tad7", "")
+
+	foreign := &unstructured.Unstructured{}
+	foreign.SetGroupVersionKind(helmReleaseGVK)
+	foreign.SetName("tad7-somebody-elses")
+	foreign.SetNamespace("tenant-tad7")
+	foreign.SetLabels(map[string]string{"kubevirt-ui.io/tenant": "tad7"})
+	_ = unstructured.SetNestedMap(foreign.Object, map[string]any{
+		"interval": "30m",
+		"chart": map[string]any{"spec": map[string]any{
+			"chart": "./x", "sourceRef": map[string]any{
+				"kind": "GitRepository", "name": "flux-system",
+			},
+		}},
+	}, "spec")
+	if err := k8sClient.Create(testCtx, foreign); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("planting a foreign release: %v", err)
+	}
+
+	if _, _, _, err := addonReconciler("cat-e").reconcileAddons(
+		testCtx, talosTenant("tad7"), "tenant-tad7"); err != nil {
+		t.Fatalf("reconcileAddons: %v", err)
+	}
+	if _, found := releasesOf(t, "tenant-tad7", "tad7")["tad7-somebody-elses"]; !found {
+		t.Error("it retired a release it did not write")
+	}
+}

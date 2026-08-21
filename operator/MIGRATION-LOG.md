@@ -2806,3 +2806,31 @@ call and has to be left in the background — where it would otherwise be
 measuring a tree still being edited, which has already invalidated one series
 here. `hack/soak.sh` copies the tree first, like the mutation script, runs N
 times keeping every run's output, and stops at the first that is not green.
+
+### The sediment, found on the stand rather than in the plan's summary
+
+The plan lists "addon namespace sediment after Disable — clean up after
+itself (a measured finding)". Here is the measurement, still true today:
+
+```
+uat-t1 namespaces list: [default, tigera-operator, kube-system, uat-t1-alloy]
+uat-t1 releases:        calico, kubevirt-csi-driver, namespaces
+```
+
+Alloy was enabled and later disabled. Disabling deleted its HelmRelease and left
+`uat-t1-alloy` in the list of namespaces the tenant's cluster should have,
+because the thing that added the entry only ever added.
+
+And the entry is wrong on its own terms. The enable-later path prefixes the
+namespace with the tenant name while the release's `targetNamespace` is
+unprefixed — so the namespaces chart created `uat-t1-alloy` while alloy
+installed into `alloy`. The tenant carries an empty namespace named after
+something it does not have, and never got the namespace it did use (it relied on
+`createNamespace` instead). Two conventions in one list, visible above: three
+unprefixed entries and one prefixed.
+
+Rendering the whole set every pass makes the list follow by construction — there
+is no add-only path to leave anything behind. What needed saying out loud is the
+release: an addon no longer wanted has its release retired, and only ever ours,
+by the label this operator puts on them. A release in that namespace nobody here
+wrote belongs to somebody else.
