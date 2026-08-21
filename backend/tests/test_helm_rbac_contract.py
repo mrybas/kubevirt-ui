@@ -147,6 +147,12 @@ REQUIRED: list[tuple[str, str, str, str]] = [
      "vpcs._create_managed_network"),
     ("platform.kubevirt-ui.io", "managednetworks", "delete",
      "vpcs.delete_vpc (the operator cascades)"),
+    # Enabling an addon edits the tenant's description rather than writing a
+    # second HelmRelease — see tests/test_addons_have_one_writer.py.
+    ("platform.kubevirt-ui.io", "managedtenants", "get",
+     "tenants_crud._described_tenant"),
+    ("platform.kubevirt-ui.io", "managedtenants", "patch",
+     "tenants_crud._write_described_addons"),
 ]
 
 

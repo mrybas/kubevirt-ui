@@ -6,12 +6,22 @@
 # reported as one three times. This copies the working tree, including anything
 # uncommitted, into a throwaway directory and mutates there.
 #
-#   hack/mutate.sh <file-relative-to-repo> <sed-expression> <go-test-args...>
+#   hack/mutate.sh <file-relative-to-repo> <sed-expression> <test-args...>
 #
-# Example:
+# A path under `backend/` runs pytest instead of the Go suite, and the test
+# arguments are pytest's. That case is not a convenience: the compose service
+# bind-mounts `backend/` into the container, so a mutation applied "inside the
+# container" is a mutation of the working tree — which is exactly how the
+# in-tree mutation happened again after the first two were fixed.
+#
+# Examples:
 #   hack/mutate.sh operator/internal/controller/managedtenant_transit.go \
 #     's/if len(unprotected) == 0 && !hasDeny/if !hasDeny/' \
 #     -run TestTheBaselineIsWithheld
+#
+#   hack/mutate.sh backend/app/api/v1/tenants_crud.py \
+#     's/if resource_version:/if False and resource_version:/' \
+#     tests/test_addons_have_one_writer.py
 #
 # It prints whether the mutant was actually applied — a mutation run that
 # silently changed nothing is worse than none, because it reads as "the test
@@ -29,8 +39,13 @@ trap 'rm -rf "$work"' EXIT
 # that is the caveat that made the first worktree attempt measure the old code.
 # Only what the Go suite needs — copying the frontend's dependencies costs a
 # minute and leaves a directory nothing can delete.
-tar -C "$repo" --exclude .git --exclude .mutation -cf - operator test \
-	| tar -C "$work" -xf -
+case "$target" in
+backend/*) trees="backend" ;;
+*)         trees="operator test" ;;
+esac
+# shellcheck disable=SC2086
+tar -C "$repo" --exclude .git --exclude .mutation --exclude __pycache__ \
+	-cf - $trees | tar -C "$work" -xf -
 
 before="$(md5 -q "$work/$target" 2>/dev/null || md5sum "$work/$target" | cut -d' ' -f1)"
 sed -i.orig "$expression" "$work/$target"
@@ -40,6 +55,17 @@ if [ "$before" = "$after" ]; then
 	exit 2
 fi
 echo "мутація застосована у $work"
+
+if [ "$trees" = "backend" ]; then
+	# The same image the compose service uses, but mounted read-write at the
+	# copy — never at the repo.
+	image="$(docker compose -f "$repo/docker-compose.yml" config --format json 2>/dev/null \
+		| python3 -c 'import json,sys; print(json.load(sys.stdin)["services"]["backend"]["image"])' \
+		2>/dev/null || echo kubevirt-ui-backend)"
+	docker run --rm -v "$work/backend:/app" -w /app "$image" \
+		pytest -q "$@" 2>&1 | tail -12
+	exit 0
+fi
 
 docker run --rm -v "$work:/work" -w /work/operator \
 	-e KUBEBUILDER_ASSETS=/work/operator/bin/k8s/1.36.0-linux-arm64 \

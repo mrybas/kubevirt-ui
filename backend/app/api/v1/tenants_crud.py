@@ -112,7 +112,12 @@ from app.core.tenant_transit import (
     transit_subnet_name,
 )
 from app.api.v1.tenants_ntp import ensure_ntp_server, ensure_tenant_ntp_service
-from app.core.operator import tenant_addons_path_enabled, tenant_time_path_enabled
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    tenant_addons_path_enabled,
+    tenant_time_path_enabled,
+)
 from app.api.v1.tenants_talosconfig import (
     DEFAULT_TTL_HOURS,
     build_talosconfig,
@@ -177,6 +182,65 @@ _OVERHEAD_MARGIN = 1.25
 # of them — `test_worker_vms_stay_within_the_reserved_shape` fails if that
 # ever stops being true, because each would add its own term.
 
+
+
+TENANT_PLURAL = "managedtenants"
+
+
+async def _described_tenant(k8s, name: str) -> dict[str, Any] | None:
+    """The tenant's own description, if the operator has one.
+
+    Only consulted when the addon path has been handed over. A tenant the
+    operator does not know about is still the product's to write, which is what
+    lets a half-migrated cluster work at all.
+    """
+    if not tenant_addons_path_enabled():
+        return None
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+async def _write_described_addons(
+    k8s, name: str, addons: list[dict[str, Any]], resource_version: str | None,
+) -> None:
+    """Say what the tenant should have, and let the operator make it so.
+
+    The whole list goes in one patch, which is the shape that has already cost
+    us twice: two requests read the same list, each writes its own version, and
+    the later write erases the earlier addon with nothing logged. So the read's
+    `resourceVersion` rides along as a precondition — the API server refuses the
+    second write with a 409 instead of losing it.
+    """
+    body: dict[str, Any] = {"spec": {"addons": addons}}
+    if resource_version:
+        body["metadata"] = {"resourceVersion": resource_version}
+    try:
+        await k8s.custom_api.patch_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, name=name,
+            body=body,
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        if e.status == 409:
+            # Named rather than absorbed: a retry here would re-run the read
+            # this function was not given, and guessing what the other request
+            # wanted is how the lost write comes back wearing a retry.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Tenant '{name}' was changed by someone else while this "
+                    f"addon was being enabled. Nothing was written — try again."
+                ),
+            ) from e
+        raise
 
 
 async def _create_tenant_addons(k8s, name: str, addons, catalog) -> bool:
@@ -2534,6 +2598,35 @@ async def enable_addon(
     for p in component.parameters:
         params[p.id] = addon.parameters.get(p.id, p.default)
 
+    described = await _described_tenant(k8s, name)
+    if described is not None:
+        # Third writer of this object, retired. The release itself came out the
+        # same shape as the operator's, but this path also appended
+        # `<tenant>-<namespace>` to the namespace list — a namespace nothing
+        # ever installs into, because the release targets `<namespace>` — and,
+        # worse, wrote a release the tenant's own description does not mention.
+        # Measured on the stand: it survives until the next reconcile of the
+        # ManagedTenant and is then deleted within seconds, so the button works
+        # and the addon disappears minutes later.
+        existing = list((described.get("spec") or {}).get("addons") or [])
+        if any(entry.get("id") == addon.addon_id for entry in existing):
+            raise HTTPException(
+                status_code=409, detail=f"Addon '{addon.addon_id}' already enabled",
+            )
+        entry: dict[str, Any] = {"id": addon.addon_id}
+        if addon.parameters:
+            entry["parameters"] = dict(addon.parameters)
+        await _write_described_addons(
+            k8s, name, existing + [entry],
+            (described.get("metadata") or {}).get("resourceVersion"),
+        )
+        return TenantAddonStatus(
+            addon_id=addon.addon_id,
+            name=f"{name}-{addon.addon_id}",
+            ready=False,
+            message="Described, waiting for the operator",
+        )
+
     try:
         # If new addon has a target namespace, patch the namespaces HelmRelease
         if component.namespace:
@@ -2622,6 +2715,20 @@ async def disable_addon(request: Request, name: str, addon_id: str, user: User =
         raise HTTPException(
             status_code=400, detail=f"Cannot disable required addon '{addon_id}'"
         )
+
+    described = await _described_tenant(k8s, name)
+    if described is not None:
+        # Same reason as enabling: the description is what the operator acts on,
+        # and deleting the release here would leave the two disagreeing until
+        # the next pass put it back.
+        existing = list((described.get("spec") or {}).get("addons") or [])
+        remaining = [e for e in existing if e.get("id") != addon_id]
+        if len(remaining) != len(existing):
+            await _write_described_addons(
+                k8s, name, remaining,
+                (described.get("metadata") or {}).get("resourceVersion"),
+            )
+        return
 
     # Delete Flux HelmRelease
     try:

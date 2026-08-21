@@ -139,6 +139,15 @@ rules:
       - managednetworks
     verbs: ["get", "create", "delete"]
 
+  # A tenant's addons are described, not written: the Enable button edits this
+  # object and the operator renders the releases. No create — a tenant becomes
+  # described by being adopted, which is a deliberate act, not a side effect of
+  # pressing Enable on a tenant the operator has never seen.
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedtenants
+    verbs: ["get", "patch"]
+
   # -----------------------------------------------------------------------
   # Core resources
   # -----------------------------------------------------------------------
