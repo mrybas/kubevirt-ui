@@ -236,18 +236,21 @@ func TestNoCatalogueIsSaidRatherThanGuessed(t *testing.T) {
 	_ = fmt.Sprint()
 }
 
-// TestAnAddonNoLongerWantedIsRetiredAndLeavesNoSediment.
+// TestAnAddonNoLongerWantedIsRetiredButItsNamespaceStays.
 //
-// Measured on the stand: a tenant still lists `uat-t1-alloy` among the
-// namespaces its cluster should have, long after the addon was disabled and its
-// release deleted. Nothing removed the entry, because the thing that added it
-// only ever added — and the namespace it names is not even the one the addon
-// installed into, so the tenant carries an empty namespace named after
-// something it does not have.
+// This test used to require the opposite, and the cluster settled it.
 //
-// Rendering the whole set every pass makes the list follow by construction. The
-// release has to be said out loud.
-func TestAnAddonNoLongerWantedIsRetiredAndLeavesNoSediment(t *testing.T) {
+// The original reading was tidiness: a tenant still listed `uat-t1-alloy` among
+// the namespaces its cluster should have, long after the addon was disabled, so
+// rendering the list whole from what is wanted swept the entry away. What that
+// actually does is make Helm prune a Namespace — on one tenant the `alloy`
+// namespace was deleted along with anything in it, and on another the pruned
+// entry was `kube-system`, which the API server refuses, leaving the release
+// wedged and every addon behind it stuck on a failed upgrade.
+//
+// So the release is still retired out loud, and the namespace entry stays. It
+// is sediment, and sediment is the cheaper of the two mistakes.
+func TestAnAddonNoLongerWantedIsRetiredButItsNamespaceStays(t *testing.T) {
 	mustCatalog(t, "cat-d")
 	mustNamespace(t, "tenant-tad6", "")
 
@@ -282,10 +285,11 @@ func TestAnAddonNoLongerWantedIsRetiredAndLeavesNoSediment(t *testing.T) {
 		}
 		return nil
 	})
-	// And the sediment with it: nothing asks the tenant's cluster for that
-	// namespace any more.
-	if strings.Contains(namespacesOf(), "alloy") {
-		t.Errorf("the namespace list still asks for it: %s", namespacesOf())
+	// But not the namespace: removing the entry is a deletion in the tenant's
+	// own cluster, which is not what disabling an addon asked for.
+	if !strings.Contains(namespacesOf(), "alloy") {
+		t.Errorf("the entry was dropped, which deletes the namespace: %s",
+			namespacesOf())
 	}
 	// What is required stays, disabled or not.
 	got := releasesOf(t, "tenant-tad6", "tad6")
@@ -378,5 +382,51 @@ func TestAReleaseFluxHasDefaultedIsNotRewrittenForever(t *testing.T) {
 		t.Errorf("three passes moved resourceVersion %s -> %s, so it is "+
 			"rewriting an object nothing asked it to change",
 			settled, after.GetResourceVersion())
+	}
+}
+
+// TestANamespaceSomebodyElseAddedIsNotPrunedAway.
+//
+// The wedged release on the stand, reproduced: `kube-system` was in the list
+// this operator inherited, is in no addon's rendering, and Kubernetes will not
+// let Helm delete it — so the upgrade fails and calico, which depends on this
+// release, never installs. The entry has to survive a pass that does not
+// mention it.
+func TestANamespaceSomebodyElseAddedIsNotPrunedAway(t *testing.T) {
+	mustCatalog(t, "cat-k")
+	mustNamespace(t, "tenant-tadk", "")
+
+	obj := talosTenant("tadk")
+	reconciler := addonReconciler("cat-k")
+	if _, _, _, err := reconciler.reconcileAddons(testCtx, obj, "tenant-tadk"); err != nil {
+		t.Fatalf("reconcileAddons: %v", err)
+	}
+
+	// Somebody else's entry, of the kind a tenant built by the product carries.
+	release := releasesOf(t, "tenant-tadk", "tadk")["tadk-namespaces"]
+	list, _, _ := unstructured.NestedSlice(release.Object, "spec", "values", "namespaces")
+	list = append(list, map[string]any{"name": "kube-system"})
+	if err := unstructured.SetNestedSlice(release.Object, list,
+		"spec", "values", "namespaces"); err != nil {
+		t.Fatalf("setting the list: %v", err)
+	}
+	if err := k8sClient.Update(testCtx, release); err != nil {
+		t.Fatalf("updating the release: %v", err)
+	}
+
+	if _, _, _, err := reconciler.reconcileAddons(testCtx, obj, "tenant-tadk"); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+
+	after, _, _ := unstructured.NestedSlice(
+		releasesOf(t, "tenant-tadk", "tadk")["tadk-namespaces"].Object,
+		"spec", "values", "namespaces")
+	if !strings.Contains(fmt.Sprint(after), "kube-system") {
+		t.Fatalf("the entry was pruned, which is a deletion the tenant did not "+
+			"ask for: %v", after)
+	}
+	// And what this operator does want is still there beside it.
+	if !strings.Contains(fmt.Sprint(after), "tigera-operator") {
+		t.Errorf("keeping the old entry lost the rendered ones: %v", after)
 	}
 }

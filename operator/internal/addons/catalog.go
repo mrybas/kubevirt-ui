@@ -96,6 +96,16 @@ type Release struct {
 	Namespace string
 	Labels    map[string]string
 	Spec      map[string]any
+
+	// CreatesNamespaces marks the one release whose values are a list of
+	// namespaces to create in the tenant's own cluster.
+	//
+	// It is flagged rather than recognised by name because of what removal
+	// from that list does: Helm prunes what a revision no longer renders, and
+	// pruning a Namespace deletes everything in it. The writer needs to know
+	// which release it must never shrink, and guessing from the name is the
+	// kind of thing that stops being true quietly.
+	CreatesNamespaces bool
 }
 
 // Render turns the tenant's chosen addons into releases, in dependency order.
@@ -163,7 +173,8 @@ func Render(tenant, namespace string, catalog Catalog, requested []Request) []Re
 				"kubevirt-ui.io/tenant": tenant,
 				"kubevirt-ui.io/addon":  component.ID,
 			},
-			Spec: releaseSpec(tenant, namespace, catalog, component, values, dependsOn),
+			Spec:              releaseSpec(tenant, namespace, catalog, component, values, dependsOn),
+			CreatesNamespaces: component.ID == "namespaces",
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

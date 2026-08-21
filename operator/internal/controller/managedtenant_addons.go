@@ -82,20 +82,87 @@ func (r *ManagedTenantReconciler) reconcileAddons(
 		live.SetNamespace(release.Namespace)
 		spec := release.Spec
 		labels := release.Labels
+		grows := release.CreatesNamespaces
 		if _, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
 			mergeLabels(live, labels)
 			// Laid over what is there rather than replacing it: Flux writes its
 			// own defaults into this object, and stripping them every pass
 			// while it writes them back is a loop with nothing changing.
 			existing, _, _ := unstructured.NestedMap(live.Object, "spec")
-			return unstructured.SetNestedMap(live.Object,
-				kube.MergeSpec(existing, spec), "spec")
+			merged := kube.MergeSpec(existing, spec)
+			if grows {
+				merged = keepNamespaces(existing, merged)
+			}
+			return unstructured.SetNestedMap(live.Object, merged, "spec")
 		}); err != nil {
 			return false, "", "", fmt.Errorf("writing %s: %w", release.Name, err)
 		}
 	}
 
 	return r.addonState(ctx, obj, namespace)
+}
+
+// keepNamespaces makes the namespace list grow and never shrink.
+//
+// Everywhere else here, rendering the whole thing from what is wanted is the
+// discipline: it is how the sediment of an addon nobody enabled any more gets
+// swept up. This one release is the exception, and the exception was measured.
+// The list is a Helm manifest, Helm prunes what a new revision stops
+// rendering, and these resources are Namespaces **in the tenant's own
+// cluster** — so shrinking the list does not tidy a record, it deletes a
+// namespace and everything the tenant put in it.
+//
+// Two ways that showed up on the stand, from one earlier pass of this code:
+// one tenant's `alloy` namespace was removed and quietly deleted, and another's
+// `kube-system` was removed, refused by the API server, and left the release
+// wedged with every addon that depends on it stuck behind a failed upgrade.
+//
+// So the cost is accepted in the other direction: an entry nobody needs stays
+// in the list, and an unwanted namespace goes away when somebody deletes it on
+// purpose, not as a side effect of describing something else.
+func keepNamespaces(existing, merged map[string]any) map[string]any {
+	before, found, err := unstructured.NestedSlice(existing, "values", "namespaces")
+	if !found || err != nil {
+		return merged
+	}
+	after, _, err := unstructured.NestedSlice(merged, "values", "namespaces")
+	if err != nil {
+		return merged
+	}
+
+	named := func(entry any) (string, bool) {
+		fields, ok := entry.(map[string]any)
+		if !ok {
+			return "", false
+		}
+		name, ok := fields["name"].(string)
+		return name, ok
+	}
+
+	held := map[string]bool{}
+	for _, entry := range after {
+		if name, ok := named(entry); ok {
+			held[name] = true
+		}
+	}
+	for _, entry := range before {
+		name, ok := named(entry)
+		// An entry nobody can read a name out of is kept as it stands: it is
+		// still a resource in somebody's cluster, and dropping what this code
+		// does not understand is how the deletion happened in the first place.
+		if !ok || !held[name] {
+			after = append(after, entry)
+			if ok {
+				held[name] = true
+			}
+		}
+	}
+
+	out := merged
+	if err := unstructured.SetNestedSlice(out, after, "values", "namespaces"); err != nil {
+		return merged
+	}
+	return out
 }
 
 // retireAddons removes the releases of addons the tenant no longer wants.
@@ -105,8 +172,10 @@ func (r *ManagedTenantReconciler) reconcileAddons(
 // should have, months after the addon was disabled and its release deleted.
 // Nothing removed the entry, because the thing that added it only ever added.
 //
-// Here the namespace list is rendered whole from what is wanted, so it follows
-// by construction; what needs saying explicitly is the release itself. Only
+// The namespace list is a different matter: it is rendered from what is wanted
+// but never shrunk when it is written, because removing an entry deletes a
+// namespace in the tenant's cluster — see keepNamespaces. What needs saying
+// explicitly here is the release itself. Only
 // ours — by the label this operator puts on them — because a HelmRelease in
 // this namespace that nobody here wrote belongs to somebody else.
 func (r *ManagedTenantReconciler) retireAddons(
