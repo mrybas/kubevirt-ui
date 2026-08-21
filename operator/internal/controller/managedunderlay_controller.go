@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -302,7 +303,16 @@ func (r *ManagedUnderlayReconciler) healGatewayLabels(
 
 	sort.Strings(labelled)
 	u.Status.LabelledNodes = labelled
-	u.Status.LabelHeals += int64(healed)
+	// Not added to the in-memory status: that write can lose a conflict, and
+	// the next pass finds the label already correct and has nothing left to
+	// count, so the increment would be gone for good — a counter whose whole
+	// purpose is to be evidence that something keeps rewriting this label,
+	// quietly under-reporting. Applied against a fresh read instead.
+	if healed > 0 {
+		if err := r.recordHeals(ctx, u, int64(healed)); err != nil {
+			return err
+		}
+	}
 
 	if len(failed) > 0 {
 		r.setCondition(u, platformv1alpha1.ConditionNodesLabelled, false, "LabelWriteFailed",
@@ -475,6 +485,32 @@ func mergePodTemplate(live *corev1.PodTemplateSpec, want corev1.PodTemplateSpec)
 			live.Spec.Containers = append(live.Spec.Containers, wanted)
 		}
 	}
+}
+
+// recordHeals adds to the heal count against the freshest value there is.
+//
+// Read-modify-write with a retry, because it is a count and not a fact: the
+// object it lives on is written by this pass and by whoever else is touching
+// the underlay, and a status re-applied from a stale read takes the number
+// **down** — measured, 2 back to 1, the first time this was fixed the easy way.
+func (r *ManagedUnderlayReconciler) recordHeals(
+	ctx context.Context, u *platformv1alpha1.ManagedUnderlay, healed int64,
+) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		fresh := &platformv1alpha1.ManagedUnderlay{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(u), fresh); err != nil {
+			return err
+		}
+		fresh.Status.LabelHeals += healed
+		if err := r.Status().Update(ctx, fresh); err != nil {
+			return err
+		}
+		// Kept on the object the caller is still writing, so the status it
+		// writes at the end of the pass does not carry a stale number.
+		u.Status.LabelHeals = fresh.Status.LabelHeals
+		u.SetResourceVersion(fresh.GetResourceVersion())
+		return nil
+	})
 }
 
 // daemonSetState reports whether a DaemonSet is doing anything, as opposed to

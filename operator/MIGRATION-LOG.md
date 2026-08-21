@@ -2868,3 +2868,35 @@ release Flux has defaulted and asserts resourceVersion does not move.
 Worth naming as method: this cost one read-only query and found a write loop
 that would have run on the first adopted tenant. The diff before the write is
 the cheapest thing in this migration.
+
+## The flake had a mechanism, and the first fix made it worse
+
+Five soak runs, five green, at 305 seconds each — and the timing is the part
+worth reading: within a third of a second across five runs. A machine under load
+does not do that. So "the addon informer made everything slower and pushed the
+assertion over" was wrong, and the flake had to be a race in the thing itself.
+
+It is. The heal counter accumulates **in memory** — `Status.LabelHeals += healed`
+— and is persisted by the status write at the end of the pass. When that write
+loses a conflict the reconcile requeues, the next pass re-reads the object,
+finds the label already correct, and has nothing left to count. The increment is
+gone for good. So the number is not "how many heals happened" but "how many
+heals whose status write happened to land", and its entire purpose is to be
+evidence that something else keeps rewriting that label.
+
+**The obvious fix made it worse, and an existing test said so immediately.**
+Retrying the status write on conflict means re-applying a status computed from
+the read that lost — and for a counter that goes *backwards*:
+
+```
+timed out waiting for the heal to be counted: labelHeals = 1, was 2
+```
+
+Two heals had been counted; the retry wrote back one. A lost increment is a
+number that is too small; last-writer-wins on a counter is a number that is
+wrong in both directions.
+
+So the generic retry is reverted, with the reason written where somebody would
+otherwise add it again, and the counter is incremented against a fresh read by
+the controller that owns it. A count is not a fact: a fact can be recomputed
+from the world on the next pass, and a count cannot.

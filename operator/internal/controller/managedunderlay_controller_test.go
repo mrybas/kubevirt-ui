@@ -625,3 +625,68 @@ func TestUnderlayStopsWritingTheDaemonSet(t *testing.T) {
 		return nil
 	})
 }
+
+// TestAHealSurvivesAConcurrentWriteToTheObject.
+//
+// The counter accumulates in memory and is persisted at the end of the pass. If
+// that write loses a conflict, the next pass re-reads the object, finds the
+// label already correct, and has nothing left to count — so the increment is
+// gone for good, and a counter whose whole purpose is to be evidence that
+// something keeps rewriting the label quietly under-reports.
+//
+// This is the mechanism behind a flake that appeared once in ten full runs:
+// the label came back and the number never moved.
+func TestAHealSurvivesAConcurrentWriteToTheObject(t *testing.T) {
+	mustKubeOVNNamespace(t, "kube-ovn-conc", "kubeovn/kube-ovn:v1.14.0")
+	mustNode(t, "conc-worker-1")
+	mustUnderlay(t, &platformv1alpha1.ManagedUnderlay{
+		ObjectMeta: metav1.ObjectMeta{Name: "conc"},
+		Spec: platformv1alpha1.ManagedUnderlaySpec{
+			Interface:           "eth1",
+			ExternalCIDR:        "10.63.0.0/24",
+			ExternalGateway:     "10.63.0.1",
+			ProviderNetworkName: "conc-pn",
+			VLANName:            "conc-vlan",
+			SubnetName:          "conc-subnet",
+			KubeOVNNamespace:    "kube-ovn-conc",
+		},
+	})
+
+	mustReadyNodes(t, "conc-pn", "conc-worker-1")
+
+	eventually(t, "the underlay to settle", func() error {
+		if getUnderlay(t, "conc").Status.LabelledNodes == nil {
+			return fmt.Errorf("not reconciled yet")
+		}
+		return nil
+	})
+	healsBefore := getUnderlay(t, "conc").Status.LabelHeals
+
+	// Break the label and, in the same moment, touch the object so the pass's
+	// status write is racing somebody.
+	node := &corev1.Node{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{Name: "conc-worker-1"}, node); err != nil {
+		t.Fatalf("reading the node: %v", err)
+	}
+	patched := node.DeepCopy()
+	patched.Labels[underlay.ExternalGWLabel] = "false"
+	if err := k8sClient.Patch(testCtx, patched, client.MergeFrom(node)); err != nil {
+		t.Fatalf("breaking the label: %v", err)
+	}
+	for i := 0; i < 5; i++ {
+		live := getUnderlay(t, "conc")
+		if live.Annotations == nil {
+			live.Annotations = map[string]string{}
+		}
+		live.Annotations["touched"] = fmt.Sprint(i)
+		_ = k8sClient.Update(testCtx, live)
+	}
+
+	eventually(t, "the heal to be counted despite the contention", func() error {
+		heals := getUnderlay(t, "conc").Status.LabelHeals
+		if heals <= healsBefore {
+			return fmt.Errorf("labelHeals = %d, was %d", heals, healsBefore)
+		}
+		return nil
+	})
+}

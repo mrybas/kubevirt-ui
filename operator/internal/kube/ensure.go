@@ -80,6 +80,12 @@ func UpdateStatus(
 		return nil
 	}
 	if err := c.Status().Update(ctx, obj); err != nil {
+		// Deliberately not retried here. A retry would have to re-apply a
+		// status computed from the read that lost, and for anything counted
+		// rather than observed that goes backwards: the underlay's heal counter
+		// dropped from 2 to 1 the first time this was tried. A counter that
+		// needs to survive a conflict has to be incremented against a fresh
+		// read by whoever owns it — see the underlay controller.
 		return err
 	}
 	count(c.Scheme(), obj, controller, "status")
