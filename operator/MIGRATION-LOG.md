@@ -3416,3 +3416,70 @@ The product's delete paths let go rather than take off: an owned peering is
 removed by deleting its object, because removing the ends from here is a second
 writer taking away what the first still believes it holds — and the first puts
 it back, pointing at a router that is being deleted.
+
+## Four reports in an afternoon, one shape
+
+Scaling, resizing, storage, the external name. Each arrived as its own symptom
+and each was the same thing: a step that lived in the create handler and has no
+counterpart in the receiver. The tenant path was handed over one object at a
+time, and what was handed over is what a create writes — not what the product
+does to a tenant afterwards.
+
+**The name in the certificate led nowhere.** `ingressHost` put
+`<tenant>.<domain>` in the apiserver's SANs and nothing wrote an
+IngressRouteTCP, so external-dns had nothing to publish from and the name did
+not resolve at all. Twelve conditions True while `kubectl` could not find the
+host — and the kubeconfig the UI hands out rewrites the server to that name
+unconditionally, so a green tenant produced a file that cannot work. The route
+is written now, and a route nothing publishes is reported rather than left to be
+discovered: `ExternallyReachable=False` when there is no target for it.
+
+**Scaling moved a number and it came back.** The endpoint patches
+`MachineDeployment.spec.replicas`; the operator writes that field from
+`spec.workers.count` every pass. No error at either end.
+
+**Resizing did nothing at all**, and the second reason was underneath the first.
+CAPI rolls a pool when the template *reference* changes, and the operator wrote
+the template under a fixed name — so even after the endpoint learned to edit the
+description, the new shape would reach the next worker created and none of the
+running ones. Measured rather than assumed: the field accepts the patch and
+nothing happens. The name is a digest of the shape now, which also keeps
+adoption silent — the template the product built is kept while it still says
+what the description says.
+
+**Storage installed its host side and no driver.** Two halves, independent. The
+described create path never added the CSI addon when the box was ticked. And the
+operator never wrote `KubevirtCluster.spec.infraClusterSecretRef`, which is what
+the product's own UI reads to decide whether storage may be enabled — so the
+button told the user to recreate a tenant whose credential was sitting in its
+namespace.
+
+### And one that cost trust rather than function
+
+A tenant thirty seconds old said `AddonFailed: will not install: test3-calico
+(DependencyNotReady)`, and installed forty-seven seconds later untouched. Every
+`Ready=False` from Flux was being read as failure, and most of them mean "not
+yet": a release queued behind the one it depends on, a chart being fetched, an
+install in flight.
+
+Two things follow. Somebody reads a fresh tenant, sees a failure, and looks for
+a break that is not there. And the day there is a real `InstallFailed`, it looks
+exactly like thirty seconds of normal operation.
+
+Only the reasons Flux gives for something it will not finish on its own are
+failures now. The rest are progress — and the one case no reason string covers,
+a wrong chart path answering `ArtifactFailed` for ever, is separated from a
+fetch in flight by the only evidence there is: how long it has been saying it.
+That is `AddonStalled`, with the reason and the duration, rather than a failure
+Flux never declared.
+
+### Bookkeeping, said out loud
+
+These landed as one commit, `ece3daa`, whose message covers the first four and
+not the fifth. I split them locally afterwards and found the combined one
+already pushed; rewriting a published branch to improve a commit message is a
+worse trade than saying so here.
+
+And one of the four was mine to begin with: adopting `op-t1` with `addons: []`
+retired the CSI release the product had installed for it. The adoption procedure
+says to describe what is there, and I described what I had looked at.
