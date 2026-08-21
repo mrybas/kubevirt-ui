@@ -2779,3 +2779,30 @@ The plausible mechanism is mine: this slice adds a HelmRelease informer and a
 slower, and that assertion was already close to its edge. Not chased further
 because two clean runs is thin evidence either way — but the output is kept, so
 the next occurrence can be diffed against this one instead of re-argued.
+
+### Two credentials, two opposite disciplines
+
+The storage driver's credential goes into the tenant beside the kubelet's, and
+they are handled deliberately differently.
+
+The bootstrap token is **the** credential: written once, never rewritten,
+because rotating it invalidates what every existing worker holds. The storage
+one is a **copy** of a credential that lives on the host, so it is kept in
+step — a stale copy is a driver that cannot reach the host API, and every volume
+it is asked for fails with an authentication error that says nothing about a
+secret.
+
+Kept in step, not rewritten: an unchanged copy is left alone, because this runs
+on every pass. And a tenant with no storage is not given one — the host side is
+absent for those, and absence there is not a failure to report.
+
+Both mutations land where they should: stopping the update leaves the copy stale
+*and* rewrites one that had not changed, and the test says both.
+
+### A soak that does not measure a moving tree
+
+The suite is five minutes a run now, so a series of them outlives any single
+call and has to be left in the background — where it would otherwise be
+measuring a tree still being edited, which has already invalidated one series
+here. `hack/soak.sh` copies the tree first, like the mutation script, runs N
+times keeping every run's output, and stops at the first that is not green.

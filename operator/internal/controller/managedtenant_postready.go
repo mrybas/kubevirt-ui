@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"strings"
@@ -97,6 +98,11 @@ func (r *ManagedTenantReconciler) reconcileInsideTheTenant(
 	// and the kubelet both report healthy, and the cluster has no node at all,
 	// because the kubelet's TLS bootstrap has nothing to authenticate with and
 	// never files a CSR.
+	if err := r.replicateCSICredential(ctx, obj, namespace, tenantClient); err != nil {
+		return false, "TenantUnreachable", fmt.Sprintf(
+			"could not put the storage credential in the tenant: %v", err), nil
+	}
+
 	name := "bootstrap-token-" + id
 	existing := &corev1.Secret{}
 	err = tenantClient.Get(ctx, types.NamespacedName{
@@ -133,6 +139,69 @@ func (r *ManagedTenantReconciler) reconcileInsideTheTenant(
 	kube.CountWrite(r.Scheme, placed, tenantControllerName, "created")
 	return true, "Placed", fmt.Sprintf(
 		"the kubelet bootstrap credential %s is in the tenant", name), nil
+}
+
+// replicateCSICredential copies the host credential the tenant's storage driver
+// reads into the tenant's own cluster.
+//
+// The opposite discipline to the bootstrap token beside it, and for a reason
+// worth naming: that one is *the* credential and is written once, because
+// rotating it invalidates what every worker holds. This one is a **copy** of a
+// credential that lives somewhere else, so it is kept in step — a stale copy is
+// a driver that cannot reach the host API, and every volume it is asked for
+// fails with an authentication error that names nothing about a secret.
+//
+// Absent on the host side is not an error here: a tenant without storage never
+// has one, and the storage path creates it when there is storage to wire.
+func (r *ManagedTenantReconciler) replicateCSICredential(
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
+	namespace string, tenantClient client.Client,
+) error {
+	source := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: namespace, Name: csiCredentialSecret,
+	}, source); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("reading %s/%s: %w", namespace, csiCredentialSecret, err)
+	}
+	payload := source.Data["kubeconfig"]
+	if len(payload) == 0 {
+		return nil
+	}
+
+	copied := &corev1.Secret{}
+	err := tenantClient.Get(ctx, types.NamespacedName{
+		Namespace: "kube-system", Name: csiCredentialSecret,
+	}, copied)
+	switch {
+	case apierrors.IsNotFound(err):
+		placed := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Namespace: "kube-system", Name: csiCredentialSecret,
+			Labels: map[string]string{"kubevirt-ui.io/managed": "true"},
+		}}
+		placed.Type = corev1.SecretTypeOpaque
+		placed.Data = map[string][]byte{"kubeconfig": payload}
+		if err := tenantClient.Create(ctx, placed); err != nil &&
+			!apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		kube.CountWrite(r.Scheme, placed, tenantControllerName, "created")
+		return nil
+	case err != nil:
+		return err
+	}
+
+	if bytes.Equal(copied.Data["kubeconfig"], payload) {
+		return nil
+	}
+	copied.Data = map[string][]byte{"kubeconfig": payload}
+	if err := tenantClient.Update(ctx, copied); err != nil {
+		return err
+	}
+	kube.CountWrite(r.Scheme, copied, tenantControllerName, "updated")
+	return nil
 }
 
 // clientForTenant opens a client to the tenant's own API server.
@@ -185,6 +254,10 @@ func (r *ManagedTenantReconciler) clientForTenant(
 // controller that stops reconciling every other tenant because one of them is
 // accepting connections and not replying.
 const insideTenantTimeout = 10 * time.Second
+
+// csiCredentialSecret is the host credential the tenant's storage driver reads,
+// by the name it reads it under on both sides.
+const csiCredentialSecret = "infra-cluster-credentials"
 
 func defaultTenantClient(_ context.Context, kubeconfig []byte) (client.Client, error) {
 	config, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)

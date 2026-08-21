@@ -240,3 +240,112 @@ func TestOneSilentTenantDoesNotHoldTheRest(t *testing.T) {
 			"one tenant cannot hold the pass", waited, insideTenantTimeout)
 	}
 }
+
+// TestTheStorageCredentialIsKeptInStepRatherThanWrittenOnce.
+//
+// The opposite discipline to the bootstrap token beside it, and deliberately.
+// That one is *the* credential and is written once, because rotating it
+// invalidates what every worker holds. This one is a copy of a credential that
+// lives on the host, so a stale copy is a driver that cannot reach the host API
+// — and every volume it is asked for fails with an authentication error that
+// says nothing about a secret.
+func TestTheStorageCredentialIsKeptInStepRatherThanWrittenOnce(t *testing.T) {
+	mustNamespace(t, "tenant-tin6", "")
+	mustMachineSecrets(t, "tenant-tin6", "tin6", "abcdef.0123456789abcdef")
+	mustAdminKubeconfig(t, "tenant-tin6", "tin6", "super-admin.svc")
+
+	host := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "tenant-tin6", Name: "infra-cluster-credentials",
+	}}
+	host.Data = map[string][]byte{"kubeconfig": []byte("first")}
+	if err := k8sClient.Create(testCtx, host); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("creating the host credential: %v", err)
+	}
+
+	cluster := newTenantCluster(t)
+	reconciler := &ManagedTenantReconciler{
+		Client: k8sClient, Scheme: k8sClient.Scheme(), APIReader: k8sReader,
+		TenantClient: cluster.open,
+	}
+	if _, _, _, err := reconciler.reconcileInsideTheTenant(
+		testCtx, talosTenant("tin6"), "tenant-tin6"); err != nil {
+		t.Fatalf("reconcileInsideTheTenant: %v", err)
+	}
+
+	copied := &corev1.Secret{}
+	if err := cluster.client.Get(testCtx, types.NamespacedName{
+		Namespace: "kube-system", Name: "infra-cluster-credentials",
+	}, copied); err != nil {
+		t.Fatalf("the credential was not copied into the tenant: %v", err)
+	}
+	if string(copied.Data["kubeconfig"]) != "first" {
+		t.Fatalf("copied %q", copied.Data["kubeconfig"])
+	}
+
+	// Rotated on the host: the copy follows.
+	live := &corev1.Secret{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "tenant-tin6", Name: "infra-cluster-credentials",
+	}, live); err != nil {
+		t.Fatalf("reading the host credential: %v", err)
+	}
+	live.Data = map[string][]byte{"kubeconfig": []byte("second")}
+	if err := k8sClient.Update(testCtx, live); err != nil {
+		t.Fatalf("rotating it: %v", err)
+	}
+	if _, _, _, err := reconciler.reconcileInsideTheTenant(
+		testCtx, talosTenant("tin6"), "tenant-tin6"); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if err := cluster.client.Get(testCtx, types.NamespacedName{
+		Namespace: "kube-system", Name: "infra-cluster-credentials",
+	}, copied); err != nil {
+		t.Fatalf("reading the copy: %v", err)
+	}
+	if string(copied.Data["kubeconfig"]) != "second" {
+		t.Errorf("the copy is stale: %q", copied.Data["kubeconfig"])
+	}
+
+	// Unchanged is not rewritten: this runs every pass.
+	before := copied.ResourceVersion
+	if _, _, _, err := reconciler.reconcileInsideTheTenant(
+		testCtx, talosTenant("tin6"), "tenant-tin6"); err != nil {
+		t.Fatalf("third pass: %v", err)
+	}
+	if err := cluster.client.Get(testCtx, types.NamespacedName{
+		Namespace: "kube-system", Name: "infra-cluster-credentials",
+	}, copied); err != nil {
+		t.Fatalf("reading the copy: %v", err)
+	}
+	if copied.ResourceVersion != before {
+		t.Error("it rewrote a copy that had not changed")
+	}
+}
+
+// TestATenantWithoutStorageIsNotGivenACredential. A tenant with no storage
+// never has a host-side one, and its absence is not a failure to report.
+func TestATenantWithoutStorageIsNotGivenACredential(t *testing.T) {
+	mustNamespace(t, "tenant-tin7", "")
+	mustMachineSecrets(t, "tenant-tin7", "tin7", "abcdef.0123456789abcdef")
+	mustAdminKubeconfig(t, "tenant-tin7", "tin7", "super-admin.svc")
+
+	cluster := newTenantCluster(t)
+	reconciler := &ManagedTenantReconciler{
+		Client: k8sClient, Scheme: k8sClient.Scheme(), APIReader: k8sReader,
+		TenantClient: cluster.open,
+	}
+	ready, reason, message, err := reconciler.reconcileInsideTheTenant(
+		testCtx, talosTenant("tin7"), "tenant-tin7")
+	if err != nil || !ready {
+		t.Fatalf("ready=%v reason=%s %s err=%v", ready, reason, message, err)
+	}
+	copied := &corev1.Secret{}
+	err = cluster.client.Get(testCtx, types.NamespacedName{
+		Namespace: "kube-system", Name: "infra-cluster-credentials",
+	}, copied)
+	if err == nil {
+		t.Error("it invented a storage credential for a tenant with no storage")
+	} else if !apierrors.IsNotFound(err) {
+		t.Fatalf("reading the copy: %v", err)
+	}
+}
