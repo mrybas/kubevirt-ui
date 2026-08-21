@@ -192,8 +192,8 @@ func (r *ManagedTenantReconciler) ensureCluster(
 		if obj.Spec.Environment != "" {
 			labels["kubevirt-ui.io/environment"] = obj.Spec.Environment
 		}
-		live.SetLabels(labels)
-		live.SetAnnotations(map[string]string{
+		mergeLabels(live, labels)
+		mergeAnnotations(live, map[string]string{
 			"kubevirt-ui.io/display-name": obj.Spec.DisplayName,
 		})
 
@@ -245,13 +245,10 @@ func (r *ManagedTenantReconciler) ensureKubevirtCluster(
 	live.SetName(obj.Name)
 	live.SetNamespace(namespace)
 	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
-		live.SetLabels(map[string]string{"kubevirt-ui.io/tenant": obj.Name})
-		annotations := live.GetAnnotations()
-		if annotations == nil {
-			annotations = map[string]string{}
-		}
-		annotations["cluster.x-k8s.io/managed-by"] = "kamaji"
-		live.SetAnnotations(annotations)
+		mergeLabels(live, map[string]string{"kubevirt-ui.io/tenant": obj.Name})
+		mergeAnnotations(live, map[string]string{
+			"cluster.x-k8s.io/managed-by": "kamaji",
+		})
 		return nil
 	})
 	if err != nil {
@@ -271,7 +268,7 @@ func (r *ManagedTenantReconciler) ensureKamajiControlPlane(
 	live.SetName(obj.Name)
 	live.SetNamespace(namespace)
 	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
-		live.SetLabels(map[string]string{"kubevirt-ui.io/tenant": obj.Name})
+		mergeLabels(live, map[string]string{"kubevirt-ui.io/tenant": obj.Name})
 
 		network := map[string]any{
 			// ClusterIP, deliberately. `serviceAddress` is a NodePort/VIP-only

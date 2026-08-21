@@ -161,7 +161,7 @@ func (r *ManagedTenantReconciler) reconcilePKI(
 		live.SetNamespace(namespace)
 		spec := item.spec
 		if _, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
-			live.SetLabels(labels)
+			mergeLabels(live, labels)
 			return unstructured.SetNestedMap(live.Object, spec, "spec")
 		}); err != nil {
 			if apierrors.IsNotFound(err) || apimetaIsNoMatch(err) {

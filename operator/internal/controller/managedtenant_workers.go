@@ -487,7 +487,7 @@ func (r *ManagedTenantReconciler) ensureMachineTemplate(
 	live.SetName(obj.Name + "-workers")
 	live.SetNamespace(namespace)
 	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
-		live.SetLabels(map[string]string{"kubevirt-ui.io/tenant": obj.Name})
+		mergeLabels(live, map[string]string{"kubevirt-ui.io/tenant": obj.Name})
 
 		podAnnotations := map[string]any{
 			// Bridge binding needs this to permit live migration on a
@@ -622,7 +622,7 @@ func (r *ManagedTenantReconciler) ensureMachineDeployment(
 	live.SetName(obj.Name + "-workers")
 	live.SetNamespace(namespace)
 	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
-		live.SetLabels(map[string]string{"kubevirt-ui.io/tenant": obj.Name})
+		mergeLabels(live, map[string]string{"kubevirt-ui.io/tenant": obj.Name})
 		return unstructured.SetNestedMap(live.Object, map[string]any{
 			"clusterName": obj.Name,
 			"replicas":    int64(obj.Spec.Workers.Count),
@@ -678,7 +678,7 @@ func (r *ManagedTenantReconciler) ensureMachineHealthCheck(
 	live.SetNamespace(namespace)
 	timeout := workerUnhealthyTimeout()
 	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
-		live.SetLabels(map[string]string{"kubevirt-ui.io/tenant": obj.Name})
+		mergeLabels(live, map[string]string{"kubevirt-ui.io/tenant": obj.Name})
 		return unstructured.SetNestedMap(live.Object, map[string]any{
 			"clusterName":        obj.Name,
 			"maxUnhealthy":       "100%",

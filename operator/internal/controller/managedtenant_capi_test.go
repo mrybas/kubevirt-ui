@@ -451,3 +451,66 @@ func TestTheControlPlaneKamajiWroteAboutItselfSurvives(t *testing.T) {
 			"nothing asked it to change", settled, after.GetResourceVersion())
 	}
 }
+
+// TestAdoptionDoesNotClearMetadataSomebodyElseWrote.
+//
+// Measured on the stand, by adopting a live tenant: writing the Cluster
+// stripped `kubevirt-ui.io/worker-type` and `kubevirt-ui.io/enable-oidc` from
+// it. Both were written by the product, both are carried by every tenant beside
+// it, and both were gone the moment this operator touched the object — because
+// the writer replaced the annotation map instead of merging into it.
+//
+// Metadata somebody else put there is not this writer's to clear just because
+// it does not render it.
+func TestAdoptionDoesNotClearMetadataSomebodyElseWrote(t *testing.T) {
+	obj := vpcTalosTenant("tcp9")
+	obj.Annotations = map[string]string{"platform.kubevirt-ui.io/paused": "true"}
+	mustTenant(t, obj)
+	mustNamespace(t, "tenant-tcp9", "")
+
+	reconciler := &ManagedTenantReconciler{
+		Client: k8sClient, Scheme: k8sClient.Scheme(), APIReader: k8sReader,
+	}
+	if err := reconciler.ensureCluster(
+		testCtx, obj, "tenant-tcp9", "10.199.0.120", 6443, true); err != nil {
+		t.Fatalf("first pass: %v", err)
+	}
+
+	// The product's part.
+	cluster, err := capiObject(clusterGVK, "tenant-tcp9", "tcp9")
+	if err != nil {
+		t.Fatalf("reading the Cluster: %v", err)
+	}
+	annotations := cluster.GetAnnotations()
+	annotations["kubevirt-ui.io/worker-type"] = "vm"
+	annotations["kubevirt-ui.io/enable-oidc"] = "true"
+	cluster.SetAnnotations(annotations)
+	labels := cluster.GetLabels()
+	labels["somebody-elses"] = "label"
+	cluster.SetLabels(labels)
+	if err := k8sClient.Update(testCtx, cluster); err != nil {
+		t.Fatalf("writing the product's metadata: %v", err)
+	}
+
+	if err := reconciler.ensureCluster(
+		testCtx, obj, "tenant-tcp9", "10.199.0.120", 6443, true); err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+
+	after, err := capiObject(clusterGVK, "tenant-tcp9", "tcp9")
+	if err != nil {
+		t.Fatalf("reading it back: %v", err)
+	}
+	for key, want := range map[string]string{
+		"kubevirt-ui.io/worker-type":  "vm",
+		"kubevirt-ui.io/enable-oidc":  "true",
+		"kubevirt-ui.io/display-name": "tcp9",
+	} {
+		if got := after.GetAnnotations()[key]; got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+	if after.GetLabels()["somebody-elses"] != "label" {
+		t.Errorf("labels = %v", after.GetLabels())
+	}
+}

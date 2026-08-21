@@ -570,6 +570,25 @@ func toAnySlice(in []string) []any {
 	return out
 }
 
+// mergeAnnotations is mergeLabels for annotations, and it exists because
+// replacing the map cost a live tenant two of them.
+//
+// Adopting `uat-t1` stripped `kubevirt-ui.io/worker-type` and
+// `kubevirt-ui.io/enable-oidc` from its Cluster — written by the product,
+// carried by every tenant beside it, and gone the moment this operator wrote
+// the object. Metadata somebody else put there is not this writer's to clear
+// just because it does not render it.
+func mergeAnnotations(obj *unstructured.Unstructured, want map[string]string) {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	for k, v := range want {
+		annotations[k] = v
+	}
+	obj.SetAnnotations(annotations)
+}
+
 func mergeLabels(obj *unstructured.Unstructured, want map[string]string) {
 	labels := obj.GetLabels()
 	if labels == nil {
