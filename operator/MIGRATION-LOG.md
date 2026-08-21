@@ -3318,3 +3318,34 @@ deliberately skipped outside a release tag, with a comment saying why: the dev
 operator is deployed with kustomize, so a branch build must not publish a chart
 version. That is still right, and it means the rebuild waits on a release rather
 than on the packaging.
+
+### Templates or `crds/`, settled by trying it
+
+The objection to templating the CRDs is that `helm uninstall` would delete them
+and cascade-delete every tenant, network and VM. That is what the annotation on
+each of them is for, and rather than argue from documentation it was measured on
+the stand: a throwaway chart with one CRD carrying
+`helm.sh/resource-policy: keep`, one custom object of that kind, install, then
+uninstall.
+
+```
+release "keepcheck" uninstalled
+crd  keepprobes.scratch.kubevirt-ui.io   still there
+     keepprobe/survivor                  still there
+```
+
+So the dangerous half does not happen. What remains true of `crds/` is the other
+half, and it is the reason not to use it: **Helm never upgrades what is in
+`crds/`.** The schema would stay at whatever version was installed first, for
+ever, and the offered mitigation — remember to `kubectl apply -f crds/` on every
+release — is a manual step whose omission is silent. This project's failures are
+almost entirely of that shape: the change that did not reach the object, and the
+check that read as passing because it never ran. The `ManagedTenant` schema
+changed twice today.
+
+The cost of templating is paid once per pre-existing cluster, by
+`hack/adopt-into-helm.sh`, and it is metadata. The cost of `crds/` would be paid
+silently, on the release nobody remembers.
+
+A test now asserts every rendered CRD carries the annotation, because the whole
+choice rests on it. Removing it from the generator turns that test red.

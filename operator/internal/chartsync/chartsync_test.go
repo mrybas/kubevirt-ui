@@ -2,6 +2,7 @@ package chartsync_test
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mrybas/kubevirt-ui/operator/internal/chartsync"
@@ -29,5 +30,42 @@ func TestTheChartCarriesTodaysOperator(t *testing.T) {
 	if len(drifted) > 0 {
 		t.Fatalf("the chart still has the old %v — run "+
 			"`go run ./cmd/chartsync` from operator/", drifted)
+	}
+}
+
+// TestEveryCRDIsKeptWhenTheReleaseGoes.
+//
+// The CRDs are templates rather than files in `crds/`, and that choice hangs on
+// this annotation. Helm never *upgrades* what is in `crds/` — the schema would
+// silently stay at whatever version was installed first, and the alternative
+// offered was "remember to kubectl apply them on every release", a manual step
+// whose omission is invisible until a field the API server prunes goes missing
+// from an object nobody is looking at.
+//
+// The price of templating them is that uninstall could delete them, taking
+// every tenant, network and VM with it. Measured on the stand rather than
+// assumed: a throwaway chart with one annotated CRD and one custom object of
+// that kind, installed and then uninstalled — both survived. So the annotation
+// is what makes the choice safe, and this is the guard that it stays on all of
+// them.
+func TestEveryCRDIsKeptWhenTheReleaseGoes(t *testing.T) {
+	root, err := filepath.Abs("../../..")
+	if err != nil {
+		t.Fatalf("locating the repository: %v", err)
+	}
+	files, err := chartsync.Files(root)
+	if err != nil {
+		t.Fatalf("rendering: %v", err)
+	}
+	crds := files["helm/kubevirt-ui/templates/operator-crds.yaml"]
+
+	definitions := strings.Count(crds, "kind: CustomResourceDefinition")
+	kept := strings.Count(crds, "helm.sh/resource-policy: keep")
+	if definitions == 0 {
+		t.Fatal("no CRDs rendered at all")
+	}
+	if kept != definitions {
+		t.Errorf("%d CRDs, %d carry the keep annotation — uninstalling the UI "+
+			"would cascade-delete what the others describe", definitions, kept)
 	}
 }
