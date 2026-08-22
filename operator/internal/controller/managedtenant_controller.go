@@ -34,6 +34,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
@@ -227,12 +228,45 @@ func (r *ManagedTenantReconciler) Reconcile(
 		Storage: total.Storage.String(),
 	}
 
-	if err := r.ensureQuota(ctx, obj, namespace, total, len(redundant) == 0); err != nil {
-		r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved,
-			false, "WriteFailed", err.Error())
-		obj.Status.ObservedGeneration = obj.Generation
-		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
-		return ctrl.Result{}, err
+	// The folder ceiling, asked here and not only by the API.
+	//
+	// `ConditionQuotaReserved` has always been documented as the ceiling's
+	// answer and nothing ever gave it one: the API refused a tenant that did
+	// not fit and this reconciler wrote the same quota from the same
+	// description without asking, so `spec.workers.count` edited on the CR
+	// went through with nothing in the way.
+	//
+	// A refusal withholds the *growth*, not the tenant. `CheckCeiling` returns
+	// room whenever the reservation does not exceed what the namespace already
+	// holds, so a refusal always means growth, and the quota and the worker
+	// shape are the two writes that carry it. Everything else about a running
+	// tenant — its address, its PKI, its transit, its addons — goes on being
+	// reconciled, because a number somebody typed is not a reason to stop
+	// maintaining a cluster that exists.
+	//
+	// Withholding both matters. Letting the shape through while holding the
+	// quota is the state this whole area keeps producing: machines that exist
+	// and pods the quota refuses, reported as "namespace quota has no room for
+	// the replacement pod".
+	overCeiling, err := r.ceilingRefusal(ctx, obj, namespace, total)
+	if err != nil {
+		// Failing to *ask* is not a refusal. A ceiling that cannot be read has
+		// not said no, and treating the two alike would freeze every tenant in
+		// the cluster on one unreadable ConfigMap.
+		logf.FromContext(ctx).Error(err, "could not read the folder ceiling",
+			"tenant", obj.Name, "folder", obj.Spec.Folder)
+	}
+	// The condition itself is set at the end, with the rest of the quota's
+	// answer: a setter here is overwritten by that one, which is how the first
+	// version of this passed its own reading and none of its tests.
+	if overCeiling == nil {
+		if err := r.ensureQuota(ctx, obj, namespace, total, len(redundant) == 0); err != nil {
+			r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved,
+				false, "WriteFailed", err.Error())
+			obj.Status.ObservedGeneration = obj.Generation
+			_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+			return ctrl.Result{}, err
+		}
 	}
 
 	obj.Status.RedundantQuotas = redundant
@@ -337,18 +371,26 @@ func (r *ManagedTenantReconciler) Reconcile(
 
 	// After the control plane: the worker config carries the Kubernetes CA that
 	// Kamaji only mints once the control plane exists.
-	workersReady, workersReason, workersMessage, err := r.reconcileWorkers(
-		ctx, obj, namespace, obj.Status.ControlPlaneVIP, release, addressNeeded)
-	if err != nil {
+	if overCeiling != nil {
+		// The shape is held back with the quota. Written now, CAPI would
+		// create machines whose pods the unchanged quota refuses.
+		apimeta.SetStatusCondition(&obj.Status.Conditions, workersCondition(
+			false, "HeldByFolderQuota", overCeiling.Error()))
+		pending = true
+	} else {
+		workersReady, workersReason, workersMessage, err := r.reconcileWorkers(
+			ctx, obj, namespace, obj.Status.ControlPlaneVIP, release, addressNeeded)
+		if err != nil {
+			apimeta.SetStatusCondition(&obj.Status.Conditions,
+				workersCondition(false, "WriteFailed", err.Error()))
+			obj.Status.ObservedGeneration = obj.Generation
+			_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+			return ctrl.Result{}, err
+		}
 		apimeta.SetStatusCondition(&obj.Status.Conditions,
-			workersCondition(false, "WriteFailed", err.Error()))
-		obj.Status.ObservedGeneration = obj.Generation
-		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
-		return ctrl.Result{}, err
+			workersCondition(workersReady, workersReason, workersMessage))
+		pending = pending || !workersReady
 	}
-	apimeta.SetStatusCondition(&obj.Status.Conditions,
-		workersCondition(workersReady, workersReason, workersMessage))
-	pending = pending || !workersReady
 
 	// The name the certificate already answers for, and the address the
 	// kubeconfig hands out: both were written before anything routed them.
@@ -414,9 +456,18 @@ func (r *ManagedTenantReconciler) Reconcile(
 		pending = pending || !goldenReady
 	}
 
-	r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady, true, "Ready",
-		fmt.Sprintf("%s has its quota and its LimitRange", namespace))
-	if len(redundant) > 0 {
+	if overCeiling != nil {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady, true, "Ready",
+			fmt.Sprintf("%s has its LimitRange; its quota is unchanged while "+
+				"the folder ceiling refuses the growth", namespace))
+	} else {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady, true, "Ready",
+			fmt.Sprintf("%s has its quota and its LimitRange", namespace))
+	}
+	if overCeiling != nil {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved,
+			false, "DoesNotFit", overCeiling.Error())
+	} else if len(redundant) > 0 {
 		r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved,
 			false, "CountedTwice",
 			fmt.Sprintf("%s also caps storage in this namespace. Kubernetes "+

@@ -1,0 +1,115 @@
+{
+  "_why": "One statement of the folder ceiling, asserted by both implementations. The backend refuses a tenant that does not fit before writing anything; the operator writes the same quota from the same description and, until this table existed, never asked. A tenant refused by the API and admitted by its reconciler is worse than either answer on its own, so neither side generates this file: if either arithmetic moves, its own suite goes red here before a cluster sees it. Namespace quotas are the sum of the `hard` requests the namespace carries, which is what the ceiling charges for.",
+  "cases": [
+    {
+      "name": "a root folder with no ceiling checks nothing",
+      "_note": "The stand as it was found: poc-transit is a root folder that carried no quota key, so nothing capped any dimension and 72 CPU accumulated in full view of a check that never ran.",
+      "folders": {"poc-transit": {"parent": null, "quota": {}}},
+      "namespaces": [
+        {"namespace": "poc-transit-dev", "folder": "poc-transit", "cpu": "40", "memory": "80Gi", "storage": "500Gi"},
+        {"namespace": "tenant-test3", "folder": "poc-transit", "cpu": "17", "memory": "11670Mi", "storage": "180Gi"}
+      ],
+      "folder": "poc-transit",
+      "asking": "tenant-test3",
+      "want": {"cpu": "999", "memory": "999Gi", "storage": "9999Gi"},
+      "expected": {"refused": false}
+    },
+    {
+      "name": "growing past the ceiling is refused",
+      "folders": {"poc-transit": {"parent": null, "quota": {"cpu": "32", "memory": "64Gi", "storage": "500Gi"}}},
+      "namespaces": [
+        {"namespace": "poc-transit-dev", "folder": "poc-transit", "cpu": "40", "memory": "80Gi", "storage": "500Gi"},
+        {"namespace": "tenant-test3", "folder": "poc-transit", "cpu": "17", "memory": "11670Mi", "storage": "180Gi"}
+      ],
+      "folder": "poc-transit",
+      "asking": "tenant-test3",
+      "want": {"cpu": "21", "memory": "11670Mi", "storage": "180Gi"},
+      "expected": {"refused": true, "dimension": "CPU"}
+    },
+    {
+      "name": "shrinking is allowed even with nothing free",
+      "_note": "Three workers down to two. Refusing the request that hands room back is a locked door on an over-committed folder.",
+      "folders": {"poc-transit": {"parent": null, "quota": {"cpu": "32", "memory": "64Gi", "storage": "500Gi"}}},
+      "namespaces": [
+        {"namespace": "poc-transit-dev", "folder": "poc-transit", "cpu": "40", "memory": "80Gi", "storage": "500Gi"},
+        {"namespace": "tenant-test3", "folder": "poc-transit", "cpu": "17", "memory": "11670Mi", "storage": "180Gi"}
+      ],
+      "folder": "poc-transit",
+      "asking": "tenant-test3",
+      "want": {"cpu": "13", "memory": "8Gi", "storage": "120Gi"},
+      "expected": {"refused": false}
+    },
+    {
+      "name": "standing still is allowed",
+      "folders": {"poc-transit": {"parent": null, "quota": {"cpu": "32", "memory": "64Gi", "storage": "500Gi"}}},
+      "namespaces": [
+        {"namespace": "poc-transit-dev", "folder": "poc-transit", "cpu": "40", "memory": "80Gi", "storage": "500Gi"},
+        {"namespace": "tenant-test3", "folder": "poc-transit", "cpu": "17", "memory": "11670Mi", "storage": "180Gi"}
+      ],
+      "folder": "poc-transit",
+      "asking": "tenant-test3",
+      "want": {"cpu": "17", "memory": "11670Mi", "storage": "180Gi"},
+      "expected": {"refused": false}
+    },
+    {
+      "name": "a namespace that holds nothing yet meets the ceiling in full",
+      "folders": {"lab": {"parent": null, "quota": {"cpu": "16", "memory": "32Gi", "storage": "200Gi"}}},
+      "namespaces": [
+        {"namespace": "lab-dev", "folder": "lab", "cpu": "12", "memory": "24Gi", "storage": "150Gi"}
+      ],
+      "folder": "lab",
+      "asking": "tenant-new",
+      "want": {"cpu": "8", "memory": "4Gi", "storage": "20Gi"},
+      "expected": {"refused": true, "dimension": "CPU"}
+    },
+    {
+      "name": "a folder silent about a dimension is not permission for it",
+      "_note": "The ceiling is looked for above as well: the child caps nothing, the parent caps CPU, and the parent's ceiling is the one the request has to fit under.",
+      "folders": {
+        "root": {"parent": null, "quota": {"cpu": "16"}},
+        "kid": {"parent": "root", "quota": {}}
+      },
+      "namespaces": [
+        {"namespace": "kid-dev", "folder": "kid", "cpu": "10", "memory": "8Gi", "storage": "50Gi"}
+      ],
+      "folder": "kid",
+      "asking": "tenant-new",
+      "want": {"cpu": "8", "memory": "64Gi", "storage": "900Gi"},
+      "expected": {"refused": true, "dimension": "CPU"}
+    },
+    {
+      "name": "a sub-folder's declared quota is reserved out of the parent whether or not it is used",
+      "folders": {
+        "root": {"parent": null, "quota": {"cpu": "16"}},
+        "kid": {"parent": "root", "quota": {"cpu": "12"}}
+      },
+      "namespaces": [],
+      "folder": "root",
+      "asking": "tenant-new",
+      "want": {"cpu": "8", "memory": "1Gi", "storage": "10Gi"},
+      "expected": {"refused": true, "dimension": "CPU"}
+    },
+    {
+      "name": "memory is checked on its own terms, not by whether CPU fits",
+      "folders": {"lab": {"parent": null, "quota": {"cpu": "64", "memory": "32Gi"}}},
+      "namespaces": [
+        {"namespace": "lab-dev", "folder": "lab", "cpu": "4", "memory": "30Gi", "storage": "10Gi"}
+      ],
+      "folder": "lab",
+      "asking": "tenant-new",
+      "want": {"cpu": "8", "memory": "8Gi", "storage": "10Gi"},
+      "expected": {"refused": true, "dimension": "memory"}
+    },
+    {
+      "name": "what fits, fits",
+      "folders": {"lab": {"parent": null, "quota": {"cpu": "16", "memory": "32Gi", "storage": "200Gi"}}},
+      "namespaces": [
+        {"namespace": "lab-dev", "folder": "lab", "cpu": "4", "memory": "8Gi", "storage": "50Gi"}
+      ],
+      "folder": "lab",
+      "asking": "tenant-new",
+      "want": {"cpu": "8", "memory": "16Gi", "storage": "100Gi"},
+      "expected": {"refused": false}
+    }
+  ]
+}

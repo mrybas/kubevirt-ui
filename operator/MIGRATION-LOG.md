@@ -3483,3 +3483,77 @@ worse trade than saying so here.
 And one of the four was mine to begin with: adopting `op-t1` with `addons: []`
 retired the CSI release the product had installed for it. The adoption procedure
 says to describe what is there, and I described what I had looked at.
+
+## The folder ceiling, asked by the reconciler
+
+Reported from the stand: a scale said there was nowhere to scale, scaled
+anyway, and left 72 CPU of quota under a 32 CPU ceiling.
+
+The 72 is not usage. A folder's `allocated` is the sum of `requests.*` over
+every ResourceQuota in every namespace carrying its label — two environments at
+40 and 8, two tenant namespaces at 7 and 17 — while the same namespaces were
+actually consuming about 4.7 CPU between them. Tenant namespaces carry the
+folder label, which is what makes a tenant visible to the ceiling, and equally
+what makes it count against one.
+
+Why nothing refused the growth: the arithmetic never ran. `poc-transit` is a
+root folder — the only folder in the ConfigMap, no parent — and it carried no
+quota key at all. The ceiling is looked for at the folder and then above it, and
+there was nothing above; with no holder the check returns before comparing
+anything. Counting is not checking, and for months everything counted.
+
+Then a ceiling appeared, and the folder was instantly stuck: with 55 allocated
+under a 32 cap, `free` is zero and *every* request fails — including the one
+that hands room back. Three workers down to two came back "0 is free and tenant
+'test3' asks for 13". A request that does not grow what the asker already holds
+is now never refused for lack of room. The ceiling binds upwards; the way out
+is down.
+
+And the two halves of the report were both true. The tenant's own quota was
+written after its shape, so in the gap the new machines existed and the old
+quota refused their pods: "namespace quota has no room for the replacement
+pod", accurate when read and wrong a moment later. A growing dimension is
+raised before the shape now, a shrinking one left alone, and the write that
+follows the shape still brings it down.
+
+### The hole this exposed
+
+The API was the only thing asking. This controller writes the same quota from
+the same description and never consulted the folder at all, so
+`spec.workers.count` edited on the CR — kubectl, GitOps, a `kubectl edit` in a
+hurry — grew the charge with nothing in the way. `ConditionQuotaReserved` has
+been documented since it was introduced as "the folder ceiling's answer, taken
+before anything exists", and nothing had ever given it one.
+
+It asks now, and a refusal withholds the *growth* rather than the tenant.
+`CheckCeiling` returns room whenever the reservation does not exceed what the
+namespace already holds, so a refusal always means growth, and the quota and the
+worker shape are exactly the two writes that carry it. Both are withheld
+together — letting the shape through while holding the quota is how machines
+come to exist whose pods the quota refuses, which is the state described above.
+Everything else about a running tenant goes on being reconciled: a number
+somebody typed is not a reason to stop maintaining a cluster that exists.
+
+Failing to *ask* is not a refusal. An unreadable tree or an API error is logged
+and the reservation proceeds; a ceiling that cannot be read has not said no, and
+the alternative is one unreadable ConfigMap freezing every tenant in the
+cluster.
+
+Two implementations now decide the same thing, so they are held to one
+statement: `test/parity/folder-ceiling.json`, nine cases, asserted by the Go
+arithmetic and by `assert_within_folder_quota` through a fake cluster built from
+the same table. A tenant refused by the API and admitted by its reconciler is
+worse than either answer alone.
+
+### What it cost to find
+
+The first version set the condition where the check runs and read correctly to
+me — and a block near the end of `Reconcile` sets `QuotaReserved` unconditionally,
+so the refusal was overwritten before it was ever written to the API server. It
+passed my reading of the diff and failed its own test, which is the whole
+argument for the test.
+
+Still open, named rather than covered: nothing refuses a `spec.workers.count`
+that fits the ceiling but not the cluster, and the quota a tenant charges is
+still its reservation rather than its use — a folder can be full of room nobody
+is using.
