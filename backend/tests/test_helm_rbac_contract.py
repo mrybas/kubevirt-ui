@@ -136,6 +136,8 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     ("platform.kubevirt-ui.io", "managedvmtemplates", "patch",
      "templates.update_template"),
     ("platform.kubevirt-ui.io", "managedimages", "get", "templates (image lookup)"),
+    ("platform.kubevirt-ui.io", "managedimages", "list",
+     "templates.list_golden_images — the images asked for but not yet built"),
     ("platform.kubevirt-ui.io", "managedimages", "create",
      "templates._create_managed_image"),
     ("platform.kubevirt-ui.io", "managedimages", "delete", "templates.delete_image"),

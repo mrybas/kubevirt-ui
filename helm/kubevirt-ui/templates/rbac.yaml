@@ -127,7 +127,7 @@ rules:
   - apiGroups: ["platform.kubevirt-ui.io"]
     resources:
       - managedimages
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "list", "create", "delete"]
 
   - apiGroups: ["platform.kubevirt-ui.io"]
     resources:

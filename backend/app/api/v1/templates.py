@@ -965,6 +965,20 @@ async def list_golden_images(
                 logger.warning(f"Failed to list DataVolumes in {ns}: {e}")
                 continue
         
+        # And the ones that were asked for but not built.
+        #
+        # The list reads DataVolumes, which is what the operator *makes* from a
+        # ManagedImage. Anything it has not made yet — or will never make,
+        # because the request cannot be satisfied — appeared nowhere at all: no
+        # row, no error, no trace. UAT run 4, G3: a disk refused by the
+        # namespace quota was invisible while it consumed the quota that
+        # refused it.
+        images.extend(await _described_but_unbuilt_images(
+            custom_api, namespaces_to_check, namespace,
+            {f"{img.namespace}/{img.name}" for img in images},
+            ns_labels_map,
+        ))
+
         return GoldenImageListResponse(items=images, total=len(images))
     
     except ApiException as e:
@@ -973,6 +987,82 @@ async def list_golden_images(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list images: {e.reason}",
         )
+
+
+async def _described_but_unbuilt_images(
+    custom_api: Any, namespaces: list[str], filter_namespace: str | None,
+    already: set[str], ns_labels_map: dict[str, dict],
+) -> list[GoldenImage]:
+    """Images that exist as a request and not yet as a disk.
+
+    A ManagedImage is the thing the user asked for; the DataVolume is what the
+    operator builds from it. Listing only the second means the seconds between
+    them show nothing — and, when the build cannot happen at all, so does
+    forever.
+
+    The row carries whatever the resource says about itself, so "why is it not
+    there" is answered on the page rather than by reading a controller's log.
+    """
+    out: list[GoldenImage] = []
+    for ns in namespaces:
+        try:
+            described = await custom_api.list_namespaced_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                namespace=ns, plural="managedimages",
+            )
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning(f"Failed to list ManagedImages in {ns}: {e}")
+            continue
+
+        for item in described.get("items", []):
+            meta = item.get("metadata", {}) or {}
+            name = meta.get("name", "")
+            if not name or f"{ns}/{name}" in already:
+                continue
+            spec = item.get("spec", {}) or {}
+            status_obj = item.get("status", {}) or {}
+            labels = meta.get("labels", {}) or {}
+            scope = labels.get("kubevirt-ui.io/scope", "environment")
+            if filter_namespace and ns != filter_namespace and scope not in (
+                "project", "folder",
+            ):
+                continue
+
+            # What the resource says, in the order it becomes knowable: a
+            # refusal first, then a phase, then the honest default.
+            reason, message = "", ""
+            for cond in status_obj.get("conditions", []):
+                if cond.get("status") == "False" and cond.get("reason"):
+                    reason, message = cond["reason"], cond.get("message", "")
+                    break
+            display = "Error" if reason else (status_obj.get("phase") or "Pending")
+            if display not in ("Error", "Ready", "Pending"):
+                display = "Pending"
+
+            ns_labels = ns_labels_map.get(ns, {})
+            source = spec.get("source", {}) or {}
+            out.append(GoldenImage(
+                name=name,
+                namespace=ns,
+                display_name=spec.get("displayName") or name,
+                description=spec.get("description"),
+                os_type=labels.get("kubevirt-ui.io/os-type"),
+                os_version=labels.get("kubevirt-ui.io/os-version"),
+                size=spec.get("size", "Unknown"),
+                status=display,
+                error_message=(message or reason) if display == "Error" else None,
+                source_url=source.get("url") or source.get("registry"),
+                created=meta.get("creationTimestamp"),
+                used_by=status_obj.get("usedBy") or None,
+                disk_type=labels.get("kubevirt-ui.io/disk-type", "image"),
+                persistent=labels.get("kubevirt-ui.io/persistent", "false").lower() == "true",
+                scope=scope,
+                project=labels.get("kubevirt-ui.io/project")
+                or ns_labels.get("kubevirt-ui.io/project"),
+                environment=ns_labels.get("kubevirt-ui.io/environment"),
+            ))
+    return out
 
 
 async def _create_managed_image(
