@@ -56,6 +56,7 @@ from app.core.constants import (
     KYVERNO_API_VERSION,
 )
 from app.core.errors import k8s_error_to_http
+from app.core.vpc_access import VpcFacts, visible_vpcs
 from app.core.groups import (
     get_user_namespaces,
     is_admin,
@@ -1082,38 +1083,21 @@ async def list_vpcs(
         vpcs = [v for v in vpcs if v.environment == environment or not v.environment]
 
     if not is_admin(user.groups, user):
-        # B4 (T9): a folder-scoped VPC that was just created has an empty
-        # `spec.namespaces` (no tenants attached yet), so the namespace-
-        # overlap filter alone would hide the VPC from the folder admin who
-        # is supposed to pick it in the wizard. OR-in a label-based check
-        # against the folder access machinery: folder-viewer sees folder-wide
-        # VPCs, env-viewer sees env-scoped VPCs.
-        user_ns = set(await get_user_namespaces(k8s, user))
-        try:
-            folders_map = await load_folders(k8s)
-        except HTTPException as e:
-            # 404 → no folders configured yet → no label-based access; fall
-            # back to ns-overlap only. Other errors bubble up.
-            if e.status_code == 404:
-                folders_map = {}
-            else:
-                raise
-
-        def _label_accessible(v: VpcResponse) -> bool:
-            if not v.folder:
-                return False  # unlabeled VPC — admin-only via existing filter
-            folder_meta = folders_map.get(v.folder)
-            if not folder_meta:
-                return False  # folder no longer exists or unparseable meta
-            if v.environment is None:
-                return is_folder_viewer(user, folder_meta)
-            return is_env_viewer(user, folder_meta, v.environment)
-
-        vpcs = [
-            v for v in vpcs
-            if v.name != SYSTEM_VPC_NAME
-            and ((set(v.namespaces or []) & user_ns) or _label_accessible(v))
-        ]
+        # The rule lives in app.core.vpc_access, because `GET /subnets` needs
+        # the same answer and used to compute a different one: it asked only
+        # whether `spec.namespaces` overlapped, which hides a VPC that nothing
+        # is attached to yet — that is, every VPC that has just been created.
+        # The wizard that lists networks for a VM read that half and offered
+        # nothing while this endpoint offered three.
+        visible = await visible_vpcs(
+            k8s, user,
+            (VpcFacts(
+                name=v.name, folder=v.folder, environment=v.environment,
+                namespaces=tuple(v.namespaces or ()),
+            ) for v in vpcs),
+            SYSTEM_VPC_NAME,
+        )
+        vpcs = [v for v in vpcs if v.name in visible]
 
     return VpcListResponse(items=vpcs, total=len(vpcs))
 
