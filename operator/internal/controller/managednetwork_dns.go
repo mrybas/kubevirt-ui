@@ -85,6 +85,32 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 		return nil
 	}
 
+	// Is there anything on the other side of this?
+	//
+	// kube-ovn's VpcDns controller is configured by `vpc-dns-config`, and
+	// without that ConfigMap it answers every VpcDns with "failed to add or
+	// update vpc-dns, not enabled" and creates nothing. The product used to
+	// write the object anyway and report `DeploymentPending` — "the route
+	// goes on as soon as kube-ovn creates it" — which promises time for
+	// something that will not happen at all. Measured in UAT run 4: three
+	// VPCs, three VpcDns objects, no deployments, and VMs in those networks
+	// with no resolver at all while the condition said "yet".
+	//
+	// So the missing precondition is named instead. Absence of the ConfigMap
+	// is the observable form of the feature being off; the message says which
+	// object was looked for, so disagreeing with it costs one kubectl.
+	if !r.vpcDNSIsServed(ctx, kubeOVNNS) {
+		net.Status.ServiceRoute = ""
+		r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, false,
+			"KubeOVNVpcDNSDisabled",
+			fmt.Sprintf("kube-ovn's vpc-dns feature is not enabled in this "+
+				"cluster — there is no ConfigMap %s/%s, so nothing will serve "+
+				"a VpcDns and workloads in this network have no resolver. "+
+				"Enable it in kube-ovn, or set a dnsServer on this network.",
+				kubeOVNNS, vpcDNSConfigMap))
+		return nil
+	}
+
 	if err := r.ensureVpcDNS(ctx, net); err != nil {
 		r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, false, "WriteFailed", err.Error())
 		return nil
@@ -98,6 +124,25 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 	}
 	r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, true, "Routed", message)
 	return nil
+}
+
+// vpcDNSIsServed reports whether anything in this cluster will act on a VpcDns.
+//
+// The same ConfigMap `resolveDNSServer` reads for the resolver address, asked
+// for a different reason: it is kube-ovn's own configuration for the feature,
+// so its absence is the cluster saying the feature is off. An unreadable
+// namespace is treated as "cannot tell" rather than "off" — the write it
+// gates is idempotent, and refusing to try because a read failed is how a
+// working cluster gets told its feature is missing.
+func (r *ManagedNetworkReconciler) vpcDNSIsServed(ctx context.Context, kubeOVNNS string) bool {
+	if kubeOVNNS == "" {
+		return true
+	}
+	cm := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: kubeOVNNS, Name: vpcDNSConfigMap,
+	}, cm)
+	return !apierrors.IsNotFound(err)
 }
 
 // resolveDNSServer is the address workloads are handed over DHCP.

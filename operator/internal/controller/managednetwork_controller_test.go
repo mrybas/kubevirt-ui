@@ -496,6 +496,9 @@ func TestNetworkStopsWriting(t *testing.T) {
 func TestTheServiceRouteGoesOnWhenTheDeploymentAppears(t *testing.T) {
 	mustSharedNamespace(t, "kube-ovn")
 	mustOverlaySubnet(t)
+	// The feature has to be on for any of this to be reachable — see
+	// TestAVpcDnsNobodyServesIsNotCalledPending.
+	mustKubeOVNResolver(t)
 
 	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
 		ObjectMeta: metav1.ObjectMeta{Name: "netdns"},
