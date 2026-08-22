@@ -64,6 +64,9 @@ async def _create_image(
 
     api = MagicMock()
     api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
+    # Creating an image now refuses one whose display name is taken, which
+    # means reading what is there first. Nothing is, in these tests.
+    api.list_namespaced_custom_object = AsyncMock(return_value={"items": []})
 
     request = MagicMock()
     request.app.state.k8s_client = _k8s_with_namespace()

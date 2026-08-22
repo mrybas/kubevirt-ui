@@ -989,6 +989,65 @@ async def list_golden_images(
         )
 
 
+async def _refuse_a_duplicate_image(
+    k8s_client: Any, namespace: str, display_name: str,
+) -> None:
+    """An image with this name in this namespace already exists.
+
+    While images were named by the user, a second one with the same name was
+    refused by Kubernetes for free. Moving to `generateName` — which fixed
+    real collisions and let two people import the same distribution — removed
+    that refusal and put nothing in its place, so importing the same image
+    twice produced two objects with one display name, distinguishable only by
+    a synthetic suffix nobody sees:
+
+        UAT Ubuntu 22.04   uat-ubuntu-dkvpb   10Gi   InUse   1 VM
+        UAT Ubuntu 22.04   uat-ubuntu-x8czz   10Gi   Ready   -
+
+    Both appear in the image picker, identically, and the second one pulls the
+    same gigabyte into Ceph again. Reported as D-2 in UAT run 4.
+
+    Creating a tenant and creating a template both already answer this case in
+    almost these words; images were the only one that did not.
+    """
+    if not display_name:
+        return
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    for plural, group, version in (
+        ("datavolumes", "cdi.kubevirt.io", "v1beta1"),
+        ("managedimages", OPERATOR_GROUP, OPERATOR_VERSION),
+    ):
+        try:
+            existing = await custom_api.list_namespaced_custom_object(
+                group=group, version=version, namespace=namespace, plural=plural,
+            )
+        except ApiException as e:
+            # A CRD that is not installed says nothing about duplicates.
+            if e.status == 404:
+                continue
+            raise
+        for item in existing.get("items", []):
+            meta = item.get("metadata", {}) or {}
+            spec = item.get("spec", {}) or {}
+            name = (
+                (meta.get("annotations") or {}).get(DISPLAY_NAME_ANNOTATION)
+                or spec.get("displayName")
+                or meta.get("name", "")
+            )
+            if name != display_name:
+                continue
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"An image called '{display_name}' already exists in "
+                    f"{namespace} (as '{meta.get('name')}'). Pick another "
+                    f"name, or delete that one first — two images with one "
+                    f"name cannot be told apart in the picker, and the second "
+                    f"import downloads the same content again."
+                ),
+            )
+
+
 async def _described_but_unbuilt_images(
     custom_api: Any, namespaces: list[str], filter_namespace: str | None,
     already: set[str], ns_labels_map: dict[str, dict],
@@ -1178,11 +1237,19 @@ async def create_golden_image(
     """
     k8s_client = request.app.state.k8s_client
 
+    # Refused before anything is written, like a tenant and a template with a
+    # name that is taken.
+    await _refuse_a_duplicate_image(k8s_client, namespace, image.display_name)
+
     # Asked before the DataVolume exists, because the quota counts the PVC
     # that CDI makes from it and not the DataVolume itself — which is how a
     # 100Gi disk against a 12Gi quota came back 201 and then never appeared.
     await assert_storage_headroom(
-        k8s_client, namespace, image.size, what=f"{image.name!r}",
+        k8s_client, namespace, image.size,
+        # The display name, not `name`: that one is an optional seed for the
+        # kubernetes name and is empty on the ordinary path, so the refusal
+        # read "None asks for 400Gi" — a message about a disk with no name.
+        what=f"{image.display_name or image.name or 'this disk'!r}",
     )
 
     # At-least-one runtime check (soft contract — matches create_tenant_image).

@@ -101,7 +101,12 @@ type ManagedTenantReconciler struct {
 
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups="",resources=namespaces;resourcequotas;limitranges,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups="",resources=namespaces;limitranges,verbs=get;list;watch;create;update;patch
+// Quotas alone carry delete, for taking over the one the backend used to
+// write. Namespaces and LimitRanges deliberately do not: this controller has
+// no business removing either, and a verb granted for one purpose is a verb
+// available for every other.
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedimages,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch
 // Held so it can be granted: Kubernetes refuses to create a Role conferring
@@ -194,7 +199,7 @@ func (r *ManagedTenantReconciler) Reconcile(
 	}
 	// What else caps storage here decides what this quota may say, so it is
 	// read before the quota is written and not after.
-	redundant, err := r.redundantStorageQuotas(ctx, namespace)
+	redundant, absorb, err := r.redundantStorageQuotas(ctx, namespace, obj)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -266,6 +271,21 @@ func (r *ManagedTenantReconciler) Reconcile(
 			obj.Status.ObservedGeneration = obj.Generation
 			_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
 			return ctrl.Result{}, err
+		}
+	}
+
+	// Taking over the quota the backend used to write, now that ours carries
+	// the same allowance. This order never leaves the namespace uncapped:
+	// while both exist Kubernetes enforces the smaller, which is what was
+	// enforced a moment ago, and removing the second widens the cap to the
+	// figure the folder was already being charged for.
+	if overCeiling == nil {
+		for _, name := range absorb {
+			old := &corev1.ResourceQuota{}
+			old.Name, old.Namespace = name, namespace
+			if err := kube.Delete(ctx, r.Client, tenantControllerName, old); err != nil {
+				return ctrl.Result{}, fmt.Errorf("absorbing ResourceQuota/%s: %w", name, err)
+			}
 		}
 	}
 
@@ -652,24 +672,53 @@ func (r *ManagedTenantReconciler) ensureQuota(
 // while reserving 120Gi, and the tenant beside it had only one, so the
 // double-count was not even consistent.
 func (r *ManagedTenantReconciler) redundantStorageQuotas(
-	ctx context.Context, namespace string,
-) ([]string, error) {
+	ctx context.Context, namespace string, obj *platformv1alpha1.ManagedTenant,
+) (foreign, absorb []string, err error) {
 	list := &corev1.ResourceQuotaList{}
 	if err := r.List(ctx, list, client.InNamespace(namespace)); err != nil {
-		return nil, fmt.Errorf("listing quotas in %s: %w", namespace, err)
+		return nil, nil, fmt.Errorf("listing quotas in %s: %w", namespace, err)
 	}
 	ours := namespace + "-quota"
-	var out []string
 	for i := range list.Items {
-		if list.Items[i].Name == ours {
+		q := &list.Items[i]
+		if q.Name == ours {
 			continue
 		}
-		if _, caps := list.Items[i].Spec.Hard[corev1.ResourceRequestsStorage]; caps {
-			out = append(out, list.Items[i].Name)
+		if _, caps := q.Spec.Hard[corev1.ResourceRequestsStorage]; !caps {
+			continue
 		}
+		// One of ours from before the handover is not a second opinion to
+		// defer to — it is the product's older writer, still writing. Deferring
+		// to it left `QuotaReserved=False (CountedTwice)` on every tenant with
+		// storage, permanently, and a condition that is always false teaches
+		// people to stop reading conditions.
+		if oursFromBefore(q, obj) {
+			absorb = append(absorb, q.Name)
+			continue
+		}
+		foreign = append(foreign, q.Name)
 	}
-	sort.Strings(out)
-	return out, nil
+	sort.Strings(foreign)
+	sort.Strings(absorb)
+	return foreign, absorb, nil
+}
+
+// legacyCSIQuotaName is what the backend calls the quota it writes when it
+// wires a tenant's storage — `tenants_storage.CSI_RESOURCE_QUOTA_NAME`. Named
+// here because this controller has to recognise its predecessor's work.
+const legacyCSIQuotaName = "tenant-storage"
+
+// oursFromBefore recognises the storage quota the backend wrote for this
+// tenant before the operator owned the namespace.
+//
+// Three labels, all three required. Anything less would let the operator
+// delete a quota somebody else put there deliberately, which is the whole
+// reason the redundant-quota path exists.
+func oursFromBefore(q *corev1.ResourceQuota, obj *platformv1alpha1.ManagedTenant) bool {
+	return q.Name == legacyCSIQuotaName &&
+		q.Labels["kubevirt-ui.io/managed"] == "true" &&
+		q.Labels["kubevirt-ui.io/role"] == "csi-infra" &&
+		q.Labels["kubevirt-ui.io/tenant"] == obj.Name
 }
 
 // storageAllowanceOf is what the tenant's own workloads may provision.
