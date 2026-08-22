@@ -657,3 +657,72 @@ func TestTheChartCanSetEverySiteEnvTheOperatorReads(t *testing.T) {
 		}
 	}
 }
+
+// TestTenantsTrustTheProviderTheProductAlreadyUses.
+//
+// UAT run 4, O-1: two tenants created with `enableOIDC: true`, the wizard
+// showing "Enabled", the resource carrying it — and not one `--oidc-*`
+// argument on either apiserver. The operator reads OIDC_ISSUER and the chart
+// only set it from `operator.config.oidcIssuer`, a second, empty place to
+// state the issuer this deployment already signs in with.
+//
+// One fact, one place: the tenant issuer defaults to `auth.oidc.issuer`, and
+// the separate value stays for the one case it is for — pointing tenants at a
+// different provider from the UI's.
+func TestTenantsTrustTheProviderTheProductAlreadyUses(t *testing.T) {
+	base := []string{
+		"--set", "operator.enabled=true",
+		"--set", "operator.config.kubeOvnNamespace=k",
+		"--set", "operator.config.metallbNamespace=m",
+		"--set", "operator.config.metallbPool=p",
+		"--set", "operator.config.cpTransitSubnet=c",
+		"--set", "operator.config.ingressDomain=d",
+		"--set", "operator.config.tenantSupernet=10.200.0.0/14",
+		"--set", "operator.config.externalDNSTarget=10.198.175.200",
+	}
+
+	issuerOf := func(t *testing.T, args ...string) (string, string) {
+		t.Helper()
+		docs := renderObjects(t, append(append([]string{}, base...), args...)...)
+		tenant := one(t, docs, "Deployment", "kubevirt-ui-operator-tenant")
+		env, _ := dig(tenant, "spec", "template", "spec", "containers").([]any)
+		issuer, client := "", ""
+		for _, c := range env {
+			vars, _ := dig(c, "env").([]any)
+			for _, v := range vars {
+				switch dig(v, "name") {
+				case "OIDC_ISSUER":
+					issuer, _ = dig(v, "value").(string)
+				case "OIDC_CLIENT_ID":
+					client, _ = dig(v, "value").(string)
+				}
+			}
+		}
+		return issuer, client
+	}
+
+	// The ordinary install: one issuer, stated once.
+	issuer, client := issuerOf(t, "--set", "auth.oidc.issuer=https://dex.example.test")
+	if issuer != "https://dex.example.test" {
+		t.Errorf("the tenant domain got issuer %q from an install that has one", issuer)
+	}
+	if client == "" {
+		t.Errorf("an issuer with no client id is a half-configured apiserver")
+	}
+
+	// A different provider for tenants than for the UI, which is the only
+	// reason the separate value exists.
+	issuer, _ = issuerOf(t,
+		"--set", "auth.oidc.issuer=https://dex.example.test",
+		"--set", "operator.config.oidcIssuer=https://tenants.idp.example.test")
+	if issuer != "https://tenants.idp.example.test" {
+		t.Errorf("the explicit tenant issuer was ignored: %q", issuer)
+	}
+
+	// And an install with no provider at all does not invent one. The operator
+	// reports it on the tenant that asked; the chart says nothing.
+	issuer, _ = issuerOf(t, "--set", "auth.oidc.issuer=")
+	if issuer != "" {
+		t.Errorf("an issuer appeared out of nowhere: %q", issuer)
+	}
+}

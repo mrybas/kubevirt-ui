@@ -273,13 +273,19 @@ spec:
             - name: TENANTS_TRAEFIK_TRUSTD_ENTRYPOINT
               value: {{ $cfg.traefikTrustdEntryPoint | quote }}
             {{- end }}
-            {{- if $cfg.oidcIssuer }}
-            # Optional: a tenant may opt into OIDC. Same values the backend
-            # reads, for the same reason as above.
+            {{- $tenantIssuer := $cfg.oidcIssuer | default $top.Values.auth.oidc.issuer }}
+            {{- if $tenantIssuer }}
+            # A tenant may opt into OIDC, and the issuer defaults to the one
+            # this deployment already signs in with — stating it twice is how
+            # the feature came to be off everywhere. UAT run 4, O-1: two
+            # tenants created with `enableOIDC: true`, no `--oidc-*` argument
+            # on either apiserver, because this value was empty and nothing
+            # said so. Set `operator.config.oidcIssuer` only to point tenants
+            # at a *different* provider from the UI's.
             - name: OIDC_ISSUER
-              value: {{ $cfg.oidcIssuer | quote }}
+              value: {{ $tenantIssuer | quote }}
             - name: OIDC_CLIENT_ID
-              value: {{ required "operator.config.oidcClientId is required when an issuer is set" $cfg.oidcClientId | quote }}
+              value: {{ $cfg.oidcClientId | default $top.Values.auth.oidc.clientId | quote }}
             {{- end }}
             {{- end }}
             {{- range $key, $value := $top.Values.operator.extraEnv }}

@@ -747,8 +747,13 @@ operator:
     # explicitly where neither is readable, which is every managed control
     # plane.
     serviceCIDR: ""
-    # Optional. A tenant may opt into OIDC; if an issuer is set, so must be the
-    # client id.
+    # Optional. A tenant may opt into OIDC (`enableOIDC`), and its apiserver
+    # then trusts this issuer. Empty means the issuer under `auth.oidc` — the
+    # one the UI itself signs in with — which is nearly always the intent.
+    # Set these only to point tenants at a *different* provider.
+    #
+    # The apiserver refuses to start on an http issuer, so a non-https one is
+    # reported on the tenant rather than applied.
     oidcIssuer: ""
     oidcClientId: ""
   extraEnv: {}

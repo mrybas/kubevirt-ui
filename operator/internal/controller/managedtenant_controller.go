@@ -464,6 +464,10 @@ func (r *ManagedTenantReconciler) Reconcile(
 		r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady, true, "Ready",
 			fmt.Sprintf("%s has its quota and its LimitRange", namespace))
 	}
+	// Said whether or not it is good news: a request that was accepted and not
+	// delivered is the thing this condition exists to make visible.
+	apimeta.SetStatusCondition(&obj.Status.Conditions, singleSignOnCondition(obj))
+
 	if overCeiling != nil {
 		r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved,
 			false, "DoesNotFit", overCeiling.Error())

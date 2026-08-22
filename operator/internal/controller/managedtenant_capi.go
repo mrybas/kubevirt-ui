@@ -383,7 +383,7 @@ func (r *ManagedTenantReconciler) ensureKamajiControlPlane(
 		// to point at. A tenant that opted out runs with no `--oidc-*` flags at
 		// all, which is what a deployment whose provider the apiserver cannot
 		// reach actually needs.
-		if args := oidcArgs(obj); len(args) > 0 {
+		if args, _ := oidcArgs(obj); len(args) > 0 {
 			spec["apiServer"] = map[string]any{"extraArgs": args}
 		}
 		// Laid over what is there. Kamaji writes five fields of its own into
@@ -403,24 +403,70 @@ func (r *ManagedTenantReconciler) ensureKamajiControlPlane(
 }
 
 // oidcArgs are the apiserver flags that make the platform's identity provider
-// usable inside a tenant.
+// usable inside a tenant, and the reason there are none.
 //
-// Gated on the issuer being https: an apiserver told to trust an http issuer
-// refuses to start, and a control plane that will not start is a worse answer
-// than one without single sign-on.
-func oidcArgs(obj *platformv1alpha1.ManagedTenant) []any {
+// Three ways to get nothing back, and they are not the same thing. The tenant
+// did not ask — nothing to report. The tenant asked and this deployment has no
+// issuer configured. The tenant asked and the issuer is not https, which is
+// refused because an apiserver told to trust an http issuer will not start,
+// and a control plane that does not start is worse than one without single
+// sign-on.
+//
+// The last two used to be silence. `enableOIDC: true` was stored, no argument
+// reached the apiserver, and every condition read True — so an OIDC kubeconfig
+// for that tenant answered Unauthorized and nothing anywhere said why. UAT run
+// 4 found it on two tenants; it is the same shape as a VpcDns handed to a
+// controller that will not take it.
+func oidcArgs(obj *platformv1alpha1.ManagedTenant) (args []any, refusal string) {
 	if !obj.Spec.EnableOIDC {
-		return nil
+		return nil, ""
 	}
 	issuer := envOr("OIDC_ISSUER", "")
+	if issuer == "" {
+		return nil, "this deployment has no identity provider configured for " +
+			"tenants (OIDC_ISSUER is unset — set operator.config.oidcIssuer, " +
+			"which defaults to the issuer the UI itself signs in with). The " +
+			"tenant is built without single sign-on: its apiserver accepts " +
+			"only its own certificates and tokens."
+	}
 	if !strings.HasPrefix(issuer, "https://") {
-		return nil
+		return nil, fmt.Sprintf(
+			"the configured issuer %q is not https, and an apiserver told to "+
+				"trust an http issuer refuses to start. The tenant is built "+
+				"without single sign-on rather than not built at all.", issuer)
 	}
 	return []any{
 		"--oidc-issuer-url=" + issuer,
 		"--oidc-client-id=" + envOr("OIDC_CLIENT_ID", "kubevirt-ui"),
 		"--oidc-username-claim=email",
 		"--oidc-groups-claim=groups",
+	}, ""
+}
+
+// singleSignOnCondition says whether the tenant's apiserver trusts the
+// platform's provider, and when it does not, why.
+func singleSignOnCondition(obj *platformv1alpha1.ManagedTenant) metav1.Condition {
+	args, refusal := oidcArgs(obj)
+	switch {
+	case !obj.Spec.EnableOIDC:
+		return metav1.Condition{
+			Type: platformv1alpha1.ConditionSingleSignOn, Status: metav1.ConditionTrue,
+			Reason:  "NotRequested",
+			Message: "enableOIDC=false — this cluster's apiserver accepts its own credentials only",
+		}
+	case refusal != "":
+		return metav1.Condition{
+			Type: platformv1alpha1.ConditionSingleSignOn, Status: metav1.ConditionFalse,
+			Reason: "NoIssuer", Message: refusal,
+		}
+	default:
+		_ = args
+		return metav1.Condition{
+			Type: platformv1alpha1.ConditionSingleSignOn, Status: metav1.ConditionTrue,
+			Reason: "Trusted",
+			Message: "the tenant's apiserver trusts " + envOr("OIDC_ISSUER", "") +
+				" for client " + envOr("OIDC_CLIENT_ID", "kubevirt-ui"),
+		}
 	}
 }
 

@@ -360,13 +360,16 @@ func TestTheApiserverTakesTheIdentityProviderOnlyWhenAsked(t *testing.T) {
 	t.Setenv("OIDC_CLIENT_ID", "kubevirt-ui")
 
 	off := vpcTenant("tcp6")
-	if args := oidcArgs(off); args != nil {
-		t.Errorf("a tenant that did not ask for it got %v", args)
+	if args, refusal := oidcArgs(off); args != nil || refusal != "" {
+		t.Errorf("a tenant that did not ask for it got %v / %q", args, refusal)
 	}
 
 	on := vpcTenant("tcp7")
 	on.Spec.EnableOIDC = true
-	args := oidcArgs(on)
+	args, refusal := oidcArgs(on)
+	if refusal != "" {
+		t.Fatalf("refused a request it can satisfy: %s", refusal)
+	}
 	if len(args) != 4 {
 		t.Fatalf("args = %v", args)
 	}
@@ -376,10 +379,54 @@ func TestTheApiserverTakesTheIdentityProviderOnlyWhenAsked(t *testing.T) {
 
 	// An apiserver told to trust an http issuer refuses to start, and a control
 	// plane that will not start is a worse answer than one without single
-	// sign-on.
+	// sign-on. It is said out loud rather than dropped, which is the whole of
+	// UAT run 4's O-1.
 	t.Setenv("OIDC_ISSUER", "http://example.invalid/dex")
-	if args := oidcArgs(on); args != nil {
+	args, refusal = oidcArgs(on)
+	if args != nil {
 		t.Errorf("an http issuer was accepted: %v", args)
+	}
+	if !strings.Contains(refusal, "https") {
+		t.Errorf("the refusal does not say what is wrong: %q", refusal)
+	}
+}
+
+// TestATenantThatAskedForSingleSignOnAndDidNotGetItSaysSo.
+//
+// UAT run 4, O-1: `enableOIDC: true` on two tenants, wizard showing "Enabled",
+// no `--oidc-*` argument anywhere on either apiserver, and every condition
+// True. The deployment simply had no OIDC_ISSUER, and the code returned nil
+// without a word — so an OIDC kubeconfig for those tenants could only answer
+// Unauthorized, with nothing anywhere to explain it.
+func TestATenantThatAskedForSingleSignOnAndDidNotGetItSaysSo(t *testing.T) {
+	asked := vpcTenant("tcp8")
+	asked.Spec.EnableOIDC = true
+
+	t.Setenv("OIDC_ISSUER", "")
+	cond := singleSignOnCondition(asked)
+	if cond.Status != metav1.ConditionFalse {
+		t.Fatalf("condition = %+v", cond)
+	}
+	// The missing precondition by name, and what to do about it.
+	for _, want := range []string{"OIDC_ISSUER", "oidcIssuer"} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("message does not name %q: %s", want, cond.Message)
+		}
+	}
+	// And what the tenant *is*, since it was built anyway.
+	if !strings.Contains(cond.Message, "without single sign-on") {
+		t.Errorf("message does not say what was built: %s", cond.Message)
+	}
+
+	t.Setenv("OIDC_ISSUER", "https://example.invalid/dex")
+	if cond := singleSignOnCondition(asked); cond.Status != metav1.ConditionTrue {
+		t.Errorf("condition with an issuer configured = %+v", cond)
+	}
+
+	notAsked := vpcTenant("tcp9")
+	cond = singleSignOnCondition(notAsked)
+	if cond.Status != metav1.ConditionTrue || cond.Reason != "NotRequested" {
+		t.Errorf("a tenant that did not ask reads as broken: %+v", cond)
 	}
 }
 

@@ -289,6 +289,19 @@ const (
 	// cluster simply has no node.
 	ConditionTenantBootstrapped = "TenantBootstrapped"
 
+	// ConditionSingleSignOn is whether the tenant's apiserver actually trusts
+	// the platform's identity provider.
+	//
+	// `enableOIDC` is a request, and the deployment has to have a provider to
+	// point at: an issuer that is configured and https. It used to be neither
+	// honoured nor reported when it was not — the flag was stored, no
+	// `--oidc-*` argument reached the apiserver, and every condition on the
+	// tenant said True. Measured in UAT run 4 on two tenants: the wizard said
+	// Enabled, the resource said `enableOIDC: true`, and the control plane had
+	// never heard of it, so an OIDC kubeconfig for that tenant could only ever
+	// answer Unauthorized.
+	ConditionSingleSignOn = "SingleSignOn"
+
 	// ConditionAddonsReady is whether what the tenant's cluster is built from
 	// has installed.
 	//
