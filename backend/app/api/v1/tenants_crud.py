@@ -189,6 +189,25 @@ _OVERHEAD_MARGIN = 1.25
 TENANT_PLURAL = "managedtenants"
 
 
+async def _tenant_description(k8s, name: str) -> dict[str, Any] | None:
+    """This tenant's ManagedTenant, if it has one.
+
+    Unlike `_described_tenant`, this does not ask whether the addon path has
+    been handed over: reading what the operator says about a tenant is right
+    whenever there is an operator saying it, and an adopted tenant has a
+    description with every flag off.
+    """
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, name=name,
+        )
+    except ApiException as e:
+        if e.status in (403, 404):
+            return None
+        raise
+
+
 async def _described_tenant(k8s, name: str) -> dict[str, Any] | None:
     """The tenant's own description, if the operator has one.
 
@@ -694,6 +713,7 @@ def _api_reason(e: ApiException) -> str:
 def _parse_tenant_response(
     cluster: dict[str, Any],
     addon_statuses: list[TenantAddonStatus] | None = None,
+    described: dict[str, Any] | None = None,
 ) -> TenantResponse:
     metadata = cluster.get("metadata", {})
     spec = cluster.get("spec", {})
@@ -731,6 +751,28 @@ def _parse_tenant_response(
     # Parse conditions
     conditions = []
     for c in cluster_status.get("conditions", []):
+        conditions.append(TenantCondition(
+            type=c.get("type", ""),
+            status=c.get("status", "Unknown"),
+            message=c.get("message", ""),
+            reason=c.get("reason", ""),
+            last_transition_time=c.get("lastTransitionTime"),
+        ))
+
+    # And what the operator says, which is most of what there is to know.
+    #
+    # These were only ever visible to `kubectl`. A tenant whose external name
+    # did not resolve said so in a sentence naming the setting and the
+    # consequence — and the screen showed four CAPI conditions, all True, so the
+    # reader went to the objects instead. A condition nobody sees is half a
+    # condition.
+    #
+    # CAPI's own view is kept where the two overlap: the infrastructure's
+    # opinion of ControlPlaneReady is not the operator's to overwrite.
+    seen = {c.type for c in conditions}
+    for c in ((described or {}).get("status") or {}).get("conditions", []):
+        if c.get("type", "") in seen:
+            continue
         conditions.append(TenantCondition(
             type=c.get("type", ""),
             status=c.get("status", "Unknown"),
@@ -2268,7 +2310,11 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
         raise k8s_error_to_http(e, "tenant operation")
 
     addon_statuses = await _get_addon_statuses(k8s, name)
-    tenant = _parse_tenant_response(cluster, addon_statuses)
+    # Unconditionally, not behind the handover flag: what matters is whether
+    # this tenant has a description, and an adopted one has it with every flag
+    # off.
+    tenant = _parse_tenant_response(
+        cluster, addon_statuses, await _tenant_description(k8s, name))
     tenant = await _enrich_with_workers(k8s, tenant)
     tenant = await _enrich_with_control_plane(k8s, tenant)
     tenant = await _enrich_with_cp_address(k8s, tenant)
@@ -3016,6 +3062,48 @@ async def _tenant_storage_enabled(k8s, name: str) -> bool:
         return False
     return bool((kvc.get("spec") or {}).get("infraClusterSecretRef"))
 
+async def _wire_tenant_storage(k8s, name: str) -> None:
+    """Create the host side of storage for a tenant that has none.
+
+    Everything the driver talks to lives out here: a service account in the
+    tenant's namespace, its rights, a non-expiring token, a kubeconfig built
+    from it, and the same again for the CAPK identity. The copy inside the
+    tenant follows.
+
+    Best-effort on that copy alone: the credential existing is what unblocks the
+    driver, and the operator places the copy on its next pass regardless.
+    """
+    from app.api.v1.tenants_storage import (
+        create_csi_infrastructure_resources,
+        replicate_csi_credentials_to_tenant,
+    )
+
+    # The creator reads a request for the tenant's name and two quota numbers,
+    # and this is the whole of it. Building a real TenantCreateRequest would
+    # mean inventing a folder, an environment and a worker shape for a tenant
+    # that already has them.
+    shape = SimpleNamespace(
+        name=name,
+        storage_pvc_count=_DEFAULT_STORAGE_PVC_COUNT,
+        storage_quota_gi=_DEFAULT_STORAGE_ALLOWANCE_GI,
+    )
+    await create_csi_infrastructure_resources(k8s, shape)
+    try:
+        await replicate_csi_credentials_to_tenant(k8s, name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Tenant %r: host-side storage is wired; the copy inside the tenant "
+            "did not land (%s), and the operator places it on its next pass",
+            name, exc,
+        )
+
+
+# What a tenant that gains storage later is allowed, when nobody says. The same
+# numbers the create form offers.
+_DEFAULT_STORAGE_PVC_COUNT = 20
+_DEFAULT_STORAGE_ALLOWANCE_GI = 100
+
+
 @router.post("/{name}/addons", status_code=201)
 async def enable_addon(
     request: Request, name: str, addon: TenantAddon,
@@ -3040,15 +3128,17 @@ async def enable_addon(
     # wiring card that would have explained it is hidden in exactly that
     # state. Refused with the reason instead.
     if addon.addon_id in _STORAGE_ADDONS and not await _tenant_storage_enabled(k8s, name):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Tenant '{name}' was created without storage, so the "
-                f"host-side CSI credentials it needs do not exist. The driver "
-                f"would install and then wait for them indefinitely. Recreate "
-                f"the tenant with storage enabled."
-            ),
-        )
+        # This used to refuse, and the refusal was right about the driver and
+        # wrong about the way out. It said "recreate the tenant with storage
+        # enabled", and that was literally the only path: `storage/reconcile`
+        # copies a credential that does not exist yet, and nothing anywhere
+        # creates one after the tenant is built. A product whose answer is
+        # "destroy it and start again" has not answered.
+        #
+        # The host side is created first and the driver enabled after, which
+        # keeps the guarantee the refusal existed for — the driver never
+        # installs into a tenant with nothing for it to talk to.
+        await _wire_tenant_storage(k8s, name)
 
     # Merge defaults with user params
     params: dict[str, str] = {}

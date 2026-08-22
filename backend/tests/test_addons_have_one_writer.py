@@ -175,7 +175,9 @@ async def test_two_enables_that_read_the_same_list_do_not_lose_one(monkeypatch) 
 
     with pytest.raises(HTTPException) as e:
         await enable_addon(
-            request, "uat-t2", TenantAddon(addon_id="kubevirt-csi-driver"), user=MagicMock(),
+            # Any second addon; not the CSI driver, which now wires the host
+            # side of storage on its way through and would need a cluster.
+            request, "uat-t2", TenantAddon(addon_id="alloy2"), user=MagicMock(),
         )
 
     assert e.value.status_code == 409

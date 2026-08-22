@@ -45,6 +45,20 @@ one line of output, rather than in a cluster where it is an investigation.
 {{- if and .Values.operator.enabled .Values.operator.webhooks.enabled (not .Values.operator.domains.vm.enabled) }}
 {{- fail "operator.webhooks.enabled needs operator.domains.vm.enabled: the admission server runs in that deployment, and a webhook configuration pointing at a service with no endpoints rejects every write it guards — these fail closed" }}
 {{- end }}
+{{- /*
+A tenant's external name is written into its certificate and into the kubeconfig
+the UI hands out. Publishing it takes an address, because external-dns cannot
+read one off an IngressRouteTCP — there is no load-balancer status on it — so
+with this empty the route exists, the certificate answers, and the name does not
+resolve. That happened, and the tenant reported it correctly while everybody
+read the objects instead.
+
+"none" is a real answer: a site whose records are made by something else says so
+once, here, rather than living with a condition that is False for ever.
+*/}}
+{{- if and .Values.operator.enabled .Values.operator.domains.tenant.enabled .Values.operator.config.ingressDomain (not .Values.operator.config.externalDNSTarget) }}
+{{- fail "operator.config.externalDNSTarget is required alongside ingressDomain: external-dns cannot infer an address from an IngressRouteTCP, so without it a tenant's name is in its certificate and in its kubeconfig and resolves nowhere. Set the ingress address, or \"none\" if something else publishes these records." }}
+{{- end }}
 {{- if and .Values.operator.enabled .Values.operator.domains.network.enabled (not $supernet) }}
 {{- fail "operator.config.tenantSupernet is required by the network domain: without it no isolation is written at all, and a VPC comes up attached, routed, and open to every other tenant while the UI says it is isolated" }}
 {{- end }}
@@ -242,7 +256,7 @@ spec:
             # every test looks.
             - name: TENANTS_INGRESS_DOMAIN
               value: {{ required "operator.config.ingressDomain is required by the tenant domain — the suffix tenant apiservers are reached by" $cfg.ingressDomain | quote }}
-            {{- if $cfg.externalDNSTarget }}
+            {{- if and $cfg.externalDNSTarget (ne $cfg.externalDNSTarget "none") }}
             # The address external-dns publishes for those names. It cannot read
             # one off an IngressRouteTCP — there is no load-balancer status on
             # it — so without this the route exists and the name does not

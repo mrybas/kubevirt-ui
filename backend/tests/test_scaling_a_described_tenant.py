@@ -181,3 +181,80 @@ def test_asking_twice_adds_it_once() -> None:
     assert len(csi) == 1
     # And what the caller said wins over what was discovered.
     assert csi[0]["parameters"]["INFRA_STORAGE_CLASS_NAME"] == "other"
+
+
+# --- what the screen shows --------------------------------------------------
+#
+# The operator's conditions were only ever visible to `kubectl`. A tenant whose
+# external name did not resolve said so in a sentence naming the setting and the
+# consequence — and the page showed four CAPI conditions, all True, so the
+# reader went digging through objects instead. A condition nobody sees is half a
+# condition.
+
+@pytest.fixture(autouse=True)
+def _cluster_config(monkeypatch):
+    """`_parse_tenant_response` reads the site's endpoint shape, which is
+    discovered once at startup. These tests are about conditions."""
+    import app.api.v1.tenants_common as common
+
+    monkeypatch.setattr(common, "_cluster_config", {
+        "ingress_ip": "10.198.175.200", "ingress_class": "traefik",
+        "ingress_domain": "tenants.example", "fetched_at": 0,
+    })
+
+
+def _cluster(*conditions):
+    return {
+        "metadata": {"name": "t1", "namespace": "tenant-t1"},
+        "spec": {}, "status": {"conditions": list(conditions)},
+    }
+
+
+def test_the_operators_conditions_reach_the_page() -> None:
+    from app.api.v1.tenants_crud import _parse_tenant_response
+
+    described = {"status": {"conditions": [
+        {"type": "ExternallyReachable", "status": "False",
+         "reason": "NoDNSTarget", "message": "nothing publishes it"},
+        {"type": "TransitReady", "status": "True", "reason": "Wired",
+         "message": "leaves under 10.199.1.6"},
+    ]}}
+
+    tenant = _parse_tenant_response(
+        _cluster({"type": "Ready", "status": "True", "reason": "Ready",
+                  "message": ""}),
+        None, described)
+
+    by_type = {c.type: c for c in tenant.conditions}
+    assert "ExternallyReachable" in by_type, "the reason is still only in kubectl"
+    assert by_type["ExternallyReachable"].message == "nothing publishes it"
+    assert "TransitReady" in by_type
+    assert "Ready" in by_type, "the infrastructure's own view was dropped"
+
+
+def test_capis_view_wins_where_both_speak() -> None:
+    """The infrastructure's opinion of its own readiness is not the operator's
+    to overwrite; the operator's extra conditions are what was missing."""
+    from app.api.v1.tenants_crud import _parse_tenant_response
+
+    tenant = _parse_tenant_response(
+        _cluster({"type": "ControlPlaneReady", "status": "True",
+                  "reason": "FromCAPI", "message": "capi"}),
+        None,
+        {"status": {"conditions": [
+            {"type": "ControlPlaneReady", "status": "False",
+             "reason": "FromOperator", "message": "operator"}]}},
+    )
+
+    same = [c for c in tenant.conditions if c.type == "ControlPlaneReady"]
+    assert len(same) == 1, "the reader gets two rows saying opposite things"
+    assert same[0].reason == "FromCAPI"
+
+
+def test_a_tenant_with_no_description_is_unchanged() -> None:
+    from app.api.v1.tenants_crud import _parse_tenant_response
+
+    tenant = _parse_tenant_response(
+        _cluster({"type": "Ready", "status": "True", "reason": "R",
+                  "message": ""}), None, None)
+    assert [c.type for c in tenant.conditions] == ["Ready"]

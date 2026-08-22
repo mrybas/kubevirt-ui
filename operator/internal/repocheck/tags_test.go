@@ -216,7 +216,9 @@ func backendEnv(t *testing.T, operator bool, overrides map[string]string) map[st
 			// Required by the network domain, which is on by default. The chart
 			// refuses without it, which is the point of the guard beside this
 			// one — so a test that renders a valid install has to supply it.
-			"--set", "operator.config.tenantSupernet=10.200.0.0/14")
+			"--set", "operator.config.tenantSupernet=10.200.0.0/14",
+			// And a tenant's name has to be publishable by somebody.
+			"--set", "operator.config.externalDNSTarget=10.198.175.200")
 	}
 	for key, value := range overrides {
 		args = append(args, "--set", "backend.env."+key+"="+value)
@@ -327,14 +329,28 @@ func TestAFlagWithNoControllerBehindItIsRefused(t *testing.T) {
 		wants: "the operator is not installed",
 		args:  []string{"--set", "backend.env.OPERATOR_VM_ENABLED=true"},
 	}, {
-		name:  "the network domain without a supernet",
-		wants: "tenantSupernet is required",
+		name:  "a name nothing would publish",
+		wants: "externalDNSTarget is required",
 		args: []string{"--set", "operator.enabled=true",
 			"--set", "operator.config.kubeOvnNamespace=k",
 			"--set", "operator.config.metallbNamespace=m",
 			"--set", "operator.config.metallbPool=p",
 			"--set", "operator.config.cpTransitSubnet=c",
-			"--set", "operator.config.ingressDomain=d"},
+			"--set", "operator.config.ingressDomain=tenants.example",
+			"--set", "operator.config.tenantSupernet=10.200.0.0/14"},
+	}, {
+		name:  "the network domain without a supernet",
+		wants: "tenantSupernet is required",
+		// Differing from a working install by exactly one setting, so that the
+		// refusal names that one. Without the DNS target here, the other guard
+		// fires first and this case proves nothing about supernets.
+		args: []string{"--set", "operator.enabled=true",
+			"--set", "operator.config.kubeOvnNamespace=k",
+			"--set", "operator.config.metallbNamespace=m",
+			"--set", "operator.config.metallbPool=p",
+			"--set", "operator.config.cpTransitSubnet=c",
+			"--set", "operator.config.ingressDomain=d",
+			"--set", "operator.config.externalDNSTarget=10.198.175.200"},
 	}, {
 		name:  "one fact, two readers, disagreeing",
 		wants: "they must agree",
@@ -403,7 +419,8 @@ func TestAdmissionIsWiredEndToEnd(t *testing.T) {
 		"--set", "operator.config.metallbPool=p",
 		"--set", "operator.config.cpTransitSubnet=c",
 		"--set", "operator.config.ingressDomain=d",
-		"--set", "operator.config.tenantSupernet=10.200.0.0/14")
+		"--set", "operator.config.tenantSupernet=10.200.0.0/14",
+		"--set", "operator.config.externalDNSTarget=10.198.175.200")
 
 	config := one(t, docs, "ValidatingWebhookConfiguration", "")
 	service := one(t, docs, "Service", "kubevirt-ui-operator-webhook")
@@ -455,7 +472,8 @@ func TestAdmissionCannotBeAskedForWithoutTheDeploymentThatServesIt(t *testing.T)
 		"--set", "operator.config.metallbPool=p",
 		"--set", "operator.config.cpTransitSubnet=c",
 		"--set", "operator.config.ingressDomain=d",
-		"--set", "operator.config.tenantSupernet=10.200.0.0/14")
+		"--set", "operator.config.tenantSupernet=10.200.0.0/14",
+		"--set", "operator.config.externalDNSTarget=10.198.175.200")
 	if err == nil {
 		t.Fatal("it rendered a webhook configuration with nothing behind it")
 	}
@@ -476,7 +494,8 @@ func TestWithAdmissionOffNothingIsLeftBehind(t *testing.T) {
 		"--set", "operator.config.metallbPool=p",
 		"--set", "operator.config.cpTransitSubnet=c",
 		"--set", "operator.config.ingressDomain=d",
-		"--set", "operator.config.tenantSupernet=10.200.0.0/14")
+		"--set", "operator.config.tenantSupernet=10.200.0.0/14",
+		"--set", "operator.config.externalDNSTarget=10.198.175.200")
 	if err != nil {
 		t.Fatalf("rendering: %v", err)
 	}
