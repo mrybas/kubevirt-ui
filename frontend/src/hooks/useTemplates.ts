@@ -4,6 +4,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import * as templatesApi from '@/api/templates';
+import { settle } from './settle';
 import type {
 
   VMTemplateCreate,
@@ -87,9 +88,9 @@ export function useCreateImage() {
   return useMutation({
     mutationFn: ({ data, namespace }: { data: GoldenImageCreate; namespace: string }) => 
       templatesApi.createImage(data, namespace),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['images'] });
-    },
+    // The import starts after the object is written, so the first read finds
+    // a row with no status yet.
+    onSuccess: () => settle(queryClient, [['images']]),
   });
 }
 

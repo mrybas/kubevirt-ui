@@ -24,6 +24,7 @@ import {
 import type { CreateVpcRequest, AddVpcPeeringRequest, UpdateVpcRoutesRequest, UpdateVpcDnsRequest } from '../types/vpc';
 import { ApiError } from '../api/client';
 import { notify } from '../store/notifications';
+import { settle } from './settle';
 
 export function useVpcs(params?: { folder?: string; environment?: string }) {
   return useQuery({
@@ -46,8 +47,10 @@ export function useVpc(name: string | undefined) {
 // list from before the VPC existed — "Total Subnets 2" with four on the
 // cluster — until someone reloaded the page.
 function invalidateVpcAndSubnets(queryClient: ReturnType<typeof useQueryClient>) {
-  queryClient.invalidateQueries({ queryKey: ['vpcs'] });
-  queryClient.invalidateQueries({ queryKey: ['network'] });
+  // And again over the next few seconds: the request writes a ManagedNetwork,
+  // the operator builds the VPC and its subnet from it, and one invalidation
+  // lands before any of that exists.
+  settle(queryClient, [['vpcs'], ['network']]);
 }
 
 export function useCreateVpc() {
@@ -83,9 +86,9 @@ export function useAddVpcPeering(vpcName: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (request: AddVpcPeeringRequest) => addVpcPeering(vpcName, request),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['vpcs'] });
-    },
+    // "No peerings configured", with the ManagedNetworkPeering already
+    // written and both legs in place — UAT run 4, G2.
+    onSuccess: () => settle(queryClient, [['vpcs']]),
   });
 }
 
@@ -93,9 +96,7 @@ export function useRemoveVpcPeering(vpcName: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (remoteVpc: string) => removeVpcPeering(vpcName, remoteVpc),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['vpcs'] });
-    },
+    onSuccess: () => settle(queryClient, [['vpcs']]),
   });
 }
 
