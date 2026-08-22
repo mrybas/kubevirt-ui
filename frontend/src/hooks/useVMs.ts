@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient, Query } from '@tanstack/react-qu
 import * as vmApi from '@/api/vms';
 import type { VM, VMCreateRequest, VMUpdateRequest, VMDisplayNameUpdateRequest, DiskResizeRequest } from '@/types/vm';
 import { notify } from '@/store/notifications';
+import { settle } from './settle';
 
 export function useVMs(namespace?: string, page?: number, perPage?: number, search?: string) {
   return useQuery({
@@ -196,8 +197,15 @@ export function useMigrateVM() {
     mutationFn: ({ namespace, name, targetNode }: { namespace: string; name: string; targetNode: string }) =>
       vmApi.migrateVM(namespace, name, targetNode),
     onSuccess: (_, variables) => {
-      queryClient.invalidateQueries({ queryKey: ['vms'] });
-      queryClient.invalidateQueries({ queryKey: ['vm', variables.namespace, variables.name] });
+      // "Migration started" is exactly right, and it is why one refetch is
+      // wrong: the VMI is still on the old node when this returns. The page
+      // header went on naming the previous node until somebody reloaded —
+      // the fourth instance of the same thing in UAT run 4, and the one where
+      // the wait is measured in seconds rather than milliseconds.
+      settle(queryClient, [
+        ['vms'],
+        ['vm', variables.namespace, variables.name],
+      ], [1000, 3000, 8000]);
       notify.success(`VM "${variables.name}" migration started`);
     },
     onError: (err: Error) => {

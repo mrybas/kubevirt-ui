@@ -73,5 +73,10 @@ describe('the writes that go through a controller', () => {
 
     expect(readFileSync(join(hooks, 'useUnderlay.ts'), 'utf8')).toContain('settle(queryClient');
     expect(readFileSync(join(hooks, 'useTemplates.ts'), 'utf8')).toContain('settle(queryClient');
+    // Migration is the slowest of them: the VMI is still on the old node when
+    // the request returns, and the page named that node until a reload.
+    const vms = readFileSync(join(hooks, 'useVMs.ts'), 'utf8');
+    expect(vms).toContain('settle(queryClient');
+    expect(vms).toMatch(/\[1000, 3000, 8000\]/);
   });
 });
