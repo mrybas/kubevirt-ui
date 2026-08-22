@@ -27,6 +27,7 @@ from app.core.groups import (
     is_env_viewer,
     is_folder_admin,
     load_folder,
+    load_folders,
     resolve_env,
 )
 from app.core.naming import (
@@ -1924,6 +1925,34 @@ async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
         )
 
 
+async def _folder_you_may_build_in(k8s, user: User, folder: str) -> dict:
+    """The folder's metadata, if this caller may create a tenant in it.
+
+    One refusal for both "no such folder" and "not yours", because telling
+    them apart is a way to enumerate folders — which is what the error text of
+    this endpoint was doing before the authorisation moved to the front of it.
+
+    Global admins keep the plain 404, since there is nothing they could learn
+    from it that they cannot list outright.
+    """
+    folders = await load_folders(k8s)
+    meta = folders.get(folder)
+    if meta is not None and is_folder_admin(user, meta):
+        return meta
+    if is_admin(user.groups, user) and meta is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Folder '{folder}' not found",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(
+            f"You cannot create a tenant in folder '{folder}'. It takes "
+            f"folder-admin on that folder, or platform admin."
+        ),
+    )
+
+
 @router.post("", response_model=TenantResponse, status_code=201)
 async def create_tenant(request: Request, req: TenantCreateRequest, user: User = Depends(require_auth)) -> TenantResponse:
     """Create a new tenant cluster."""
@@ -1966,10 +1995,20 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         await assert_cabpt_installed(k8s)
 
-    # T1 — validate folder/env exist + caller has folder_admin (or global admin).
-    # We don't run the namespace check below until folder/env are confirmed; this
-    # guarantees we never partially-create a tenant on bad metadata.
-    folder_meta = await load_folder(k8s, req.folder)  # 404 if missing
+    # Authorisation first, before anything is read or reported.
+    #
+    # This endpoint used to be `require_auth` at the door with the folder-admin
+    # check three lookups later, and the lookups answer questions. UAT run 4,
+    # A-1: a viewer's `POST /tenants` came back "Folder 'x' not found" and then
+    # "Environment 'y' does not exist in folder 'poc-transit'. Known envs:
+    # ['dev', 'prod']" — the full contents of a folder they may not write to,
+    # from the error text of a call they are not allowed to make. `POST /vms`
+    # and `POST /vpcs` answer 403 at the door.
+    #
+    # "Not yours" and "does not exist" are the same answer here, deliberately.
+    # Distinguishing them is the leak: a 404 for one folder name and a 403 for
+    # another is a directory of folder names.
+    folder_meta = await _folder_you_may_build_in(k8s, user, req.folder)
     # Bug #1 fix (BUGS-TENANT-CREATE.md): discover environments from namespace
     # labels — the folder ConfigMap doesn't carry the env list (envs are
     # backend-projected from managed namespaces stamped with kubevirt-ui.io/
@@ -2000,13 +2039,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                 f"'{req.folder}'. Known envs: {env_names!r}"
             ),
         )
-    if not is_folder_admin(user, folder_meta):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                f"User does not have folder_admin access on folder '{req.folder}'"
-            ),
-        )
+    # The folder-admin check has already run, at the door.
 
     # Check if already exists
     if await _namespace_exists(k8s, ns):
