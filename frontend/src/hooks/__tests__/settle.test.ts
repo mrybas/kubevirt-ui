@@ -73,10 +73,13 @@ describe('the writes that go through a controller', () => {
 
     expect(readFileSync(join(hooks, 'useUnderlay.ts'), 'utf8')).toContain('settle(queryClient');
     expect(readFileSync(join(hooks, 'useTemplates.ts'), 'utf8')).toContain('settle(queryClient');
-    // Migration is the slowest of them: the VMI is still on the old node when
-    // the request returns, and the page named that node until a reload.
+    // Migration used a ladder here and no longer does: a schedule is a guess
+    // about how long a controller takes, and the guess was wrong by a factor
+    // of four. It waits on the migration's own phase instead —
+    // WaitForTheFactNotTheClock covers that. What is left here is the single
+    // refetch, for the list, which has no per-item "still moving" to read.
     const vms = readFileSync(join(hooks, 'useVMs.ts'), 'utf8');
     expect(vms).toContain('settle(queryClient');
-    expect(vms).toMatch(/\[1000, 3000, 8000\]/);
+    expect(vms).not.toMatch(/\[1000, 3000, 8000\]/);
   });
 });

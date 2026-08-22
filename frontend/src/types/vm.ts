@@ -24,6 +24,12 @@ export interface VM {
   phase?: string;
   ip_address?: string;
   node?: string;
+  /**
+   * The phase of a live migration that has not finished, if there is one.
+   * A migrating VM stays Running, so this is the only field that says the
+   * page's answer is still moving.
+   */
+  migration_phase?: string | null;
   labels: Record<string, string>;
   annotations: Record<string, string>;
   project?: string;

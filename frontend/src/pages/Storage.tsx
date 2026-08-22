@@ -142,6 +142,10 @@ export function Storage() {
         'kubevirt-ui.io/persistent': String(data.persistent),
       },
     };
+    // The refusal is the useful part and it used to be dropped here. The
+    // backend answers a disk that will not fit with "400Gi of storage and
+    // 110Gi already used, so 290Gi is free — asks for 350Gi", and the dialog
+    // showed nothing at all: the silence had simply moved up a layer.
     await createMutation.mutateAsync({ data: createData as any, namespace });
     setShowImportImageModal(false);
     setShowNewDiskModal(false);
@@ -568,6 +572,7 @@ function ImportImageModal({
   const [name, setName] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [description] = useState('');
+  const [submitError, setSubmitError] = useState('');
   const [osType, setOsType] = useState('linux');
   const [size, setSize] = useState('10Gi');
   const [storageClass, setStorageClass] = useState('');
@@ -601,7 +606,14 @@ function ImportImageModal({
       data.source_registry = sourceUrl;
     }
 
-    await onSubmit(data, selectedProject);
+    setSubmitError('');
+    try {
+      await onSubmit(data, selectedProject);
+    } catch (e) {
+      // Kept open, with the reason. Closing on a refusal is how a disk that
+      // was never created came to look like one that was.
+      setSubmitError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const isValid = displayName.length > 0 && sourceUrl.length > 0 && selectedProject.length > 0;
@@ -802,6 +814,12 @@ function ImportImageModal({
             </label>
           </div>
 
+          {submitError && (
+            <p className="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+              {submitError}
+            </p>
+          )}
+
           <div className="flex justify-end gap-3 pt-4 border-t border-surface-700">
             <button type="button" onClick={onClose} className="btn-secondary">
               Cancel
@@ -840,6 +858,7 @@ function NewDiskModal({
   const [size, setSize] = useState('50Gi');
   const [storageClass, setStorageClass] = useState('');
   const [selectedProject, setSelectedProject] = useState(defaultProject || '');
+  const [submitError, setSubmitError] = useState('');
   const [persistent, setPersistent] = useState(true);
   const [sourceType, setSourceType] = useState<'blank' | 'clone'>('blank');
   const [cloneFrom, setCloneFrom] = useState('');
@@ -871,7 +890,14 @@ function NewDiskModal({
     }
     // If blank, no source needed - backend will create blank volume
 
-    await onSubmit(data, selectedProject);
+    setSubmitError('');
+    try {
+      await onSubmit(data, selectedProject);
+    } catch (e) {
+      // Kept open, with the reason. Closing on a refusal is how a disk that
+      // was never created came to look like one that was.
+      setSubmitError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   const isValid = displayName.length > 0 && selectedProject.length > 0 && (sourceType === 'blank' || cloneFrom.length > 0);
@@ -1052,6 +1078,12 @@ function NewDiskModal({
               </div>
             </label>
           </div>
+
+          {submitError && (
+            <p className="text-sm text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
+              {submitError}
+            </p>
+          )}
 
           <div className="flex justify-end gap-3 pt-4 border-t border-surface-700">
             <button type="button" onClick={onClose} className="btn-secondary">

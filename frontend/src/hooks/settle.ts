@@ -37,3 +37,23 @@ export function settle(
   refetch();
   for (const delay of schedule) setTimeout(refetch, delay);
 }
+
+/**
+ * Keep asking while the answer is still moving, and stop when it settles.
+ *
+ * The counterpart to `settle` above, and the better half of it wherever the
+ * data can say whether it has arrived. A schedule is a guess about how long a
+ * controller takes: mine said 1/3/8 seconds and a measured migration ran past
+ * forty-five, so the page stopped looking just before the answer and showed
+ * the node the VM had left. A predicate over the data cannot be wrong about
+ * that — it stops when the thing it is waiting for is done, however long that
+ * takes, and costs nothing when there is nothing to wait for.
+ *
+ * Returns the callback react-query wants for `refetchInterval`.
+ */
+export function pollWhile<T>(
+  unsettled: (data: T | undefined) => boolean,
+  everyMs = 3000,
+): (query: { state: { data?: T } }) => number | false {
+  return (query) => (unsettled(query.state.data) ? everyMs : false);
+}

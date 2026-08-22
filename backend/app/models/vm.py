@@ -372,6 +372,15 @@ class VMResponse(BaseModel):
     ip_address: str | None = None
     node: str | None = None
 
+    # A migration that has been asked for and has not finished, by phase
+    # (`Scheduling`, `Running`, …). `None` means nothing is in flight.
+    #
+    # Here so a client can wait for the machine to arrive instead of guessing
+    # how long that takes: the page used to refetch on a fixed ladder and stop
+    # after twelve seconds, while a measured migration took over forty-five,
+    # so it went back to naming the node the VM had left.
+    migration_phase: str | None = None
+
     # Guest Agent
     guest_agent: GuestAgentInfo | None = None
 

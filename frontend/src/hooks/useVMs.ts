@@ -2,7 +2,7 @@ import { useQuery, useMutation, useQueryClient, Query } from '@tanstack/react-qu
 import * as vmApi from '@/api/vms';
 import type { VM, VMCreateRequest, VMUpdateRequest, VMDisplayNameUpdateRequest, DiskResizeRequest } from '@/types/vm';
 import { notify } from '@/store/notifications';
-import { settle } from './settle';
+import { pollWhile, settle } from './settle';
 
 export function useVMs(namespace?: string, page?: number, perPage?: number, search?: string) {
   return useQuery({
@@ -26,7 +26,13 @@ export function useVM(namespace: string, name: string) {
         // Check both status and phase for transitional states
         const isTransitional = TRANSITIONAL_VALUES.includes(vm.status) || 
                                TRANSITIONAL_VALUES.includes(vm.phase || '');
-        if (isTransitional) {
+        // A migrating VM is Running the whole way across — the VMI never
+        // leaves that phase — so this poll never engaged for the one case
+        // where the page's answer changes without anybody touching it, and
+        // the header went on naming the node the machine had left. The
+        // migration object says whether it is still going; the server hands
+        // that over as `migration_phase`.
+        if (isTransitional || vm.migration_phase) {
           return 3000;
         }
       }
@@ -197,15 +203,18 @@ export function useMigrateVM() {
     mutationFn: ({ namespace, name, targetNode }: { namespace: string; name: string; targetNode: string }) =>
       vmApi.migrateVM(namespace, name, targetNode),
     onSuccess: (_, variables) => {
-      // "Migration started" is exactly right, and it is why one refetch is
-      // wrong: the VMI is still on the old node when this returns. The page
-      // header went on naming the previous node until somebody reloaded —
-      // the fourth instance of the same thing in UAT run 4, and the one where
-      // the wait is measured in seconds rather than milliseconds.
+      // One refetch here, and then the VM query keeps asking on its own for
+      // as long as the migration is in flight.
+      //
+      // This was a ladder of 1/3/8 seconds, which is a guess about how long a
+      // migration takes — and the guess was wrong by a factor of four: a
+      // measured migration ran past forty-five seconds, so the page stopped
+      // looking just before the answer arrived and showed the old node until
+      // somebody reloaded. A schedule cannot know; the object can.
       settle(queryClient, [
         ['vms'],
         ['vm', variables.namespace, variables.name],
-      ], [1000, 3000, 8000]);
+      ], []);
       notify.success(`VM "${variables.name}" migration started`);
     },
     onError: (err: Error) => {
@@ -314,6 +323,14 @@ export function useDiskSnapshots(namespace: string, pvcName: string) {
     queryKey: ['disk-snapshots', namespace, pvcName],
     queryFn: () => vmApi.listDiskSnapshots(namespace, pvcName),
     enabled: !!namespace && !!pvcName,
+    // A snapshot is ReadyToUse a few seconds after it is created, and this
+    // list was fetched once. So the row said Pending for ever — and, because
+    // every action on a snapshot is behind `ready`, the only button left on a
+    // perfectly good snapshot was Delete. Rollback was reported missing; it
+    // was hidden behind a stale answer.
+    refetchInterval: pollWhile<{ ready?: boolean }[]>(
+      (snaps) => (snaps ?? []).some((snap) => !snap.ready),
+    ),
   });
 }
 

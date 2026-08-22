@@ -420,10 +420,18 @@ async def _datavolume_blockers(
     return out
 
 
-async def _migration_blockers(
+async def _migration_state(
     k8s_client: Any, namespace: str, vm_name: str,
-) -> list[dict[str, str]]:
-    """A live migration that is not going anywhere.
+) -> tuple[list[dict[str, str]], str | None]:
+    """What this VM's live migration is doing, and what is stopping it.
+
+    Two answers from one read. The blockers are conditions to show; the phase
+    is what tells a client whether to keep looking — a page that stops asking
+    before the machine arrives goes on naming the node it has left, which is
+    what a fixed refetch schedule did to a migration that took forty-five
+    seconds.
+
+    A live migration that is not going anywhere:
 
     Migration runs a second launcher pod beside the first, so for its duration
     the VM counts twice against the environment's quota. With none to spare
@@ -441,9 +449,10 @@ async def _migration_blockers(
             plural="virtualmachineinstancemigrations",
         )
     except Exception:
-        return []
+        return [], None
 
     out: list[dict[str, str]] = []
+    in_flight: str | None = None
     for m in migrations.get("items", []):
         if (m.get("spec") or {}).get("vmiName") != vm_name:
             continue
@@ -451,6 +460,8 @@ async def _migration_blockers(
         phase = status.get("phase")
         if phase in ("Succeeded", "Failed", None):
             continue
+        # Not finished, so somebody waiting on this VM should keep waiting.
+        in_flight = phase
         rejected = next(
             (c for c in (status.get("conditions") or [])
              if c.get("type") == "migrationRejectedByResourceQuota"
@@ -469,7 +480,7 @@ async def _migration_blockers(
                 f"Migration {m['metadata']['name']} is {phase}."
             ),
         })
-    return out
+    return out, in_flight
 
 
 @router.get("/{name}", response_model=VMResponse)
@@ -511,10 +522,12 @@ async def get_vm(
             pass
 
         resp = vm_from_k8s(vm, vmi, pod_ip=pod_ip)
+        blockers, resp.migration_phase = await _migration_state(
+            k8s_client, namespace, name)
         resp.conditions = (
             list(resp.conditions or [])
             + await _datavolume_blockers(k8s_client, namespace, vm)
-            + await _migration_blockers(k8s_client, namespace, name)
+            + blockers
         )
         return resp
 
