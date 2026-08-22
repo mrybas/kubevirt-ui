@@ -44,6 +44,10 @@ def _stand(monkeypatch, *, described: dict | None):
         k8s.custom_api.get_cluster_custom_object = AsyncMock(return_value=described)
     k8s.custom_api.patch_cluster_custom_object = AsyncMock()
     k8s.custom_api.patch_namespaced_custom_object = AsyncMock()
+    # The quota is widened before the shape is written, and that reads the
+    # one the namespace has now.
+    k8s.core_api.list_namespaced_resource_quota = AsyncMock(
+        return_value=SimpleNamespace(items=[]))
 
     request = MagicMock()
     request.app.state.k8s_client = k8s

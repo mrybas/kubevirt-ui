@@ -1668,6 +1668,24 @@ async def assert_within_folder_quota(
         }
         ceiling = (folders.get(folder_name) or {}).get("quota") or {}
         free = limit - allocated[field]
+        # Asking for no more than you already hold is never a refusal.
+        #
+        # The comparison is otherwise the whole request against what is free,
+        # and a folder can be over its ceiling without ever having asked this
+        # function — a quota lowered under what is already handed out, or a
+        # tenant namespace that joined the folder after the fact. In that
+        # state `free` is zero, and *every* request fails, including the one
+        # that gives room back: scaling a tenant from three workers down to
+        # two was refused for lack of room to shrink into. Measured on the
+        # stand, where poc-transit capped CPU at 32 with 55 already allocated
+        # elsewhere, and 3→2 workers came back "0 is free and tenant 'test3'
+        # asks for 13".
+        #
+        # The ceiling is still enforced: a request that grows the asker's own
+        # reservation is checked in full, so the way out is down and never
+        # further up.
+        if want <= excluded[field] + 1e-9:
+            continue
         if want > free + 1e-9:
             raise HTTPException(
                 status_code=409,

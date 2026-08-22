@@ -1833,6 +1833,42 @@ async def _ensure_tenant_limit_range(k8s, ns: str) -> None:
             raise
 
 
+async def _widen_tenant_quota(k8s, ns: str, planned: dict[str, str]) -> None:
+    """Make room before the shape needs it, never take room away here.
+
+    The quota used to be written after the shape, and a scale-up spent the gap
+    between the two writes with the new machines already asked for and the old
+    quota still refusing their pods. The tenant reported "namespace quota has
+    no room for the replacement pod" and then, a moment later, scaled — a
+    diagnosis that was true when it was read and false by the time it was
+    shown.
+
+    So a growing dimension is raised first and a shrinking one is left alone:
+    the quota carries the larger of the two shapes across the gap. Lowering it
+    to the planned figure is the job of the write that still follows the
+    shape, once the machines that were counted against the old one are gone.
+    """
+    hard = dict(planned)
+    try:
+        existing = await k8s.core_api.list_namespaced_resource_quota(namespace=ns)
+    except ApiException:
+        existing = None
+    for quota in (existing.items if existing else []):
+        if (quota.metadata.name or "") != f"{ns}-quota":
+            continue
+        current = (quota.spec.hard if quota.spec else None) or {}
+        for key, field in (
+            ("requests.cpu", "cpu"),
+            ("requests.memory", "memory"),
+            ("requests.storage", "storage"),
+        ):
+            now = parse_quantity(current.get(key))
+            want = parse_quantity(planned.get(field))
+            if now is not None and want is not None and now > want:
+                hard[field] = current[key]
+    await _write_tenant_quota(k8s, ns, hard)
+
+
 async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
     """Put the tenant's own quota on its namespace.
 
@@ -2667,15 +2703,20 @@ async def scale_tenant(
             workers["vcpu"] = scale.worker_vcpu
         if scale.worker_memory:
             workers["memory"] = scale.worker_memory
+        # Room first, then the shape that needs it.
+        await _widen_tenant_quota(k8s, ns, planned_quota)
         await _write_described_workers(
             k8s, name, workers,
             (described.get("metadata") or {}).get("resourceVersion"),
         )
-        # The namespace quota still follows the shape from here: the operator
-        # writes it from the same description, but only on its next pass, and a
-        # scale-up that lands first would be refused pod by pod until then.
+        # And the quota follows the shape down. The operator writes it from
+        # the same description too, but only on its next pass.
         await _write_tenant_quota(k8s, ns, planned_quota)
         return await get_tenant(request, name, user=user)
+
+    # Room first, then the shape that needs it: the pods of the new machines
+    # are created against whatever the quota says at that moment.
+    await _widen_tenant_quota(k8s, ns, planned_quota)
 
     try:
         # Resize first (rotate template), so the replica patch below lands on
