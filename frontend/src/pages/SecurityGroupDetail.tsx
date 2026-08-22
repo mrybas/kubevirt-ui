@@ -139,9 +139,12 @@ export default function SecurityGroupDetail() {
           )}
           <button
             onClick={() => setShowDeleteModal(true)}
-            className="p-2 text-surface-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+            title="Delete this security group"
+            aria-label="Delete this security group"
+            className="flex items-center gap-1.5 px-2.5 py-2 text-sm text-surface-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
           >
             <Trash2 className="h-4 w-4" />
+            Delete
           </button>
         </div>
       </div>

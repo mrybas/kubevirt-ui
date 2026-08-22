@@ -453,6 +453,8 @@ function ReservedTable({ reserved, onAdd, onRemove, isRemoving }: ReservedTableP
                     <button
                       onClick={() => onRemove(item.ip_or_range)}
                       disabled={isRemoving}
+                      title={`Remove ${item.ip_or_range}`}
+                      aria-label={`Remove ${item.ip_or_range}`}
                       className="p-1 hover:bg-surface-700 rounded text-surface-400 hover:text-red-400 disabled:opacity-50"
                     >
                       <Trash2 className="h-4 w-4" />
