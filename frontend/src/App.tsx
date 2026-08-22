@@ -198,14 +198,14 @@ function AppRoutes() {
                     <Route path="/network/underlay" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=underlay" replace /></RequireAdmin>} />
                     <Route path="/network/system" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=system" replace /></RequireAdmin>} />
                     <Route path="/network/subnets/create" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=subnets&create=true" replace /></RequireAdmin>} />
-                    <Route path="/network/subnets/:name" element={<RequireAdmin><NetworkDetail /></RequireAdmin>} />
+                    <Route path="/network/subnets/:name" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><NetworkDetail /></RequireAdmin>} />
                     <Route path="/network/vpcs/create" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=vpcs&create=true" replace /></RequireAdmin>} />
-                    <Route path="/network/vpcs/:name" element={<RequireAdmin><VPCDetail /></RequireAdmin>} />
-                    <Route path="/network/egress-gateways" element={<RequireAdmin><EgressGateways /></RequireAdmin>} />
-                    <Route path="/network/ovn-gateways" element={<RequireAdmin><OvnGateways /></RequireAdmin>} />
-                    <Route path="/network/bgp" element={<RequireAdmin><BgpPeering /></RequireAdmin>} />
-                    <Route path="/network/security-groups" element={<RequireAdmin><SecurityGroups /></RequireAdmin>} />
-                    <Route path="/network/security-groups/:name" element={<RequireAdmin><SecurityGroupDetail /></RequireAdmin>} />
+                    <Route path="/network/vpcs/:name" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><VPCDetail /></RequireAdmin>} />
+                    <Route path="/network/egress-gateways" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><EgressGateways /></RequireAdmin>} />
+                    <Route path="/network/ovn-gateways" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><OvnGateways /></RequireAdmin>} />
+                    <Route path="/network/bgp" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><BgpPeering /></RequireAdmin>} />
+                    <Route path="/network/security-groups" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><SecurityGroups /></RequireAdmin>} />
+                    <Route path="/network/security-groups/:name" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><SecurityGroupDetail /></RequireAdmin>} />
                     {/* Backups — admin only */}
                     <Route path="/backups" element={<RequireAdmin><Backups /></RequireAdmin>} />
                     {/* Security — admin only */}

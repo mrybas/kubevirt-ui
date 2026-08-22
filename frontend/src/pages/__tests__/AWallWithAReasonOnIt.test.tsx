@@ -50,11 +50,39 @@ describe('the network routes', () => {
   });
 
   it('say it once', () => {
-    // Seven routes carry it; seven copies of a sentence drift into seven
-    // sentences.
+    // Fifteen routes carry it; fifteen copies of a sentence drift into
+    // fifteen sentences.
     const inline = app.match(/reason=\{"Networks are managed/g) ?? [];
     expect(inline).toHaveLength(0);
-    expect(app.match(/reason=\{NETWORKS_ARE_ADMIN_ONLY\}/g)?.length)
-      .toBeGreaterThanOrEqual(5);
+  });
+
+  it('every one of them, with none left behind', () => {
+    // The first version of this asked for "at least five", which is a licence
+    // for the sixth to be forgotten — and seven were. A tester found
+    // /network/bgp still showing the bare wall while /network/vpcs showed the
+    // new one; the regex that added the reason had matched only the routes
+    // that redirect, not the ones that render a page.
+    //
+    // So: every admin-only route under /network, counted, by name.
+    const routes = [...app.matchAll(/<Route path="(\/network[^"]*)" element=\{([^\n]*)/g)]
+      .filter(([, , element]) => element.includes('RequireAdmin'));
+
+    expect(routes.length).toBeGreaterThan(10);
+    const bare = routes
+      .filter(([, , element]) => !element.includes('NETWORKS_ARE_ADMIN_ONLY'))
+      .map(([, path]) => path);
+    expect(bare).toEqual([]);
+  });
+
+  it('the detector would notice one going bare', () => {
+    const withOneBare = `
+      <Route path="/network" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Networks /></RequireAdmin>} />
+      <Route path="/network/bgp" element={<RequireAdmin><BgpPeering /></RequireAdmin>} />`;
+    const routes = [...withOneBare.matchAll(/<Route path="(\/network[^"]*)" element=\{([^\n]*)/g)]
+      .filter(([, , element]) => element.includes('RequireAdmin'));
+    const bare = routes
+      .filter(([, , element]) => !element.includes('NETWORKS_ARE_ADMIN_ONLY'))
+      .map(([, path]) => path);
+    expect(bare).toEqual(['/network/bgp']);
   });
 });
