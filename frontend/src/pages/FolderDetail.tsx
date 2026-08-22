@@ -42,6 +42,7 @@ import {
 import { useTeams } from '../hooks/useProjects';
 import { FolderBreadcrumb } from '../components/folders/FolderBreadcrumb';
 import { FolderAccessTab } from '../components/folders/FolderAccessTab';
+import { FolderQuotaTab } from '../components/folders/FolderQuotaTab';
 import { CustomSelect } from '../components/common/CustomSelect';
 import { UnitToggle } from '../components/common/UnitToggle';
 import { ConfirmDeleteModal } from '../components/common/ConfirmDeleteModal';
@@ -52,10 +53,11 @@ import {
 } from '../utils/quantity';
 import { FOLDER_ROLE_LABELS, FOLDER_ROLE_DESCRIPTIONS } from '../types/folder';
 
-type Tab = 'overview' | 'children' | 'environments' | 'members' | 'access' | 'images' | 'vms';
+type Tab = 'overview' | 'quota' | 'children' | 'environments' | 'members' | 'access' | 'images' | 'vms';
 
 const TABS: { id: Tab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
   { id: 'overview', label: 'Overview', icon: Folder },
+  { id: 'quota', label: 'Quota', icon: Gauge },
   { id: 'children', label: 'Sub-folders', icon: FolderOpen },
   { id: 'environments', label: 'Environments', icon: Layers },
   { id: 'members', label: 'Members', icon: Users },
@@ -210,7 +212,10 @@ export default function FolderDetail() {
       </div>
 
       {/* Tab Content */}
-      {activeTab === 'overview' && <OverviewTab folder={folder} />}
+      {activeTab === 'overview' && (
+        <OverviewTab folder={folder} onOpenQuota={() => setActiveTab('quota')} />
+      )}
+      {activeTab === 'quota' && <FolderQuotaTab folder={folder} />}
       {activeTab === 'children' && (
         <ChildrenTab
           folder={folder}
@@ -261,7 +266,10 @@ export default function FolderDetail() {
 // OverviewTab
 // ---------------------------------------------------------------------------
 
-function OverviewTab({ folder }: { folder: ReturnType<typeof useFolder>['data'] & {} }) {
+function OverviewTab({ folder, onOpenQuota }: {
+  folder: ReturnType<typeof useFolder>['data'] & {};
+  onOpenQuota: () => void;
+}) {
   if (!folder) return null;
 
   return (
@@ -303,43 +311,44 @@ function OverviewTab({ folder }: { folder: ReturnType<typeof useFolder>['data'] 
         </div>
       </div>
 
-      {/* Quota */}
-      {folder.quota ? (
-        <div className="card">
-          <div className="card-body">
-            <h3 className="font-medium text-surface-100 mb-3 flex items-center gap-2">
+      {/* Quota — the numbers and their editing live in the Quota tab; this is
+          a pointer, not a second editor. */}
+      <div className="card">
+        <div className="card-body">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-medium text-surface-100 flex items-center gap-2">
               <Gauge className="h-4 w-4 text-surface-400" />
               Quota
             </h3>
+            <button
+              onClick={onOpenQuota}
+              className="text-xs text-primary-400 hover:text-primary-300 flex items-center gap-1"
+            >
+              Manage <ChevronRight className="h-3 w-3" />
+            </button>
+          </div>
+          {folder.quota ? (
             <div className="space-y-2 text-sm">
-              {folder.quota.cpu && (
-                <div className="flex justify-between">
-                  <span className="text-surface-400">CPU</span>
-                  <span className="text-surface-200">{folder.quota.cpu} cores</span>
-                </div>
-              )}
-              {folder.quota.memory && (
-                <div className="flex justify-between">
-                  <span className="text-surface-400">Memory</span>
-                  <span className="text-surface-200">{folder.quota.memory}</span>
-                </div>
-              )}
-              {folder.quota.storage && (
-                <div className="flex justify-between">
-                  <span className="text-surface-400">Storage</span>
-                  <span className="text-surface-200">{folder.quota.storage}</span>
-                </div>
-              )}
+              <div className="flex justify-between">
+                <span className="text-surface-400">CPU</span>
+                <span className="text-surface-200">
+                  {folder.quota.cpu ? `${folder.quota.cpu} cores` : 'not capped'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-surface-400">Memory</span>
+                <span className="text-surface-200">{folder.quota.memory || 'not capped'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-surface-400">Storage</span>
+                <span className="text-surface-200">{folder.quota.storage || 'not capped'}</span>
+              </div>
             </div>
-          </div>
+          ) : (
+            <p className="text-sm text-surface-500">No quota configured</p>
+          )}
         </div>
-      ) : (
-        <div className="card">
-          <div className="card-body flex items-center justify-center h-full text-surface-500 text-sm">
-            No quota configured
-          </div>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -1210,6 +1219,13 @@ function CreateChildModal({
   );
 }
 
+/**
+ * Name and description only.
+ *
+ * Quota used to be here as well, and that made two editors for one number
+ * with no view of what the number was spent on. It moved to the Quota tab,
+ * next to the allocation it caps.
+ */
 function EditFolderModal({
   folder,
   onClose,
@@ -1219,27 +1235,13 @@ function EditFolderModal({
 }) {
   const [displayName, setDisplayName] = useState(folder.display_name);
   const [description, setDescription] = useState(folder.description ?? '');
-  // Quota could be set when the folder was created and never afterwards: the
-  // detail page shows a quota panel and the edit dialog had no way to reach
-  // it, so "No quota configured" was a permanent state for every existing
-  // folder. `PATCH /folders/{name}` has always accepted a quota.
-  const [quotaCpu, setQuotaCpu] = useState(folder.quota?.cpu ?? '');
-  const [quotaMemory, setQuotaMemory] = useState(folder.quota?.memory ?? '');
-  const [quotaStorage, setQuotaStorage] = useState(folder.quota?.storage ?? '');
   const updateFolder = useUpdateFolder();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const quota = (quotaCpu || quotaMemory || quotaStorage)
-      ? {
-          cpu: quotaCpu || undefined,
-          memory: quotaMemory || undefined,
-          storage: quotaStorage || undefined,
-        }
-      : undefined;
     await updateFolder.mutateAsync({
       name: folder.name,
-      request: { display_name: displayName, description, ...(quota ? { quota } : {}) },
+      request: { display_name: displayName, description },
     });
     onClose();
   };
@@ -1262,27 +1264,10 @@ function EditFolderModal({
             <label className="block text-sm font-medium text-surface-300 mb-1">Description</label>
             <textarea value={description} onChange={(e) => setDescription(e.target.value)} rows={2} className="input w-full resize-none" />
           </div>
-          <div>
-            <label className="block text-sm font-medium text-surface-300 mb-1">Quota</label>
-            <div className="grid grid-cols-3 gap-2">
-              <input
-                type="text" value={quotaCpu} onChange={(e) => setQuotaCpu(e.target.value)}
-                placeholder="CPU e.g. 16" className="input w-full" aria-label="Quota CPU"
-              />
-              <input
-                type="text" value={quotaMemory} onChange={(e) => setQuotaMemory(e.target.value)}
-                placeholder="Memory e.g. 32Gi" className="input w-full" aria-label="Quota memory"
-              />
-              <input
-                type="text" value={quotaStorage} onChange={(e) => setQuotaStorage(e.target.value)}
-                placeholder="Storage e.g. 200Gi" className="input w-full" aria-label="Quota storage"
-              />
-            </div>
-            <p className="text-xs text-surface-500 mt-1">
-              A budget shown when creating VMs in this folder, not a limit the
-              cluster enforces. Leave all three empty for no quota.
-            </p>
-          </div>
+          <p className="text-xs text-surface-500">
+            Quota is on the folder's Quota tab, shown against what is already
+            allocated to its environments and sub-folders.
+          </p>
           <div className="flex justify-end gap-3 pt-2">
             <button type="button" onClick={onClose} className="btn-secondary">Cancel</button>
             <button type="submit" disabled={updateFolder.isPending || !displayName} className="btn-primary">

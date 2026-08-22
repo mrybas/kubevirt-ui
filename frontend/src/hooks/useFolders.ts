@@ -13,6 +13,7 @@ import {
   moveFolder,
   addFolderEnvironment,
   removeFolderEnvironment,
+  setEnvironmentQuota,
   getFolderQuotaHeadroom,
   listFolderAccess,
   addFolderAccess,
@@ -106,6 +107,26 @@ export function useAddFolderEnvironment(folderName: string) {
   return useMutation({
     mutationFn: (request: AddFolderEnvironmentRequest) =>
       addFolderEnvironment(folderName, request),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['folders'] });
+    },
+  });
+}
+
+/**
+ * Re-sizing an environment after it exists.
+ *
+ * `PUT /folders/{name}/environments/{env}/quota` has been there since
+ * rebalancing was added, and nothing in the UI called it: a quota could be
+ * given at creation and never changed.
+ */
+export function useSetEnvironmentQuota(folderName: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ environment, quota }: {
+      environment: string;
+      quota: { cpu?: string; memory?: string; storage?: string };
+    }) => setEnvironmentQuota(folderName, environment, quota),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['folders'] });
     },
