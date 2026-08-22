@@ -19,6 +19,7 @@ from app.core.operator import (
     template_path_enabled,
 )
 from app.core.naming import DISPLAY_NAME_ANNOTATION, SLUG_LABEL, sanitize_display_name
+from app.core.storage_headroom import assert_storage_headroom
 from app.models.template import (
     TemplateCloudInit,
     TemplateCompute,
@@ -897,6 +898,19 @@ async def list_golden_images(
                             has_error_condition = True
                             error_message = cond.get("message")
                             break
+                        # A quota refusal never reaches the Running condition:
+                        # CDI cannot make the PVC at all, so the DataVolume
+                        # sits Pending with `Bound=False` and the reason on an
+                        # event. In UAT run 4 that read as a disk importing
+                        # for ever, next to a quota that was counting it.
+                        if (
+                            cond.get("type") == "Bound"
+                            and cond.get("status") == "False"
+                            and "quota" in (cond.get("reason", "") + cond.get("message", "")).lower()
+                        ):
+                            has_error_condition = True
+                            error_message = cond.get("message") or cond.get("reason")
+                            break
                     
                     if phase in ("Failed", "Error") or has_error_condition:
                         display_status = "Error"
@@ -1073,6 +1087,13 @@ async def create_golden_image(
     - project: image is labeled as available to all envs in the project
     """
     k8s_client = request.app.state.k8s_client
+
+    # Asked before the DataVolume exists, because the quota counts the PVC
+    # that CDI makes from it and not the DataVolume itself — which is how a
+    # 100Gi disk against a 12Gi quota came back 201 and then never appeared.
+    await assert_storage_headroom(
+        k8s_client, namespace, image.size, what=f"{image.name!r}",
+    )
 
     # At-least-one runtime check (soft contract — matches create_tenant_image).
     if not image.name and not image.display_name:

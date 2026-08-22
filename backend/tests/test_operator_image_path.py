@@ -14,6 +14,7 @@ user would watch a deleted image come back.
 """
 
 from typing import Any
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,6 +29,10 @@ def _k8s_with_namespace(project: str | None = "opdev") -> MagicMock:
     ns = MagicMock()
     ns.metadata.labels = {"kubevirt-ui.io/project": project} if project else {}
     k8s.core_api.read_namespace = AsyncMock(return_value=ns)
+    # Creating a disk asks the namespace's quota for room first; no quota
+    # here means nothing constrains these tests.
+    k8s.core_api.list_namespaced_resource_quota = AsyncMock(
+        return_value=SimpleNamespace(items=[]))
     return k8s
 
 

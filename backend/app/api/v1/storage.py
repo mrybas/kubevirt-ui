@@ -138,6 +138,13 @@ async def create_datavolume(
     await require_namespace_access(request, user, namespace)
     k8s_client = request.app.state.k8s_client
 
+    # The quota counts the PVC CDI makes from this, not this. Asked here so a
+    # refusal is an answer to the request rather than a Pending object nobody
+    # is looking at.
+    await assert_storage_headroom(
+        k8s_client, namespace, dv_request.size, what=f"{dv_request.name!r}",
+    )
+
     # Build DataVolume manifest
     dv_manifest = dv_request.to_k8s_manifest(namespace)
 

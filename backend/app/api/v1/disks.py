@@ -21,6 +21,7 @@ from app.core.naming import (
     get_display_name,
     with_synthetic_metadata,
 )
+from app.core.storage_headroom import assert_storage_headroom
 from app.models.template import (
     PersistentDisk,
     PersistentDiskCreate,
@@ -133,7 +134,16 @@ async def create_persistent_disk(
 ) -> PersistentDisk:
     """Create a new persistent disk."""
     k8s_client = request.app.state.k8s_client
-    
+
+    # Before the DataVolume, because the quota does not count DataVolumes.
+    # CDI turns one into a PVC a moment later and the API server refuses
+    # *that*, long after this endpoint has answered 201 and the dialog has
+    # closed the way it closes on success.
+    await assert_storage_headroom(
+        k8s_client, namespace, disk.size,
+        what=f"the disk {disk.display_name!r}",
+    )
+
     try:
         # Determine source
         if disk.source_image:
