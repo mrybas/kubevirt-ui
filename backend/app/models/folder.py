@@ -150,6 +150,14 @@ class FolderResponse(BaseModel):
     # legacy "global admins only" behaviour, no breakage.
     access: FolderAccessSpec | None = None
 
+    # Whether *this caller* may create things in this folder — a VM, a disk, a
+    # tenant. Decided by the backend with the same predicates that enforce it,
+    # so a page can render a create button from a fact instead of re-deriving
+    # the access rules and getting a different answer. A viewer was being shown
+    # two "Create VM" buttons and a "Create Folder" button, all of which answer
+    # 403 (UAT run 4, B5 and R-2).
+    can_create: bool = False
+
 
 class FolderTreeResponse(BaseModel):
     """Tree of folders (root-level items with nested children)."""

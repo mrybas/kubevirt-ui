@@ -50,6 +50,12 @@ export interface Folder {
    * non-null → access configured; use for Access tab.
    */
   access: AccessBlock | null;
+  /**
+   * Whether *this* user may create something here. Decided by the backend
+   * with the predicates that enforce it, so a create button is rendered from
+   * a fact rather than from the access rules re-derived in TypeScript.
+   */
+  can_create?: boolean;
 }
 
 export interface FolderTreeResponse {

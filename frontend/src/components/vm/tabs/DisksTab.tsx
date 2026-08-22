@@ -52,13 +52,27 @@ function DiskSnapshotsPanel({
   const [rollbackConfirm, setRollbackConfirm] = useState<string | null>(null);
   const [rollbackMsg, setRollbackMsg] = useState('');
 
+  // The name is a real value, not a placeholder.
+  //
+  // It used to be an empty field showing `<pvc>-snap` as a hint, next to a
+  // button disabled until you typed. A tester pressed Create Snapshot twice
+  // and recorded that the page never called its own backend — which was true
+  // and not the reason: there was nothing to send, and nothing said so. The
+  // suggestion is now the value, editable, and put back after each create
+  // rather than cleared, because clearing it disables the button again.
+  const suggested = `${pvcName}-snap`;
+  useEffect(() => {
+    setSnapshotName(suggested);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pvcName]);
+
   const handleCreate = () => {
     if (!snapshotName) return;
     setSnapshotError('');
     createSnapshot.mutate(
       { namespace, pvcName, data: { display_name: snapshotName } },
       {
-        onSuccess: () => setSnapshotName(''),
+        onSuccess: () => setSnapshotName(suggested),
         onError: (err: any) => setSnapshotError(err?.message || 'Failed to create snapshot'),
       }
     );
@@ -103,7 +117,7 @@ function DiskSnapshotsPanel({
             type="text"
             value={snapshotName}
             onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSnapshotName(e.target.value)}
-            placeholder={`${pvcName}-snap`}
+            placeholder={suggested}
             className="input text-sm py-1 px-2 w-64"
             onKeyDown={(e: React.KeyboardEvent) => e.key === 'Enter' && handleCreate()}
           />

@@ -20,9 +20,23 @@ export function MigrateVMModal({
   const { data: nodesData, isLoading: nodesLoading } = useNodes();
   const [selectedNode, setSelectedNode] = useState<string>('');
 
-  const availableNodes = (nodesData?.items || []).filter(
-    (node) => node.name !== currentNode && node.status === 'Ready'
-  );
+  // Workers first, and a control plane marked as one.
+  //
+  // The list came back in whatever order the API gave it, which put
+  // `kubevirt-lab-cp-1` at the top — so the easiest thing to click in a Live
+  // Migrate dialog was "move this workload onto the control plane". They stay
+  // in the list, because a cluster with untainted masters may well want them;
+  // they stop being the first thing under the cursor.
+  const isControlPlane = (node: { roles?: string[] }) =>
+    (node.roles ?? []).some((role) =>
+      role === 'control-plane' || role === 'master');
+
+  const availableNodes = (nodesData?.items || [])
+    .filter((node) => node.name !== currentNode && node.status === 'Ready')
+    .sort((a, b) => {
+      const byRole = Number(isControlPlane(a)) - Number(isControlPlane(b));
+      return byRole !== 0 ? byRole : a.name.localeCompare(b.name);
+    });
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
@@ -80,7 +94,12 @@ export function MigrateVMModal({
                     <div className="flex-1 min-w-0">
                       <p className="font-medium truncate">{node.name}</p>
                       <p className="text-xs text-surface-500">
-                        {node.roles?.join(', ') || 'worker'} • {node.cpu || '?'} CPU • {node.memory || '?'} RAM
+                        {isControlPlane(node) ? (
+                          <span className="text-amber-400">control plane</span>
+                        ) : (
+                          node.roles?.join(', ') || 'worker'
+                        )}
+                        {' • '}{node.cpu || '?'} CPU • {node.memory || '?'} RAM
                       </p>
                     </div>
                     {selectedNode === node.name && (

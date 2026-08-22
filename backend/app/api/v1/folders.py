@@ -28,7 +28,9 @@ from app.core.auth import (
 from app.core.groups import (
     get_user_namespaces,
     is_admin,
+    is_env_member,
     is_env_viewer,
+    is_folder_member,
     is_folder_viewer,
 )
 
@@ -812,6 +814,28 @@ async def _propagate_folder_access(
 # Folder CRUD
 # ---------------------------------------------------------------------------
 
+def _may_create_in(user: User, meta: dict, env_ns_list: list) -> bool:
+    """Whether this caller may make something in this folder.
+
+    Answered here, by the predicates that enforce it, so that a page showing a
+    create button is reading a fact rather than re-deriving the access rules in
+    TypeScript. The two disagreeing is how a viewer came to be offered two
+    "Create VM" buttons and a "Create Folder" button, each of which answers 403.
+    """
+    if is_admin(user.groups, user):
+        return True
+    if is_folder_member(user, meta):
+        return True
+    return any(
+        is_env_member(user, meta, env)
+        for env in (
+            (ns.metadata.labels or {}).get(ENV_ENVIRONMENT_LABEL)
+            for ns in env_ns_list
+        )
+        if env
+    )
+
+
 def _folders_you_may_see(
     user: User, folders: dict[str, dict], user_ns: set[str],
     ns_by_folder: dict[str, list],
@@ -936,6 +960,7 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
             teams=teams,
             users=users,
             access=_build_access_spec(meta),
+            can_create=_may_create_in(user, meta, env_ns_list),
         )
 
     if flat:

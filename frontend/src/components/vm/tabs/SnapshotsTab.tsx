@@ -7,7 +7,10 @@ export function SnapshotsTab({ vm }: { vm: any }) {
   const createSnapshot = useCreateVMSnapshot();
   const deleteSnapshot = useDeleteVMSnapshot();
   const restoreSnapshot = useRestoreVMSnapshot();
-  const [snapshotName, setSnapshotName] = useState('');
+  // A real value rather than a hint: an empty field beside a button disabled
+  // until you type reads as a broken button, and was reported as one.
+  const suggested = `${vm.name}-snap`;
+  const [snapshotName, setSnapshotName] = useState(suggested);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const [restoreConfirm, setRestoreConfirm] = useState<string | null>(null);
 
@@ -15,7 +18,7 @@ export function SnapshotsTab({ vm }: { vm: any }) {
     if (!snapshotName.trim()) return;
     createSnapshot.mutate(
       { namespace: vm.namespace, vmName: vm.name, data: { display_name: snapshotName.trim() } },
-      { onSuccess: () => setSnapshotName('') }
+      { onSuccess: () => setSnapshotName(suggested) }
     );
   };
 
