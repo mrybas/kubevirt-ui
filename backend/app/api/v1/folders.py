@@ -25,6 +25,13 @@ from app.core.auth import (
     check_folder_access,
 )
 
+from app.core.groups import (
+    get_user_namespaces,
+    is_admin,
+    is_env_viewer,
+    is_folder_viewer,
+)
+
 from app.models.folder import (
     FolderCreateRequest,
     FolderUpdateRequest,
@@ -805,6 +812,59 @@ async def _propagate_folder_access(
 # Folder CRUD
 # ---------------------------------------------------------------------------
 
+def _folders_you_may_see(
+    user: User, folders: dict[str, dict], user_ns: set[str],
+    ns_by_folder: dict[str, list],
+) -> dict[str, dict]:
+    """The folders this user has any business knowing about.
+
+    `GET /folders` filtered nothing. Every authenticated user got every
+    folder — its name, its display name, who is in it, how many VMs it holds
+    and how much storage — and the UI hid the ones that were not theirs by
+    convention. UAT run 4 saw the other folder from two different roles and
+    wrote it down twice before concluding it was the endpoint and not the
+    role. It is also why there was a Create Folder button that answers 403:
+    the page was drawing what it could see rather than what it could use.
+
+    Three ways to see one, matching how access is granted everywhere else:
+
+      * the folder's access block admits you at folder level;
+      * it admits you at the level of one of its environments;
+      * you have RBAC in one of its namespaces — the legacy path, and the
+        only one for a folder made before access blocks existed.
+
+    Ancestors of anything visible come too. A tree cannot render a child
+    whose parent is missing, and the parent's name is implied by the child's
+    path in any case.
+    """
+    visible: set[str] = set()
+    for name, meta in folders.items():
+        if is_folder_viewer(user, meta):
+            visible.add(name)
+            continue
+        envs = [
+            (ns.metadata.labels or {}).get(ENV_ENVIRONMENT_LABEL)
+            or ns.metadata.name.removeprefix(f"{name}-")
+            for ns in ns_by_folder.get(name, [])
+        ]
+        if any(is_env_viewer(user, meta, env) for env in envs if env):
+            visible.add(name)
+            continue
+        if {ns.metadata.name for ns in ns_by_folder.get(name, [])} & user_ns:
+            visible.add(name)
+
+    # Ancestors, so the tree the child hangs from exists.
+    for name in list(visible):
+        parent = (folders.get(name) or {}).get("parent_id")
+        seen = {name}
+        while parent and parent in folders and parent not in seen:
+            visible.add(parent)
+            seen.add(parent)
+            parent = (folders.get(parent) or {}).get("parent_id")
+
+    return {n: m for n, m in folders.items() if n in visible}
+
+
 @router.get("", response_model=FolderTreeResponse)
 async def list_folders(request: Request, flat: bool = False, user: User = Depends(require_auth)):
     """List all folders. Returns tree structure by default, flat list if flat=true."""
@@ -829,6 +889,13 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
         folder = (ns.metadata.labels or {}).get(ENV_FOLDER_LABEL)
         if folder:
             ns_by_folder.setdefault(folder, []).append(ns)
+
+    if not is_admin(user.groups, user):
+        folders = _folders_you_may_see(
+            user, folders,
+            set(await get_user_namespaces(k8s_client, user)),
+            ns_by_folder,
+        )
 
     rbac_api = await _get_rbac_api(k8s_client)
 
