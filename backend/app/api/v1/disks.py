@@ -21,6 +21,7 @@ from app.core.naming import (
     get_display_name,
     with_synthetic_metadata,
 )
+from app.core.errors import k8s_error_to_http
 from app.core.storage_headroom import assert_storage_headroom
 from app.models.template import (
     PersistentDisk,
@@ -119,10 +120,7 @@ async def list_persistent_disks(
     
     except ApiException as e:
         logger.error(f"Failed to list persistent disks: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list persistent disks: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to list persistent disks")
 
 
 @router.post("", response_model=PersistentDisk, status_code=status.HTTP_201_CREATED)
@@ -216,10 +214,7 @@ async def create_persistent_disk(
     
     except ApiException as e:
         logger.error(f"Failed to create persistent disk: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create persistent disk: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to create persistent disk")
 
 
 @router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
@@ -275,10 +270,7 @@ async def delete_persistent_disk(
                 detail=f"Disk {name} not found",
             )
         logger.error(f"Failed to delete persistent disk: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete persistent disk: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to delete persistent disk")
 
 
 @router.post("/{name}/attach", status_code=status.HTTP_200_OK)
@@ -520,10 +512,7 @@ async def attach_disk_to_vm(
         raise
     except ApiException as e:
         logger.error(f"Failed to attach disk: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to attach disk: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to attach disk")
 
 
 @router.post("/{name}/detach", status_code=status.HTTP_200_OK)
@@ -738,10 +727,7 @@ async def detach_disk_from_vm(
         raise
     except ApiException as e:
         logger.error(f"Failed to detach disk: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to detach disk: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to detach disk")
 
 
 # ==================== Save disk as image ====================
@@ -848,10 +834,7 @@ async def save_disk_as_image(
         raise
     except ApiException as e:
         logger.error(f"Failed to save disk as image: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to save disk as image: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to save disk as image")
 
 
 # ==================== VolumeSnapshot endpoints ====================
@@ -911,10 +894,7 @@ async def list_disk_snapshots(
         if e.status == 404:
             return []
         logger.error(f"Failed to list snapshots: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list snapshots: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to list snapshots")
 
 
 @router.post("/{name}/snapshots", status_code=status.HTTP_201_CREATED)
@@ -1006,10 +986,7 @@ async def create_disk_snapshot(
 
     except ApiException as e:
         logger.error(f"Failed to create snapshot: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create snapshot: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to create snapshot")
 
 
 # ==================== Snapshots router (mounted at /namespaces/{ns}/snapshots) ====================
@@ -1039,10 +1016,7 @@ async def delete_snapshot(
         if e.status == 404:
             return
         logger.error(f"Failed to delete snapshot: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete snapshot: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to delete snapshot")
 
 
 async def _managed_owner_holding_snapshot_source(
@@ -1078,6 +1052,16 @@ async def _managed_owner_holding_snapshot_source(
         for disk in ((vm.get("spec", {}) or {}).get("disks") or []):
             if disk.get("claim") == source:
                 return vm["metadata"]["name"]
+        # The root disk is not in `spec.disks` — it is built from the image and
+        # its name is recorded on the status. Missing it here is what sent a
+        # root-disk rollback down the path below, which stops a machine by
+        # patching `runStrategy` — a field this operator owns and writes
+        # straight back. So the machine never stopped, the wait expired, and
+        # the claim was deleted out from under a running pod: Terminating for
+        # ever behind pvc-protection, with the guest still writing to it and
+        # the UI showing a healthy VM. Measured on the stand, UAT run 4.
+        if ((vm.get("status", {}) or {}).get("rootDiskName") or "") == source:
+            return vm["metadata"]["name"]
     return None
 
 
@@ -1203,6 +1187,14 @@ async def rollback_snapshot(
                     _content_type="application/merge-patch+json",
                 )
                 # Wait for VMI to disappear
+                #
+                # And refuse if it does not. This loop used to fall through
+                # when it ran out of attempts, and the next thing the handler
+                # does is delete the claim — so a machine that would not stop
+                # was answered by destroying the disk underneath it. Two
+                # minutes of waiting followed by a deletion is worse than
+                # either waiting longer or saying no.
+                gone = False
                 for _ in range(60):
                     try:
                         await custom_api.get_namespaced_custom_object(
@@ -1212,8 +1204,21 @@ async def rollback_snapshot(
                         await asyncio.sleep(2)
                     except ApiException as e:
                         if e.status == 404:
+                            gone = True
                             break
                         raise
+                if not gone:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            f"'{vm_name}' is still running two minutes after "
+                            f"being asked to stop, so its disk cannot be "
+                            f"replaced — a claim deleted while the guest has "
+                            f"it mounted hangs in Terminating and takes the "
+                            f"rollback with it. Stop the machine and try "
+                            f"again."
+                        ),
+                    )
 
         # 4. Delete original PVC (and DataVolume if exists)
         try:
@@ -1306,7 +1311,4 @@ async def rollback_snapshot(
         raise
     except ApiException as e:
         logger.error(f"Failed to rollback snapshot: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to rollback snapshot: {e.reason}",
-        )
+        raise k8s_error_to_http(e, "failed to rollback snapshot")

@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -83,10 +84,14 @@ func (r *ManagedVMOperationReconciler) reconcileRollbackDisk(
 		return ctrl.Result{}, nil
 	}
 
-	// The machine's own root disk is not one of these. Rolling it back means
-	// replacing what the machine was built from, which is what a VM snapshot
-	// and a Restore are for; doing it through a claim swap would leave the
-	// machine's own template describing a disk that no longer exists.
+	// A machine's own root disk is not in `spec.disks`, and rolling it back is
+	// a different move: the machine is described by a template that names the
+	// disk, so the swap has to happen there. Recreate already does exactly
+	// that — a fresh disk under the next epoch's name, the template pointed at
+	// it, the predecessor retired once nothing holds it — and the only
+	// difference here is where the contents come from. So it goes through the
+	// same code rather than being refused with a suggestion to use a
+	// VirtualMachineSnapshot instead, which is what it used to say.
 	attached := false
 	for _, disk := range vm.Spec.Disks {
 		if disk.Claim == source {
@@ -95,9 +100,11 @@ func (r *ManagedVMOperationReconciler) reconcileRollbackDisk(
 		}
 	}
 	if !attached {
+		if isRootDiskOf(vm, source) {
+			return r.rollbackRootDisk(ctx, op, vm, snapshot, source)
+		}
 		r.finish(op, platformv1alpha1.OperationPhaseFailed, fmt.Sprintf(
-			"%s is not one of this machine's attached disks; to put a machine's own "+
-				"root disk back, take a VirtualMachineSnapshot and use a Restore",
+			"%s is neither one of this machine's attached disks nor its root disk",
 			source))
 		return ctrl.Result{}, nil
 	}
@@ -172,6 +179,124 @@ func (r *ManagedVMOperationReconciler) reconcileRollbackDisk(
 	r.finish(op, platformv1alpha1.OperationPhaseSucceeded, fmt.Sprintf(
 		"%s rolled back to %s as %s",
 		op.Status.ReplacedDisk, op.Spec.RollbackDisk.SnapshotName, op.Status.ReplacementDisk))
+	return ctrl.Result{}, nil
+}
+
+// isRootDiskOf says whether this claim is the machine's own disk.
+//
+// Read from the status the controller keeps, falling back to the name the
+// epoch scheme produces. Getting this wrong in the permissive direction is
+// what sent a root-disk rollback down a path that stops machines by patching
+// a field this operator owns and immediately writes back — so the machine
+// never stopped, and the claim was deleted while the guest was writing to it.
+func isRootDiskOf(vm *platformv1alpha1.ManagedVM, claim string) bool {
+	if vm.Status.RootDiskName != "" {
+		return vm.Status.RootDiskName == claim
+	}
+	return strings.HasPrefix(claim, vm.Name+"-root-")
+}
+
+// rollbackRootDisk puts the machine's own disk back to a snapshot.
+//
+// Build the replacement, stop the machine, point its template at the new disk,
+// retire the old one, start it again — the order Recreate established, for the
+// same reason: every failure before the swap leaves the machine on the disk it
+// had.
+//
+// Nothing is deleted while the machine runs. That is not a detail: a claim
+// deleted under a mounted volume sits in Terminating behind pvc-protection
+// while the guest keeps writing, and the rollback waits for room that will
+// never come. On RBD the replacement is a copy-on-write clone of the snapshot,
+// so building it first costs nearly nothing — there is no reason to free the
+// old disk in order to make the new one.
+func (r *ManagedVMOperationReconciler) rollbackRootDisk(
+	ctx context.Context,
+	op *platformv1alpha1.ManagedVMOperation,
+	vm *platformv1alpha1.ManagedVM,
+	snapshot *unstructured.Unstructured,
+	source string,
+) (ctrl.Result, error) {
+	name := vm.Status.VirtualMachineName
+	if name == "" {
+		name = vm.Name
+	}
+	kvm := &kubevirtv1.VirtualMachine{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: op.Namespace, Name: name,
+	}, kvm); err != nil {
+		if apierrors.IsNotFound(err) {
+			r.finish(op, platformv1alpha1.OperationPhaseFailed, fmt.Sprintf(
+				"VirtualMachine %s/%s does not exist", op.Namespace, name))
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("reading the machine: %w", err)
+	}
+	if len(kvm.Spec.DataVolumeTemplates) == 0 {
+		r.finish(op, platformv1alpha1.OperationPhaseFailed,
+			"this machine has no disk of its own to roll back")
+		return ctrl.Result{}, nil
+	}
+
+	current := kvm.Spec.DataVolumeTemplates[0].Name
+	if op.Status.ReplacedDisk == "" {
+		op.Status.ReplacedDisk = current
+	}
+	if op.Status.ReplacementDisk == "" {
+		op.Status.ReplacementDisk = nextRootDiskName(vm.Name, current)
+	}
+
+	replacement := &cdiv1.DataVolume{}
+	err := r.Get(ctx, types.NamespacedName{
+		Namespace: op.Namespace, Name: op.Status.ReplacementDisk,
+	}, replacement)
+	switch {
+	case apierrors.IsNotFound(err):
+		built, buildErr := r.buildReplacementDisk(ctx, op, snapshot, source)
+		if buildErr != nil {
+			return ctrl.Result{}, buildErr
+		}
+		if err := r.Create(ctx, built); err != nil && !apierrors.IsAlreadyExists(err) {
+			return ctrl.Result{}, fmt.Errorf("building the replacement disk: %w", err)
+		}
+		kube.CountWrite(r.Scheme, built, operationControllerName, "created")
+		r.running(op, fmt.Sprintf("building %s from %s",
+			op.Status.ReplacementDisk, op.Spec.RollbackDisk.SnapshotName))
+		return ctrl.Result{RequeueAfter: operationPoll}, nil
+	case err != nil:
+		return ctrl.Result{}, fmt.Errorf("reading the replacement disk: %w", err)
+	}
+
+	if replacement.Status.Phase != cdiv1.Succeeded {
+		r.running(op, fmt.Sprintf("restoring %s into %s (%s)",
+			op.Spec.RollbackDisk.SnapshotName, op.Status.ReplacementDisk,
+			orUnknown(string(replacement.Status.Phase))))
+		return ctrl.Result{RequeueAfter: operationPoll}, nil
+	}
+
+	stopped, err := r.ensureStopped(ctx, vm)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !stopped {
+		r.running(op, "waiting for the machine to stop before swapping its root disk")
+		return ctrl.Result{RequeueAfter: operationPoll}, nil
+	}
+
+	swapped, err := r.pointAtRootDisk(ctx, op, vm, kvm, current, "rolling back")
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !swapped {
+		return ctrl.Result{RequeueAfter: operationPoll}, nil
+	}
+
+	if err := r.restoreRunState(ctx, op, vm); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.finish(op, platformv1alpha1.OperationPhaseSucceeded, fmt.Sprintf(
+		"%s rolled back to %s as %s",
+		op.Status.ReplacedDisk, op.Spec.RollbackDisk.SnapshotName,
+		op.Status.ReplacementDisk))
 	return ctrl.Result{}, nil
 }
 
@@ -304,7 +429,12 @@ func (r *ManagedVMOperationReconciler) swapDisk(
 		}
 	}
 	if !changed {
-		return nil
+		// Silence here is how a rollback deletes a disk it never replaced:
+		// the caller goes straight on to remove the predecessor. The root
+		// disk is the case that reaches this, and it has its own path.
+		return fmt.Errorf(
+			"%s is not attached to %s, so there is nothing to point at %s",
+			from, vm.Name, to)
 	}
 	if err := r.Update(ctx, patched); err != nil {
 		return fmt.Errorf("pointing the machine at the replacement disk: %w", err)

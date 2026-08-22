@@ -551,10 +551,21 @@ func TestARollbackReplacesTheDiskInsteadOfDestroyingIt(t *testing.T) {
 	})
 }
 
-// A machine's own root disk is not rolled back this way: the machine is built
-// from it, and swapping a claim would leave its template describing something
-// that no longer exists. The refusal says what to use instead.
-func TestRollingBackARootDiskIsRefusedWithTheAlternative(t *testing.T) {
+// A snapshot of a disk this machine has never had is refused, and the refusal
+// says what it looked at.
+//
+// This test used to assert the other half of that sentence — that a machine's
+// own root disk could not be rolled back either, with a refusal pointing at
+// VirtualMachineSnapshot and Restore. That refusal is gone, because the thing
+// it refused now works: Recreate already replaces a root disk safely, and a
+// rollback differs from it only in where the replacement's contents come from.
+// TestRollingBackTheMachinesOwnDisk measures that path.
+//
+// Keeping this test as it was would have protected the limitation rather than
+// the meaning. What is still true, and what it checks now, is that a snapshot
+// belonging to neither an attached disk nor this machine's own is not
+// something to guess about.
+func TestRollingBackADiskThisMachineDoesNotHaveIsRefused(t *testing.T) {
 	ns := "op-rollback-root"
 	mustNamespace(t, ns, "opdev")
 	readyImage(t, ns, "ubuntu")
@@ -566,27 +577,28 @@ func TestRollingBackARootDiskIsRefusedWithTheAlternative(t *testing.T) {
 		_, err := getKubeVirtVM(ns, "rooted")
 		return err
 	})
-	mustVolumeSnapshot(t, ns, "root-snap", "rooted-root-1", "20Gi", true)
+	// A snapshot of somebody else's claim entirely.
+	mustVolumeSnapshot(t, ns, "stranger-snap", "some-other-disk", "20Gi", true)
 
 	op := &platformv1alpha1.ManagedVMOperation{
-		ObjectMeta: metav1.ObjectMeta{Name: "roll-root", Namespace: ns},
+		ObjectMeta: metav1.ObjectMeta{Name: "roll-stranger", Namespace: ns},
 		Spec: platformv1alpha1.ManagedVMOperationSpec{
 			VMName:       "rooted",
 			Action:       platformv1alpha1.OperationRollbackDisk,
-			RollbackDisk: &platformv1alpha1.RollbackDiskSpec{SnapshotName: "root-snap"},
+			RollbackDisk: &platformv1alpha1.RollbackDiskSpec{SnapshotName: "stranger-snap"},
 		},
 	}
 	if err := k8sClient.Create(testCtx, op); err != nil {
 		t.Fatalf("creating operation: %v", err)
 	}
 
-	eventually(t, "the refusal to point at the right tool", func() error {
-		got := getOp(t, ns, "roll-root")
+	eventually(t, "the refusal to name the disk it could not place", func() error {
+		got := getOp(t, ns, "roll-stranger")
 		if got.Status.Phase != platformv1alpha1.OperationPhaseFailed {
-			return fmt.Errorf("phase = %q", got.Status.Phase)
+			return fmt.Errorf("phase = %q (%s)", got.Status.Phase, got.Status.Message)
 		}
-		if !strings.Contains(got.Status.Message, "Restore") {
-			return fmt.Errorf("the refusal does not name the alternative: %q", got.Status.Message)
+		if !strings.Contains(got.Status.Message, "some-other-disk") {
+			return fmt.Errorf("the refusal does not name it: %q", got.Status.Message)
 		}
 		return nil
 	})

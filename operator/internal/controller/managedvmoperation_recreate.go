@@ -90,6 +90,47 @@ func (r *ManagedVMOperationReconciler) reconcileRecreate(
 		return ctrl.Result{RequeueAfter: operationPoll}, nil
 	}
 
+	swapped, err := r.pointAtRootDisk(ctx, op, vm, kvm, current, "rebuilding")
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !swapped {
+		return ctrl.Result{RequeueAfter: operationPoll}, nil
+	}
+
+	if err := r.restoreRunState(ctx, op, vm); err != nil {
+		return ctrl.Result{}, err
+	}
+	r.finish(op, platformv1alpha1.OperationPhaseSucceeded, fmt.Sprintf(
+		"%s rebuilt from its image as %s", vm.Name, op.Status.ReplacementDisk))
+	return ctrl.Result{}, nil
+}
+
+// pointAtRootDisk moves a machine onto another root disk and retires the one
+// it was on: rewrite the template and the volume, then — on the next pass,
+// when nothing references it any more — delete the predecessor and record the
+// epoch.
+//
+// Shared by Recreate and by a rollback of the root disk, which differ only in
+// where the replacement's contents come from. They had one implementation and
+// one comment between them before the rollback needed it too; two would be two
+// answers to "what is this machine's disk".
+//
+// Returns false while the swap is still in flight, so the caller requeues.
+//
+// The order carries the whole safety property. The claim is deleted only after
+// nothing mounts it and the machine is stopped — a claim deleted while a guest
+// has it mounted does not go away, it sits in Terminating behind
+// pvc-protection with the pod still writing to it, and takes the operation
+// with it.
+func (r *ManagedVMOperationReconciler) pointAtRootDisk(
+	ctx context.Context,
+	op *platformv1alpha1.ManagedVMOperation,
+	vm *platformv1alpha1.ManagedVM,
+	kvm *kubevirtv1.VirtualMachine,
+	current string,
+	verb string,
+) (bool, error) {
 	if current != op.Status.ReplacementDisk {
 		patched := kvm.DeepCopy()
 		patched.Spec.DataVolumeTemplates[0].Name = op.Status.ReplacementDisk
@@ -100,12 +141,12 @@ func (r *ManagedVMOperationReconciler) reconcileRecreate(
 			}
 		}
 		if err := r.Update(ctx, patched); err != nil {
-			return ctrl.Result{}, fmt.Errorf("pointing the machine at a fresh disk: %w", err)
+			return false, fmt.Errorf("pointing the machine at a fresh disk: %w", err)
 		}
 		kube.CountWrite(r.Scheme, patched, operationControllerName, "updated")
-		r.running(op, fmt.Sprintf("rebuilding %s as %s",
-			op.Status.ReplacedDisk, op.Status.ReplacementDisk))
-		return ctrl.Result{RequeueAfter: operationPoll}, nil
+		r.running(op, fmt.Sprintf("%s %s as %s",
+			verb, op.Status.ReplacedDisk, op.Status.ReplacementDisk))
+		return false, nil
 	}
 
 	// Nothing references the old disk any more, so removing it cannot leave the
@@ -118,10 +159,10 @@ func (r *ManagedVMOperationReconciler) reconcileRecreate(
 		switch {
 		case err == nil:
 			if err := kube.Delete(ctx, r.Client, operationControllerName, old); err != nil {
-				return ctrl.Result{}, fmt.Errorf("removing the old disk: %w", err)
+				return false, fmt.Errorf("removing the old disk: %w", err)
 			}
 		case !apierrors.IsNotFound(err):
-			return ctrl.Result{}, fmt.Errorf("reading the old disk: %w", err)
+			return false, fmt.Errorf("reading the old disk: %w", err)
 		}
 	}
 
@@ -132,17 +173,12 @@ func (r *ManagedVMOperationReconciler) reconcileRecreate(
 		patched.Status.RootDiskEpoch = epoch
 		patched.Status.RootDiskName = op.Status.ReplacementDisk
 		if err := r.Status().Update(ctx, patched); err != nil {
-			return ctrl.Result{}, fmt.Errorf("recording the disk epoch: %w", err)
+			return false, fmt.Errorf("recording the disk epoch: %w", err)
 		}
 		kube.CountWrite(r.Scheme, patched, operationControllerName, "status")
+		*vm = *patched
 	}
-
-	if err := r.restoreRunState(ctx, op, vm); err != nil {
-		return ctrl.Result{}, err
-	}
-	r.finish(op, platformv1alpha1.OperationPhaseSucceeded, fmt.Sprintf(
-		"%s rebuilt from its image as %s", vm.Name, op.Status.ReplacementDisk))
-	return ctrl.Result{}, nil
+	return true, nil
 }
 
 // nextRootDiskName advances the epoch in a root disk's name.
