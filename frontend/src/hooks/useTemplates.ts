@@ -88,6 +88,9 @@ export function useCreateImage() {
   return useMutation({
     mutationFn: ({ data, namespace }: { data: GoldenImageCreate; namespace: string }) => 
       templatesApi.createImage(data, namespace),
+    // The Storage dialogs catch this and show it inline, in the form that was
+    // refused. A toast as well would report one refusal twice.
+    meta: { handledLocally: true },
     // The import starts after the object is written, so the first read finds
     // a row with no status yet.
     onSuccess: () => settle(queryClient, [['images']]),

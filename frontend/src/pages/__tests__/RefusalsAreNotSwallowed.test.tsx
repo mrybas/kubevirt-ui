@@ -58,6 +58,19 @@ describe('the net under every write', () => {
     expect(errors).toEqual([]);
   });
 
+  it('keeps quiet for a call site that shows the refusal itself', async () => {
+    // The Storage dialogs render it inline, in the form that was refused.
+    // Reporting the same 409 as a toast as well is the noise this net was
+    // meant to replace.
+    const client = createQueryClient();
+    await fire(client, {
+      mutationFn: async () => { throw new Error('shown in the dialog'); },
+      meta: { handledLocally: true },
+      retry: false,
+    });
+    expect(errors).toEqual([]);
+  });
+
   it('says something even when the failure carries no message', async () => {
     const client = createQueryClient();
     await fire(client, {
@@ -76,6 +89,12 @@ describe('the net under every write', () => {
 
 describe('the dialog that was reported', () => {
   const page = readFileSync(join(__dirname, '..', 'Storage.tsx'), 'utf8');
+
+  it('claims the refusal, so it is not also toasted', () => {
+    const hooks = readFileSync(
+      join(__dirname, '..', '..', 'hooks', 'useTemplates.ts'), 'utf8');
+    expect(hooks).toMatch(/meta: \{ handledLocally: true \}/);
+  });
 
   it('keeps itself open and shows the reason', () => {
     // Both dialogs: importing an image and creating a disk.

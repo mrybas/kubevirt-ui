@@ -28,7 +28,13 @@ export function createQueryClient(): QueryClient {
     },
     mutationCache: new MutationCache({
       onError: (error, _variables, _context, mutation) => {
+        // Handled where it happened: either by the mutation's own onError, or
+        // by a call site that says so. The second exists because a dialog that
+        // renders the refusal next to the field that is wrong does not also
+        // want it as a toast — one refusal, reported twice, is the noise this
+        // net was meant to replace, not add to.
         if (mutation.options.onError) return;
+        if (mutation.meta?.handledLocally) return;
         const message = error instanceof Error ? error.message : String(error);
         notify.error(message || 'The request was refused');
       },
