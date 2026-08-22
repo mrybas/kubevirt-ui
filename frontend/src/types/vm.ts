@@ -25,6 +25,18 @@ export interface VM {
   ip_address?: string;
   node?: string;
   /**
+   * What the controller is doing to this machine right now — a rollback, a
+   * recreate — while it is doing it. The endpoints that ask for one answer as
+   * soon as the resource is written; this is how a page tells a request from
+   * a result.
+   */
+  operation?: {
+    name: string;
+    action: string;
+    phase: string;
+    message?: string;
+  } | null;
+  /**
    * The phase of a live migration that has not finished, if there is one.
    * A migrating VM stays Running, so this is the only field that says the
    * page's answer is still moving.

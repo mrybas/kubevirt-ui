@@ -32,7 +32,10 @@ export function useVM(namespace: string, name: string) {
         // the header went on naming the node the machine had left. The
         // migration object says whether it is still going; the server hands
         // that over as `migration_phase`.
-        if (isTransitional || vm.migration_phase) {
+        // An operation the controller is running counts too: a rollback
+        // builds a clone, stops the machine, swaps its disk and starts it
+        // again, and none of that changes `status` until it is over.
+        if (isTransitional || vm.migration_phase || vm.operation) {
           return 3000;
         }
       }

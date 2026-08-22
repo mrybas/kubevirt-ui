@@ -56,6 +56,16 @@ describe('a migrating VM', () => {
   });
 });
 
+describe('a machine under an operation', () => {
+  it('is waited on while the controller works', () => {
+    // A rollback builds a clone, stops the machine, swaps its disk and starts
+    // it again. None of that moves `status`, so the page looked idle through
+    // the whole thing — and the request that started it had already reported
+    // itself as the result.
+    expect(intervalOf(vms, 'useVM')).toContain('vm.operation');
+  });
+});
+
 describe('a snapshot that is not usable yet', () => {
   it('is polled until it is, and then not', () => {
     // The rule itself, run rather than read: the source-grep version of this

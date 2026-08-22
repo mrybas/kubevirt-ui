@@ -349,6 +349,15 @@ class GuestAgentInfo(BaseModel):
     users: list[dict[str, Any]] = Field(default_factory=list)
 
 
+class VMOperationInfo(BaseModel):
+    """What the controller is doing to this machine right now."""
+
+    name: str
+    action: str
+    phase: str
+    message: str = ""
+
+
 class VMResponse(BaseModel):
     """Response model for a VirtualMachine."""
 
@@ -371,6 +380,15 @@ class VMResponse(BaseModel):
     phase: str | None = None
     ip_address: str | None = None
     node: str | None = None
+
+    # An operation the controller is running on this machine — a rollback, a
+    # recreate, a migration asked for as an operation — while it is running.
+    #
+    # A page that cannot see this reports the request as the result: the
+    # rollback endpoint answers as soon as the operation is written, and the
+    # UI said "Rolled back. VM is restarting." while a clone was still being
+    # made. `None` means nothing is in flight.
+    operation: VMOperationInfo | None = None
 
     # A migration that has been asked for and has not finished, by phase
     # (`Scheduling`, `Running`, …). `None` means nothing is in flight.

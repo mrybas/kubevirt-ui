@@ -86,6 +86,26 @@ describe('Create Snapshot', () => {
   });
 });
 
+describe('a rollback that has only been asked for', () => {
+  const disks = readFileSync(
+    join(__dirname, '..', '..', 'components', 'vm', 'tabs', 'DisksTab.tsx'), 'utf8');
+  const detail = readFileSync(join(__dirname, '..', 'VMDetail.tsx'), 'utf8');
+
+  it('is not reported as one that has happened', () => {
+    // The operator path answers as soon as the request is written; saying
+    // "Rolled back. VM is restarting." there describes a result that does
+    // not exist yet.
+    expect(disks).toMatch(/res\?\.status === 'rolling_back'/);
+    expect(disks).toMatch(/Rolling \$\{pvcName\} back to/);
+  });
+
+  it('is visible on the machine while it runs', () => {
+    expect(detail).toMatch(/vm\.operation && \(/);
+    expect(detail).toContain('OPERATION_LABELS');
+    expect(detail).toMatch(/RollbackDisk: 'Rolling a disk back to a snapshot'/);
+  });
+});
+
 describe('Create VM', () => {
   const page = readFileSync(join(__dirname, '..', 'VirtualMachines.tsx'), 'utf8');
 

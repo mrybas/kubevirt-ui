@@ -124,6 +124,8 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     ("platform.kubevirt-ui.io", "managedvms", "create", "vms._create_managed_vm"),
     ("platform.kubevirt-ui.io", "managedvms", "patch", "operator.patch_managed_disks"),
     ("platform.kubevirt-ui.io", "managedvms", "delete", "vms.delete_vm"),
+    ("platform.kubevirt-ui.io", "managedvmoperations", "list",
+     "vms.get_vm — the operation the machine is under, while it is under one"),
     ("platform.kubevirt-ui.io", "managedvmoperations", "create",
      "vm_actions._start_operation"),
     ("platform.kubevirt-ui.io", "managedvmtemplates", "list",

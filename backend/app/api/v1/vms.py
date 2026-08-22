@@ -35,6 +35,7 @@ from app.models.vm import (
     VMCloudInitResponse,
     VMCreateRequest,
     VMListResponse,
+    VMOperationInfo,
     VMResponse,
     VMUpdateCloudInitFormRequest,
     VMUpdateCloudInitRequest,
@@ -420,6 +421,50 @@ async def _datavolume_blockers(
     return out
 
 
+async def _operation_in_flight(
+    k8s_client: Any, namespace: str, vm_name: str,
+) -> VMOperationInfo | None:
+    """The operation this machine is under, while it is under one.
+
+    A rollback, a recreate, an operation-driven migration: the endpoint that
+    asks for one answers as soon as the resource is written, and everything
+    after that happens in the controller. Without this the page reports the
+    request as the result — "Rolled back. VM is restarting." while a clone is
+    still being made and the machine has not been stopped yet.
+
+    Terminal operations are left out: what finished is history, and history
+    that looks like a current state is the thing being fixed.
+    """
+    try:
+        ops = await k8s_client.custom_api.list_namespaced_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            namespace=namespace, plural="managedvmoperations",
+        )
+    except Exception:
+        # An operator that is not installed, or a read that failed. Neither is
+        # a reason to refuse to describe the machine.
+        return None
+
+    newest = None
+    for item in ops.get("items", []):
+        spec = item.get("spec") or {}
+        if spec.get("vmName") != vm_name:
+            continue
+        status = item.get("status") or {}
+        phase = status.get("phase") or "Pending"
+        if phase in ("Succeeded", "Failed"):
+            continue
+        created = (item.get("metadata") or {}).get("creationTimestamp") or ""
+        if newest is None or created > newest[0]:
+            newest = (created, VMOperationInfo(
+                name=(item.get("metadata") or {}).get("name", ""),
+                action=spec.get("action", ""),
+                phase=phase,
+                message=status.get("message", ""),
+            ))
+    return newest[1] if newest else None
+
+
 async def _migration_state(
     k8s_client: Any, namespace: str, vm_name: str,
 ) -> tuple[list[dict[str, str]], str | None]:
@@ -524,6 +569,7 @@ async def get_vm(
         resp = vm_from_k8s(vm, vmi, pod_ip=pod_ip)
         blockers, resp.migration_phase = await _migration_state(
             k8s_client, namespace, name)
+        resp.operation = await _operation_in_flight(k8s_client, namespace, name)
         resp.conditions = (
             list(resp.conditions or [])
             + await _datavolume_blockers(k8s_client, namespace, vm)

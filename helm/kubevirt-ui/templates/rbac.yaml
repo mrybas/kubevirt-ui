@@ -117,7 +117,7 @@ rules:
   - apiGroups: ["platform.kubevirt-ui.io"]
     resources:
       - managedvmoperations
-    verbs: ["create"]
+    verbs: ["list", "create"]
 
   - apiGroups: ["platform.kubevirt-ui.io"]
     resources:

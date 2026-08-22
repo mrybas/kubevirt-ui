@@ -92,7 +92,18 @@ function DiskSnapshotsPanel({
       {
         onSuccess: (res: any) => {
           setRollbackConfirm(null);
-          setRollbackMsg(`Rolled back to ${snapName}. ${res?.was_running ? 'VM is restarting.' : 'VM is stopped.'}`);
+          // Two different answers, and they used to read as one. The path
+          // through the operator returns as soon as the request is written —
+          // the clone is not made, the machine is not stopped, nothing has
+          // been rolled back yet — and saying "Rolled back. VM is
+          // restarting." there is a report of a result that does not exist.
+          setRollbackMsg(
+            res?.status === 'rolling_back'
+              ? `Rolling ${pvcName} back to ${snapName}. The machine stops, `
+                + `its disk is replaced, and it starts again — the VM page `
+                + `shows the progress.`
+              : `Rolled back to ${snapName}. ${res?.was_running ? 'VM is restarting.' : 'VM is stopped.'}`,
+          );
         },
         onError: (err: any) => {
           setRollbackConfirm(null);
