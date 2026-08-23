@@ -290,6 +290,18 @@ rules:
   - update
   - watch
 - apiGroups:
+  - kyverno.io
+  resources:
+  - clusterpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - metallb.io
   resources:
   - ipaddresspools

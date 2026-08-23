@@ -13,6 +13,7 @@ import (
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 	"github.com/mrybas/kubevirt-ui/operator/internal/kubevirt"
+	"github.com/mrybas/kubevirt-ui/operator/internal/network"
 )
 
 /*
@@ -32,122 +33,101 @@ can answer on it. An address anywhere else — a resolver on the VLAN, a public
 one — is somebody's deliberate setting and is left alone.
 */
 
-func TestAnUnreachableResolverIsNotProgrammed(t *testing.T) {
+// TestTheGroundUnderAVpcDnsIsBuilt.
+//
+// The step that did not survive the handover, and the whole of E2. kube-ovn's
+// vpc-dns controller does nothing until the attachment and two ConfigMaps
+// exist, and all three are this product's to create: the backend's VPC-create
+// path makes them, the operator's path made the VpcDns object and nothing
+// under it. A VPC created through the operator therefore handed its guests a
+// resolver address with nothing answering on it.
+//
+// Twice misread before it was measured — first as "this kube-ovn does not have
+// the feature" (it does; the resource is `vpc-dnses`, and `kubectl get vpcdns`
+// finds nothing), then as "the product invented an address" (it picks it, by a
+// fixed convention, and is supposed to write it into the configuration below).
+func TestTheGroundUnderAVpcDnsIsBuilt(t *testing.T) {
 	mustSharedNamespace(t, "kube-ovn")
 	mustOverlaySubnet(t)
-
-	// The feature off, as on the stand.
-	config := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "kube-ovn", Name: vpcDNSConfigMap,
-	}}
-	if err := k8sClient.Delete(testCtx, config); err != nil && !apierrors.IsNotFound(err) {
-		t.Fatalf("clearing the vpc-dns config: %v", err)
-	}
-	t.Cleanup(func() { mustKubeOVNResolver(t) })
+	clusterDNS := mustClusterDNSService(t)
 
 	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
-		ObjectMeta: metav1.ObjectMeta{Name: "netdeadns"},
+		ObjectMeta: metav1.ObjectMeta{Name: "netprereq"},
 		Spec: platformv1alpha1.ManagedNetworkSpec{
-			CIDR:        "10.200.140.0/22",
+			CIDR:        "10.200.148.0/22",
 			ServiceCIDR: "10.96.0.0/12",
-			// What every network created before the fix carries.
-			DNSServer: "10.96.0.200",
 		},
 	})
 
-	// The subnet does not carry it. That is the half a guest can feel.
-	eventually(t, "the dead address to stay out of the datapath", func() error {
-		subnet := &unstructured.Unstructured{}
-		subnet.SetGroupVersionKind(subnetGVK)
+	eventually(t, "the gate configuration to exist, with an address in it", func() error {
+		cm := &corev1.ConfigMap{}
 		if err := k8sClient.Get(testCtx, types.NamespacedName{
-			Name: "netdeadns-default",
-		}, subnet); err != nil {
+			Namespace: "kube-ovn", Name: network.VPCDNSConfigMap,
+		}, cm); err != nil {
 			return err
 		}
-		opts, _, _ := unstructured.NestedString(subnet.Object, "spec", "dhcpV4Options")
-		if strings.Contains(opts, "dns_server") {
-			return fmt.Errorf("the subnet still hands it out: %q", opts)
+		// The one value kube-ovn spins on when it is missing.
+		if cm.Data["coredns-vip"] != "10.96.0.200" {
+			return fmt.Errorf("coredns-vip = %q", cm.Data["coredns-vip"])
+		}
+		if cm.Data["enable-vpc-dns"] != "true" {
+			return fmt.Errorf("the feature is not switched on: %v", cm.Data)
+		}
+		// The route the pod gets on its second NIC has to be the DNS it
+		// forwards to, not the API server, or every query is a timeout.
+		if cm.Data["k8s-service-host"] != clusterDNS {
+			return fmt.Errorf("k8s-service-host = %q", cm.Data["k8s-service-host"])
 		}
 		return nil
 	})
 
-	// And the condition names it, so the declaration can be corrected by
-	// whoever made it.
-	eventually(t, "the network to say what it refused and why", func() error {
-		cond := networkCondition(
-			getNetwork(t, "netdeadns"), platformv1alpha1.ConditionDNSReady)
-		if cond == nil || cond.Reason != "KubeOVNVpcDNSDisabled" {
-			return fmt.Errorf("condition = %v", cond)
+	eventually(t, "the Corefile to forward where that route leads", func() error {
+		cm := &corev1.ConfigMap{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "kube-ovn", Name: network.VPCDNSCorefileConfigMap,
+		}, cm); err != nil {
+			return err
 		}
-		for _, want := range []string{"10.96.0.200", "no route", "spec.dnsServer"} {
-			if !strings.Contains(cond.Message, want) {
-				return fmt.Errorf("message does not say %q: %s", want, cond.Message)
-			}
+		if !strings.Contains(cm.Data["Corefile"], "forward . "+clusterDNS) {
+			return fmt.Errorf("Corefile = %q", cm.Data["Corefile"])
 		}
 		return nil
 	})
 
-	// The declaration itself is untouched: a controller that edits the spec
-	// it was given is a second writer of somebody else's field.
-	got := getNetwork(t, "netdeadns")
-	if got.Spec.DNSServer != "10.96.0.200" {
-		t.Fatalf("the operator rewrote the spec: dnsServer = %q", got.Spec.DNSServer)
-	}
+	eventually(t, "the attachment every VpcDns pod needs", func() error {
+		nad := &unstructured.Unstructured{}
+		nad.SetGroupVersionKind(nadGVK)
+		return k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "default", Name: network.VPCDNSNADName,
+		}, nad)
+	})
 }
 
-func TestAResolverSomewhereElseIsLeftAlone(t *testing.T) {
-	mustSharedNamespace(t, "kube-ovn")
-	mustOverlaySubnet(t)
-
-	config := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
-		Namespace: "kube-ovn", Name: vpcDNSConfigMap,
-	}}
-	if err := k8sClient.Delete(testCtx, config); err != nil && !apierrors.IsNotFound(err) {
-		t.Fatalf("clearing the vpc-dns config: %v", err)
+// TestAnEmptyVIPIsNeverWritten.
+//
+// `enable-vpc-dns: true` with no address describes neither an enabled feature
+// nor a disabled one. kube-ovn answers every VpcDns in the cluster with
+// "corednsVip should be set" and builds nothing, and every check that reads
+// the file's existence as an answer is told the wrong thing — including the
+// one that decides whether to hand the address to a guest.
+//
+// It happened because the value was read out of the file it is written to: a
+// circle that was self-consistent while an arithmetic supplied the address,
+// and wrote the product's own ignorance into its own source of truth the
+// moment that arithmetic was removed.
+func TestAnEmptyVIPIsNeverWritten(t *testing.T) {
+	r := &ManagedNetworkReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	if err := r.ensureVpcDNSPrereqs(testCtx, "kube-ovn", "", "10.0.0.10"); err != nil {
+		t.Fatalf("refusing to write should not be an error: %v", err)
 	}
-	t.Cleanup(func() { mustKubeOVNResolver(t) })
-
-	mustNetwork(t, &platformv1alpha1.ManagedNetwork{
-		ObjectMeta: metav1.ObjectMeta{Name: "netownns"},
-		Spec: platformv1alpha1.ManagedNetworkSpec{
-			CIDR:        "10.200.144.0/22",
-			ServiceCIDR: "10.96.0.0/12",
-			// A resolver an admin chose, outside the service network: on the
-			// VLAN, or public. Nothing here knows whether it answers, and
-			// nothing here is entitled to decide it does not.
-			DNSServer: "10.199.4.53",
-		},
-	})
-
-	// Give the controller the same chance to touch it, then check it did not.
-	eventually(t, "the network to be reconciled at all", func() error {
-		cond := networkCondition(
-			getNetwork(t, "netownns"), platformv1alpha1.ConditionDNSReady)
-		if cond == nil {
-			return fmt.Errorf("not reconciled yet")
-		}
-		return nil
-	})
-	got := getNetwork(t, "netownns")
-	if got.Spec.DNSServer != "10.199.4.53" {
-		t.Fatalf("somebody else's resolver was withdrawn: %q", got.Spec.DNSServer)
+	// Nothing was created for it, and nothing existing was blanked.
+	cm := &corev1.ConfigMap{}
+	err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "kube-ovn", Name: network.VPCDNSConfigMap,
+	}, cm)
+	if err == nil && cm.Data["coredns-vip"] == "" {
+		t.Fatal("a configuration with an empty coredns-vip was written")
 	}
-
-	// And it is programmed, because nothing here knows it does not answer.
-	eventually(t, "the subnet to hand it out", func() error {
-		subnet := &unstructured.Unstructured{}
-		subnet.SetGroupVersionKind(subnetGVK)
-		if err := k8sClient.Get(testCtx, types.NamespacedName{
-			Name: "netownns-default",
-		}, subnet); err != nil {
-			return err
-		}
-		opts, _, _ := unstructured.NestedString(subnet.Object, "spec", "dhcpV4Options")
-		if !strings.Contains(opts, "dns_server=10.199.4.53") {
-			return fmt.Errorf("dhcpV4Options = %q", opts)
-		}
-		return nil
-	})
 }
 
 func TestAMachineOnAVPCSaysWhetherItCanResolve(t *testing.T) {
@@ -185,4 +165,29 @@ func kubevirtInputForTest(onVPC bool, vip string) kubevirt.Input {
 	in := kubevirt.Input{VPCDNSVIP: vip}
 	in.Networks = []kubevirt.ResolvedNetwork{{Subnet: "s", IsVPCOverlay: onVPC}}
 	return in
+}
+
+// mustClusterDNSService stands in for the cluster's own CoreDNS, which is what
+// a VpcDns forwards everything to. Its address is whatever this API server
+// allocates — the test asserts the forward matches it rather than a literal,
+// because the point is that the two agree.
+func mustClusterDNSService(t *testing.T) string {
+	t.Helper()
+	mustSharedNamespace(t, "kube-system")
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system", Name: "kube-dns"},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Name: "dns", Port: 53, Protocol: corev1.ProtocolUDP}},
+		},
+	}
+	if err := k8sClient.Create(testCtx, svc); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("planting the cluster resolver: %v", err)
+	}
+	live := &corev1.Service{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "kube-system", Name: "kube-dns",
+	}, live); err != nil {
+		t.Fatalf("reading the cluster resolver: %v", err)
+	}
+	return live.Spec.ClusterIP
 }

@@ -175,30 +175,48 @@ async def _ensure_cluster_config(k8s) -> dict[str, Any]:
     # `assert_tenant_cidrs_free`.
     host_service_cidr = await _discover_service_cidr(k8s)
 
-    # The address of a resolver, read from the cluster that would run it.
+    # The address of the CoreDNS this product runs for VPCs.
     #
-    # This used to be arithmetic: take the service CIDR, put 200 in the last
-    # octet, and hand the result to every VPC over DHCP. It is a plausible
-    # address and nothing ever checked that anything answers on it. On a
-    # cluster where kube-ovn's vpc-dns feature is off — no `vpc-dns-config`,
-    # no VpcDns CRD at all — every VM in every VPC was told to resolve names
-    # at 10.96.0.200, which is why an IP works from those machines and a name
-    # does not. UAT run 4, E2.
+    # A choice, not a discovery, and I had that backwards for two releases.
+    # kube-ovn's VpcDns gives each VPC a CoreDNS deployment fronted by one
+    # cluster-wide VIP, and the product picks that VIP, writes it into the
+    # `vpc-dns-config` it creates, and hands it to guests. Deriving it from
+    # the service network — that network's address with 200 in the last octet
+    # — is how it has always been picked.
     #
-    # `vpc-dns-config` is where kube-ovn's own controller is configured, so
-    # its `coredns-vip` is the cluster stating the address, and its absence is
-    # the cluster saying there is no resolver to point at. Then nothing is
-    # promised: a DHCP option naming a server that does not exist is worse
-    # than no option, because the guest stops asking anything else.
+    # What was actually wrong is not the arithmetic. It is that a VPC created
+    # through the operator never got the machinery that answers on the address
+    # (the NAD, the two ConfigMaps, the Kyverno policy), because that lived on
+    # the create path the handover switched off. So the address was handed out
+    # and nothing served it, which reads exactly like an invented address.
+    #
+    # Taking the arithmetic away did not fix that and broke the other half:
+    # the writer had nothing to write, so `vpc-dns-config` was created with an
+    # empty `coredns-vip` and kube-ovn refused every VpcDns in the cluster
+    # with "vpc-dns corednsVip should be set". Measured on the stand.
+    #
+    # So: an address already chosen is kept, an override wins over everything,
+    # and otherwise it is derived. Whether anything answers on it is a
+    # separate question, asked where it belongs — by whoever is about to hand
+    # it to a guest.
     vpcdns_vip = vpcdns_vip_override
     if not vpcdns_vip:
         vpcdns_vip = await _vpcdns_vip_from_kubeovn(k8s)
     if not vpcdns_vip:
-        logger.info(
-            "No VpcDns resolver is configured in this cluster (no "
-            "`coredns-vip` in the kube-ovn `vpc-dns-config` ConfigMap), so "
-            "VPC subnets are created without a DNS server. Enable vpc-dns in "
-            "kube-ovn, or set TENANTS_VPCDNS_VIP to an address that answers."
+        service_cidr = host_service_cidr
+        if service_cidr:
+            try:
+                net = ipaddress.ip_network(service_cidr, strict=False)
+                octets = str(net.network_address).split(".")
+                if len(octets) == 4:
+                    vpcdns_vip = f"{octets[0]}.{octets[1]}.{octets[2]}.200"
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Could not parse service CIDR {service_cidr!r}: {e}")
+    if not vpcdns_vip:
+        logger.warning(
+            "No VpcDns VIP: the service network could not be read and none is "
+            "configured. VPC subnets are created without a DNS server. Set "
+            "TENANTS_VPCDNS_VIP to the address the VPC CoreDNS should answer on."
         )
 
     ingress_domain = domain_override or f"{ingress_ip}.nip.io"

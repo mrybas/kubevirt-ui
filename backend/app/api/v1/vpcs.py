@@ -464,6 +464,19 @@ async def _ensure_vpc_dns_prereqs(k8s) -> None:
     from app.api.v1.network import _find_kubeovn_namespace
     kubeovn_ns = await _find_kubeovn_namespace(k8s)
     vip = _vpcdns_vip()
+    if not vip:
+        # Never write the question mark. A `vpc-dns-config` carrying
+        # `enable-vpc-dns: true` with an empty `coredns-vip` describes neither
+        # an enabled feature nor a disabled one: kube-ovn refuses every VpcDns
+        # in the cluster with "corednsVip should be set", and every check that
+        # reads the file's existence as an answer is told the wrong thing.
+        # Measured on the stand after the address stopped being derived.
+        logger.warning(
+            "Not writing VpcDns prerequisites: no VIP is configured or "
+            "derivable, and a configuration with an empty coredns-vip is "
+            "worse than none."
+        )
+        return
     labels = {"kubevirt-ui.io/managed": "true"}
 
     # 1. NetworkAttachmentDefinition (default ns, shared across VPCs)
@@ -823,12 +836,17 @@ async def _ensure_vpc_dns(
     # explicit recreate endpoint. Errors here are non-fatal (admin can
     # debug the partial state); they just reduce the chance VpcDns reaches
     # ACTIVE on first reconcile.
-    try:
-        await _ensure_vpc_dns_prereqs(k8s)
-    except Exception as exc:
-        logger.warning(
-            f"VpcDns prereq ensure for VPC {vpc_name!r} hit a non-fatal error: {exc}"
-        )
+    # One writer per object. With the network path handed over, the operator
+    # creates these — the step that did not move with it, and the whole of E2 —
+    # and two writers of `vpc-dns-config` is how a VIP gets overwritten by
+    # whichever pass ran last.
+    if not network_path_enabled():
+        try:
+            await _ensure_vpc_dns_prereqs(k8s)
+        except Exception as exc:
+            logger.warning(
+                f"VpcDns prereq ensure for VPC {vpc_name!r} hit a non-fatal error: {exc}"
+            )
 
     body = {
         "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",

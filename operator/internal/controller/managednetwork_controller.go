@@ -101,7 +101,16 @@ type ManagedNetworkReconciler struct {
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managednetworks/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeovn.io,resources=vpcs;vpc-dnses,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;patch
-// +kubebuilder:rbac:groups="",resources=configmaps;pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// The ConfigMaps that gate kube-ovn's vpc-dns and carry its Corefile are this
+// product's to create — the step that did not survive the handover — so this
+// controller writes them as well as reads them.
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
+// The attachment every VpcDns pod uses for its second NIC.
+// +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;list;watch;create;update;patch
+// The policy that tells a pod — and so a guest — which resolver to use. Absent
+// Kyverno is reported, not fatal.
+// +kubebuilder:rbac:groups=kyverno.io,resources=clusterpolicies,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile writes the VPC and its default subnet.
 func (r *ManagedNetworkReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

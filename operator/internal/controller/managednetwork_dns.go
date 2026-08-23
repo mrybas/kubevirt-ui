@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -28,7 +29,9 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -100,14 +103,13 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 	// So the missing precondition is named instead. Absence of the ConfigMap
 	// is the observable form of the feature being off; the message says which
 	// object was looked for, so disagreeing with it costs one kubectl.
-	if !r.vpcDNSIsServed(ctx, kubeOVNNS) {
+	if !r.vpcDNSIsServed(ctx) {
 		net.Status.ServiceRoute = ""
-		message := fmt.Sprintf("kube-ovn's vpc-dns feature is not enabled in "+
-			"this cluster — there is no ConfigMap %s/%s, so nothing will "+
-			"serve a VpcDns and workloads in this network have no resolver. "+
-			"Enable it in kube-ovn, or set a dnsServer on this network.",
-			kubeOVNNS, vpcDNSConfigMap)
-		if r.unreachableResolver(ctx, net) {
+		message := "this kube-ovn does not bring the VpcDns type, so no " +
+			"resolver can be run for a VPC here. Workloads in this network " +
+			"resolve nothing unless the network names a dnsServer that is " +
+			"reachable from it."
+		if r.inServiceNetwork(ctx, net) {
 			message = fmt.Sprintf("this network names %s as its resolver, "+
 				"which is inside the cluster's service network and therefore "+
 				"has no route from inside a VPC — and kube-ovn's vpc-dns, "+
@@ -122,9 +124,40 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 		return nil
 	}
 
+	// The ground a VpcDns stands on, which the handover left behind: the
+	// attachment, the gate configuration, the Corefile, and the policy that
+	// tells a launcher pod — and therefore its guest — which resolver to use.
+	vip := r.resolveDNSServer(ctx, net, kubeOVNNS)
+	if vip == "" {
+		vip = r.chooseVpcDNSVIP(ctx, net)
+	}
+	forward := r.forwardDNS(ctx)
+	if vip != "" && forward != "" {
+		if err := r.ensureVpcDNSPrereqs(ctx, kubeOVNNS, vip, forward); err != nil {
+			r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady,
+				false, "WriteFailed", err.Error())
+			return nil
+		}
+	}
+
 	if err := r.ensureVpcDNS(ctx, net); err != nil {
 		r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, false, "WriteFailed", err.Error())
 		return nil
+	}
+
+	// The pods are told separately, and a cluster without Kyverno cannot be
+	// told at all. That is a state to report, not a reconcile to fail: the
+	// network is built and routed, and what is missing is the injection that
+	// would reach a guest.
+	policyMissing := false
+	if err := r.ensureVpcDNSPolicy(ctx, net, vip); err != nil {
+		if errors.Is(err, errNoKyverno) {
+			policyMissing = true
+		} else {
+			r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady,
+				false, "WriteFailed", err.Error())
+			return nil
+		}
 	}
 
 	route, reason, message := r.ensureServiceRoute(ctx, net, kubeOVNNS)
@@ -133,12 +166,23 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 		r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, false, reason, message)
 		return nil
 	}
+	if policyMissing {
+		r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, false,
+			"NoKyverno",
+			"the resolver is running and routed, and nothing tells a pod to "+
+				"use it: injecting it needs Kyverno, which this cluster does "+
+				"not have. With bridge binding a guest is handed its launcher "+
+				"pod's resolver, so without the injection a VM in this network "+
+				"resolves at the cluster CoreDNS, which it cannot reach. "+
+				"Install Kyverno, or set dnsConfig on the machines yourself.")
+		return nil
+	}
 	r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, true, "Routed", message)
 	return nil
 }
 
-// unreachableResolver says whether this network's declared resolver is one
-// nothing can answer on from inside it.
+// inServiceNetwork says whether this network's declared resolver is a
+// ClusterIP.
 //
 // Narrow on purpose, and a datapath fact rather than a memory of our own
 // mistake: an address inside the cluster's service network is a ClusterIP,
@@ -152,7 +196,7 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 // this operator exists to have removed. The declaration is withdrawn by
 // whoever made it; what happens here is that it is not programmed and the
 // network says why.
-func (r *ManagedNetworkReconciler) unreachableResolver(
+func (r *ManagedNetworkReconciler) inServiceNetwork(
 	ctx context.Context, net *platformv1alpha1.ManagedNetwork,
 ) bool {
 	if net.Spec.DNSServer == "" {
@@ -171,23 +215,50 @@ func (r *ManagedNetworkReconciler) unreachableResolver(
 	return aerr == nil && prefix.Contains(addr)
 }
 
-// vpcDNSIsServed reports whether anything in this cluster will act on a VpcDns.
+// chooseVpcDNSVIP picks the address this product's VPC CoreDNS answers on.
 //
-// The same ConfigMap `resolveDNSServer` reads for the resolver address, asked
-// for a different reason: it is kube-ovn's own configuration for the feature,
-// so its absence is the cluster saying the feature is off. An unreadable
-// namespace is treated as "cannot tell" rather than "off" — the write it
-// gates is idempotent, and refusing to try because a read failed is how a
-// working cluster gets told its feature is missing.
-func (r *ManagedNetworkReconciler) vpcDNSIsServed(ctx context.Context, kubeOVNNS string) bool {
-	if kubeOVNNS == "" {
-		return true
+// A choice, not a discovery. kube-ovn runs one CoreDNS per VPC behind a single
+// cluster-wide VIP and expects to be told which address that is; the product
+// has always taken the service network's own address with 200 in the last
+// octet. It is written into `vpc-dns-config` here, so by the time a guest is
+// handed it there is something answering.
+//
+// Chosen only when nothing has chosen already: `resolveDNSServer` looks at the
+// network's own declaration and at the existing configuration first, and a
+// cluster that has picked an address keeps it.
+func (r *ManagedNetworkReconciler) chooseVpcDNSVIP(
+	ctx context.Context, net *platformv1alpha1.ManagedNetwork,
+) string {
+	cidr, err := r.serviceCIDR(ctx, net)
+	if err != nil || cidr == "" {
+		return ""
 	}
-	cm := &corev1.ConfigMap{}
-	err := r.Get(ctx, types.NamespacedName{
-		Namespace: kubeOVNNS, Name: vpcDNSConfigMap,
-	}, cm)
-	return !apierrors.IsNotFound(err)
+	prefix, perr := netip.ParsePrefix(cidr)
+	if perr != nil || !prefix.Addr().Is4() {
+		return ""
+	}
+	return network.VPCDNSVIPFor(prefix.Addr().As4())
+}
+
+// vpcDNSIsServed reports whether this cluster can act on a VpcDns at all.
+//
+// The question is whether kube-ovn brings the type, and only that. The gate
+// used to ask whether `vpc-dns-config` existed, which was wrong in a way that
+// took two releases to see: that ConfigMap is *this product's* to create, and
+// the reason it was missing is that the create path which makes it did not
+// survive the handover. Reading our own missing step as the platform's answer
+// turned "we have not set this up yet" into "the cluster does not support
+// this", and the fix built on top refused to program an address we were about
+// to serve.
+//
+// The CRD is the fact that is not ours. `vpc-dnses.kubeovn.io` — which is also
+// where both of us went wrong when checking by hand, because `kubectl get
+// vpcdns` finds nothing and the type is there.
+func (r *ManagedNetworkReconciler) vpcDNSIsServed(ctx context.Context) bool {
+	list := &unstructured.UnstructuredList{}
+	list.SetGroupVersionKind(vpcDNSGVK.GroupVersion().WithKind("VpcDnsList"))
+	err := r.List(ctx, list, client.Limit(1))
+	return !meta.IsNoMatchError(err) && !runtime.IsNotRegisteredError(err)
 }
 
 // resolveDNSServer is the address workloads are handed over DHCP.
@@ -200,12 +271,16 @@ func (r *ManagedNetworkReconciler) resolveDNSServer(
 	ctx context.Context, net *platformv1alpha1.ManagedNetwork, kubeOVNNS string,
 ) string {
 	if net.Spec.DNSServer != "" {
-		// Unless nothing can answer on it. A network created while the
-		// product invented this address still orders a ClusterIP that no
-		// guest in the VPC can reach; programming it puts a dead resolver in
-		// every guest's resolv.conf, which is worse than none, because the
-		// guest stops looking anywhere else.
-		if r.unreachableResolver(ctx, net) {
+		// Unless nothing in this cluster can ever answer on it. A ClusterIP
+		// is reachable from a VPC only through a VpcDns, so on a kube-ovn
+		// that does not bring the type, programming one puts a dead resolver
+		// in every guest's resolv.conf — worse than none, because the guest
+		// then stops looking anywhere else.
+		//
+		// Where the type *is* available this address is the right one: it is
+		// the VIP the product runs its own CoreDNS on, and the configuration
+		// that makes that happen is written a few lines up.
+		if !r.vpcDNSIsServed(ctx) && r.inServiceNetwork(ctx, net) {
 			return ""
 		}
 		return net.Spec.DNSServer

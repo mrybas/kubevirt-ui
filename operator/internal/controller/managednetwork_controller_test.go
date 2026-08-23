@@ -565,14 +565,22 @@ func TestTheServiceRouteGoesOnWhenTheDeploymentAppears(t *testing.T) {
 		return nil
 	})
 
-	eventually(t, "DNSReady", func() error {
+	eventually(t, "the route to be recorded", func() error {
 		net := getNetwork(t, "netdns")
-		cond := networkCondition(net, platformv1alpha1.ConditionDNSReady)
-		if cond == nil || cond.Status != metav1.ConditionTrue {
-			return fmt.Errorf("condition = %v", cond)
-		}
 		if net.Status.ServiceRoute != "10.96.0.0/12 via 10.16.0.1" {
 			return fmt.Errorf("status.serviceRoute = %q", net.Status.ServiceRoute)
+		}
+		// Not DNSReady=True: this envtest has no Kyverno, and without it
+		// nothing injects the resolver into a pod, so a guest in this network
+		// would still resolve at the cluster CoreDNS it cannot reach. That is
+		// reported as its own reason and covered by
+		// TestTheGroundUnderAVpcDnsIsBuilt; this test is about the route.
+		cond := networkCondition(net, platformv1alpha1.ConditionDNSReady)
+		if cond == nil {
+			return fmt.Errorf("no DNS condition at all")
+		}
+		if cond.Reason == "WriteFailed" || cond.Reason == "DeploymentPending" {
+			return fmt.Errorf("condition = %v", cond)
 		}
 		return nil
 	})

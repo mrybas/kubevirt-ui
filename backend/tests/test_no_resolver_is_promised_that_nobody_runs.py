@@ -1,4 +1,4 @@
-"""A VPC is told where its resolver is only when there is one.
+"""Where the address of the VPC resolver comes from.
 
 UAT run 4, E2: from a VM in a VPC an IP answers and a name does not. The
 subnets hand out `dns_server=10.96.0.200` over DHCP, and this cluster has no
@@ -60,20 +60,32 @@ class TestWhereTheResolverAddressComesFrom:
         assert await self._ask({"coredns-vip": "10.96.0.200"}, namespace=None) == ""
 
 
-def test_the_address_is_never_computed_from_the_service_cidr() -> None:
-    """The arithmetic and its fallback are gone, not merely unused.
+def test_the_address_is_derived_when_nothing_has_chosen_one() -> None:
+    """This assertion used to say the opposite, and it was wrong.
 
-    Both produced 10.96.0.200 on this cluster, which is the address in the
-    report — a resolver that does not exist, handed to every VM in every VPC.
+    It read "the address is never computed from the service CIDR", on the
+    theory that computing it was inventing a resolver nobody runs. The
+    resolver is ours: kube-ovn's VpcDns runs a CoreDNS per VPC behind one
+    cluster-wide VIP, and the product picks that VIP and writes it into the
+    `vpc-dns-config` it creates. Deriving it is how it has always been picked.
+
+    Removing the derivation left the writer with nothing to write, so the
+    ConfigMap was created with an empty `coredns-vip` and kube-ovn refused
+    every VpcDns in the cluster: "vpc-dns corednsVip should be set". The real
+    defect was elsewhere — the operator path never created the machinery that
+    answers on the address — and this test was the shape of that mistake.
     """
     import inspect
 
     from app.api.v1 import tenants_common
 
-    source = inspect.getsource(tenants_common)
-    assert "_VPCDNS_VIP_FALLBACK" not in source
-    # No "last octet becomes 200" arithmetic anywhere.
-    assert '.200"' not in source.replace('# ', '')
+    source = inspect.getsource(tenants_common._ensure_cluster_config)
+    # An address already chosen is kept, an override beats everything, and a
+    # derivation is the last resort rather than the only one.
+    assert source.index("vpcdns_vip_override") < source.index(
+        "_vpcdns_vip_from_kubeovn")
+    assert source.index("_vpcdns_vip_from_kubeovn") < source.index(
+        "net.network_address")
 
 
 def test_an_explicit_override_still_wins() -> None:
