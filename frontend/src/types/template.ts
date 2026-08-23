@@ -146,6 +146,8 @@ export interface PersistentDisk {
   size: string;
   storage_class?: string;
   status: string;
+  /** How far an import has got, as CDI reports it ("89.84%"). */
+  progress?: string | null;
   attached_to?: string;
   created?: string;
 }

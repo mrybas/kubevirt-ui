@@ -24,6 +24,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -404,6 +405,59 @@ func (r *ManagedVMReconciler) resolveNetworks(
 		}
 	}
 	return nil
+}
+
+// resolvableCondition says whether this machine has a name server it can reach.
+//
+// A machine on the default overlay uses the cluster's resolver and that works,
+// so there is nothing to report. A machine on a VPC is a different story: with
+// bridge binding the guest is served DHCP by its own launcher pod and gets
+// that pod's resolver, which is the cluster CoreDNS ClusterIP — no route from
+// inside a VPC. The subnet's own `dhcpV4Options` never reach the guest at all,
+// which is the part that took a packet capture inside a VM to establish.
+//
+// So the machine either has a resolver placed on the launcher deliberately, or
+// it has none. "None" is a legitimate state; looking identical to "configured"
+// is not, and that is what it did — an IP answers, a name does not, and no
+// object anywhere mentions DNS.
+func resolvableCondition(
+	vm *platformv1alpha1.ManagedVM, in kubevirt.Input,
+) metav1.Condition {
+	onVPC := false
+	for _, n := range in.Networks {
+		if n.IsVPCOverlay {
+			onVPC = true
+			break
+		}
+	}
+	switch {
+	case !onVPC:
+		return metav1.Condition{
+			Type: platformv1alpha1.ConditionResolvable, Status: metav1.ConditionTrue,
+			Reason:             "ClusterDNS",
+			Message:            "this machine is on the cluster overlay and uses the cluster resolver",
+			ObservedGeneration: vm.Generation,
+		}
+	case in.VPCDNSVIP != "":
+		return metav1.Condition{
+			Type: platformv1alpha1.ConditionResolvable, Status: metav1.ConditionTrue,
+			Reason:             "VPCResolver",
+			Message:            "the guest resolves names at " + in.VPCDNSVIP,
+			ObservedGeneration: vm.Generation,
+		}
+	default:
+		return metav1.Condition{
+			Type: platformv1alpha1.ConditionResolvable, Status: metav1.ConditionFalse,
+			Reason: "NoResolverInVPC",
+			Message: "this machine is on a VPC and has no name server it can " +
+				"reach: kube-ovn's vpc-dns is not enabled and the network " +
+				"names no dnsServer, so the launcher hands the guest the " +
+				"cluster resolver, which has no route from here. Addresses " +
+				"work and names do not. Enable vpc-dns in kube-ovn, or set a " +
+				"dnsServer on the network that is reachable from it.",
+			ObservedGeneration: vm.Generation,
+		}
+	}
 }
 
 // vpcDNSVIP finds the resolver a guest on this subnet must use.

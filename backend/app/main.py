@@ -62,6 +62,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         except Exception as e:
             logger.warning(f"LLDAP seeding failed (will retry on first request): {e}")
 
+    # One-off: take back a resolver address this backend invented and wrote
+    # onto networks. See app/core/dns_migration.py — it is a no-op on a
+    # cluster that never had it.
+    try:
+        from app.core.dns_migration import withdraw_unreachable_dns_servers
+        withdrawn = await withdraw_unreachable_dns_servers(k8s_client)
+        if withdrawn:
+            logger.info(f"Withdrew an unreachable dnsServer from: {withdrawn}")
+    except Exception as e:
+        logger.warning(f"dnsServer withdrawal skipped: {e}")
+
     # Start tenant addon reconciler (background task) — only if tenants enabled
     from app.config import get_settings
     reconciler_task = None

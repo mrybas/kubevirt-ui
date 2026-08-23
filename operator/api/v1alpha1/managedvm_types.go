@@ -267,6 +267,18 @@ const (
 	// ConditionDisksAttached is false when a declared disk could not be
 	// attached, and names what is holding it.
 	ConditionDisksAttached = "DisksAttached"
+
+	// ConditionResolvable is whether this machine has a name server it can
+	// actually reach.
+	//
+	// Only meaningful on a VPC. With bridge binding the guest is served DHCP
+	// by its own launcher pod, which hands over the pod's resolver — the
+	// cluster's CoreDNS ClusterIP, which has no route from inside a VPC. The
+	// subnet's own DHCP options never reach the guest at all. So a machine on
+	// a VPC either has a resolver placed on the launcher deliberately, or it
+	// has none, and "none" used to look exactly like "configured": an IP
+	// answers, a name does not, and nothing anywhere says why.
+	ConditionResolvable = "Resolvable"
 )
 
 // ManagedVMStatus is the derived state, kept deliberately small.

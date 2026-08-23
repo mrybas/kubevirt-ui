@@ -4,7 +4,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import * as templatesApi from '@/api/templates';
-import { settle } from './settle';
+import { pollWhile, settle } from './settle';
 import type {
 
   VMTemplateCreate,
@@ -79,6 +79,14 @@ export function useImages(namespace?: string) {
   return useQuery({
     queryKey: ['images', namespace],
     queryFn: () => templatesApi.listImages(namespace),
+    // An import takes minutes and the row was fetched once: a disk that had
+    // been Ready for eighty seconds still read Pending until somebody
+    // reloaded the page. The status is honest now — Pending during an import
+    // rather than a premature Ready — which makes standing still on it worse,
+    // not better.
+    refetchInterval: pollWhile<{ items: { status: string }[] }>((data) =>
+      (data?.items ?? []).some((image) => image.status === 'Pending'),
+    ),
   });
 }
 

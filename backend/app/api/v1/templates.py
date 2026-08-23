@@ -943,6 +943,7 @@ async def list_golden_images(
                         continue
                     
                     images.append(GoldenImage(
+                        progress=(status_obj.get("progress") or None),
                         name=dv_name,
                         namespace=dv_ns,
                         display_name=annotations.get("kubevirt-ui.io/display-name", dv_name),
@@ -1102,6 +1103,7 @@ async def _described_but_unbuilt_images(
             ns_labels = ns_labels_map.get(ns, {})
             source = spec.get("source", {}) or {}
             out.append(GoldenImage(
+                progress=(status_obj.get("progress") or None),
                 name=name,
                 namespace=ns,
                 display_name=spec.get("displayName") or name,

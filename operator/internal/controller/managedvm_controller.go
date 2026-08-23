@@ -215,6 +215,7 @@ func (r *ManagedVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		Message:            fmt.Sprintf("cloning from %s/%s", in.GoldenPVCNamespace, in.GoldenPVCName),
 		ObservedGeneration: vm.Generation,
 	})
+	apimeta.SetStatusCondition(&vm.Status.Conditions, resolvableCondition(vm, in))
 	vm.Status.ObservedGeneration = vm.Generation
 
 	if err := kube.UpdateStatus(ctx, r.Client, vmControllerName, vm, before); err != nil {
@@ -551,6 +552,16 @@ func (r *ManagedVMReconciler) reconcileExistingVM(
 			patched.Spec.Template.Spec.Domain.CPU = desired.Spec.Template.Spec.Domain.CPU
 			patched.Spec.Template.Spec.Domain.Memory = desired.Spec.Template.Spec.Domain.Memory
 			patched.Spec.Template.Spec.Domain.Resources = desired.Spec.Template.Spec.Domain.Resources
+			// The resolver too, including when the answer is "none".
+			//
+			// This block reconciles what the controller owns, and DNS was not
+			// in it, so an address written into a machine stayed there for
+			// ever. Machines built while the product invented a resolver
+			// address still carry `dnsConfig.nameservers: [10.96.0.200]` —
+			// a ClusterIP with no route from the VPC the machine is on — and
+			// no amount of reconciling took it away, because nothing looked.
+			patched.Spec.Template.Spec.DNSPolicy = desired.Spec.Template.Spec.DNSPolicy
+			patched.Spec.Template.Spec.DNSConfig = desired.Spec.Template.Spec.DNSConfig
 		}
 		return nil
 	})

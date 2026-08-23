@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/netip"
 	"regexp"
 	"strings"
 	"sync"
@@ -101,13 +102,23 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 	// object was looked for, so disagreeing with it costs one kubectl.
 	if !r.vpcDNSIsServed(ctx, kubeOVNNS) {
 		net.Status.ServiceRoute = ""
+		message := fmt.Sprintf("kube-ovn's vpc-dns feature is not enabled in "+
+			"this cluster — there is no ConfigMap %s/%s, so nothing will "+
+			"serve a VpcDns and workloads in this network have no resolver. "+
+			"Enable it in kube-ovn, or set a dnsServer on this network.",
+			kubeOVNNS, vpcDNSConfigMap)
+		if r.unreachableResolver(ctx, net) {
+			message = fmt.Sprintf("this network names %s as its resolver, "+
+				"which is inside the cluster's service network and therefore "+
+				"has no route from inside a VPC — and kube-ovn's vpc-dns, "+
+				"which would serve one, is not enabled (no ConfigMap %s/%s). "+
+				"It is not programmed: a dead resolver in a guest is worse "+
+				"than none. Clear spec.dnsServer, name one that is reachable "+
+				"from this network, or enable vpc-dns.",
+				net.Spec.DNSServer, kubeOVNNS, vpcDNSConfigMap)
+		}
 		r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, false,
-			"KubeOVNVpcDNSDisabled",
-			fmt.Sprintf("kube-ovn's vpc-dns feature is not enabled in this "+
-				"cluster — there is no ConfigMap %s/%s, so nothing will serve "+
-				"a VpcDns and workloads in this network have no resolver. "+
-				"Enable it in kube-ovn, or set a dnsServer on this network.",
-				kubeOVNNS, vpcDNSConfigMap))
+			"KubeOVNVpcDNSDisabled", message)
 		return nil
 	}
 
@@ -124,6 +135,40 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 	}
 	r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, true, "Routed", message)
 	return nil
+}
+
+// unreachableResolver says whether this network's declared resolver is one
+// nothing can answer on from inside it.
+//
+// Narrow on purpose, and a datapath fact rather than a memory of our own
+// mistake: an address inside the cluster's service network is a ClusterIP,
+// and a ClusterIP has no route from a VPC unless kube-ovn's vpc-dns is
+// serving one. An address anywhere else — a resolver on the VLAN, a public
+// one — might work perfectly and is nobody's business here.
+//
+// It reports; it does not rewrite. `spec.dnsServer` is the caller's
+// declaration, and a controller that edits the spec it is given is a second
+// writer of somebody else's field — which is the shape of half the defects
+// this operator exists to have removed. The declaration is withdrawn by
+// whoever made it; what happens here is that it is not programmed and the
+// network says why.
+func (r *ManagedNetworkReconciler) unreachableResolver(
+	ctx context.Context, net *platformv1alpha1.ManagedNetwork,
+) bool {
+	if net.Spec.DNSServer == "" {
+		return false
+	}
+	cidr, err := r.serviceCIDR(ctx, net)
+	if err != nil || cidr == "" {
+		// Cannot tell, so nothing is refused.
+		return false
+	}
+	prefix, perr := netip.ParsePrefix(cidr)
+	if perr != nil {
+		return false
+	}
+	addr, aerr := netip.ParseAddr(net.Spec.DNSServer)
+	return aerr == nil && prefix.Contains(addr)
 }
 
 // vpcDNSIsServed reports whether anything in this cluster will act on a VpcDns.
@@ -155,6 +200,14 @@ func (r *ManagedNetworkReconciler) resolveDNSServer(
 	ctx context.Context, net *platformv1alpha1.ManagedNetwork, kubeOVNNS string,
 ) string {
 	if net.Spec.DNSServer != "" {
+		// Unless nothing can answer on it. A network created while the
+		// product invented this address still orders a ClusterIP that no
+		// guest in the VPC can reach; programming it puts a dead resolver in
+		// every guest's resolv.conf, which is worse than none, because the
+		// guest stops looking anywhere else.
+		if r.unreachableResolver(ctx, net) {
+			return ""
+		}
 		return net.Spec.DNSServer
 	}
 	if !wantsDNS(net) || kubeOVNNS == "" {

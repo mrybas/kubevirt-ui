@@ -137,7 +137,7 @@ rules:
   - apiGroups: ["platform.kubevirt-ui.io"]
     resources:
       - managednetworks
-    verbs: ["get", "create", "delete"]
+    verbs: ["get", "list", "create", "delete", "patch"]
 
   # A peering is described here and written by the operator. No patch: the
   # declaration is created or removed, never edited in place — changing which
