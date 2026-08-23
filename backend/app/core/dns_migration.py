@@ -16,11 +16,17 @@ it is this backend that withdraws it. A controller editing the spec it was
 handed is a second writer of somebody else's field, which is the shape of half
 the defects removed from this product in the last month.
 
-Narrow, and on a datapath fact rather than on a memory of the formula: only an
-address inside the cluster's service network, only while vpc-dns is not
-enabled, only on networks this product manages. An address anywhere else may
-be a resolver on the VLAN or a public one, and is somebody's deliberate
-choice.
+Narrow, and on a datapath fact rather than on a memory of the formula: an
+address inside the cluster's service network, while vpc-dns is not enabled, is
+a ClusterIP with no route from the VPC. An address anywhere else may be a
+resolver on the VLAN or a public one, and is somebody's deliberate choice.
+
+Every ManagedNetwork is examined, not only the ones this product created — the
+gate is what the address is, not who wrote it, and a network declared through
+GitOps with an unreachable ClusterIP is in exactly the same position. Such a
+source will re-apply the field on its next sync; nothing loops, because this
+runs once at startup, and the operator refuses to program it and says so on
+the network either way.
 
 Idempotent, and it runs once at startup. There is nothing to do on a cluster
 that never had the invented address, and nothing to undo on one where somebody
@@ -38,6 +44,28 @@ from app.core.operator import OPERATOR_GROUP, OPERATOR_VERSION
 logger = logging.getLogger(__name__)
 
 
+async def _vpc_dns_is_off(k8s: Any, kubeovn_ns: str) -> bool:
+    """Whether kube-ovn's vpc-dns is definitely not enabled.
+
+    Only a 404 says that. A 403, a timeout or a broken connection say the
+    cluster could not be asked — and treating "cannot tell" as "off" would
+    withdraw working resolver addresses on a cluster where the feature is on,
+    which is the one outcome this migration must never produce. The operator
+    draws the same line in `vpcDNSIsServed`.
+    """
+    from kubernetes_asyncio.client.rest import ApiException
+
+    try:
+        await k8s.core_api.read_namespaced_config_map(
+            name="vpc-dns-config", namespace=kubeovn_ns,
+        )
+    except ApiException as e:
+        return e.status == 404
+    except Exception:
+        return False
+    return False
+
+
 async def withdraw_unreachable_dns_servers(k8s: Any) -> list[str]:
     """Clear `spec.dnsServer` where nothing can answer on it. Returns the names."""
     from app.api.v1.network import _find_kubeovn_namespace
@@ -45,15 +73,11 @@ async def withdraw_unreachable_dns_servers(k8s: Any) -> list[str]:
 
     try:
         kubeovn_ns = await _find_kubeovn_namespace(k8s)
-        if kubeovn_ns:
-            try:
-                await k8s.core_api.read_namespaced_config_map(
-                    name="vpc-dns-config", namespace=kubeovn_ns,
-                )
-                # The feature is on: the address may well be the real one.
-                return []
-            except Exception:
-                pass
+        if kubeovn_ns and not await _vpc_dns_is_off(k8s, kubeovn_ns):
+            # Either the feature is on — the address may well be the real one —
+            # or the question could not be answered. Neither is grounds for
+            # taking somebody's declaration away.
+            return []
 
         await _ensure_cluster_config(k8s)
         service_cidr = _host_service_cidr()

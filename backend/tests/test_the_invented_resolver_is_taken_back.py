@@ -20,6 +20,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kubernetes_asyncio.client.rest import ApiException
+
 from app.core.dns_migration import withdraw_unreachable_dns_servers
 
 
@@ -29,19 +31,21 @@ def _network(name: str, dns: str | None) -> dict:
 
 async def _run(
     networks: list[dict], *, service_cidr: str | None = "10.96.0.0/12",
-    vpc_dns_enabled: bool = False,
+    vpc_dns_enabled: bool = False, config_error: Exception | None = None,
 ) -> tuple[list[str], list]:
     api = MagicMock()
     api.list_cluster_custom_object = AsyncMock(return_value={"items": networks})
     api.patch_cluster_custom_object = AsyncMock()
 
     k8s = MagicMock()
-    if vpc_dns_enabled:
+    if config_error is not None:
+        k8s.core_api.read_namespaced_config_map = AsyncMock(side_effect=config_error)
+    elif vpc_dns_enabled:
         k8s.core_api.read_namespaced_config_map = AsyncMock(
             return_value=SimpleNamespace(data={"coredns-vip": "10.96.0.200"}))
     else:
         k8s.core_api.read_namespaced_config_map = AsyncMock(
-            side_effect=Exception("not found"))
+            side_effect=ApiException(status=404, reason="Not Found"))
 
     with (
         patch("app.api.v1.network._find_kubeovn_namespace",
@@ -96,6 +100,22 @@ class TestWhatIsLeftAlone:
         withdrawn, patches = await _run(
             [_network("n", "10.96.0.200")], service_cidr=None)
         assert withdrawn == [] and patches == []
+
+    async def test_everything_when_the_question_could_not_be_asked(self) -> None:
+        """A 403 or a timeout is "cannot tell", not "the feature is off".
+
+        Treating them alike would take working resolver addresses away on a
+        cluster where vpc-dns is on — the one outcome this must never produce,
+        and the easiest to write by catching every exception alike.
+        """
+        for failure in (
+            ApiException(status=403, reason="Forbidden"),
+            ApiException(status=500, reason="Internal Server Error"),
+            TimeoutError("the apiserver did not answer"),
+        ):
+            withdrawn, patches = await _run(
+                [_network("n", "10.96.0.200")], config_error=failure)
+            assert withdrawn == [] and patches == [], failure
 
     async def test_a_dnsserver_that_is_not_an_address(self) -> None:
         withdrawn, _ = await _run([_network("n", "dns.internal")])
