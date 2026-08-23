@@ -111,16 +111,15 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 			"reachable from it."
 		if r.inServiceNetwork(ctx, net) {
 			message = fmt.Sprintf("this network names %s as its resolver, "+
-				"which is inside the cluster's service network and therefore "+
-				"has no route from inside a VPC — and kube-ovn's vpc-dns, "+
-				"which would serve one, is not enabled (no ConfigMap %s/%s). "+
-				"It is not programmed: a dead resolver in a guest is worse "+
-				"than none. Clear spec.dnsServer, name one that is reachable "+
-				"from this network, or enable vpc-dns.",
-				net.Spec.DNSServer, kubeOVNNS, vpcDNSConfigMap)
+				"which is a ClusterIP and therefore reachable from a VPC only "+
+				"through a VpcDns — and this kube-ovn does not bring that "+
+				"type. It is not programmed: a dead resolver in a guest is "+
+				"worse than none, because the guest stops looking anywhere "+
+				"else. Name a resolver reachable from this network, or clear "+
+				"spec.dnsServer.", net.Spec.DNSServer)
 		}
 		r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, false,
-			"KubeOVNVpcDNSDisabled", message)
+			"NoVpcDnsType", message)
 		return nil
 	}
 

@@ -103,6 +103,68 @@ func TestTheGroundUnderAVpcDnsIsBuilt(t *testing.T) {
 	})
 }
 
+// TestTheEmptyAnswerLeftBehindIsRepaired.
+//
+// The state every stand that ran -dev.14 is in: `vpc-dns-config` exists,
+// written by the product, with `coredns-vip: ""` — and kube-ovn spinning on
+// "corednsVip should be set" for every VpcDns in the cluster. A create-only
+// prerequisite step would look at the existing file, find it there, and leave
+// the empty answer in place for ever.
+func TestTheEmptyAnswerLeftBehindIsRepaired(t *testing.T) {
+	mustSharedNamespace(t, "kube-ovn")
+	mustOverlaySubnet(t)
+	clusterDNS := mustClusterDNSService(t)
+
+	broken := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "kube-ovn", Name: network.VPCDNSConfigMap,
+			Labels: map[string]string{"kubevirt-ui.io/managed": "true"},
+		},
+		Data: map[string]string{
+			"coredns-vip":    "",
+			"enable-vpc-dns": "true",
+			// And a key nobody here owns, which must survive the repair.
+			"somebody-elses": "keep me",
+		},
+	}
+	// Planted, or forced into that state if a sibling test already made it —
+	// the first version of this created-or-ignored, so the state under test
+	// was never actually there and the assertion measured somebody else's
+	// ConfigMap.
+	if err := k8sClient.Create(testCtx, broken); apierrors.IsAlreadyExists(err) {
+		live := &corev1.ConfigMap{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "kube-ovn", Name: network.VPCDNSConfigMap,
+		}, live); err != nil {
+			t.Fatalf("reading the existing config: %v", err)
+		}
+		live.Data = broken.Data
+		if err := k8sClient.Update(testCtx, live); err != nil {
+			t.Fatalf("forcing the empty answer: %v", err)
+		}
+	} else if err != nil {
+		t.Fatalf("planting the empty answer: %v", err)
+	}
+
+	r := &ManagedNetworkReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	if err := r.ensureVpcDNSPrereqs(testCtx, "kube-ovn", "10.96.0.200", clusterDNS); err != nil {
+		t.Fatalf("repairing: %v", err)
+	}
+
+	live := &corev1.ConfigMap{}
+	if err := k8sClient.Get(testCtx, types.NamespacedName{
+		Namespace: "kube-ovn", Name: network.VPCDNSConfigMap,
+	}, live); err != nil {
+		t.Fatalf("reading it back: %v", err)
+	}
+	if live.Data["coredns-vip"] != "10.96.0.200" {
+		t.Fatalf("coredns-vip = %q — the empty answer survived", live.Data["coredns-vip"])
+	}
+	if live.Data["somebody-elses"] != "keep me" {
+		t.Errorf("a key this controller does not own was dropped: %v", live.Data)
+	}
+}
+
 // TestAnEmptyVIPIsNeverWritten.
 //
 // `enable-vpc-dns: true` with no address describes neither an enabled feature

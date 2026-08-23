@@ -3557,3 +3557,55 @@ Still open, named rather than covered: nothing refuses a `spec.workers.count`
 that fits the ceiling but not the cluster, and the quota a tenant charges is
 still its reservation rather than its use — a folder can be full of room nobody
 is using.
+
+## The step that did not move: a VPC's resolver
+
+The largest handover miss found so far, and it took three wrong diagnoses —
+two of them mine — to see it.
+
+kube-ovn's VpcDns runs a CoreDNS per VPC behind one cluster-wide VIP. The
+controller that builds it does nothing until four things exist, and all four
+are this product's to create: the `ovn-nad` attachment, the `vpc-dns-config`
+gate, the `vpc-dns-corefile`, and a Kyverno ClusterPolicy per VPC. The
+backend's VPC-create path makes all four. The operator's path made the VpcDns
+object and nothing under it.
+
+So every VPC created after the network handover had the resolver's address
+handed to its guests over DHCP and nothing answering on it. From inside such a
+machine an address works and a name does not.
+
+### Three readings of one symptom
+
+The first was the tester's: Velero-style, "the CRD is absent, the platform does
+not have this feature". `kubectl get vpcdns` finds nothing because the resource
+is `vpc-dnses`. I repeated the same check and drew the same conclusion, and
+built a condition on it that told people to enable a feature the product
+enables itself.
+
+The second was mine: "the product invents a resolver address". It does pick
+one — service network, 200 in the last octet — but that is a convention, and
+the address is written into the configuration the product creates so that
+something answers there. Taking the derivation away did not fix anything and
+broke the other half: the value was read out of the very file it is written
+to, so the product recorded its own ignorance in its own source of truth
+(`coredns-vip: ""`) and kube-ovn refused every VpcDns in the cluster.
+
+The third was the one that held: the ground was never built on this path.
+
+### What it says about the handover
+
+Every other miss in this log has the same shape — a step that lived in a
+create handler with no counterpart in the receiver — and this one is the
+largest because it is four objects rather than one field, and because two of
+them are cluster singletons that look like somebody else's infrastructure. The
+gate I wrote read one of them as exactly that.
+
+The rule that would have caught it earlier is the one already in this log,
+applied to a wider object: *derive from the datapath, never from a fact you
+might own yourself*. A missing ConfigMap is not a statement by the platform if
+the product is the thing that writes it.
+
+Acceptance is on a cluster, not in a test: the operator's first pass repairs
+`coredns-vip` in place on a stand that has the empty one, kube-ovn builds the
+Deployment, the policy appears per VPC, a restarted launcher carries the VIP,
+and a guest resolves a name.
