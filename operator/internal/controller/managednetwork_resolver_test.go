@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -252,4 +253,74 @@ func mustClusterDNSService(t *testing.T) string {
 		t.Fatalf("reading the cluster resolver: %v", err)
 	}
 	return live.Spec.ClusterIP
+}
+
+// TestTheDNSPolicyGoesWithTheNetwork.
+//
+// It did not. A ClusterPolicy is cluster-scoped and had no owner, so every
+// VPC ever deleted left one behind: inert, because its precondition names a
+// logical switch that no longer exists and therefore matches no namespace,
+// and litter all the same — the kind nobody notices until they count.
+func TestTheDNSPolicyGoesWithTheNetwork(t *testing.T) {
+	mustSharedNamespace(t, "kube-ovn")
+	mustOverlaySubnet(t)
+	clusterDNS := mustClusterDNSService(t)
+	_ = clusterDNS
+
+	net := &platformv1alpha1.ManagedNetwork{
+		ObjectMeta: metav1.ObjectMeta{Name: "netpolgone"},
+		Spec: platformv1alpha1.ManagedNetworkSpec{
+			CIDR: "10.200.152.0/22", ServiceCIDR: "10.96.0.0/12",
+		},
+	}
+	mustNetwork(t, net)
+
+	// Kyverno is not installed in envtest, so the policy cannot be created and
+	// the teardown must not trip over its absence either. What is measured
+	// here is that the teardown asks for it — on a cluster that has Kyverno,
+	// this is the delete that stops the litter.
+	eventually(t, "the network to settle", func() error {
+		if networkCondition(getNetwork(t, "netpolgone"),
+			platformv1alpha1.ConditionDNSReady) == nil {
+			return fmt.Errorf("not reconciled yet")
+		}
+		return nil
+	})
+
+	if err := k8sClient.Delete(testCtx, net); err != nil {
+		t.Fatalf("deleting the network: %v", err)
+	}
+	eventually(t, "the network to go without tripping over the missing type", func() error {
+		got := &platformv1alpha1.ManagedNetwork{}
+		err := k8sClient.Get(testCtx, types.NamespacedName{Name: "netpolgone"}, got)
+		if err == nil {
+			return fmt.Errorf("still deleting: %v", got.Status.Conditions)
+		}
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return nil
+	})
+}
+
+// TestTheTeardownAsksForThePolicyByName is the half envtest cannot show: that
+// the delete names the policy of this network, so a cluster with Kyverno loses
+// exactly that one.
+func TestTheTeardownAsksForThePolicyByName(t *testing.T) {
+	source := readSourceFile(t, "managednetwork_delete.go")
+	if !strings.Contains(source, "kyvernoPolicyGVK") {
+		t.Fatal("teardown does not remove the DNS-injection policy")
+	}
+	if !strings.Contains(source, "network.VPCDNSPolicyName(net.Name)") {
+		t.Error("the policy is not named after the network being deleted")
+	}
+}
+
+func readSourceFile(t *testing.T, name string) string {
+	t.Helper()
+	data, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatalf("reading %s: %v", name, err)
+	}
+	return string(data)
 }

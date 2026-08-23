@@ -22,9 +22,20 @@ What has to be there:
     (`enable-vpc-dns`), the VIP, the NAD to use, and the one host the pod is
     given a route to.
   - ConfigMap `vpc-dns-corefile` — mounted by every VpcDns pod in the cluster.
-  - a Kyverno ClusterPolicy per VPC, which is what actually reaches a guest:
-    with bridge binding the guest is served DHCP by its launcher pod and gets
-    that pod's resolver, so the pod is what has to be told.
+  - a Kyverno ClusterPolicy per VPC, for ordinary pods in a namespace bound
+    to that VPC.
+
+A machine does not need the policy and cannot be served by it. The rule's
+precondition reads the *namespace's* logical switch, and a VM's subnet is
+chosen on the machine, so for a VM it never fires — measured by deleting the
+policy and recreating the launcher, which resolved names anyway. What carries
+the resolver into a guest is the product writing `dnsPolicy`/`dnsConfig` into
+the VM itself; KubeVirt hands that to the launcher and the launcher hands it
+to the guest over DHCP.
+
+This was already known here and I asserted the opposite twice before measuring
+it: 0b333f6, "write the VPC resolver into the VM, not into a policy that may
+not fire".
 
 Two of those carry a hard-won detail apiece, and both are repeated here rather
 than rediscovered: `k8s-service-host` decides the single /32 route on the

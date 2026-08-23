@@ -24,7 +24,9 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -32,6 +34,7 @@ import (
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
 	"github.com/mrybas/kubevirt-ui/operator/internal/kube"
+	"github.com/mrybas/kubevirt-ui/operator/internal/network"
 )
 
 const (
@@ -103,6 +106,22 @@ func (r *ManagedNetworkReconciler) tearDown(
 		return ctrl.Result{}, err
 	}
 
+	// The DNS-injection policy goes with the network it was written for.
+	//
+	// It survived a delete: cluster-scoped, no owner, one left behind per VPC
+	// ever removed. Harmless — its precondition names a logical switch that no
+	// longer exists, so it matches nothing — and harmless litter is still
+	// litter, and the kind that is only noticed when somebody counts.
+	//
+	// A cluster with no Kyverno has no such object and nothing to remove;
+	// `deleteIfPresent` treats the missing type the same as the missing
+	// object.
+	if err := r.deleteIfPresent(
+		ctx, kyvernoPolicyGVK, network.VPCDNSPolicyName(net.Name),
+	); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	subnets, err := r.subnetsOf(ctx, net.Name)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -170,6 +189,12 @@ func (r *ManagedNetworkReconciler) deleteIfPresent(
 	obj.SetName(name)
 	if err := r.Get(ctx, types.NamespacedName{Name: name}, obj); err != nil {
 		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		// A type this cluster does not have is the same answer as an object
+		// it does not have: nothing to remove. Teardown is not the moment to
+		// discover that Kyverno was never installed.
+		if meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err) {
 			return nil
 		}
 		return fmt.Errorf("reading %s/%s: %w", gvk.Kind, name, err)

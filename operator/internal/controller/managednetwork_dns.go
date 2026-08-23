@@ -166,14 +166,29 @@ func (r *ManagedNetworkReconciler) reconcileDNS(
 		return nil
 	}
 	if policyMissing {
-		r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, false,
-			"NoKyverno",
-			"the resolver is running and routed, and nothing tells a pod to "+
-				"use it: injecting it needs Kyverno, which this cluster does "+
-				"not have. With bridge binding a guest is handed its launcher "+
-				"pod's resolver, so without the injection a VM in this network "+
-				"resolves at the cluster CoreDNS, which it cannot reach. "+
-				"Install Kyverno, or set dnsConfig on the machines yourself.")
+		// True, not false. The resolver is up and routed, and a machine in
+		// this network reaches it: the product writes `dnsConfig` into the VM
+		// itself, KubeVirt hands that to the launcher, and the launcher hands
+		// it to the guest over DHCP.
+		//
+		// I had this backwards and said so twice — that the policy was "the
+		// piece a guest actually feels". It cannot be: its precondition reads
+		// the *namespace's* logical switch, and a VM's subnet is chosen on the
+		// machine, so for a VM the rule never fires. Proven by deleting the
+		// policy and recreating the pod, which resolved names anyway; and
+		// written down in this repo before I forgot it (0b333f6 — "write the
+		// VPC resolver into the VM, not into a policy that may not fire").
+		//
+		// So Kyverno's absence costs plain pods in a namespace bound to this
+		// VPC, not machines. Reporting it as a broken network would put every
+		// Kyverno-less cluster permanently in the red while every VM on it
+		// resolves — a condition that cries wolf teaches people to stop
+		// reading conditions.
+		r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, true, "Routed",
+			message+". Kyverno is not installed, so ordinary pods in a "+
+				"namespace bound to this network keep the cluster resolver; "+
+				"machines are unaffected, their resolver is written into the "+
+				"VM itself")
 		return nil
 	}
 	r.setNetworkCondition(net, platformv1alpha1.ConditionDNSReady, true, "Routed", message)

@@ -87,16 +87,21 @@ func (r *ManagedNetworkReconciler) ensureVpcDNSPrereqs(
 	return nil
 }
 
-// ensureVpcDNSPolicy tells the pods of this VPC which resolver to use.
+// ensureVpcDNSPolicy tells ordinary pods in this VPC which resolver to use.
 //
-// The piece a guest actually feels. With bridge binding the guest is served
-// DHCP by its own launcher pod and is handed that pod's resolver, so the
-// subnet's DHCP options never reach it — the pod is what has to be told, and
-// Kyverno tells it at admission. Without this a launcher in a VPC inherits the
-// cluster CoreDNS ClusterIP, which has no route from there.
+// Not machines. The rule's precondition reads the namespace's logical switch,
+// and a VM's subnet is chosen on the machine, so for a VM it never fires —
+// what carries the resolver into a guest is `dnsConfig` written into the VM
+// object itself. Deleting this policy and recreating a launcher leaves the
+// guest resolving names exactly as before; that is measured, unlike the two
+// times I claimed otherwise.
 //
-// Absent Kyverno is not a failure: the policy cannot be written and the
-// network says so through its DNS condition rather than the reconcile ending.
+// It matters for the case it is for: a namespace bound wholesale to a VPC,
+// where nothing writes a pod spec on the product's behalf and the namespace
+// annotation does match.
+//
+// Absent Kyverno is not a failure and not a broken network: the pods keep the
+// cluster resolver, the machines are unaffected, and the network says so.
 func (r *ManagedNetworkReconciler) ensureVpcDNSPolicy(
 	ctx context.Context, net *platformv1alpha1.ManagedNetwork, vip string,
 ) error {
