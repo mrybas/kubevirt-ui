@@ -36,6 +36,10 @@ export async function restoreVeleroBackup(
   });
 }
 
+export async function listVeleroRestores(): Promise<VeleroRestore[]> {
+  return apiRequest<VeleroRestore[]>('/velero/restores');
+}
+
 // ── Schedules ─────────────────────────────────────────────────────────────────
 
 export async function listVeleroSchedules(): Promise<VeleroSchedule[]> {

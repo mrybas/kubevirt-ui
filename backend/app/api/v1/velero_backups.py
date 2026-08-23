@@ -21,6 +21,7 @@ from app.core.auth import User, require_admin, require_auth
 from app.core.errors import k8s_error_to_http
 from app.core.groups import ENV_FOLDER_LABEL, ENV_ENVIRONMENT_LABEL
 from app.core.naming import VM_NAME_LABEL
+from app.api.v1.folders import _is_tenant_ns
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -68,6 +69,21 @@ class VeleroRestoreCreateRequest(BaseModel):
     included_namespaces: list[str] = []
     label_selector: str = ""
     restore_pvs: bool = True
+    # What happens to an object the target namespace already has.
+    #
+    # Velero's default is `none`: existing objects are left exactly as they
+    # are and counted as warnings. That is a reasonable default and a terrible
+    # surprise — UAT run 4 restored a VM onto a live one, got "Completed, 279
+    # items, 0 errors" with 66 warnings nobody displayed, and concluded the
+    # backup had restored an empty disk. Nothing was restored at all.
+    #
+    # So it is a choice the caller makes, and the answer comes back in the
+    # restore's warnings either way.
+    existing_resource_policy: str = Field(
+        "none",
+        pattern="^(none|update)$",
+        description="none: leave existing objects untouched. update: overwrite them.",
+    )
 
 
 class VeleroSchedulePatchRequest(BaseModel):
@@ -165,11 +181,21 @@ async def _find_velero_namespace(k8s_client: Any) -> str:
 
 
 async def _namespaces_for_env(k8s_client: Any, folder: str, environment: str) -> list[str]:
-    """Resolve a (folder, environment) pair to its env namespace(s)."""
+    """Resolve a (folder, environment) pair to its env namespace(s).
+
+    Tenant control-plane namespaces carry the same folder and environment
+    labels — that is how a tenant is scoped — so this used to return them too.
+    A dialog that asks for an environment then backed up three namespaces
+    including two tenants' control planes: 429 items where a person expected
+    their VMs. Measured in UAT run 4.
+
+    The folders code skips them in the same way, and for the same reason: a
+    tenant is not an environment somebody picks.
+    """
     core_api = client.CoreV1Api(k8s_client._api_client)
     selector = f"{ENV_FOLDER_LABEL}={folder},{ENV_ENVIRONMENT_LABEL}={environment}"
     ns_list = await core_api.list_namespace(label_selector=selector)
-    return [ns.metadata.name for ns in ns_list.items]
+    return [ns.metadata.name for ns in ns_list.items if not _is_tenant_ns(ns)]
 
 
 async def _ensure_vm_name_labels(k8s_client: Any, namespace: str, names: list[str]) -> None:
@@ -365,7 +391,13 @@ def _parse_restore(item: dict[str, Any]) -> dict[str, Any]:
         "started_at": restore_status.get("startTimestamp", ""),
         "completed_at": restore_status.get("completionTimestamp", ""),
         "errors": restore_status.get("errors", 0),
+        # Where the truth lived and nobody looked: Velero counts an object it
+        # left alone because the target already had it as a warning, not an
+        # error, and reports the restore Completed.
         "warnings": restore_status.get("warnings", 0),
+        "items_restored": (restore_status.get("progress") or {}).get("itemsRestored", 0),
+        "total_items": (restore_status.get("progress") or {}).get("totalItems", 0),
+        "existing_resource_policy": spec.get("existingResourcePolicy", "none"),
         "creation_time": metadata.get("creationTimestamp", ""),
     }
 
@@ -416,6 +448,27 @@ def _parse_storage_location(item: dict[str, Any]) -> dict[str, Any]:
 # ── Backup endpoints ─────────────────────────────────────────────────────────
 
 
+async def _visible_to(k8s_client: Any, user: User, namespaces: list[str]) -> bool:
+    """Whether this caller may see a backup, schedule or restore of this scope.
+
+    The same rule `_authorise_scope` enforces for doing something, asked
+    without raising so a listing can filter instead of refuse. Every listing
+    here was `require_auth` and unfiltered, so any authenticated user could
+    read every backup in the cluster and the namespaces it covers — the
+    folder-listing leak again, in the backup pages.
+
+    All of it, not some: a backup that spans three namespaces is one object
+    and restoring it touches all three, so seeing it takes being allowed all
+    three. A cluster-wide one (no namespaces named) stays admin-only, which is
+    what `_authorise_scope` already decided for acting on it.
+    """
+    try:
+        await _authorise_scope(k8s_client, user, namespaces, "see")
+    except HTTPException:
+        return False
+    return True
+
+
 @router.get("/backups", status_code=status.HTTP_200_OK)
 async def list_velero_backups(
     request: Request,
@@ -432,6 +485,10 @@ async def list_velero_backups(
             namespace=velero_ns, plural="backups",
         )
         backups = [_parse_backup(item) for item in result.get("items", [])]
+        backups = [
+            b for b in backups
+            if await _visible_to(k8s_client, user, b["included_namespaces"])
+        ]
         backups.sort(key=lambda x: x["creation_time"], reverse=True)
         return backups
 
@@ -439,6 +496,50 @@ async def list_velero_backups(
         if e.status == 404:
             return []
         raise k8s_error_to_http(e, "listing Velero backups")
+
+
+@router.get("/restores", status_code=status.HTTP_200_OK)
+async def list_velero_restores(
+    request: Request,
+    user: User = Depends(require_auth),
+) -> list[dict[str, Any]]:
+    """List Velero restores.
+
+    There was no way to read one. A restore could be started and the product
+    had no screen for how it went — not the phase, not the item count, not the
+    warnings. UAT run 4 restored a VM onto a live namespace and read
+    "Completed, 279 items, 0 errors" from the Velero CR by hand; the 66
+    warnings that said every one of those items had been skipped because it
+    already existed were nowhere, because nothing displayed any of it.
+
+    A restore is the operation people run when something has gone wrong. It is
+    the last one that should be fire-and-forget.
+    """
+    k8s_client = request.app.state.k8s_client
+    velero_ns = await _find_velero_namespace(k8s_client)
+
+    try:
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        result = await custom_api.list_namespaced_custom_object(
+            group=VELERO_GROUP, version=VELERO_VERSION,
+            namespace=velero_ns, plural="restores",
+        )
+        restores = [_parse_restore(item) for item in result.get("items", [])]
+        restores = [
+            r for r in restores
+            if await _visible_to(k8s_client, user, r["included_namespaces"])
+            or await _visible_to(
+                k8s_client, user,
+                await _scope_of(k8s_client, velero_ns, "backups", r["backup_name"]),
+            )
+        ]
+        restores.sort(key=lambda x: x["creation_time"], reverse=True)
+        return restores
+
+    except ApiException as e:
+        if e.status == 404:
+            return []
+        raise k8s_error_to_http(e, "listing Velero restores")
 
 
 @router.post("/backups", status_code=status.HTTP_201_CREATED)
@@ -548,6 +649,9 @@ async def create_velero_restore(
     spec: dict[str, Any] = {
         "backupName": backup_name,
         "restorePVs": restore_request.restore_pvs if restore_request else True,
+        "existingResourcePolicy": (
+            restore_request.existing_resource_policy if restore_request else "none"
+        ),
     }
     if restore_request and restore_request.included_namespaces:
         spec["includedNamespaces"] = restore_request.included_namespaces
@@ -597,6 +701,10 @@ async def list_velero_schedules(
             namespace=velero_ns, plural="schedules",
         )
         schedules = [_parse_schedule(item) for item in result.get("items", [])]
+        schedules = [
+            sch for sch in schedules
+            if await _visible_to(k8s_client, user, sch["included_namespaces"])
+        ]
         schedules.sort(key=lambda x: x["creation_time"], reverse=True)
         return schedules
 

@@ -56,7 +56,15 @@ export interface VeleroRestore {
   started_at: string;
   completed_at: string;
   errors: number;
+  /**
+   * An object Velero left alone because the target namespace already had it
+   * is counted here, not in `errors`, and the restore still says Completed.
+   * A restore with warnings is not a clean restore.
+   */
   warnings: number;
+  items_restored: number;
+  total_items: number;
+  existing_resource_policy: string;
   creation_time: string;
 }
 
@@ -90,6 +98,12 @@ export interface CreateVeleroRestoreRequest {
   included_namespaces?: string[];
   label_selector?: string;
   restore_pvs?: boolean;
+  /**
+   * What happens to an object the target namespace already has. Velero's
+   * default leaves it exactly as it is and counts a warning — which is how a
+   * restore onto a live VM reported 279 items, 0 errors, and changed nothing.
+   */
+  existing_resource_policy?: 'none' | 'update';
 }
 
 export interface CreateStorageLocationRequest {

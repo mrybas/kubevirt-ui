@@ -113,7 +113,11 @@ def test_the_covered_set_is_read_from_the_spec() -> None:
 
 # Each route, and the decision made for it. A new route with no entry fails.
 EXPECTED = {
+    # The listings are `require_auth` at the door and filtered inside: a
+    # backup names the namespaces it covers, and reading every backup in the
+    # cluster was the folder-listing leak in another set of pages.
     ("GET", "/velero/backups"): "require_auth",
+    ("GET", "/velero/restores"): "require_auth",
     ("POST", "/velero/backups"): "require_auth+scope",
     ("DELETE", "/velero/backups/{name}"): "require_auth+scope",
     ("POST", "/velero/backups/{backup_name}/restore"): "require_auth+scope",
