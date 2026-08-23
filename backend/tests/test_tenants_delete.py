@@ -26,6 +26,23 @@ from kubernetes_asyncio.client import ApiException
 from app.api.v1 import tenants_crud
 
 
+def _managed_tenant_deletes(k8s: MagicMock) -> list[dict]:
+    """The cluster-scoped deletes that were about the tenant's description.
+
+    These assertions used to be `assert_awaited_once` on the mock itself,
+    which counts every cluster-scoped delete the teardown makes — and the
+    teardown grew: releasing the transit plane removes kube-ovn objects that
+    are cluster-scoped too. The tests then failed for a reason unrelated to
+    what they are about, and stayed red long enough to become scenery.
+
+    What they mean is "the ManagedTenant was deleted, once".
+    """
+    return [
+        call.kwargs for call in k8s.custom_api.delete_cluster_custom_object.await_args_list
+        if call.kwargs.get("plural") == "managedtenants"
+    ]
+
+
 @pytest.fixture
 def k8s() -> MagicMock:
     mock = MagicMock()
@@ -150,10 +167,7 @@ async def test_a_described_tenant_is_handed_to_its_finalizer_first(
 
     await tenants_crud.delete_tenant(request_obj, "demo", user=_admin_user())
 
-    k8s.custom_api.delete_cluster_custom_object.assert_awaited_once()
-    assert k8s.custom_api.delete_cluster_custom_object.await_args.kwargs["plural"] == (
-        "managedtenants"
-    )
+    assert len(_managed_tenant_deletes(k8s)) == 1
     # And the sweep still runs: it removes the same things and finds nothing,
     # which is cheaper than two teardown paths kept in agreement by hand.
     k8s.core_api.delete_namespace.assert_awaited_once_with(name="tenant-demo")
@@ -175,4 +189,4 @@ async def test_a_described_tenant_is_deletable_with_no_namespace_left(
 
     await tenants_crud.delete_tenant(request_obj, "demo", user=_admin_user())
 
-    k8s.custom_api.delete_cluster_custom_object.assert_awaited_once()
+    assert len(_managed_tenant_deletes(k8s)) == 1

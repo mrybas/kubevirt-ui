@@ -42,7 +42,10 @@ FLUX_HELM_VERSION = "v2"
 # These match Talos defaults (service CIDR 10.96.0.0/12). Override per cluster via:
 #   TENANTS_VPCDNS_FORWARD_DNS  (kube-dns ClusterIP)
 #   TENANTS_VPCDNS_VIP          (free IP in service CIDR for VpcDns VIP)
-_VPCDNS_VIP_FALLBACK = "10.96.0.200"
+# Deliberately gone: there was a fallback address here, used when the service
+# CIDR could not be read, and it was the last of three ways to end up
+# promising a resolver nobody runs. A cluster that does not say where its VPC
+# resolver is does not have one.
 _VPCDNS_FORWARD_DNS_FALLBACK = "10.96.0.10"
 
 # OIDC defaults (can be overridden by env)
@@ -172,26 +175,31 @@ async def _ensure_cluster_config(k8s) -> dict[str, Any]:
     # `assert_tenant_cidrs_free`.
     host_service_cidr = await _discover_service_cidr(k8s)
 
+    # The address of a resolver, read from the cluster that would run it.
+    #
+    # This used to be arithmetic: take the service CIDR, put 200 in the last
+    # octet, and hand the result to every VPC over DHCP. It is a plausible
+    # address and nothing ever checked that anything answers on it. On a
+    # cluster where kube-ovn's vpc-dns feature is off — no `vpc-dns-config`,
+    # no VpcDns CRD at all — every VM in every VPC was told to resolve names
+    # at 10.96.0.200, which is why an IP works from those machines and a name
+    # does not. UAT run 4, E2.
+    #
+    # `vpc-dns-config` is where kube-ovn's own controller is configured, so
+    # its `coredns-vip` is the cluster stating the address, and its absence is
+    # the cluster saying there is no resolver to point at. Then nothing is
+    # promised: a DHCP option naming a server that does not exist is worse
+    # than no option, because the guest stops asking anything else.
     vpcdns_vip = vpcdns_vip_override
     if not vpcdns_vip:
-        service_cidr = host_service_cidr
-        if service_cidr:
-            try:
-                net = ipaddress.ip_network(service_cidr, strict=False)
-                # Replace the last octet of the network address with 200.
-                # For IPv4 service CIDRs like 10.96.0.0/12 → 10.96.0.200.
-                octets = str(net.network_address).split(".")
-                if len(octets) == 4:
-                    vpcdns_vip = f"{octets[0]}.{octets[1]}.{octets[2]}.200"
-            except (ValueError, TypeError) as e:
-                logger.warning(f"Could not parse service CIDR {service_cidr!r}: {e}")
+        vpcdns_vip = await _vpcdns_vip_from_kubeovn(k8s)
     if not vpcdns_vip:
-        logger.warning(
-            "VpcDns VIP could not be autodiscovered (service CIDR not found via "
-            f"kubeadm-config or kube-apiserver pod args); falling back to {_VPCDNS_VIP_FALLBACK}. "
-            "Override via TENANTS_VPCDNS_VIP env var."
+        logger.info(
+            "No VpcDns resolver is configured in this cluster (no "
+            "`coredns-vip` in the kube-ovn `vpc-dns-config` ConfigMap), so "
+            "VPC subnets are created without a DNS server. Enable vpc-dns in "
+            "kube-ovn, or set TENANTS_VPCDNS_VIP to an address that answers."
         )
-        vpcdns_vip = _VPCDNS_VIP_FALLBACK
 
     ingress_domain = domain_override or f"{ingress_ip}.nip.io"
 
@@ -347,6 +355,30 @@ def _mgmt_cidr_drop() -> str | None:
 
 def _vpcdns_forward_dns() -> str:
     return _require_cluster_config()["vpcdns_forward_dns"]
+
+
+async def _vpcdns_vip_from_kubeovn(k8s: Any) -> str:
+    """The resolver address kube-ovn states for itself, or empty.
+
+    The same ConfigMap the operator reads to decide whether a VpcDns will be
+    served at all. One fact, two readers: if the operator will not create the
+    object because nothing serves it, the backend must not hand out its
+    address either.
+    """
+    try:
+        from app.api.v1.network import _find_kubeovn_namespace
+
+        ns = await _find_kubeovn_namespace(k8s)
+        if not ns:
+            return ""
+        cm = await k8s.core_api.read_namespaced_config_map(
+            name="vpc-dns-config", namespace=ns,
+        )
+    except Exception:
+        # Absent, unreadable, or no kube-ovn at all. None of those is an
+        # address, and inventing one is the defect this replaces.
+        return ""
+    return ((cm.data or {}).get("coredns-vip") or "").strip()
 
 
 def _vpcdns_vip() -> str:
