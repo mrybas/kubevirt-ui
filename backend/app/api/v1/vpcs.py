@@ -56,6 +56,7 @@ from app.core.constants import (
     KYVERNO_API_VERSION,
 )
 from app.core.errors import k8s_error_to_http
+from app.core.vpc_access import VpcFacts, visible_vpcs
 from app.core.groups import (
     get_user_namespaces,
     is_admin,
@@ -214,6 +215,19 @@ async def _mgmt_deny_sources(k8s) -> list[str]:
 # Same lesson as the isolation guard: a role is a decision, so it is written
 # down. `kubevirt-ui.io/egress-gateway` already was such a declaration and is
 # honoured as one; new roles use the general label.
+from app.core.operator import (  # noqa: E402  (kept beside the constants it serves)
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    network_path_enabled,
+    peering_path_enabled,
+)
+
+# Marks a subnet whose ACL list the operator's composer writes. Set by the
+# operator, and only after it has proved that taking the list over changes
+# nothing — so its presence means "somebody else is the single writer here".
+ACL_OWNER_ANNOTATION = "platform.kubevirt-ui.io/acl-owner"
+ACL_OWNER_OPERATOR = "operator"
+
 VPC_ROLE_LABEL = "kubevirt-ui.io/role"
 EGRESS_GATEWAY_LABEL = "kubevirt-ui.io/egress-gateway"
 ROLE_INFRASTRUCTURE = "infrastructure"
@@ -450,6 +464,19 @@ async def _ensure_vpc_dns_prereqs(k8s) -> None:
     from app.api.v1.network import _find_kubeovn_namespace
     kubeovn_ns = await _find_kubeovn_namespace(k8s)
     vip = _vpcdns_vip()
+    if not vip:
+        # Never write the question mark. A `vpc-dns-config` carrying
+        # `enable-vpc-dns: true` with an empty `coredns-vip` describes neither
+        # an enabled feature nor a disabled one: kube-ovn refuses every VpcDns
+        # in the cluster with "corednsVip should be set", and every check that
+        # reads the file's existence as an answer is told the wrong thing.
+        # Measured on the stand after the address stopped being derived.
+        logger.warning(
+            "Not writing VpcDns prerequisites: no VIP is configured or "
+            "derivable, and a configuration with an empty coredns-vip is "
+            "worse than none."
+        )
+        return
     labels = {"kubevirt-ui.io/managed": "true"}
 
     # 1. NetworkAttachmentDefinition (default ns, shared across VPCs)
@@ -809,12 +836,17 @@ async def _ensure_vpc_dns(
     # explicit recreate endpoint. Errors here are non-fatal (admin can
     # debug the partial state); they just reduce the chance VpcDns reaches
     # ACTIVE on first reconcile.
-    try:
-        await _ensure_vpc_dns_prereqs(k8s)
-    except Exception as exc:
-        logger.warning(
-            f"VpcDns prereq ensure for VPC {vpc_name!r} hit a non-fatal error: {exc}"
-        )
+    # One writer per object. With the network path handed over, the operator
+    # creates these — the step that did not move with it, and the whole of E2 —
+    # and two writers of `vpc-dns-config` is how a VIP gets overwritten by
+    # whichever pass ran last.
+    if not network_path_enabled():
+        try:
+            await _ensure_vpc_dns_prereqs(k8s)
+        except Exception as exc:
+            logger.warning(
+                f"VpcDns prereq ensure for VPC {vpc_name!r} hit a non-fatal error: {exc}"
+            )
 
     body = {
         "apiVersion": f"{KUBEOVN_GROUP}/{KUBEOVN_VERSION}",
@@ -1069,38 +1101,21 @@ async def list_vpcs(
         vpcs = [v for v in vpcs if v.environment == environment or not v.environment]
 
     if not is_admin(user.groups, user):
-        # B4 (T9): a folder-scoped VPC that was just created has an empty
-        # `spec.namespaces` (no tenants attached yet), so the namespace-
-        # overlap filter alone would hide the VPC from the folder admin who
-        # is supposed to pick it in the wizard. OR-in a label-based check
-        # against the folder access machinery: folder-viewer sees folder-wide
-        # VPCs, env-viewer sees env-scoped VPCs.
-        user_ns = set(await get_user_namespaces(k8s, user))
-        try:
-            folders_map = await load_folders(k8s)
-        except HTTPException as e:
-            # 404 → no folders configured yet → no label-based access; fall
-            # back to ns-overlap only. Other errors bubble up.
-            if e.status_code == 404:
-                folders_map = {}
-            else:
-                raise
-
-        def _label_accessible(v: VpcResponse) -> bool:
-            if not v.folder:
-                return False  # unlabeled VPC — admin-only via existing filter
-            folder_meta = folders_map.get(v.folder)
-            if not folder_meta:
-                return False  # folder no longer exists or unparseable meta
-            if v.environment is None:
-                return is_folder_viewer(user, folder_meta)
-            return is_env_viewer(user, folder_meta, v.environment)
-
-        vpcs = [
-            v for v in vpcs
-            if v.name != SYSTEM_VPC_NAME
-            and ((set(v.namespaces or []) & user_ns) or _label_accessible(v))
-        ]
+        # The rule lives in app.core.vpc_access, because `GET /subnets` needs
+        # the same answer and used to compute a different one: it asked only
+        # whether `spec.namespaces` overlapped, which hides a VPC that nothing
+        # is attached to yet — that is, every VPC that has just been created.
+        # The wizard that lists networks for a VM read that half and offered
+        # nothing while this endpoint offered three.
+        visible = await visible_vpcs(
+            k8s, user,
+            (VpcFacts(
+                name=v.name, folder=v.folder, environment=v.environment,
+                namespaces=tuple(v.namespaces or ()),
+            ) for v in vpcs),
+            SYSTEM_VPC_NAME,
+        )
+        vpcs = [v for v in vpcs if v.name in visible]
 
     return VpcListResponse(items=vpcs, total=len(vpcs))
 
@@ -1252,6 +1267,25 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
         # that CIDR next.
         and not (i.get("metadata", {}) or {}).get("deletionTimestamp")
     ]
+
+    # Subnets the operator's composer has taken over are still part of the
+    # census — every other VPC has to know their prefixes — but their own rule
+    # lists belong to it now, and writing them from here as well is the
+    # two-writer failure this whole migration exists to remove.
+    #
+    # Ownership is read off the object, not off a feature flag: it is a property
+    # of the subnet, and it stays true after the flag goes off.
+    owned = {
+        (i.get("metadata", {}) or {}).get("name")
+        for i in tenant_subnets
+        if ((i.get("metadata", {}) or {}).get("annotations") or {})
+        .get(ACL_OWNER_ANNOTATION) == ACL_OWNER_OPERATOR
+    }
+    if owned:
+        logger.info(
+            "Isolation reconcile: %d subnet(s) are the operator's and are left "
+            "to it: %s", len(owned), ", ".join(sorted(owned)),
+        )
     supernet = get_settings().tenant_supernet
 
     # A peering is a declared intent to reach the other VPC. It writes the
@@ -1288,6 +1322,10 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
     for item in tenant_subnets:
         spec = item.get("spec", {}) or {}
         name = item["metadata"]["name"]
+        if name in owned:
+            # Its prefix still counts in everybody else's census above; its own
+            # list is not this pass's to write.
+            continue
         existing = spec.get("acls") or []
         if _vpc_role(item):
             # Infrastructure is not a tenant. It is also not merely skipped:
@@ -1386,6 +1424,206 @@ async def reconcile_isolation_acls(k8s_client: Any) -> int:  # noqa: C901
         )
         updated += 1
     return updated
+
+
+# ---------------------------------------------------------------------------
+# Operator path
+#
+# With OPERATOR_NETWORK_ENABLED the endpoint writes one object saying what the
+# network is, and the operator writes the Vpc, the Subnet, the VpcDns and the
+# service-network route on the resolver. The last of those is the reason the
+# switch is worth making: it used to be applied once at create time, when the
+# Deployment it belongs on does not exist yet, and only a person calling the
+# recreate endpoint ever applied it afterwards.
+# ---------------------------------------------------------------------------
+
+NETWORK_PLURAL = "managednetworks"
+
+
+def build_managed_network(
+    data: VpcCreateRequest, *, cidr: str, gateway: str,
+    namespaces: list[str], dns_server: str | None,
+) -> dict[str, Any]:
+    """The request, as the object the operator reconciles.
+
+    `deletionPolicy: Delete` because this network is being created here and
+    nowhere else, so the object really does own it. A network written down after
+    the fact — adoption — is the other case, and its default is Retain so that
+    describing something never quietly becomes owning it.
+    """
+    spec: dict[str, Any] = {
+        "cidr": cidr,
+        "gateway": gateway,
+        "isolated": data.isolated,
+        "natGateway": bool(data.enable_nat_gateway and _vpc_nat_gateway_enabled()),
+        "deletionPolicy": "Delete",
+    }
+    if namespaces:
+        spec["namespaces"] = list(namespaces)
+    for key, value in (
+        ("tenant", data.tenant), ("folder", data.folder),
+        ("environment", data.environment), ("role", data.role),
+        ("dnsServer", dns_server),
+    ):
+        if value:
+            spec[key] = value
+    if data.shared_cidrs:
+        spec["sharedCIDRs"] = list(data.shared_cidrs)
+    if data.static_routes:
+        spec["staticRoutes"] = [
+            {"cidr": r.cidr, "nextHopIP": r.next_hop_ip, "policy": r.policy}
+            for r in data.static_routes
+        ]
+    if b3_enabled():
+        attachments = [n for n in (transit_subnet_name(), external_subnet()) if n]
+        spec["externalPlane"] = {
+            "attachments": attachments,
+            # The next hop is not passed: the operator reads it from this
+            # subnet's own gateway. Carrying the address here as well is the
+            # same number in two places, and B3_VPC_GATEWAY drifting from the
+            # external subnet is a class of outage nobody would look for.
+            "egressSubnet": external_subnet(),
+        }
+    return {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedNetwork",
+        "metadata": {"name": data.name, "labels": {"kubevirt-ui.io/managed": "true"}},
+        "spec": spec,
+    }
+
+
+async def _create_managed_network(
+    k8s, data: VpcCreateRequest, *, cidr: str, gateway: str,
+    namespaces: list[str], dns_server: str | None,
+) -> None:
+    body = build_managed_network(
+        data, cidr=cidr, gateway=gateway, namespaces=namespaces, dns_server=dns_server,
+    )
+    try:
+        await k8s.custom_api.create_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=NETWORK_PLURAL, body=body,
+        )
+    except ApiException as e:
+        if e.status == 409:
+            raise HTTPException(
+                status_code=409, detail=f"VPC '{data.name}' already exists",
+            )
+        raise k8s_error_to_http(e, "VPC operation")
+
+
+async def _await_managed_network(k8s, name: str, attempts: int = 20) -> bool:
+    """Wait until the operator reports the objects exist.
+
+    Bounded, and expiry is not an error: the network is being built either way.
+    What the caller needs is to know whether the subnet is there yet, because
+    the isolation pass that runs next is the only thing that will ever write
+    that subnet's rules — run it too early and it skips a network that then
+    stays open with nothing scheduled to look again.
+    """
+    for _ in range(attempts):
+        try:
+            cr = await k8s.custom_api.get_cluster_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                plural=NETWORK_PLURAL, name=name,
+            )
+        except ApiException:
+            await asyncio.sleep(1)
+            continue
+        for cond in ((cr.get("status") or {}).get("conditions") or []):
+            if cond.get("type") == "Ready" and cond.get("status") == "True":
+                return True
+        await asyncio.sleep(1)
+    logger.warning(
+        "ManagedNetwork %r did not report Ready in time; the isolation pass may "
+        "have nothing to write to yet. The operator keeps building it, and the "
+        "next isolation reconcile will pick the subnet up.", name,
+    )
+    return False
+
+
+async def _await_managed_network_gone(k8s, name: str, attempts: int = 30) -> bool:
+    """Block until the ManagedNetwork is really gone.
+
+    Bounded: expiry is logged rather than raised, because refusing to delete a
+    network because a description is slow to disappear would be a worse answer
+    than a slightly racy one. But it is waited for, because the alternative is
+    two controllers writing the same objects in opposite directions.
+    """
+    for _ in range(attempts):
+        try:
+            await k8s.custom_api.get_cluster_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                plural=NETWORK_PLURAL, name=name,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return True
+            raise
+        await asyncio.sleep(1)
+    logger.warning(
+        "ManagedNetwork %r is still present; deleting the network anyway. If "
+        "the operator is still reconciling it, the two will fight.", name,
+    )
+    return False
+
+
+async def _managed_network_cascades(k8s, name: str) -> bool | None:
+    """Whether a ManagedNetwork exists, and whether deleting it takes the
+    network with it.
+
+    None means there is no such object. True means the operator will tear the
+    network down. False means the object only describes it, and something else
+    still has to do the work.
+    """
+    try:
+        cr = await k8s.custom_api.get_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=NETWORK_PLURAL, name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    return ((cr.get("spec") or {}).get("deletionPolicy")) == "Delete"
+
+
+async def _post_create_isolation(k8s, name: str) -> None:
+    """The same pass the legacy path runs, factored so both call one thing."""
+    try:
+        p = await reconcile_infra_peerings(k8s)
+        if p:
+            logger.info(f"Infra peerings created: {p}")
+        n = await reconcile_isolation_acls(k8s)
+        logger.info(f"Isolation ACLs re-scoped on {n} VPC subnet(s)")
+    except Exception as e:
+        logger.warning(f"Isolation reconcile after creating {name!r} failed: {e}")
+
+
+def _vpc_create_response(
+    data: VpcCreateRequest, *, cidr: str, gateway: str, subnet_name: str,
+    namespaces: list[str], isolated: bool,
+) -> VpcResponse:
+    return VpcResponse(
+        name=data.name,
+        role=data.role,
+        tenant=data.tenant,
+        folder=data.folder,
+        environment=data.environment,
+        enable_nat_gateway=data.enable_nat_gateway,
+        default_subnet=subnet_name,
+        subnets=[VpcSubnetInfo(name=subnet_name, cidr_block=cidr, gateway=gateway)],
+        static_routes=[
+            VpcStaticRoute(cidr=r.cidr, nextHopIP=r.next_hop_ip, policy=r.policy)
+            for r in data.static_routes
+        ],
+        namespaces=namespaces,
+        # What was actually written, not what was asked for — and only the
+        # tenant-isolation half of it. The management baseline is on every VPC
+        # and says nothing about whether this one is isolated.
+        isolated=isolated,
+        ready=False,
+    )
 
 
 @router.post("", response_model=VpcResponse, status_code=201)
@@ -1493,6 +1731,35 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
         isolation_acls = [
             *isolation_acls, *build_mgmt_deny_acls(await _mgmt_deny_sources(k8s)),
         ]
+
+    if network_path_enabled():
+
+        # One writer per object: with this on, the Vpc, the Subnet and the
+        # VpcDns below belong to the operator and nothing here writes them.
+        #
+        # What stays here is everything the operator has no business deciding:
+        # the CIDR already allocated above, the namespace checks that produced
+        # the honest 400s, the peerings, and the isolation ACLs.
+        await _create_managed_network(
+            k8s, data, cidr=cidr, gateway=gateway,
+            namespaces=bind_namespaces, dns_server=_vpcdns_vip(),
+        )
+        # Waited for, and what is waited for changed. The operator writes the
+        # isolation rules itself now and does not report the network ready until
+        # they are on the subnet, so isolation is durable desired state rather
+        # than something this process has to survive long enough to apply. If
+        # this process dies here the network still ends up closed.
+        #
+        # The pass below is still run, and still matters: the tenants whose own
+        # lists are still enumerated have to learn this prefix.
+        await _await_managed_network(k8s, data.name)
+        await _peer_shared_cidrs(k8s, data.name, data.shared_cidrs or [])
+        await _post_create_isolation(k8s, data.name)
+        return _vpc_create_response(
+            data, cidr=cidr, gateway=gateway,
+            subnet_name=f"{data.name}-default",
+            namespaces=bind_namespaces, isolated=bool(tenant_isolation),
+        )
 
     labels: dict[str, str] = {"kubevirt-ui.io/managed": "true"}
     if data.role:
@@ -1783,27 +2050,9 @@ async def create_vpc(request: Request, data: VpcCreateRequest, user: User = Depe
     except Exception as e:
         logger.warning(f"Isolation reconcile after creating {data.name!r} failed: {e}")
 
-    return VpcResponse(
-        name=data.name,
-        role=data.role,
-        tenant=data.tenant,
-        folder=data.folder,
-        environment=data.environment,
-        enable_nat_gateway=data.enable_nat_gateway,
-        default_subnet=default_subnet_name,
-        subnets=[VpcSubnetInfo(
-            name=default_subnet_name, cidr_block=cidr, gateway=gateway,
-        )],
-        static_routes=[
-            VpcStaticRoute(cidr=r.cidr, nextHopIP=r.next_hop_ip, policy=r.policy)
-            for r in data.static_routes
-        ],
-        namespaces=bind_namespaces,
-        # What was actually written, not what was asked for — and only the
-        # tenant-isolation half of it. The management baseline is on every VPC
-        # and says nothing about whether this one is isolated.
-        isolated=bool(tenant_isolation),
-        ready=False,
+    return _vpc_create_response(
+        data, cidr=cidr, gateway=gateway, subnet_name=default_subnet_name,
+        namespaces=bind_namespaces, isolated=bool(tenant_isolation),
     )
 
 
@@ -1977,6 +2226,40 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
     """Delete a VPC and cascade-delete its subnets and peerings."""
     k8s = request.app.state.k8s_client
 
+    # Ownership is a property of the object, not of a flag: a network created
+    # while the operator owned this path stays the operator's afterwards, and
+    # tearing it down from here would race the cascade it is already running.
+    #
+    # But only a CR that will actually cascade counts. A `Retain` one describes
+    # a network it does not own — deleting it removes the description and
+    # nothing else. Handing the teardown to it reported "being removed" and
+    # removed nothing at all, which is how a delete endpoint lies. Measured on
+    # the stand before this line existed.
+    cascades = await _managed_network_cascades(k8s, name)
+    if cascades is not None:
+        await k8s.custom_api.delete_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=NETWORK_PLURAL, name=name,
+        )
+        if cascades:
+            # No drain loop and no 409 here. The operator holds the object with
+            # a finalizer until the subnets are really gone and the router can
+            # follow them safely — the same wait, done by something that does
+            # not need to be asked twice.
+            return {"message": f"VPC '{name}' is being removed"}
+        # Waited for, and this is ordering rather than politeness. The operator
+        # keeps reconciling that object until it observes the deletion, and its
+        # writes are `CreateOrUpdate` — so a subnet deleted below can be kept
+        # alive, or recreated, by a controller still working from a description
+        # that no longer exists. Two reconcilers pulling in opposite directions
+        # is how a teardown wedges.
+        await _await_managed_network_gone(k8s, name)
+        logger.info(
+            "VPC %r had a ManagedNetwork with deletionPolicy=Retain: the "
+            "description is gone and the network is being deleted here.",
+            name,
+        )
+
     # Clean up OVN NAT gateway if exists (keyed by vpc_name)
     from app.api.v1.ovn_gateway import OVN_GW_LABEL, _cleanup_ovn_gateway, _get_gateway_tracking
     nat_names: dict[str, list[str]] = {}
@@ -2016,15 +2299,7 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
     # Peerings live in `Vpc.spec.vpcPeerings` on *both* routers — there is no
     # `vpc-peerings` object to delete, and deleting this VPC leaves the other
     # side pointing at a router that no longer exists.
-    peerings = await _get_vpc_peerings(k8s, name)
-    for peering in peerings:
-        remote = peering.remote_vpc
-        if not remote:
-            continue
-        try:
-            await _remove_peering_side(k8s, remote, name)
-        except Exception as e:
-            logger.warning(f"Failed to remove peering {remote}→{name}: {e}")
+    released = await _release_peerings(k8s, name)
 
     # Delete subnets.
     #
@@ -2084,7 +2359,7 @@ async def delete_vpc(request: Request, name: str, user: User = Depends(require_a
         "status": "deleted",
         "name": name,
         "subnets_deleted": len(subnets),
-        "peerings_deleted": len(peerings),
+        "peerings_deleted": released,
     }
 
 
@@ -2152,6 +2427,144 @@ def _peering_side_patch(
     return {"vpcPeerings": peerings, "staticRoutes": routes, "policyRoutes": policies}
 
 
+PEERING_PLURAL = "managednetworkpeerings"
+
+
+def peering_cr_name(a: str, b: str) -> str:
+    """One name for a pair, whichever side asked.
+
+    A peering is symmetric and the endpoint takes a local and a remote, so
+    without an ordering the same link asked for twice from opposite sides is two
+    objects racing to write the same two routers.
+    """
+    return "-".join(sorted((a, b)))
+
+
+async def _peering_cr(k8s, a: str, b: str) -> dict[str, Any] | None:
+    """The object claiming this pair, if there is one.
+
+    The record of ownership. A peering is not an object on the routers — it is
+    two entries in two lists — so ownership cannot be a label on the thing
+    owned; it is the existence of this.
+    """
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=PEERING_PLURAL, name=peering_cr_name(a, b),
+        )
+    except ApiException as e:
+        if e.status in (403, 404):
+            return None
+        raise
+
+
+async def _claimed_remotes(k8s, vpc_name: str) -> set[str]:
+    """Remotes of `vpc_name` whose peering belongs to the operator.
+
+    Read before this module rewrites `spec.vpcPeerings` wholesale: an entry the
+    operator owns must survive a write from here, or the first peering made the
+    old way erases one made the new way.
+    """
+    try:
+        listing = await k8s.custom_api.list_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION, plural=PEERING_PLURAL,
+        )
+    except ApiException as e:
+        if e.status in (403, 404):
+            return set()
+        raise
+    out: set[str] = set()
+    for item in listing.get("items", []) or []:
+        networks = (item.get("spec", {}) or {}).get("networks") or []
+        if len(networks) == 2 and vpc_name in networks:
+            out.add(networks[0] if networks[1] == vpc_name else networks[1])
+    return out
+
+
+async def _release_peerings(k8s, name: str) -> int:
+    """Take this VPC out of every peering it is in, from whichever side owns it.
+
+    A peering the operator holds goes by removing its object — the controller
+    takes both ends off under a finalizer. Removing the far side from here
+    instead is a second writer taking away what the first still believes it
+    holds, and the first puts it back: the deleted VPC's router is gone, so the
+    entry it writes points at nothing.
+    """
+    peerings = await _get_vpc_peerings(k8s, name)
+    claimed = await _claimed_remotes(k8s, name)
+    for peering in peerings:
+        remote = peering.remote_vpc
+        if not remote:
+            continue
+        if remote in claimed:
+            try:
+                await k8s.custom_api.delete_cluster_custom_object(
+                    group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                    plural=PEERING_PLURAL, name=peering_cr_name(name, remote),
+                )
+            except ApiException as e:
+                if e.status != 404:
+                    logger.warning(
+                        "Failed to remove peering object %s: %s",
+                        peering_cr_name(name, remote), e,
+                    )
+            continue
+        try:
+            await _remove_peering_side(k8s, remote, name)
+        except Exception as e:
+            logger.warning(f"Failed to remove peering {remote}→{name}: {e}")
+    return len(peerings)
+
+
+async def _describe_peering(
+    k8s, local: str, remote: str, link_cidr: str | None,
+) -> VpcPeeringInfo:
+    """Ask for the peering; the operator makes it and keeps it.
+
+    Deliberately not followed by an isolation reconcile. The composer derives
+    the allow from the routers' own peering list in the same pass it writes the
+    drops, so calling it here would run before the operator has written
+    anything and prove nothing — the older, applied path still calls it because
+    there the routers are already written when it returns.
+    """
+    body: dict[str, Any] = {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedNetworkPeering",
+        "metadata": {
+            "name": peering_cr_name(local, remote),
+            "labels": {"kubevirt-ui.io/managed": "true"},
+        },
+        "spec": {"networks": sorted((local, remote))},
+    }
+    if link_cidr:
+        body["spec"]["linkCIDR"] = link_cidr
+
+    try:
+        await k8s.custom_api.create_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=PEERING_PLURAL, body=body,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Peering is routed to the operator (OPERATOR_PEERING_ENABLED), "
+                    "but the ManagedNetworkPeering CRD is not installed"
+                ),
+            )
+        if e.status == 409:
+            raise HTTPException(
+                status_code=409,
+                detail=f"'{local}' and '{remote}' are already peered",
+            )
+        raise k8s_error_to_http(e, "describing the peering")
+
+    return VpcPeeringInfo(
+        name=peering_cr_name(local, remote), local_vpc=local, remote_vpc=remote,
+    )
+
+
 @router.post("/{name}/peerings", response_model=VpcPeeringInfo, status_code=201)
 async def create_vpc_peering(
     request: Request, name: str, data: VpcPeeringCreateRequest,
@@ -2174,6 +2587,13 @@ async def create_vpc_peering(
     anyway and the peering looks broken for no visible reason.
     """
     k8s = request.app.state.k8s_client
+
+    if peering_path_enabled():
+        # Described rather than applied: the operator writes both ends or
+        # neither, and goes on holding them. This endpoint writes twice and
+        # then forgets — a leg removed by hand, or lost by kube-ovn, stays lost.
+        return await _describe_peering(k8s, name, data.remote_vpc, data.link_cidr)
+
     result = await _create_peering_pair(k8s, name, data.remote_vpc, data.link_cidr)
     # The routes alone are not the peering. Isolation still drops the peer's
     # prefix, so without this the pair is written on both routers, shows
@@ -2389,6 +2809,23 @@ async def delete_vpc_peering(request: Request, name: str, remote_vpc: str, user:
     leaves and is silently dropped.
     """
     k8s = request.app.state.k8s_client
+
+    # A peering the operator owns is torn down by removing its object: the
+    # controller takes both ends off under a finalizer. Taking the ends off from
+    # here instead would be a second writer removing what the first still
+    # believes it holds, and the first would put them back.
+    described = await _peering_cr(k8s, name, remote_vpc)
+    if described is not None:
+        await k8s.custom_api.delete_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=PEERING_PLURAL, name=peering_cr_name(name, remote_vpc),
+        )
+        logger.info("Removed peering object for %r <-> %r", name, remote_vpc)
+        return {
+            "status": "deleted",
+            "peering": peering_cr_name(name, remote_vpc),
+            "vpcs_updated": sorted((name, remote_vpc)),
+        }
 
     removed: list[str] = []
     for local, remote in ((name, remote_vpc), (remote_vpc, name)):

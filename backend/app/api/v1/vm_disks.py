@@ -8,6 +8,7 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
+from app.core.operator import managed_owner, patch_managed_disks
 from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.kubevirt import get_hotplug_mode, kubevirt_subresource_call
 
@@ -46,6 +47,20 @@ class DiskResizeRequest(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+async def _managed_owner_of_vm(custom_api: Any, namespace: str, name: str) -> str | None:
+    """The ManagedVM behind this machine, if the operator owns it."""
+    try:
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    return managed_owner(vm, "ManagedVM")
+
+
 @router.post("/{name}/attach-disk", status_code=status.HTTP_200_OK)
 async def attach_disk_to_vm(
     request: Request,
@@ -64,10 +79,26 @@ async def attach_disk_to_vm(
     - Updates kubevirt-ui.io/attached-to label on the DataVolume
     """
     k8s_client = request.app.state.k8s_client
-    
+
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
-        
+
+        # A machine the operator owns keeps its attachments in its own spec, so
+        # that what is plugged in is visible in one place and outlives whatever
+        # plugged it in. Patching the VirtualMachine directly would be reverted.
+        owner = await _managed_owner_of_vm(custom_api, namespace, name)
+        if owner:
+            await patch_managed_disks(
+                custom_api, namespace, owner, attach_request.pvc_name, attach=True,
+                volume_name=attach_request.disk_name, bus=attach_request.bus,
+            )
+            return {
+                "vm": name,
+                "disk": attach_request.pvc_name,
+                "attached": True,
+                "message": f"Disk {attach_request.pvc_name} attached to {name}",
+            }
+
         # --- Check persistent disk constraints ---
         is_persistent = False
         dv_obj = None

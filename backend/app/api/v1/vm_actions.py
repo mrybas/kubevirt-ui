@@ -11,6 +11,12 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    managed_owner,
+    operation_name,
+)
 from app.core.auth import User, require_auth, require_env_member
 from app.core.groups import is_env_member, load_folder, resolve_env
 from app.core.kubevirt import kubevirt_subresource_call
@@ -53,6 +59,83 @@ class ResizeVMRequest(BaseModel):
     memory: str | None = Field(None, pattern=r"^\d+[MGT]i$", description="Memory (e.g. '4Gi')")
 
 
+async def _managed_vm_of(k8s_client: Any, namespace: str, name: str) -> str | None:
+    """The ManagedVM behind this machine, if the operator owns it.
+
+    A read that fails is reported, never treated as "not owned". Falling
+    through on a transient error would send an operator-owned machine down the
+    old path — which for recreate and clone is the destructive one — on the
+    strength of a question nobody managed to answer.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    try:
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Could not determine who manages VM {name}: {e.reason}",
+        )
+    return managed_owner(vm, "ManagedVM")
+
+
+async def _start_operation(
+    k8s_client: Any, namespace: str, owner: str, action: str, body: dict[str, Any],
+) -> str:
+    """Ask for an operation and return its name."""
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    op_name = operation_name(action, owner)
+    spec: dict[str, Any] = {"vmName": owner, "action": action}
+    spec.update(body)
+    await custom_api.create_namespaced_custom_object(
+        group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+        namespace=namespace, plural="managedvmoperations",
+        body={
+            "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+            "kind": "ManagedVMOperation",
+            "metadata": {"name": op_name, "namespace": namespace},
+            "spec": spec,
+        },
+    )
+    return op_name
+
+
+async def _set_managed_running(
+    k8s_client: Any, namespace: str, name: str, running: bool,
+) -> bool:
+    """Set the declared power state, if this machine is described by a resource.
+
+    Returns True when the resource was patched, False when the machine is not
+    operator-owned and the caller should use the old path.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    try:
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        raise
+
+    owner = managed_owner(vm, "ManagedVM")
+    if not owner:
+        return False
+
+    await custom_api.patch_namespaced_custom_object(
+        group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+        namespace=namespace, plural="managedvms", name=owner,
+        body={"spec": {"running": running}},
+        _content_type="application/merge-patch+json",
+    )
+    return True
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
@@ -67,6 +150,13 @@ async def start_vm(
     k8s_client = request.app.state.k8s_client
 
     try:
+        # A machine the operator owns takes its power state from the resource.
+        # Patching runStrategy directly would be reverted on the next
+        # reconcile — with an event, but reverted — so the button would appear
+        # to work and then undo itself.
+        if await _set_managed_running(k8s_client, namespace, name, True):
+            return VMStatusResponse(name=name, namespace=namespace, action="start", success=True)
+
         patch = {"spec": {"runStrategy": "Always"}}
         await k8s_client.patch_virtual_machine(name=name, namespace=namespace, body=patch)
         return VMStatusResponse(name=name, namespace=namespace, action="start", success=True)
@@ -99,6 +189,10 @@ async def stop_vm(
     k8s_client = request.app.state.k8s_client
 
     try:
+        if await _set_managed_running(k8s_client, namespace, name, False):
+            action = "force_stop" if stop_request.force else "stop"
+            return VMStatusResponse(name=name, namespace=namespace, action=action, success=True)
+
         body: dict[str, Any] = {}
         if stop_request.force:
             body["gracePeriod"] = 0
@@ -185,12 +279,30 @@ async def migrate_vm(
 ) -> VMStatusResponse:
     """Live migrate a running VM to a target node.
 
+    For a machine the operator owns this asks for an operation and returns; the
+    target node then lives on the migration object, and the machine is never
+    touched. The path below is what remains for machines that predate the
+    migration, and it is the reason this endpoint is being replaced: it pins the
+    machine with a nodeSelector that nothing ever removes, so a VM migrated once
+    cannot leave that node again.
+
     1. Validates the VM is running and not already on the target node.
     2. Patches the VM template with nodeSelector for the target node.
     3. Creates a VirtualMachineInstanceMigration CR to trigger migration.
     """
     k8s_client = request.app.state.k8s_client
     target_node = migrate_request.target_node
+
+    owner = await _managed_vm_of(k8s_client, namespace, name)
+    if owner:
+        op = await _start_operation(
+            k8s_client, namespace, owner, "Migrate",
+            {"migrate": {"targetNode": target_node} if target_node else {}},
+        )
+        return VMStatusResponse(
+            name=name, namespace=namespace, action="migrate", success=True,
+            message=f"Migration requested ({op})",
+        )
 
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
@@ -312,6 +424,16 @@ async def recreate_vm(
     then starts the VM. Preserves: VM name, network config (same IP), SSH keys.
     """
     k8s_client = request.app.state.k8s_client
+
+    owner = await _managed_vm_of(k8s_client, namespace, name)
+    if owner:
+        op = await _start_operation(k8s_client, namespace, owner, "Recreate", {"recreate": {}})
+        return {
+            "status": "recreating",
+            "vm": name,
+            "operation": op,
+            "message": f"Recreate requested ({op})",
+        }
 
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
@@ -523,6 +645,29 @@ async def clone_vm(
                     f"required on target environment"
                 ),
             )
+
+    owner = await _managed_vm_of(k8s_client, namespace, name)
+    if owner and target_ns == namespace:
+        # KubeVirt's own clone controller does this properly: volume naming,
+        # a fresh MAC and a fresh SMBIOS serial. The path below builds the copy
+        # by hand with a rename map that covers only dataVolumeTemplates, so an
+        # attached claim is copied verbatim and the copy ends up referencing the
+        # original's disks.
+        #
+        # Only same-namespace, because that is what the clone API supports.
+        op = await _start_operation(
+            k8s_client, namespace, owner, "Clone",
+            {"clone": {
+                "targetName": sanitize_display_name(clone_request.display_name),
+                "startAfterClone": bool(clone_request.start),
+            }},
+        )
+        return {
+            "status": "cloning",
+            "source": name,
+            "operation": op,
+            "message": f"Clone requested ({op})",
+        }
 
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)

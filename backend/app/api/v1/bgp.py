@@ -1075,7 +1075,19 @@ async def get_routed_egress(
                     bfd=status.get("bfdStatus", ""),
                 ))
     except ApiException as e:
-        logger.debug(f"No BGPSessionState available: {e}")
+        # Not debug. An empty `sessions` list renders as "no session state
+        # reported yet", which is indistinguishable from a session that is
+        # genuinely down — so the one case where the page is lying rather than
+        # reporting has to say so somewhere. 403 is its own sentence because it
+        # is not a cluster fact at all, it is our own Role missing a resource.
+        if e.status == 403:
+            logger.warning(
+                "BGPSessionState is forbidden to this ServiceAccount — the "
+                "page will show no sessions however healthy they are; grant "
+                "bgpsessionstates in namespace %s", frr_namespace(),
+            )
+        else:
+            logger.warning("Could not read BGPSessionState: %s", e)
 
     return RoutedEgressResponse(
         enabled=True,

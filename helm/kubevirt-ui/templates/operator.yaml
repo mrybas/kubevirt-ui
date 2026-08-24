@@ -1,0 +1,334 @@
+{{- /*
+The tenant supernet is one fact with two readers: the backend has it as
+TENANT_SUPERNET and the operator takes it as a flag. Configured twice under two
+names, they drift, and the drift is silent on both sides — so the chart takes it
+once, accepts the backend's existing value as the source when only that is set,
+and refuses to render when the two are set and disagree.
+*/}}
+{{- $backendSupernet := get .Values.backend.env "TENANT_SUPERNET" | toString }}
+{{- $supernet := .Values.operator.config.tenantSupernet | default $backendSupernet }}
+{{- if and .Values.operator.config.tenantSupernet $backendSupernet }}
+{{- if ne .Values.operator.config.tenantSupernet $backendSupernet }}
+{{- fail (printf "operator.config.tenantSupernet is %q and backend.env.TENANT_SUPERNET is %q. One fact, two readers: they must agree, or the isolation the operator writes will not match the addresses the backend hands out." .Values.operator.config.tenantSupernet $backendSupernet) }}
+{{- end }}
+{{- end }}
+{{- /*
+A handover flag names a controller that has to be running. Turning one on while
+its domain is off — or while the operator is not installed at all — hands the
+work to nobody: the product stops writing, nothing takes over, and the symptom
+is a create that reports success and produces nothing. Refused here, where it is
+one line of output, rather than in a cluster where it is an investigation.
+*/}}
+{{- $needs := dict
+      "OPERATOR_IMAGE_ENABLED" "vm"
+      "OPERATOR_VM_ENABLED" "vm"
+      "OPERATOR_TEMPLATE_ENABLED" "vm"
+      "OPERATOR_NETWORK_ENABLED" "network"
+      "OPERATOR_ANNOUNCE_ENABLED" "network"
+      "OPERATOR_UNDERLAY_ENABLED" "network"
+      "OPERATOR_PEERING_ENABLED" "network"
+      "OPERATOR_TENANT_ENABLED" "tenant"
+      "OPERATOR_TENANT_BOOTSTRAP_ENABLED" "tenant"
+      "OPERATOR_TENANT_TIME_ENABLED" "tenant"
+      "OPERATOR_TENANT_ADDONS_ENABLED" "tenant" }}
+{{- range $flag, $domain := $needs }}
+{{- $asked := get $.Values.backend.env $flag | toString | lower }}
+{{- if or (eq $asked "true") (eq $asked "1") (eq $asked "yes") }}
+{{- if not $.Values.operator.enabled }}
+{{- fail (printf "%s is on and the operator is not installed. Set operator.enabled, or leave the path with the product." $flag) }}
+{{- end }}
+{{- if not (get $.Values.operator.domains $domain).enabled }}
+{{- fail (printf "%s hands its work to the %s domain, and operator.domains.%s.enabled is false. Nothing would take it over." $flag $domain $domain) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and .Values.operator.enabled .Values.operator.webhooks.enabled (not .Values.operator.domains.vm.enabled) }}
+{{- fail "operator.webhooks.enabled needs operator.domains.vm.enabled: the admission server runs in that deployment, and a webhook configuration pointing at a service with no endpoints rejects every write it guards — these fail closed" }}
+{{- end }}
+{{- /*
+A tenant's external name is written into its certificate and into the kubeconfig
+the UI hands out. Publishing it takes an address, because external-dns cannot
+read one off an IngressRouteTCP — there is no load-balancer status on it — so
+with this empty the route exists, the certificate answers, and the name does not
+resolve. That happened, and the tenant reported it correctly while everybody
+read the objects instead.
+
+"none" is a real answer: a site whose records are made by something else says so
+once, here, rather than living with a condition that is False for ever.
+*/}}
+{{- if and .Values.operator.enabled .Values.operator.domains.tenant.enabled .Values.operator.config.ingressDomain (not .Values.operator.config.externalDNSTarget) }}
+{{- fail "operator.config.externalDNSTarget is required alongside ingressDomain: external-dns cannot infer an address from an IngressRouteTCP, so without it a tenant's name is in its certificate and in its kubeconfig and resolves nowhere. Set the ingress address, or \"none\" if something else publishes these records." }}
+{{- end }}
+{{- if and .Values.operator.enabled .Values.operator.domains.network.enabled (not $supernet) }}
+{{- fail "operator.config.tenantSupernet is required by the network domain: without it no isolation is written at all, and a VPC comes up attached, routed, and open to every other tenant while the UI says it is isolated" }}
+{{- end }}
+{{- if .Values.operator.enabled }}
+{{- $top := . }}
+{{- $cfg := .Values.operator.config }}
+{{- $tag := .Values.operator.image.tag | default .Chart.AppVersion }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-operator
+  namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}-operator-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}-operator-manager
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-operator
+    namespace: {{ .Release.Namespace }}
+---
+# Leader election is per domain, so each deployment holds its own lease and a
+# crash in one half cannot stop the others. Without these rights the process
+# starts, reports its domains, and then retries for ever without reconciling
+# anything — which looks exactly like a healthy pod.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-operator-leader-election
+  namespace: {{ .Release.Namespace }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-operator-leader-election
+  namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ .Release.Name }}-operator-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-operator
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.operator.webhooks.enabled }}
+---
+# The admission server, served by the vm deployment's pods.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-operator-webhook
+  namespace: {{ .Release.Namespace }}
+spec:
+  ports:
+    - port: 443
+      targetPort: 9443
+      protocol: TCP
+      name: https
+  selector:
+    app.kubernetes.io/name: kubevirt-ui-operator
+    platform.kubevirt-ui.io/domain: vm
+---
+# Self-signed, because this CA authenticates one server to one API server and
+# nothing else trusts it. cert-manager writes the CA into the webhook
+# configuration through the annotation the generator puts there.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ .Release.Name }}-operator-selfsigned
+  namespace: {{ .Release.Namespace }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Release.Name }}-operator-serving-cert
+  namespace: {{ .Release.Namespace }}
+spec:
+  dnsNames:
+    - {{ .Release.Name }}-operator-webhook.{{ .Release.Namespace }}.svc
+    - {{ .Release.Name }}-operator-webhook.{{ .Release.Namespace }}.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: {{ .Release.Name }}-operator-selfsigned
+  secretName: {{ .Release.Name }}-operator-webhook-cert
+{{- end }}
+{{- range $domain, $spec := .Values.operator.domains }}
+{{- if $spec.enabled }}
+---
+# One deployment per domain, same image, different --domains and therefore a
+# different lease. A crash in the network controllers must not stop VM
+# reconciliation.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $top.Release.Name }}-operator-{{ $domain }}
+  namespace: {{ $top.Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: kubevirt-ui-operator
+    platform.kubevirt-ui.io/domain: {{ $domain }}
+spec:
+  replicas: {{ $spec.replicas | default 1 }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubevirt-ui-operator
+      # In the selector as well as on the pods: two deployments of one image
+      # sharing a selector each match the other's pods.
+      platform.kubevirt-ui.io/domain: {{ $domain }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubevirt-ui-operator
+        platform.kubevirt-ui.io/domain: {{ $domain }}
+    spec:
+      serviceAccountName: {{ $top.Release.Name }}-operator
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: manager
+          image: "{{ $top.Values.operator.image.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ $top.Values.operator.image.pullPolicy }}
+          command: ["/manager"]
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+            - --metrics-secure=false
+            - --domains={{ $domain }}
+            {{- if eq $domain "network" }}
+            # The aggregate every tenant network is carved from. Empty means no
+            # isolation is written **at all** — one drop with nothing to scope it
+            # to would take the internet with it — so the network domain refuses
+            # to be installed without it rather than producing VPCs that report
+            # attached, route fine, and are open to every other tenant. That is
+            # what happened: the wizard's review said "Isolated: Yes" over a
+            # network whose own condition said NoSupernet.
+            - --tenant-supernet={{ $supernet }}
+            {{- if $cfg.mgmtCIDRs }}
+            # Optional: without it each node's own address is denied as a /32,
+            # which is right for a flat management network and too narrow for a
+            # routed one.
+            - --mgmt-cidr={{ join "," $cfg.mgmtCIDRs }}
+            {{- end }}
+            {{- if $cfg.serviceCIDR }}
+            # Optional: read from the cluster when absent. Needed where neither
+            # the kubeadm ConfigMap nor an apiserver pod can be read, which is
+            # every managed control plane.
+            - --service-cidr={{ $cfg.serviceCIDR }}
+            {{- end }}
+            {{- end }}
+          env:
+            # Admission belongs to one deployment or none. Two servers answering
+            # for one webhook configuration is a coin toss.
+            - name: ENABLE_WEBHOOKS
+              value: {{ if and (eq $domain "vm") $top.Values.operator.webhooks.enabled }}"true"{{ else }}"false"{{ end }}
+            {{- if or (eq $domain "tenant") (eq $domain "network") }}
+            # Where kube-ovn states the resolver a VPC worker uses. Set wrong
+            # once, and the tenant that found it sat waiting for a ConfigMap in
+            # an empty namespace. There is no safe default: the upstream name is
+            # not the one every cluster uses.
+            - name: KUBE_OVN_NAMESPACE
+              value: {{ required "operator.config.kubeOvnNamespace is required by the tenant and network domains — the namespace kube-ovn actually runs in, which is not always \"kube-ovn\"" $cfg.kubeOvnNamespace | quote }}
+            {{- end }}
+            {{- if eq $domain "tenant" }}
+            # The same names the backend reads, deliberately: two deployments
+            # configured by different variable names for one fact drift apart in
+            # silence, and the silence looks like a check that passed.
+            - name: TENANTS_CP_METALLB_POOL
+              value: {{ required "operator.config.metallbPool is required by the tenant domain — the MetalLB pool control-plane VIPs come from" $cfg.metallbPool | quote }}
+            - name: TENANTS_CP_METALLB_NAMESPACE
+              value: {{ required "operator.config.metallbNamespace is required by the tenant domain" $cfg.metallbNamespace | quote }}
+            # Without this the pool-versus-excludeIps invariant does not run at
+            # all, and "no complaint" reads exactly like "checked and fine".
+            - name: TENANTS_CP_TRANSIT_SUBNET
+              value: {{ required "operator.config.cpTransitSubnet is required by the tenant domain — without it the pool/excludeIps invariant silently never runs" $cfg.cpTransitSubnet | quote }}
+            # The external name a tenant's apiserver answers to. Without it the
+            # certificate carries no such SAN and kubectl through the ingress
+            # fails TLS — invisible from inside the cluster, which is where
+            # every test looks.
+            - name: TENANTS_INGRESS_DOMAIN
+              value: {{ required "operator.config.ingressDomain is required by the tenant domain — the suffix tenant apiservers are reached by" $cfg.ingressDomain | quote }}
+            {{- if and $cfg.externalDNSTarget (ne $cfg.externalDNSTarget "none") }}
+            # The address external-dns publishes for those names. It cannot read
+            # one off an IngressRouteTCP — there is no load-balancer status on
+            # it — so without this the route exists and the name does not
+            # resolve. The tenant says so in its own status rather than looking
+            # ready.
+            - name: TENANTS_EXTERNAL_DNS_TARGET
+              value: {{ $cfg.externalDNSTarget | quote }}
+            {{- end }}
+            {{- if $cfg.traefikEntryPoint }}
+            - name: TENANTS_TRAEFIK_ENTRYPOINT
+              value: {{ $cfg.traefikEntryPoint | quote }}
+            {{- end }}
+            {{- if $cfg.traefikTrustdEntryPoint }}
+            - name: TENANTS_TRAEFIK_TRUSTD_ENTRYPOINT
+              value: {{ $cfg.traefikTrustdEntryPoint | quote }}
+            {{- end }}
+            {{- $tenantIssuer := $cfg.oidcIssuer | default $top.Values.auth.oidc.issuer }}
+            {{- if $tenantIssuer }}
+            # A tenant may opt into OIDC, and the issuer defaults to the one
+            # this deployment already signs in with — stating it twice is how
+            # the feature came to be off everywhere. UAT run 4, O-1: two
+            # tenants created with `enableOIDC: true`, no `--oidc-*` argument
+            # on either apiserver, because this value was empty and nothing
+            # said so. Set `operator.config.oidcIssuer` only to point tenants
+            # at a *different* provider from the UI's.
+            - name: OIDC_ISSUER
+              value: {{ $tenantIssuer | quote }}
+            - name: OIDC_CLIENT_ID
+              value: {{ $cfg.oidcClientId | default $top.Values.auth.oidc.clientId | quote }}
+            {{- end }}
+            {{- end }}
+            {{- range $key, $value := $top.Values.operator.extraEnv }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          ports:
+            - name: health
+              containerPort: 8081
+            - name: metrics
+              containerPort: 8080
+            {{- if and (eq $domain "vm") $top.Values.operator.webhooks.enabled }}
+            - name: webhook
+              containerPort: 9443
+            {{- end }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8081}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8081}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources: {{- toYaml $top.Values.operator.resources | nindent 12 }}
+          {{- if and (eq $domain "vm") $top.Values.operator.webhooks.enabled }}
+          volumeMounts:
+            # controller-runtime's default location, which is why no
+            # --webhook-cert-path is passed: one fewer thing to keep in step.
+            - name: webhook-cert
+              mountPath: /tmp/k8s-webhook-server/serving-certs
+              readOnly: true
+          {{- end }}
+      {{- if and (eq $domain "vm") $top.Values.operator.webhooks.enabled }}
+      volumes:
+        - name: webhook-cert
+          secret:
+            secretName: {{ $top.Release.Name }}-operator-webhook-cert
+      {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

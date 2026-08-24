@@ -1,0 +1,25 @@
+# The environment the Go suite runs in.
+#
+# Two consumers: hack/soak.sh and hack/mutate.sh start throwaway containers from
+# it, and the long-lived `kvbuild` container used interactively is created from
+# it too. CI installs the same tools by name rather than using this image — see
+# the `checks` job — so the dependency is declared in both places and neither is
+# a machine somebody once set up by hand.
+#
+# It was an ad-hoc container called `kvbuild`, created by hand once and depended
+# on by name from two scripts. That worked until a test needed a tool the plain
+# Go image does not have: the interactive container had helm because it had been
+# installed into it by hand, and the throwaway containers the scripts start did
+# not — so the same test passed in one place and failed in the other for reasons
+# nothing recorded.
+FROM golang:1.26
+
+ARG HELM_VERSION=v3.16.3
+RUN set -eux; \
+	arch="$(dpkg --print-architecture)"; \
+	curl -sSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${arch}.tar.gz" \
+		-o /tmp/helm.tgz; \
+	tar -xzf /tmp/helm.tgz -C /tmp; \
+	mv "/tmp/linux-${arch}/helm" /usr/local/bin/helm; \
+	rm -rf /tmp/helm.tgz "/tmp/linux-${arch}"; \
+	helm version --short

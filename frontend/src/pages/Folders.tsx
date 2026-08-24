@@ -27,9 +27,11 @@ import type { ByteUnit } from '../utils/quantity';
 import { DataTable, type Column } from '@/components/common/DataTable';
 import type { MenuItem } from '@/components/common/KebabMenu';
 import { ActionBar } from '@/components/common/ActionBar';
+import { useAuthStore } from '../store/auth';
 
 export default function Folders() {
   const navigate = useNavigate();
+  const isAdmin = useAuthStore(s => s.user?.is_admin ?? false);
   const [searchParams, setSearchParams] = useSearchParams();
   const [showCreateModal, setShowCreateModal] = useState(false);
 
@@ -144,10 +146,17 @@ export default function Folders() {
         <button onClick={() => refetch()} className="btn-secondary" title="Refresh">
           <RefreshCw className="h-4 w-4" />
         </button>
-        <button onClick={() => setShowCreateModal(true)} className="btn-primary">
-          <Plus className="w-4 h-4" />
-          Create Folder
-        </button>
+        {/* Creating a folder is admin-only on the backend (require_admin), so
+            showing the button to everyone meant a button that answers 403 to
+            the person it is offered to — UAT run 4, R-2. Hidden rather than
+            disabled: a greyed control invites a question about how to earn
+            it, and this one cannot be earned by a folder admin. */}
+        {isAdmin && (
+          <button onClick={() => setShowCreateModal(true)} className="btn-primary">
+            <Plus className="w-4 h-4" />
+            Create Folder
+          </button>
+        )}
       </ActionBar>
 
       <DataTable
@@ -164,12 +173,12 @@ export default function Folders() {
           icon: <Folder className="h-16 w-16" />,
           title: 'No folders yet',
           description: 'Create a folder to organize your VMs and environments.',
-          action: (
+          action: isAdmin ? (
             <button onClick={() => setShowCreateModal(true)} className="btn-primary">
               <Plus className="w-4 h-4" />
               Create your first folder
             </button>
-          ),
+          ) : undefined,
         }}
       />
 

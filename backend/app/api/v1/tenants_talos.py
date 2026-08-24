@@ -466,31 +466,29 @@ def talos_control_plane_additions(
     tenant: str,
     namespace: str,
     signer_image: str,
-    *,
-    shared_vip: bool,
 ) -> dict[str, Any]:
     """Fragments to merge into the KamajiControlPlane spec.
 
-    `service.additionalPorts` carries 50001 only when each tenant has its own
-    VIP. On a shared VIP it must NOT go there: MetalLB refuses identical ports
-    on one shared address, so the router fronts a per-tenant ClusterIP service
-    instead.
+    There is deliberately no port here any more. This used to return an
+    `additionalPorts` entry for trustd, and `KamajiControlPlane.spec.network`
+    **has no such field**: its schema is advertiseAddress, certSANs,
+    dnsServiceIPs, gateway, ingress, loadBalancerConfig, serviceAddress,
+    serviceAnnotations, serviceLabels, serviceType — and nothing else, so the
+    API server pruned it in silence. Confirmed on two live tenants, whose
+    network carries exactly advertiseAddress, certSANs and serviceType.
+
+    It never mattered because trustd is published by the tenant's own Services
+    — the LoadBalancer on its address and the ClusterIP beside it — which is
+    where workers actually reach it. But a write that reads like configuration
+    and does nothing is worse than no write, and four tests were guarding it.
     """
-    additions: dict[str, Any] = {
+    return {
         "additionalContainers": [build_signer_sidecar(tenant, signer_image)],
         "additionalVolumes": build_signer_volume(tenant),
         # The apiserver certificate must answer to the same names the worker
         # dials, or the join fails TLS before trustd is ever reached.
         "certSANs": signer_dns_names(tenant, namespace),
     }
-    if not shared_vip:
-        additions["additionalPorts"] = [{
-            "name": "trustd",
-            "port": TALOS_TRUSTD_PORT,
-            "targetPort": TALOS_TRUSTD_PORT,
-            "protocol": "TCP",
-        }]
-    return additions
 
 
 # ---------------------------------------------------------------------------
@@ -1254,15 +1252,11 @@ async def assert_cabpt_installed(k8s) -> None:
     """
     from fastapi import HTTPException
 
-    try:
-        await k8s.custom_api.list_cluster_custom_object(
-            group="apiextensions.k8s.io", version="v1", plural="customresourcedefinitions",
-            field_selector=f"metadata.name={CABPT_PLURAL}.{CABPT_GROUP}",
-        )
-    except ApiException:
-        # Listing CRDs may itself be forbidden; fall through to the direct
-        # probe below rather than failing on the diagnostic.
-        pass
+    # There was a CRD listing here that asked whether CABPT is installed and
+    # then threw the answer away — the result was never assigned, the failure
+    # was swallowed, and the probe below answers the same question two lines
+    # later. All it cost was a cluster-wide permission the chart never granted,
+    # so it 403'd on every call, invisibly. Found by the RBAC scan.
 
     try:
         await k8s.custom_api.list_namespaced_custom_object(

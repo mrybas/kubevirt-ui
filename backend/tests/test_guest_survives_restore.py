@@ -21,6 +21,8 @@ NIC by name instead, so it stops caring what the MAC is.
 """
 
 import re
+
+import pytest
 from pathlib import Path
 
 import yaml
@@ -120,21 +122,82 @@ class TestAStuckMigrationIsReported:
 
     and nothing said so — the VM kept running on its old node and the request
     looked accepted.
+
+    These used to grep the source for strings the handler contains, which
+    transcribes the code rather than measuring it. They call it now, which is
+    also how the second answer — is anything still in flight — is covered at
+    all. That answer exists because a page waiting on a fixed schedule stopped
+    asking after twelve seconds and a measured migration took forty-five.
     """
 
-    def test_the_detail_handler_looks_for_migrations(self) -> None:
-        assert "_migration_blockers" in SRC
-        assert "virtualmachineinstancemigrations" in SRC
+    @staticmethod
+    async def _state(items: list[dict], vm: str = "web-01"):
+        from unittest.mock import AsyncMock, MagicMock
 
-    def test_it_ignores_finished_migrations(self) -> None:
-        block = SRC[SRC.index("async def _migration_blockers"):SRC.index("@router.get(\"/{name}\"")]
-        assert 'if phase in ("Succeeded", "Failed", None):' in block
+        from app.api.v1.vms import _migration_state
 
-    def test_it_names_the_quota_as_the_cause_when_that_is_it(self) -> None:
-        block = SRC[SRC.index("async def _migration_blockers"):SRC.index("@router.get(\"/{name}\"")]
-        assert "migrationRejectedByResourceQuota" in block
-        assert "second copy of the VM" in block
+        k8s = MagicMock()
+        k8s.custom_api.list_namespaced_custom_object = AsyncMock(
+            return_value={"items": items})
+        return await _migration_state(k8s, "opdev-dev", vm)
 
-    def test_it_only_reports_this_vm(self) -> None:
-        block = SRC[SRC.index("async def _migration_blockers"):SRC.index("@router.get(\"/{name}\"")]
-        assert '.get("vmiName") != vm_name' in block
+    @staticmethod
+    def _migration(vm: str, phase: str | None, *, rejected: bool = False) -> dict:
+        return {
+            "metadata": {"name": f"migrate-{vm}-abcde"},
+            "spec": {"vmiName": vm},
+            "status": {
+                "phase": phase,
+                "conditions": [{
+                    "type": "migrationRejectedByResourceQuota", "status": "True",
+                }] if rejected else [],
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_finished_migration_says_nothing(self) -> None:
+        for phase in ("Succeeded", "Failed", None):
+            blockers, in_flight = await self._state(
+                [self._migration("web-01", phase)])
+            assert blockers == []
+            assert in_flight is None, phase
+
+    @pytest.mark.asyncio
+    async def test_one_in_flight_is_reported_and_kept_track_of(self) -> None:
+        blockers, in_flight = await self._state(
+            [self._migration("web-01", "Running")])
+        assert in_flight == "Running"
+        assert len(blockers) == 1
+        assert "Running" in blockers[0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_the_quota_is_named_when_that_is_the_cause(self) -> None:
+        blockers, _ = await self._state(
+            [self._migration("web-01", "Pending", rejected=True)])
+        assert "second copy of the VM" in blockers[0]["message"]
+        assert "ResourceQuota" in blockers[0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_another_vms_migration_is_not_this_one(self) -> None:
+        blockers, in_flight = await self._state(
+            [self._migration("other-vm", "Running")])
+        assert blockers == [] and in_flight is None
+
+    @pytest.mark.asyncio
+    async def test_a_cluster_that_cannot_be_read_blocks_nothing(self) -> None:
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.api.v1.vms import _migration_state
+
+        k8s = MagicMock()
+        k8s.custom_api.list_namespaced_custom_object = AsyncMock(
+            side_effect=Exception("nope"))
+        assert await _migration_state(k8s, "ns", "web-01") == ([], None)
+
+    def test_the_phase_reaches_the_response(self) -> None:
+        """The field is what a client waits on; unset, the wait is a guess."""
+        import inspect
+
+        from app.api.v1.vms import get_vm
+
+        assert "migration_phase" in inspect.getsource(get_vm)

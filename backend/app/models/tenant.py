@@ -117,7 +117,14 @@ class TenantCreateRequest(BaseModel):
     # plane). Talos nodes cannot be bootstrapped the cloud-init way at all —
     # they ask a trustd signer for a certificate instead — so this is a
     # different mechanism, not a different image.
-    worker_os: Literal["cloud-init", "talos"] = "cloud-init"
+    #
+    # Both values still exist here, and only Talos can be created. The type
+    # keeps describing what a tenant *can be* — the ones that exist carry it,
+    # the responses report it, and the build path still knows how — while the
+    # create endpoint refuses the other one with a sentence. A Literal of one
+    # member would refuse it with "Input should be 'talos'", which says nothing
+    # about why.
+    worker_os: Literal["cloud-init", "talos"] = "talos"
     # Which Talos release to build the workers from. Empty means the
     # catalogue's default; the value is validated against the same
     # `is_compatible()` the wizard's list is rendered from.

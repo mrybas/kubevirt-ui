@@ -141,7 +141,16 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
   const [displayName, setDisplayName] = useState('');
   const [vmCount, setVmCount] = useState(1);
   const nameInputRef = useRef<HTMLInputElement>(null);
-  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; failed: string[] } | null>(null);
+  // The reason travels with the name. It used to be discarded in the catch,
+  // so a batch that failed said "Failed to create 1 VM(s): op-vm1" and nothing
+  // else, while the API had answered "Template op-ubuntu-small not found" —
+  // which is the whole diagnosis, in a sentence, thrown away one line before it
+  // could be shown.
+  const [batchProgress, setBatchProgress] = useState<{
+    current: number;
+    total: number;
+    failed: { name: string; reason: string }[];
+  } | null>(null);
   const [cpuCores, setCpuCores] = useState<number | undefined>(defaultTemplate?.compute.cpu_cores);
   const [memory, setMemory] = useState<string | undefined>(defaultTemplate?.compute.memory);
   const [diskSize, setDiskSize] = useState<string | undefined>(defaultTemplate?.disk.size);
@@ -209,7 +218,7 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
     if (!selectedTemplate || !selectedProject) return;
 
     const names = generateDisplayNames();
-    const failed: string[] = [];
+    const failed: { name: string; reason: string }[] = [];
     setBatchProgress({ current: 0, total: names.length, failed: [] });
 
     for (let i = 0; i < names.length; i++) {
@@ -235,7 +244,10 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
       try {
         await createVM.mutateAsync({ namespace: selectedProject, data: request });
       } catch (error) {
-        failed.push(names[i]!);
+        failed.push({
+          name: names[i]!,
+          reason: error instanceof Error ? error.message : String(error),
+        });
       }
       setBatchProgress({ current: i + 1, total: names.length, failed: [...failed] });
     }
@@ -860,11 +872,14 @@ export function CreateVMWizard({ projects, defaultProject, defaultTemplate, defa
             {batchProgress.failed.length > 0 && (
               <div className="bg-red-500/10 border border-red-500/50 rounded-lg p-3 text-red-400 text-sm">
                 <p className="font-medium mb-1">Failed to create {batchProgress.failed.length} VM(s):</p>
-                <div className="flex flex-wrap gap-1">
-                  {batchProgress.failed.map((n) => (
-                    <span key={n} className="font-mono text-xs bg-red-500/20 px-1.5 py-0.5 rounded">{n}</span>
+                <ul className="space-y-1">
+                  {batchProgress.failed.map((f) => (
+                    <li key={f.name} className="flex flex-wrap items-baseline gap-1.5">
+                      <span className="font-mono text-xs bg-red-500/20 px-1.5 py-0.5 rounded">{f.name}</span>
+                      <span className="text-xs">{f.reason}</span>
+                    </li>
                   ))}
-                </div>
+                </ul>
               </div>
             )}
           </div>

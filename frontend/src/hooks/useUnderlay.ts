@@ -5,6 +5,7 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getUnderlay, ensureUnderlay, type EnsureUnderlayRequest } from '../api/underlay';
 import { notify } from '../store/notifications';
+import { settle } from './settle';
 
 export function useUnderlay(names?: {
   provider_network_name?: string;
@@ -23,8 +24,11 @@ export function useEnsureUnderlay() {
   return useMutation({
     mutationFn: (request: EnsureUnderlayRequest) => ensureUnderlay(request),
     onSuccess: (result) => {
-      queryClient.invalidateQueries({ queryKey: ['underlay'] });
-      queryClient.invalidateQueries({ queryKey: ['subnets'] });
+      // Over the next few seconds, not once: the request writes a
+      // ManagedUnderlay and the operator makes the provider network, the
+      // VLAN and the subnet from it. Reading straight away is what put
+      // "ProviderNetwork MISSING" on the screen of a build that worked.
+      settle(queryClient, [['underlay'], ['subnets']]);
       // A partial build reports ready=false with the objects that failed; that
       // is a warning, not a success — surfacing it as one is how a half-built
       // fabric gets mistaken for a working one.

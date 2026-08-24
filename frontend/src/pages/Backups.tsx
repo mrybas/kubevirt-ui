@@ -43,6 +43,7 @@ import {
 
 import {
   useVeleroBackups,
+  useVeleroRestores,
   useCreateVeleroBackup,
   useDeleteVeleroBackup,
   useRestoreVeleroBackup,
@@ -61,7 +62,7 @@ import {
 } from '../hooks/useVelero';
 import { useDeleteVMSnapshot, useRestoreVMSnapshot } from '../hooks/useVMs';
 
-import type { VeleroBackup, VeleroSchedule } from '../types/velero';
+import type { VeleroBackup, VeleroRestore, VeleroSchedule } from '../types/velero';
 import type { VMSnapshotInfo } from '../types/vm';
 import type { ScheduleInfo } from '../api/schedules';
 
@@ -441,18 +442,47 @@ function RestoreBackupModal({
 }: {
   backup: VeleroBackup;
   onClose: () => void;
-  onRestore: (restorePvs: boolean) => void;
+  onRestore: (restorePvs: boolean, policy: 'none' | 'update') => void;
   isRestoring: boolean;
 }) {
   const [restorePvs, setRestorePvs] = useState(true);
+  // Velero's default, said out loud. It used to say the opposite — "existing
+  // resources may be overwritten" — and the opposite is what somebody
+  // expects when they restore a VM onto itself and get back a machine that
+  // never changed, with the restore reporting Completed.
+  const [policy, setPolicy] = useState<'none' | 'update'>('none');
   return (
     <Modal isOpen onClose={onClose} title={`Restore: ${backup.name}`} size="md">
       <div className="space-y-4">
         <div className="flex items-start gap-3 p-3 bg-amber-900/10 border border-amber-800/30 rounded-lg">
           <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
           <p className="text-sm text-amber-300">
-            This will create a Velero Restore from backup <strong>{backup.name}</strong>. Existing resources may be overwritten.
+            This creates a Velero Restore from <strong>{backup.name}</strong>.
+            Anything the target namespace still has is <strong>not</strong>{' '}
+            replaced by default — a restore then brings back only what is
+            missing, and the rest is reported as warnings.
           </p>
+        </div>
+        <div className="space-y-2">
+          <p className="text-xs text-surface-500">Objects that already exist</p>
+          {([
+            ['none', 'Leave them as they are', 'Only what is missing comes back. Safe, and does nothing if everything is still there.'],
+            ['update', 'Overwrite them from the backup', 'Existing objects are replaced by the backed-up copy.'],
+          ] as const).map(([value, label, hint]) => (
+            <label key={value} className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="existing-policy"
+                checked={policy === value}
+                onChange={() => setPolicy(value)}
+                className="mt-1"
+              />
+              <span className="text-sm">
+                <span className="text-surface-200">{label}</span>
+                <span className="block text-xs text-surface-500">{hint}</span>
+              </span>
+            </label>
+          ))}
         </div>
         <div>
           <p className="text-xs text-surface-500 mb-1">Namespaces to restore</p>
@@ -473,7 +503,7 @@ function RestoreBackupModal({
         <div className="flex justify-end gap-3 pt-2">
           <button onClick={onClose} className="btn-secondary">Cancel</button>
           <button
-            onClick={() => onRestore(restorePvs)}
+            onClick={() => onRestore(restorePvs, policy)}
             disabled={isRestoring}
             className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
           >
@@ -518,6 +548,7 @@ function SectionHeader({
 export default function Backups() {
   // Velero backups
   const { data: veleroBackups = [], isLoading: backupsLoading, refetch: refetchBackups } = useVeleroBackups();
+  const { data: restores = [], isLoading: restoresLoading } = useVeleroRestores();
   const createBackup = useCreateVeleroBackup();
   const deleteBackup = useDeleteVeleroBackup();
   const restoreBackup = useRestoreVeleroBackup();
@@ -694,6 +725,73 @@ export default function Backups() {
   };
 
   // ── Section 2: Recent Backups ───────────────────────────────────────────────
+
+  const restoreColumns: Column<VeleroRestore>[] = [
+    {
+      key: 'name',
+      header: 'Name',
+      sortable: true,
+      accessor: (r) => <span className="font-mono font-medium text-surface-100">{r.name}</span>,
+    },
+    {
+      key: 'backup',
+      header: 'From backup',
+      hideOnMobile: true,
+      accessor: (r) => <span className="text-surface-400 text-xs">{r.backup_name}</span>,
+    },
+    {
+      key: 'items',
+      header: 'Items',
+      hideOnMobile: true,
+      accessor: (r) => (
+        <span className="text-surface-400 text-xs">
+          {r.items_restored}/{r.total_items}
+        </span>
+      ),
+    },
+    {
+      key: 'phase',
+      header: 'Status',
+      accessor: (r) => {
+        // "Completed" with warnings is not a completed restore, and reading it
+        // as one is how a restore that changed nothing was taken for a
+        // restore that worked. Velero counts every object it left alone —
+        // because the target namespace already had it — as a warning.
+        const skipped = r.phase === 'Completed' && r.warnings > 0;
+        return (
+          <div className="flex flex-col gap-0.5">
+            <span className={clsx(
+              'text-xs px-2 py-0.5 rounded-full w-fit',
+              r.phase === 'Completed' && !skipped && 'bg-emerald-900/30 text-emerald-400',
+              skipped && 'bg-amber-900/30 text-amber-400',
+              r.phase !== 'Completed' && 'bg-surface-700 text-surface-300',
+            )}>
+              {skipped ? 'Completed with warnings' : r.phase}
+            </span>
+            {skipped && (
+              <span className="text-[11px] text-amber-400/80">
+                {r.warnings} item{r.warnings === 1 ? '' : 's'} not restored — most often
+                because the namespace still had them
+              </span>
+            )}
+            {r.errors > 0 && (
+              <span className="text-[11px] text-red-400">{r.errors} error{r.errors === 1 ? '' : 's'}</span>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      key: 'started',
+      header: 'Started',
+      hideOnMobile: true,
+      accessor: (r) => (
+        <span className="text-surface-400 text-xs">
+          {r.started_at ? new Date(r.started_at).toLocaleString() : '—'}
+        </span>
+      ),
+    },
+  ];
 
   const backupColumns: Column<VeleroBackup>[] = [
     {
@@ -891,7 +989,23 @@ export default function Backups() {
         />
       </div>
 
-      {/* ── 3. VM Snapshots ── */}
+      {/* ── 3. Restores ── */}
+      <div>
+        <SectionHeader icon={RotateCcw} title="Restores" count={restores.length} />
+        <DataTable
+          columns={restoreColumns}
+          data={restores}
+          loading={restoresLoading}
+          keyExtractor={(r) => r.name}
+          emptyState={{
+            icon: <RotateCcw className="h-10 w-10" />,
+            title: 'No restores yet',
+            description: 'Restoring a backup will show its progress and result here.',
+          }}
+        />
+      </div>
+
+      {/* ── 4. VM Snapshots ── */}
       <div>
         <SectionHeader icon={Camera} title="VM Snapshots" count={allSnapshots.length} />
         <DataTable
@@ -1030,10 +1144,10 @@ export default function Backups() {
         <RestoreBackupModal
           backup={restoreBackupItem}
           onClose={() => setRestoreBackupItem(null)}
-          onRestore={async (restorePvs) => {
+          onRestore={async (restorePvs, policy) => {
             await restoreBackup.mutateAsync({
               backupName: restoreBackupItem.name,
-              data: { restore_pvs: restorePvs },
+              data: { restore_pvs: restorePvs, existing_resource_policy: policy },
             });
             setRestoreBackupItem(null);
           }}

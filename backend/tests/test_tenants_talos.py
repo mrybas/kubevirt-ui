@@ -128,7 +128,7 @@ class TestPki:
 class TestControlPlaneAdditions:
     def test_sidecar_and_volume_are_paired(self) -> None:
         adds = talos_control_plane_additions(
-            TENANT, NS, "signer:v1", shared_vip=False,
+            TENANT, NS, "signer:v1",
         )
         volume_name = adds["additionalVolumes"][0]["name"]
         mount = adds["additionalContainers"][0]["volumeMounts"][0]["name"]
@@ -137,23 +137,18 @@ class TestControlPlaneAdditions:
     def test_cert_sans_match_the_worker_endpoint_name(self) -> None:
         # If these drift, the join fails TLS before trustd is reached.
         adds = talos_control_plane_additions(
-            TENANT, NS, "signer:v1", shared_vip=False,
+            TENANT, NS, "signer:v1",
         )
         assert adds["certSANs"] == signer_dns_names(TENANT, NS)
 
-    def test_own_vip_gets_port_50001_on_the_service(self) -> None:
-        adds = talos_control_plane_additions(
-            TENANT, NS, "signer:v1", shared_vip=False,
-        )
-        assert adds["additionalPorts"][0]["port"] == TALOS_TRUSTD_PORT
-
-    def test_shared_vip_must_not_add_the_port(self) -> None:
-        # MetalLB refuses identical ports on one shared address; the router
-        # fronts a per-tenant ClusterIP service instead.
-        adds = talos_control_plane_additions(
-            TENANT, NS, "signer:v1", shared_vip=True,
-        )
-        assert "additionalPorts" not in adds
+    def test_it_returns_nothing_the_schema_cannot_hold(self) -> None:
+        """It used to return an `additionalPorts` entry, which
+        KamajiControlPlane has no field for — so the API server dropped it in
+        silence while four tests said it was there."""
+        adds = talos_control_plane_additions(TENANT, NS, "signer:v1")
+        assert set(adds) == {
+            "additionalContainers", "additionalVolumes", "certSANs",
+        }
 
 
 class TestWorkerConfig:
@@ -392,7 +387,7 @@ class TestSignerReachesTheControlPlane:
         from app.api.v1.tenants_talos import talos_control_plane_additions
 
         additions = talos_control_plane_additions(
-            "t1", "tenant-t1", "signer:latest", shared_vip=False,
+            "t1", "tenant-t1", "signer:latest",
         )
         names = [c["name"] for c in additions["additionalContainers"]]
 

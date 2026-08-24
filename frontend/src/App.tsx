@@ -70,7 +70,25 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 }
 
 // Admin-only route guard
-function RequireAdmin({ children }: { children: React.ReactNode }) {
+/**
+ * Why the network pages are closed to a folder admin.
+ *
+ * Reported in UAT run 4 (R-3) as a bug, because "Access Denied" with no
+ * reason reads like one: the backend lists VPCs for these users happily, and
+ * the page is shut. It is deliberate — a VPC carries BGP announcements,
+ * address pools and routes that reach the border router — and a boundary
+ * that says why is a boundary nobody files twice.
+ */
+const NETWORKS_ARE_ADMIN_ONLY =
+  'Networks are managed by platform admins. A VPC carries BGP announcements, ' +
+  'address pools and routes that reach the border router — one wrong prefix ' +
+  'takes traffic that is not yours with it — so creating and changing them is ' +
+  'not delegated to folder admins. Ask a platform admin for the network you ' +
+  'need; everything inside it is yours.';
+
+function RequireAdmin(
+  { children, reason }: { children: React.ReactNode; reason?: string },
+) {
   const { user, config, isLoading } = useAuthStore();
 
   // No auth configured → behave as admin (dev mode)
@@ -82,7 +100,7 @@ function RequireAdmin({ children }: { children: React.ReactNode }) {
   if (!user?.is_admin) {
     return (
       <Suspense fallback={null}>
-        <AccessDenied />
+        <AccessDenied reason={reason} />
       </Suspense>
     );
   }
@@ -169,25 +187,25 @@ function AppRoutes() {
                     <Route path="/storage/classes" element={<RequireAdmin><StorageClasses /></RequireAdmin>} />
                     <Route path="/storage/:namespace/:name" element={<ImageDetail />} />
                     {/* Network — admin only */}
-                    <Route path="/network" element={<RequireAdmin><Networks /></RequireAdmin>} />
+                    <Route path="/network" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Networks /></RequireAdmin>} />
                     {/* The breadcrumb reads "Networking" while every route is
                         /network/*, so the plural is a natural thing to type
                         (and to paste from a doc) — it used to land on a 404
                         that still drew the breadcrumb. */}
                     <Route path="/networking/*" element={<Navigate to="/network" replace />} />
-                    <Route path="/network/vpcs" element={<RequireAdmin><Navigate to="/network?tab=vpcs" replace /></RequireAdmin>} />
-                    <Route path="/network/subnets" element={<RequireAdmin><Navigate to="/network?tab=subnets" replace /></RequireAdmin>} />
-                    <Route path="/network/underlay" element={<RequireAdmin><Navigate to="/network?tab=underlay" replace /></RequireAdmin>} />
-                    <Route path="/network/system" element={<RequireAdmin><Navigate to="/network?tab=system" replace /></RequireAdmin>} />
-                    <Route path="/network/subnets/create" element={<RequireAdmin><Navigate to="/network?tab=subnets&create=true" replace /></RequireAdmin>} />
-                    <Route path="/network/subnets/:name" element={<RequireAdmin><NetworkDetail /></RequireAdmin>} />
-                    <Route path="/network/vpcs/create" element={<RequireAdmin><Navigate to="/network?tab=vpcs&create=true" replace /></RequireAdmin>} />
-                    <Route path="/network/vpcs/:name" element={<RequireAdmin><VPCDetail /></RequireAdmin>} />
-                    <Route path="/network/egress-gateways" element={<RequireAdmin><EgressGateways /></RequireAdmin>} />
-                    <Route path="/network/ovn-gateways" element={<RequireAdmin><OvnGateways /></RequireAdmin>} />
-                    <Route path="/network/bgp" element={<RequireAdmin><BgpPeering /></RequireAdmin>} />
-                    <Route path="/network/security-groups" element={<RequireAdmin><SecurityGroups /></RequireAdmin>} />
-                    <Route path="/network/security-groups/:name" element={<RequireAdmin><SecurityGroupDetail /></RequireAdmin>} />
+                    <Route path="/network/vpcs" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=vpcs" replace /></RequireAdmin>} />
+                    <Route path="/network/subnets" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=subnets" replace /></RequireAdmin>} />
+                    <Route path="/network/underlay" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=underlay" replace /></RequireAdmin>} />
+                    <Route path="/network/system" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=system" replace /></RequireAdmin>} />
+                    <Route path="/network/subnets/create" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=subnets&create=true" replace /></RequireAdmin>} />
+                    <Route path="/network/subnets/:name" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><NetworkDetail /></RequireAdmin>} />
+                    <Route path="/network/vpcs/create" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><Navigate to="/network?tab=vpcs&create=true" replace /></RequireAdmin>} />
+                    <Route path="/network/vpcs/:name" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><VPCDetail /></RequireAdmin>} />
+                    <Route path="/network/egress-gateways" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><EgressGateways /></RequireAdmin>} />
+                    <Route path="/network/ovn-gateways" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><OvnGateways /></RequireAdmin>} />
+                    <Route path="/network/bgp" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><BgpPeering /></RequireAdmin>} />
+                    <Route path="/network/security-groups" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><SecurityGroups /></RequireAdmin>} />
+                    <Route path="/network/security-groups/:name" element={<RequireAdmin reason={NETWORKS_ARE_ADMIN_ONLY}><SecurityGroupDetail /></RequireAdmin>} />
                     {/* Backups — admin only */}
                     <Route path="/backups" element={<RequireAdmin><Backups /></RequireAdmin>} />
                     {/* Security — admin only */}

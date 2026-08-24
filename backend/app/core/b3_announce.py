@@ -342,7 +342,17 @@ async def reload_failures(k8s, nodes: list[str]) -> dict[str, str]:
                 group=FRRK8S_GROUP, version=FRRK8S_VERSION,
                 plural="frrnodestates", name=name,
             )
-        except ApiException:
+        except ApiException as e:
+            # A node with no FRRNodeState yet is ordinary; being refused the
+            # read is not, and it turns this whole tier into a permanent
+            # "no failures" — the quietest way to lose the check that exists
+            # precisely because the loud symptoms are absent.
+            if e.status == 403:
+                logger.warning(
+                    "FRRNodeState is forbidden to this ServiceAccount — config "
+                    "refusals by FRR will not be reported; grant frrnodestates "
+                    "(cluster-scoped)",
+                )
             continue
         status = state.get("status", {}) or {}
         for field in ("lastConversionResult", "lastReloadResult"):

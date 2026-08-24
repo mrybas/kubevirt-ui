@@ -187,8 +187,8 @@ class TestTheQuotaFollowedTheImageOut:
             worker_os="talos", worker_count=2, worker_disk="20Gi",
         )
 
-        # data 3x20 + roots 3x20, and no golden
-        assert int(_tenant_quota(req)["storage"]) == (3 * 20 + 3 * 20) * 2**30
+        # the roots, and only those: surge x 20Gi
+        assert int(_tenant_quota(req)["storage"]) == 3 * 20 * 2**30
 
     def test_the_root_clones_are_still_counted(self) -> None:
         """They do live in the tenant namespace, one per worker."""
@@ -201,7 +201,7 @@ class TestTheQuotaFollowedTheImageOut:
                 worker_os="talos", worker_count=count, worker_disk="20Gi",
             ))["storage"])
 
-        assert storage(2) - storage(1) == (20 + 20) * 2**30
+        assert storage(2) - storage(1) == 20 * 2**30
 
 
 class TestWhoActuallyPerformsTheClone:

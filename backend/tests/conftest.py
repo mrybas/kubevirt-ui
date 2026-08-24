@@ -124,3 +124,30 @@ def client(
     finally:
         for key in overrides:
             app.dependency_overrides.pop(key, None)
+
+
+@pytest.fixture(autouse=True)
+def _no_template_resources(monkeypatch):
+    """A cluster with no ManagedVMTemplates, unless a test says otherwise.
+
+    Every path that names a template now looks in both stores — that is the fix
+    for a template written as a resource, shown in the list, offered by the
+    wizard, and answered 404 by create-from-template. The lookup is real code on
+    a mock client, so without this the tests that only ever mocked the ConfigMap
+    await a MagicMock.
+
+    Empty rather than absent on purpose: "no such resources" and "no such CRD"
+    take the same path in the reader, and the tests below are about the legacy
+    store either way.
+    """
+    import app.api.v1.templates as templates
+
+    async def none(*_args, **_kwargs):
+        return {"items": []}
+
+    api = MagicMock()
+    api.list_cluster_custom_object = AsyncMock(side_effect=none)
+    monkeypatch.setattr(
+        templates.client, "CustomObjectsApi", lambda *_a, **_k: api, raising=True,
+    )
+    return api

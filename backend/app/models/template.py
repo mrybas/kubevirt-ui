@@ -136,6 +136,12 @@ class VMImage(BaseModel):
     os_version: str | None = None
     size: str | None = None
     status: str  # Ready, InUse, Pending, Error
+    # How far the import has got, as CDI reports it ("89.84%").
+    #
+    # The list showed Pending for the whole of an import and Pending for a
+    # request nothing had started, which are hours apart in meaning. CDI
+    # publishes the figure on the DataVolume; it simply was not carried.
+    progress: str | None = None
     error_message: str | None = None  # Error details from DV conditions
     source_url: str | None = None
     created: datetime | None = None

@@ -1,11 +1,25 @@
 # Build & push Docker images and Helm chart for KubeVirt UI
-# Triggered on CalVer tags (2026.01.0, etc.) or manual dispatch.
+# Triggered on CalVer tags (2026.01.0, etc.), on the operator-dev branch, or
+# manual dispatch.
+#
+# Three tagging worlds that must never mix: a CalVer tag is a release and also
+# moves `latest`; a **prerelease** tag (`2026.10.37-dev.1`) publishes the same
+# artefacts, chart included, under its own version and moves nothing; a branch
+# build is a dev image tagged `dev-<sha7>` and publishes no chart at all. An
+# image that could be pulled as `latest` would eventually be deployed as one.
+#
+# The rule itself is hack/image-tags.sh, so it can be run and tested rather than
+# only observed after a tag is pushed.
 
 name: Build Images
 
 on:
   push:
     tags: ['20*']
+    # `main` is where the work happens now. `operator-dev` stays for a while:
+    # a build that stops running is discovered by a tag that produces no
+    # image, which is the worst moment to discover it.
+    branches: ['main', 'operator-dev']
   workflow_dispatch:
 
 env:
@@ -21,38 +35,30 @@ jobs:
     outputs:
       tags_backend: ${{ steps.meta.outputs.tags_backend }}
       tags_frontend: ${{ steps.meta.outputs.tags_frontend }}
+      tags_operator: ${{ steps.meta.outputs.tags_operator }}
       version: ${{ steps.meta.outputs.version }}
+      is_release: ${{ steps.meta.outputs.is_release }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Compute image metadata
         id: meta
         shell: bash
         run: |
-          REGISTRY="${{ env.REGISTRY }}"
-          REPO="${{ github.repository }}"
+          # The rule lives in hack/image-tags.sh so it can be run and tested off
+          # a laptop. It was a function in this file, which meant the one thing
+          # it protects — `latest` never pointing at something unreleased — was
+          # only ever exercised by tagging for real.
+          hack/image-tags.sh "${GITHUB_REF}" "${{ env.REGISTRY }}" \
+            "${{ github.repository }}" | tee -a "$GITHUB_OUTPUT"
 
-          BACKEND_IMAGE="${REGISTRY}/${REPO}/backend"
-          FRONTEND_IMAGE="${REGISTRY}/${REPO}/frontend"
-
-          TAGS_BACKEND=""
-          TAGS_FRONTEND=""
-
-          add_tag() {
-            TAGS_BACKEND="${TAGS_BACKEND:+${TAGS_BACKEND},}${BACKEND_IMAGE}:${1}"
-            TAGS_FRONTEND="${TAGS_FRONTEND:+${TAGS_FRONTEND},}${FRONTEND_IMAGE}:${1}"
-          }
-
-          VERSION="${GITHUB_REF#refs/tags/}"
-          add_tag "${VERSION}"
-          add_tag "latest"
-
-          echo "tags_backend=${TAGS_BACKEND}" >> "$GITHUB_OUTPUT"
-          echo "tags_frontend=${TAGS_FRONTEND}" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-
-          echo "### Image Tags" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Version:** ${VERSION}" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Backend:** ${TAGS_BACKEND}" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Frontend:** ${TAGS_FRONTEND}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "### Image Tags"
+            hack/image-tags.sh "${GITHUB_REF}" "${{ env.REGISTRY }}" \
+              "${{ github.repository }}" | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
   # Build backend image
@@ -135,11 +141,107 @@ jobs:
             org.opencontainers.image.description=KubeVirt UI Frontend
 
   # ---------------------------------------------------------------------------
+  # Build operator image
+  # ---------------------------------------------------------------------------
+  build-operator:
+    runs-on: ubuntu-latest
+    needs: prepare
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push operator
+        uses: docker/build-push-action@v5
+        with:
+          context: ./operator
+          file: ./operator/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ needs.prepare.outputs.tags_operator }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+            org.opencontainers.image.title=kubevirt-ui-operator
+            org.opencontainers.image.description=KubeVirt UI Operator
+
+  # ---------------------------------------------------------------------------
+  # Checks: the guards, run where somebody other than their author will see them
+  # ---------------------------------------------------------------------------
+  #
+  # Nothing ran here before. Every contract test in this repository — the chart's
+  # RBAC rules against the calls the backend makes, the chart's copy of the
+  # operator's CRDs against the operator's own markers, the route tables, the
+  # 1700 backend tests, the operator's own suite — only ever ran when the person
+  # writing them chose to run them. A guard nobody runs is a comment.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: operator/go.mod
+          cache-dependency-path: operator/go.sum
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+
+      - name: Operator suite
+        working-directory: operator
+        # `make test` brings its own envtest binaries, so the controller suite —
+        # which is most of the value — runs here too.
+        run: make test
+
+      - name: Backend suite
+        working-directory: backend
+        # In a venv, because the runner ships its own copy of some of these and
+        # pip leaves a satisfied requirement alone. The first run of this job
+        # failed on two certificate tests for exactly that: the image installs
+        # cryptography 50 from a clean environment, the runner already had a
+        # version predating `not_valid_after_utc`, and nothing asked it to move.
+        # The suite has to run against what the image has, not what the machine
+        # happened to bring.
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -r requirements.txt -r requirements-dev.txt
+          .venv/bin/python -m pytest -q
+
+  # ---------------------------------------------------------------------------
   # Package and push Helm chart to OCI registry
   # ---------------------------------------------------------------------------
   helm-package:
     runs-on: ubuntu-latest
-    needs: prepare
+    # The published chart waits on the guards. A branch image does not: it exists
+    # to be debugged with, and refusing to build one while a test is red takes
+    # away the thing you would debug with.
+    needs: [prepare, checks]
+    # A branch build publishes no chart: the dev operator is deployed with
+    # kustomize, deliberately bypassing the chart and Flux, so there is no
+    # version for it to claim. A prerelease tag does publish one, under its own
+    # prerelease version, which is how the whole product can be installed and
+    # tried without entering the line that means production.
+    if: needs.prepare.outputs.is_release == 'true'
     permissions:
       contents: read
       packages: write

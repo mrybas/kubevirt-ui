@@ -54,6 +54,13 @@ const tabs: { id: TabId; label: string; icon: typeof Activity }[] = [
   { id: 'yaml', label: 'YAML', icon: FileCode },
 ];
 
+/** The controller's action names, as a person would say them. */
+const OPERATION_LABELS: Record<string, string> = {
+  RollbackDisk: 'Rolling a disk back to a snapshot',
+  Recreate: 'Rebuilding this machine from its image',
+  Migrate: 'Migrating to another node',
+};
+
 export function VMDetail() {
   const { namespace, name } = useParams<{ namespace: string; name: string }>();
   const navigate = useNavigate();
@@ -578,6 +585,26 @@ export function VMDetail() {
         resourceType="Virtual Machine"
         isDeleting={deleteVM.isPending}
       />
+
+      {/* What the controller is doing to this machine, while it does it.
+          A rollback builds a clone, stops the machine, swaps its disk and
+          starts it again; none of that moves `status`, so without this the
+          page looks idle through the whole thing — and the request that
+          started it reported itself as the result. */}
+      {vm.operation && (
+        <div className="flex items-start gap-3 px-4 py-3 rounded-lg border border-primary-500/40 bg-primary-500/10">
+          <Loader2 className="h-4 w-4 mt-0.5 animate-spin text-primary-400 shrink-0" />
+          <div className="text-sm">
+            <span className="text-surface-100 font-medium">
+              {OPERATION_LABELS[vm.operation.action] ?? vm.operation.action}
+            </span>
+            <span className="text-surface-400"> · {vm.operation.phase}</span>
+            {vm.operation.message && (
+              <p className="text-surface-400 mt-0.5">{vm.operation.message}</p>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="border-b border-surface-700">

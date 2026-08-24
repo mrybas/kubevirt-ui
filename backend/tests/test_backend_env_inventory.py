@@ -38,7 +38,7 @@ pytestmark = pytest.mark.skipif(
 # Product configuration, as opposed to plumbing like LOG_LEVEL: these are the
 # prefixes whose absence changes what the product does rather than how loudly
 # it says it.
-CONFIG_PREFIXES = ("B3_", "TENANTS_")
+CONFIG_PREFIXES = ("B3_", "TENANTS_", "OPERATOR_")
 
 
 def _env_read_by_the_backend() -> set[str]:
@@ -50,7 +50,7 @@ def _env_read_by_the_backend() -> set[str]:
     a test claimed the list was complete. Matching the literal wherever it
     appears cannot be dodged by moving the read one line away.
     """
-    pattern = re.compile(r'"((?:B3_|TENANTS_)[A-Z0-9_]+)"')
+    pattern = re.compile(r'"((?:B3_|TENANTS_|OPERATOR_)[A-Z0-9_]+)"')
     return {
         m.group(1)
         for path in _APP.rglob("*.py")

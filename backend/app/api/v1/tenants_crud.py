@@ -4,6 +4,7 @@ Creates CAPI resources (Cluster, KamajiControlPlane, MachineDeployment, etc.)
 and Flux HelmRelease CRs per addon per tenant. Addon catalog read from ConfigMap.
 """
 
+import asyncio
 import base64
 import copy
 import json
@@ -26,6 +27,7 @@ from app.core.groups import (
     is_env_viewer,
     is_folder_admin,
     load_folder,
+    load_folders,
     resolve_env,
 )
 from app.core.naming import (
@@ -88,7 +90,6 @@ from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
 from app.api.v1.tenants_capi import (
     _create_capi_resources,
     _detach_tenant_ns_from_vpc_subnet,
-    _remove_cp_vpc_publication,
     tenant_vpc_name,
 )
 from app.api.v1.tenants_addons import (
@@ -113,6 +114,13 @@ from app.core.tenant_transit import (
     transit_subnet_name,
 )
 from app.api.v1.tenants_ntp import ensure_ntp_server, ensure_tenant_ntp_service
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    tenant_addons_path_enabled,
+    tenant_path_enabled,
+    tenant_time_path_enabled,
+)
 from app.api.v1.tenants_talosconfig import (
     DEFAULT_TTL_HOURS,
     build_talosconfig,
@@ -178,6 +186,485 @@ _OVERHEAD_MARGIN = 1.25
 # ever stops being true, because each would add its own term.
 
 
+
+TENANT_PLURAL = "managedtenants"
+
+
+async def _tenant_description(k8s, name: str) -> dict[str, Any] | None:
+    """This tenant's ManagedTenant, if it has one.
+
+    Unlike `_described_tenant`, this does not ask whether the addon path has
+    been handed over: reading what the operator says about a tenant is right
+    whenever there is an operator saying it, and an adopted tenant has a
+    description with every flag off.
+    """
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, name=name,
+        )
+    except ApiException as e:
+        if e.status in (403, 404):
+            return None
+        raise
+
+
+async def _described_tenant(k8s, name: str) -> dict[str, Any] | None:
+    """The tenant's own description, if the operator has one.
+
+    Only consulted when the addon path has been handed over. A tenant the
+    operator does not know about is still the product's to write, which is what
+    lets a half-migrated cluster work at all.
+    """
+    if not tenant_addons_path_enabled():
+        return None
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+# Every TenantCreateRequest field that `ManagedTenantSpec` has nowhere to put,
+# paired with the value that means "not asked for".
+#
+# Listed one by one rather than derived, so that adding a field to the request
+# is a decision here and not an accident: a new field left out of this table is
+# carried nowhere and refused nowhere, which is the silent drop this table
+# exists to prevent. The test beside it fails when the request grows a field
+# this file has not been told about.
+_UNDESCRIBABLE_FIELDS: tuple[tuple[str, Any, str], ...] = (
+    ("worker_type", "vm",
+     "the operator builds VM workers; bare metal has no field in ManagedTenant"),
+    ("worker_network_binding", "bridge",
+     "the binding is not part of a tenant's description"),
+    ("worker_image_source_type", "http", "worker images are not described"),
+    ("worker_image_url", "", "worker images are not described"),
+    ("worker_image_size", "10Gi", "worker images are not described"),
+    ("worker_image_os_type", "linux", "worker images are not described"),
+    ("worker_image_display_name", "", "worker images are not described"),
+    ("worker_image_pull_secrets", [], "worker images are not described"),
+    ("dns_servers", [], "tenant DNS is not described"),
+    ("dns_mode", "append", "tenant DNS is not described"),
+    ("dns_include_public_fallback", True, "tenant DNS is not described"),
+    ("admin_group", "", "OIDC group mapping is not described"),
+    ("viewer_group", "", "OIDC group mapping is not described"),
+)
+
+
+def _undescribable_fields(req: TenantCreateRequest) -> list[str]:
+    """The parts of this request a ManagedTenant could not carry.
+
+    The alternative is what every silent handover in this migration has done:
+    accept the request, describe the part that fits, and build a tenant that
+    differs from the one that was asked for with nothing anywhere saying so. A
+    worker image URL that goes missing is a tenant on the wrong image; a DNS
+    override that goes missing is a tenant that resolves the wrong names — both
+    of them long after the 201.
+
+    So the flag changes *who writes*, never *what the product accepts*: where it
+    cannot keep that promise, the request is refused and the field is named.
+    """
+    named = []
+    for field, unset, why in _UNDESCRIBABLE_FIELDS:
+        if getattr(req, field, unset) != unset:
+            named.append(f"{field} ({why})")
+    return named
+
+
+def _described_addons(
+    req: TenantCreateRequest, storage_class: str | None,
+) -> list[dict[str, Any]]:
+    """What the tenant asks the operator to install.
+
+    Storage is a checkbox, not an addon, and the driver behind it has to be
+    asked for: the older path adds it when `enable_storage` is set, and this one
+    did not. A tenant created with storage ticked therefore got the host side —
+    a service account, a credential, a quota — and no driver, so every PVC in it
+    stayed Pending with nothing saying why. The checkbox and the thing it turns
+    on have to travel together.
+    """
+    asked = [
+        {"id": a.addon_id, "parameters": dict(a.parameters or {})}
+        for a in req.addons
+    ]
+    if not req.enable_storage:
+        return asked
+    if any(a["id"] == KUBEVIRT_CSI_ADDON_ID for a in asked):
+        return asked
+    parameters: dict[str, str] = {}
+    if storage_class:
+        # The class on the *host* — what the driver provisions from. Left out
+        # when unknown rather than sent empty, which makes the driver fall back
+        # to the host default and quietly land tenant volumes somewhere else.
+        parameters["INFRA_STORAGE_CLASS_NAME"] = storage_class
+    return asked + [{"id": KUBEVIRT_CSI_ADDON_ID, "parameters": parameters}]
+
+
+def _managed_tenant_body(
+    req: TenantCreateRequest, storage_class: str | None,
+) -> dict[str, Any]:
+    """The tenant, said once, in the operator's words.
+
+    `storage_class` is resolved by the caller rather than left blank: an empty
+    class makes the tenant's CSI driver fall back to the host cluster default,
+    which on this lab is not a Ceph class, and the discovery that avoids it
+    reads host objects the operator has no reason to look at.
+    """
+    spec: dict[str, Any] = {
+        "displayName": req.display_name,
+        "folder": req.folder,
+        "environment": req.environment,
+        "kubernetesVersion": req.kubernetes_version,
+        "controlPlaneReplicas": req.control_plane_replicas,
+        "enableOIDC": req.enable_oidc,
+        "podCIDR": req.pod_cidr,
+        "serviceCIDR": req.service_cidr,
+        "workers": {
+            "count": req.worker_count,
+            "vcpu": req.worker_vcpu,
+            "memory": req.worker_memory,
+            "disk": req.worker_disk,
+            "os": req.worker_os,
+        },
+        "storage": {
+            "allowanceGi": req.storage_quota_gi,
+            "pvcCount": req.storage_pvc_count,
+        },
+        "addons": _described_addons(req, storage_class),
+    }
+    if req.talos_version:
+        spec["workers"]["talosVersion"] = req.talos_version
+    if req.vpc_name:
+        spec["network"] = req.vpc_name
+    if storage_class:
+        spec["storage"]["className"] = storage_class
+    return {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedTenant",
+        "metadata": {
+            "name": req.name,
+            "labels": {
+                "kubevirt-ui.io/managed": "true",
+                "kubevirt-ui.io/folder": req.folder,
+                "kubevirt-ui.io/environment": req.environment,
+            },
+        },
+        "spec": spec,
+    }
+
+
+async def _create_managed_tenant(k8s, body: dict[str, Any]) -> None:
+    """Write the description, and turn the operator's refusal into an answer.
+
+    The ManagedTenant webhook rejects what it cannot build, and its message is
+    the only sentence that says why. Passed through with a 400 rather than
+    collapsed into "failed to create tenant" — the wizard shows the detail, and
+    a validation refusal is the caller's to fix, not a server fault.
+    """
+    try:
+        await k8s.custom_api.create_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, body=body,
+        )
+    except ApiException as e:
+        if e.status == 409:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Tenant {body['metadata']['name']!r} already exists",
+            ) from e
+        if e.status in (400, 403, 422):
+            raise HTTPException(
+                status_code=e.status,
+                detail=f"The tenant was refused: {_api_reason(e)}",
+            ) from e
+        raise k8s_error_to_http(e, "tenant description")
+
+
+async def _await_managed_tenant(k8s, name: str, timeout: float = 30.0) -> None:
+    """Wait for the operator to accept the description, not to finish building.
+
+    Accepted is the one verdict that belongs to this request: it is the
+    operator saying the tenant is one it will build, and the only failure a
+    caller could still act on. Everything after it — the control plane, the
+    workers, the addons — takes minutes and is what the tenant page is for.
+
+    A timeout is not a failure. The object is written and the operator holds it;
+    reporting an error here would invite the caller to retry a create that has
+    already happened.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            live = await k8s.custom_api.get_cluster_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                plural=TENANT_PLURAL, name=name,
+            )
+        except ApiException:
+            live = None
+        for cond in ((live or {}).get("status") or {}).get("conditions") or []:
+            if cond.get("type") != "Accepted":
+                continue
+            if cond.get("status") == "True":
+                return
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"The operator refused tenant {name!r}: "
+                    f"{cond.get('message') or cond.get('reason') or 'no reason given'}"
+                ),
+            )
+        await asyncio.sleep(1)
+    logger.info(
+        "Tenant %r: the operator has not reported Accepted within %.0fs; the "
+        "description is written and it goes on trying", name, timeout,
+    )
+
+
+async def _delete_managed_tenant(k8s, name: str) -> bool:
+    """Delete the description, if this tenant has one.
+
+    Returns whether it did. The operator's finalizer tears the tenant down; a
+    tenant with no object here was built by this process and is torn down by it,
+    which is what keeps a half-migrated cluster deletable from one button.
+    """
+    try:
+        await k8s.custom_api.delete_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, name=name,
+        )
+        logger.info("Deleted ManagedTenant %r", name)
+        return True
+    except ApiException as e:
+        if e.status == 404:
+            return False
+        raise
+
+
+async def _await_managed_tenant_gone(k8s, name: str, timeout: float = 120.0) -> None:
+    """Wait for the operator to finish tearing the tenant down.
+
+    Its finalizer holds the object until the parts that outlive a namespace are
+    given back — the transit EIP and its ACLs, the demux ports. Deleting the
+    namespace while that is in flight is how a teardown wedges, so the sweep
+    below waits rather than races it.
+
+    A timeout falls through to that sweep on purpose: it removes the same
+    things, and a tenant that will not finish deleting is worse than one whose
+    leftovers were collected twice.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            await k8s.custom_api.get_cluster_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                plural=TENANT_PLURAL, name=name,
+            )
+        except ApiException as e:
+            if e.status == 404:
+                return
+        await asyncio.sleep(2)
+    logger.warning(
+        "Tenant %r: the ManagedTenant is still finalizing after %.0fs; "
+        "continuing the teardown", name, timeout,
+    )
+
+
+async def _await_tenant_namespace(k8s, ns: str, timeout: float = 60.0) -> bool:
+    """Wait for the namespace the operator creates. Whether it appeared."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if await _namespace_exists(k8s, ns):
+            return True
+        await asyncio.sleep(2)
+    return False
+
+
+async def _create_tenant_described(k8s, req: TenantCreateRequest) -> TenantResponse:
+    """Create a tenant by describing it, and let the operator build it.
+
+    What stays here is what the operator has no business deciding and what it
+    could not see anyway: the folder ceiling, which is read from a ConfigMap
+    this product owns and has to refuse *before* anything exists; the storage
+    class discovery, which reads host objects; and the host-side CSI resources,
+    which are the product's side of the storage boundary — the operator's own
+    code says so, and copies them inward once they are there.
+
+    What is gone is the build: no namespace, no quota, no PKI, no golden image,
+    no CAPI objects, no transit wiring, no addon releases. All of it is written
+    by a controller that comes back, which is the entire point — every one of
+    those steps in the path below happens exactly once, and the one that lost a
+    race lost it permanently.
+    """
+    ns = _tenant_ns(req.name)
+
+    refused = _undescribable_fields(req)
+    if refused:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This request asks for things a ManagedTenant cannot carry, and "
+                "creating tenants through the operator is enabled "
+                "(OPERATOR_TENANT_ENABLED). Refused rather than silently "
+                "dropped: " + "; ".join(refused)
+            ),
+        )
+
+    # Before anything exists, as on the path below: a folder ceiling that is
+    # checked after the tenant is written is a ceiling that has already been
+    # exceeded.
+    tenant_quota = _tenant_quota(req)
+    if req.folder:
+        all_folders = _parse_all_folders(await _ensure_folders_configmap(k8s))
+        await assert_within_folder_quota(
+            k8s, all_folders, req.folder,
+            tenant_quota["cpu"], tenant_quota["memory"], tenant_quota["storage"],
+            asking=f"tenant '{req.name}'",
+        )
+
+    storage_class = req.storage_class
+    if req.enable_storage and not storage_class:
+        storage_class = await suggested_infra_storage_class(k8s)
+        logger.info(
+            "Tenant %r: no storage_class given; %s", req.name,
+            f"discovered {storage_class!r}" if storage_class
+            else "none discovered, falling back to the host cluster default",
+        )
+
+    await _create_managed_tenant(k8s, _managed_tenant_body(req, storage_class))
+    try:
+        await _await_managed_tenant(k8s, req.name)
+    except HTTPException:
+        # Refused, not half-built: the operator declined the description, so
+        # take it back rather than leaving an object nobody will act on.
+        await _delete_managed_tenant(k8s, req.name)
+        raise
+
+    if req.enable_storage:
+        # The operator creates the namespace; these go into it and it copies
+        # them into the tenant afterwards. Best-effort on purpose — the tenant
+        # is described and being built, and `POST /tenants/{name}/storage/
+        # reconcile` is the same call by hand. Failing here would report a
+        # failure for a tenant that is coming up.
+        if await _await_tenant_namespace(k8s, ns):
+            try:
+                await create_csi_infrastructure_resources(k8s, req)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Tenant %r: host-side CSI resources not written (%s); the "
+                    "storage-reconcile endpoint writes them", req.name, exc,
+                )
+        else:
+            logger.warning(
+                "Tenant %r: namespace did not appear in time, so the host-side "
+                "CSI resources were not written; call the storage-reconcile "
+                "endpoint once it is up", req.name,
+            )
+
+    return TenantResponse(
+        name=req.name,
+        display_name=req.display_name,
+        namespace=ns,
+        kubernetes_version=req.kubernetes_version,
+        status="Provisioning",
+        phase="Pending",
+        endpoint=f"https://{_endpoint_host(req.name)}",
+        control_plane_replicas=req.control_plane_replicas,
+        control_plane_ready=False,
+        worker_type=req.worker_type,
+        worker_count=req.worker_count,
+        workers_ready=0,
+        worker_vcpu=req.worker_vcpu,
+        worker_memory=req.worker_memory,
+        pod_cidr=req.pod_cidr,
+        service_cidr=req.service_cidr,
+        # What was asked for, not what will exist: the operator adds the
+        # catalogue's required components itself, and this response is written
+        # before it has. The tenant page reads them from the cluster.
+        addons=[
+            TenantAddonStatus(addon_id=a.addon_id, name=f"{req.name}-{a.addon_id}")
+            for a in req.addons
+        ],
+    )
+
+
+async def _write_described_addons(
+    k8s, name: str, addons: list[dict[str, Any]], resource_version: str | None,
+) -> None:
+    """Say what the tenant should have, and let the operator make it so.
+
+    The whole list goes in one patch, which is the shape that has already cost
+    us twice: two requests read the same list, each writes its own version, and
+    the later write erases the earlier addon with nothing logged. So the read's
+    `resourceVersion` rides along as a precondition — the API server refuses the
+    second write with a 409 instead of losing it.
+    """
+    body: dict[str, Any] = {"spec": {"addons": addons}}
+    if resource_version:
+        body["metadata"] = {"resourceVersion": resource_version}
+    try:
+        await k8s.custom_api.patch_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, name=name,
+            body=body,
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        if e.status == 409:
+            # Named rather than absorbed: a retry here would re-run the read
+            # this function was not given, and guessing what the other request
+            # wanted is how the lost write comes back wearing a retry.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Tenant '{name}' was changed by someone else while this "
+                    f"addon was being enabled. Nothing was written — try again."
+                ),
+            ) from e
+        raise
+
+
+async def _create_tenant_addons(k8s, name: str, addons, catalog) -> bool:
+    """Write the tenant's addon releases, unless the operator does.
+
+    Handed over under a flag because there were two renderers of this object
+    and they disagreed — see `tenant_addons_path_enabled`. Returns whether it
+    did the work, so the caller and the tests can tell "handed over" from
+    "nothing to do".
+    """
+    if tenant_addons_path_enabled():
+        return False
+    await _create_addon_resources(k8s, name, addons, catalog)
+    return True
+
+
+async def _ensure_tenant_time(k8s, name: str, namespace: str, vip: str | None) -> bool:
+    """Give the tenant somewhere to ask for the time, unless the operator does.
+
+    Best-effort by design: without it the public fallbacks still work wherever
+    egress does, and failing a whole create over the clock would be worse than
+    the symptom.
+
+    Handed over under a flag, and not because two writers of a Service are
+    dangerous. The chrony **Deployment** has two renderers the moment both sides
+    run, and any difference between them rolls it — during a join that is a
+    worker with nowhere to ask for the time, which is a node that never appears.
+
+    Returns whether it did the work, so the caller and the tests can tell
+    "handed over" from "nothing to do".
+    """
+    if tenant_time_path_enabled():
+        return False
+    await ensure_ntp_server(k8s)
+    if vip:
+        await ensure_tenant_ntp_service(k8s, name, namespace, vip)
+    return True
+
+
 def _vmi_memory_overhead(memory: int, vcpu: int) -> int:
     """What virt-launcher asks for beyond the guest's own memory.
 
@@ -227,6 +714,7 @@ def _api_reason(e: ApiException) -> str:
 def _parse_tenant_response(
     cluster: dict[str, Any],
     addon_statuses: list[TenantAddonStatus] | None = None,
+    described: dict[str, Any] | None = None,
 ) -> TenantResponse:
     metadata = cluster.get("metadata", {})
     spec = cluster.get("spec", {})
@@ -264,6 +752,28 @@ def _parse_tenant_response(
     # Parse conditions
     conditions = []
     for c in cluster_status.get("conditions", []):
+        conditions.append(TenantCondition(
+            type=c.get("type", ""),
+            status=c.get("status", "Unknown"),
+            message=c.get("message", ""),
+            reason=c.get("reason", ""),
+            last_transition_time=c.get("lastTransitionTime"),
+        ))
+
+    # And what the operator says, which is most of what there is to know.
+    #
+    # These were only ever visible to `kubectl`. A tenant whose external name
+    # did not resolve said so in a sentence naming the setting and the
+    # consequence — and the screen showed four CAPI conditions, all True, so the
+    # reader went to the objects instead. A condition nobody sees is half a
+    # condition.
+    #
+    # CAPI's own view is kept where the two overlap: the infrastructure's
+    # opinion of ControlPlaneReady is not the operator's to overwrite.
+    seen = {c.type for c in conditions}
+    for c in ((described or {}).get("status") or {}).get("conditions", []):
+        if c.get("type", "") in seen:
+            continue
         conditions.append(TenantCondition(
             type=c.get("type", ""),
             status=c.get("status", "Unknown"),
@@ -1260,9 +1770,22 @@ def _tenant_quota(req: Any) -> dict[str, str]:
         )
         + req.control_plane_replicas * _CP_MEMORY
     )
-    storage = surge * (parse_quantity(req.worker_disk) or 0)
-    # Talos workers each clone their own root from the tenant's golden image,
-    # and both are real PVCs in this namespace. Counting only `worker_disk`
+    # Storage here is **PVC** storage, and a worker's `data` disk is not one:
+    # it is an `emptyDisk`, a qcow2 on the launcher pod's ephemeral storage. A
+    # cloud-init root is a `containerDisk`, which is the same. So neither of
+    # them belongs in `requests.storage`, and counting them reserved capacity
+    # that could never be allocated — measured on this stand, a two-worker
+    # Talos tenant whose 120Gi quota was half phantom: its namespace holds two
+    # 20Gi root PVCs and one 1Gi tenant volume, and `used` says 41Gi.
+    #
+    # What the `data` disks really consume is the node's ephemeral storage,
+    # which no quota here governs. Named rather than silently dropped: it is a
+    # real resource with no ceiling on it, and putting one on
+    # `requests.ephemeral-storage` would make that request mandatory for every
+    # pod in the namespace — the same trap the LimitRange story is about.
+    storage = 0
+    # Talos workers each clone their own root from the shared golden image, and
+    # that clone is a real PVC. Counting only `worker_disk`
     # left the quota one clone short of the cluster it was provisioning:
     # measured on a two-worker tenant, the first root bound and the second
     # stopped at
@@ -1309,6 +1832,42 @@ async def _ensure_tenant_limit_range(k8s, ns: str) -> None:
     except ApiException as e:
         if e.status != 409:
             raise
+
+
+async def _widen_tenant_quota(k8s, ns: str, planned: dict[str, str]) -> None:
+    """Make room before the shape needs it, never take room away here.
+
+    The quota used to be written after the shape, and a scale-up spent the gap
+    between the two writes with the new machines already asked for and the old
+    quota still refusing their pods. The tenant reported "namespace quota has
+    no room for the replacement pod" and then, a moment later, scaled — a
+    diagnosis that was true when it was read and false by the time it was
+    shown.
+
+    So a growing dimension is raised first and a shrinking one is left alone:
+    the quota carries the larger of the two shapes across the gap. Lowering it
+    to the planned figure is the job of the write that still follows the
+    shape, once the machines that were counted against the old one are gone.
+    """
+    hard = dict(planned)
+    try:
+        existing = await k8s.core_api.list_namespaced_resource_quota(namespace=ns)
+    except ApiException:
+        existing = None
+    for quota in (existing.items if existing else []):
+        if (quota.metadata.name or "") != f"{ns}-quota":
+            continue
+        current = (quota.spec.hard if quota.spec else None) or {}
+        for key, field in (
+            ("requests.cpu", "cpu"),
+            ("requests.memory", "memory"),
+            ("requests.storage", "storage"),
+        ):
+            now = parse_quantity(current.get(key))
+            want = parse_quantity(planned.get(field))
+            if now is not None and want is not None and now > want:
+                hard[field] = current[key]
+    await _write_tenant_quota(k8s, ns, hard)
 
 
 async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
@@ -1366,10 +1925,57 @@ async def _write_tenant_quota(k8s, ns: str, quota: dict[str, str]) -> None:
         )
 
 
+async def _folder_you_may_build_in(k8s, user: User, folder: str) -> dict:
+    """The folder's metadata, if this caller may create a tenant in it.
+
+    One refusal for both "no such folder" and "not yours", because telling
+    them apart is a way to enumerate folders — which is what the error text of
+    this endpoint was doing before the authorisation moved to the front of it.
+
+    Global admins keep the plain 404, since there is nothing they could learn
+    from it that they cannot list outright.
+    """
+    folders = await load_folders(k8s)
+    meta = folders.get(folder)
+    if meta is not None and is_folder_admin(user, meta):
+        return meta
+    if is_admin(user.groups, user) and meta is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Folder '{folder}' not found",
+        )
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail=(
+            f"You cannot create a tenant in folder '{folder}'. It takes "
+            f"folder-admin on that folder, or platform admin."
+        ),
+    )
+
+
 @router.post("", response_model=TenantResponse, status_code=201)
 async def create_tenant(request: Request, req: TenantCreateRequest, user: User = Depends(require_auth)) -> TenantResponse:
     """Create a new tenant cluster."""
     k8s = request.app.state.k8s_client
+
+    # One kind of worker is built now, and the wizard offers one. Refused here
+    # as well, because a choice taken off a screen is not a choice taken out of
+    # an API — and because the far end is patient about it: the operator answers
+    # `CloudInitNotMigrated` and waits, which presents as a tenant whose
+    # machines never join, with the reason on an object nobody is watching.
+    #
+    # The tenants that already run this way keep running: reading, scaling and
+    # deleting them all still know how. It is creating another that stops.
+    if req.worker_os != "talos":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"worker_os {req.worker_os!r} is no longer built. Talos workers "
+                f"are the only kind this deployment creates — the operator "
+                f"builds those, and a cloud-init pool would sit unbuilt. "
+                f"Existing cloud-init tenants are unaffected."
+            ),
+        )
     await _ensure_cluster_config(k8s)
     ns = _tenant_ns(req.name)
 
@@ -1389,10 +1995,20 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         await assert_cabpt_installed(k8s)
 
-    # T1 — validate folder/env exist + caller has folder_admin (or global admin).
-    # We don't run the namespace check below until folder/env are confirmed; this
-    # guarantees we never partially-create a tenant on bad metadata.
-    folder_meta = await load_folder(k8s, req.folder)  # 404 if missing
+    # Authorisation first, before anything is read or reported.
+    #
+    # This endpoint used to be `require_auth` at the door with the folder-admin
+    # check three lookups later, and the lookups answer questions. UAT run 4,
+    # A-1: a viewer's `POST /tenants` came back "Folder 'x' not found" and then
+    # "Environment 'y' does not exist in folder 'poc-transit'. Known envs:
+    # ['dev', 'prod']" — the full contents of a folder they may not write to,
+    # from the error text of a call they are not allowed to make. `POST /vms`
+    # and `POST /vpcs` answer 403 at the door.
+    #
+    # "Not yours" and "does not exist" are the same answer here, deliberately.
+    # Distinguishing them is the leak: a 404 for one folder name and a 403 for
+    # another is a directory of folder names.
+    folder_meta = await _folder_you_may_build_in(k8s, user, req.folder)
     # Bug #1 fix (BUGS-TENANT-CREATE.md): discover environments from namespace
     # labels — the folder ConfigMap doesn't carry the env list (envs are
     # backend-projected from managed namespaces stamped with kubevirt-ui.io/
@@ -1423,13 +2039,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                 f"'{req.folder}'. Known envs: {env_names!r}"
             ),
         )
-    if not is_folder_admin(user, folder_meta):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=(
-                f"User does not have folder_admin access on folder '{req.folder}'"
-            ),
-        )
+    # The folder-admin check has already run, at the door.
 
     # Check if already exists
     if await _namespace_exists(k8s, ns):
@@ -1476,6 +2086,13 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                     f"'{req.environment}' (VPC env label: {vpc_env!r})"
                 ),
             )
+
+    # Everything above is validation, and it stays: the operator cannot answer
+    # "is this folder yours" or "does that VPC belong to this environment", and
+    # a refusal is worth more before anything is written than a condition
+    # afterwards.
+    if tenant_path_enabled():
+        return await _create_tenant_described(k8s, req)
 
     try:
         # 1. Create namespace, stamping folder/env labels so the tenant
@@ -1550,12 +2167,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                     k8s, req.name, ns, worker_os=req.worker_os,
                 )
             await ensure_talos_tenant_objects(k8s, req.name, ns, vip=talos_vip)
-            # Time on the transit plane. Best-effort by design: without it the
-            # public fallbacks still work wherever egress does, and failing the
-            # whole create over the clock would be worse than the symptom.
-            await ensure_ntp_server(k8s)
-            if talos_vip:
-                await ensure_tenant_ntp_service(k8s, req.name, ns, talos_vip)
+            await _ensure_tenant_time(k8s, req.name, ns, talos_vip)
             # Resolved here rather than trusted: the wizard renders the pairs
             # this same function accepts, so a mismatch means one of them has
             # drifted and the tenant would be built on an image whose kubelet
@@ -1650,7 +2262,7 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
                 )
 
         if all_addons and catalog.git_repository_ref:
-            await _create_addon_resources(k8s, req.name, all_addons, catalog)
+            await _create_tenant_addons(k8s, req.name, all_addons, catalog)
 
         # Best-effort: push the infra-cluster-credentials secret into the
         # tenant cluster so the CSI controller can mount it. At create time
@@ -1715,7 +2327,6 @@ async def create_tenant(request: Request, req: TenantCreateRequest, user: User =
             # Subnet, so without this the subnet would carry a stale entry
             # for an aborted tenant.
             await _detach_tenant_ns_from_vpc_subnet(k8s, req.name)
-            await _remove_cp_vpc_publication(k8s, req.name)
         except Exception:
             pass
         try:
@@ -1768,7 +2379,11 @@ async def get_tenant(request: Request, name: str, user: User = Depends(require_a
         raise k8s_error_to_http(e, "tenant operation")
 
     addon_statuses = await _get_addon_statuses(k8s, name)
-    tenant = _parse_tenant_response(cluster, addon_statuses)
+    # Unconditionally, not behind the handover flag: what matters is whether
+    # this tenant has a description, and an adopted one has it with every flag
+    # off.
+    tenant = _parse_tenant_response(
+        cluster, addon_statuses, await _tenant_description(k8s, name))
     tenant = await _enrich_with_workers(k8s, tenant)
     tenant = await _enrich_with_control_plane(k8s, tenant)
     tenant = await _enrich_with_cp_address(k8s, tenant)
@@ -1802,8 +2417,20 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
     await require_tenant_access(k8s, user, name, level="admin")
     ns = _tenant_ns(name)
 
-    if not await _namespace_exists(k8s, ns):
+    # Ownership is the object, not the flag: a tenant the operator holds is
+    # torn down by the operator whether or not new tenants are being described
+    # today, and one it never held is torn down below. That is what makes a
+    # half-migrated cluster deletable from the same button, and it is why the
+    # flag can be turned off without stranding anything.
+    described = await _delete_managed_tenant(k8s, name)
+    if described:
+        await _await_managed_tenant_gone(k8s, name)
+    elif not await _namespace_exists(k8s, ns):
         raise HTTPException(status_code=404, detail=f"Tenant '{name}' not found")
+
+    # Everything from here is idempotent and 404-tolerant, so it runs in both
+    # cases: after a described teardown it finds nothing and says so, and that
+    # is cheaper than two teardown paths that have to be kept in agreement.
 
     # 1. Best-effort delete of the CAPI Cluster CR — lets CAPI finalizers run
     #    before the ns cascade yanks everything out from under them. 404-
@@ -1833,7 +2460,6 @@ async def delete_tenant(request: Request, name: str, user: User = Depends(requir
     #    and left the tenant fully alive behind a 5xx.
     for label, cleanup in (
         ("detach tenant ns from the VPC subnet", _detach_tenant_ns_from_vpc_subnet),
-        ("drop the control-plane SwitchLBRule", _remove_cp_vpc_publication),
         ("delete the CSI ClusterRoleBinding", delete_csi_cluster_role_binding),
         ("release the CP demux ports", release_cp_ports),
         ("drop the transit EIP/SNAT and its ACLs", _release_tenant_transit),
@@ -2051,6 +2677,37 @@ async def _current_worker_shape(k8s, ns: str, md_name: str) -> dict[str, Any]:
     return shape
 
 
+async def _write_described_workers(
+    k8s, name: str, workers: dict[str, Any], resource_version: str | None,
+) -> None:
+    """Say what the pool should be, and let the operator make it so.
+
+    Carries the resourceVersion for the same reason the addon list does: two
+    people resizing at once each read the same shape, and the later write would
+    silently undo the earlier one.
+    """
+    body: dict[str, Any] = {"spec": {"workers": workers}}
+    if resource_version:
+        body["metadata"] = {"resourceVersion": resource_version}
+    try:
+        await k8s.custom_api.patch_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=TENANT_PLURAL, name=name,
+            body=body,
+            _content_type="application/merge-patch+json",
+        )
+    except ApiException as e:
+        if e.status == 409:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Tenant '{name}' was changed by someone else while this "
+                    f"resize was being applied. Nothing was written — try again."
+                ),
+            ) from e
+        raise
+
+
 @router.post("/{name}/scale", response_model=TenantResponse)
 async def scale_tenant(
     request: Request, name: str, scale: TenantScaleRequest,
@@ -2065,6 +2722,34 @@ async def scale_tenant(
     # Ask the folder ceiling before touching anything: a refusal must leave
     # the tenant exactly as it was.
     planned_quota = await _plan_tenant_quota(k8s, name, ns, scale)
+
+    # A described tenant is scaled by changing the description. Patching the
+    # MachineDeployment instead does nothing that lasts: the operator writes
+    # `replicas` from `spec.workers.count` on its next pass and puts it back,
+    # and the template rotation lands on an object the operator immediately
+    # replaces. Neither reports an error — the number moves and then returns.
+    described = await _described_tenant(k8s, name)
+    if described is not None:
+        workers = dict((described.get("spec") or {}).get("workers") or {})
+        workers["count"] = scale.worker_count
+        if scale.worker_vcpu:
+            workers["vcpu"] = scale.worker_vcpu
+        if scale.worker_memory:
+            workers["memory"] = scale.worker_memory
+        # Room first, then the shape that needs it.
+        await _widen_tenant_quota(k8s, ns, planned_quota)
+        await _write_described_workers(
+            k8s, name, workers,
+            (described.get("metadata") or {}).get("resourceVersion"),
+        )
+        # And the quota follows the shape down. The operator writes it from
+        # the same description too, but only on its next pass.
+        await _write_tenant_quota(k8s, ns, planned_quota)
+        return await get_tenant(request, name, user=user)
+
+    # Room first, then the shape that needs it: the pods of the new machines
+    # are created against whatever the quota says at that moment.
+    await _widen_tenant_quota(k8s, ns, planned_quota)
 
     try:
         # Resize first (rotate template), so the replica patch below lands on
@@ -2451,6 +3136,48 @@ async def _tenant_storage_enabled(k8s, name: str) -> bool:
         return False
     return bool((kvc.get("spec") or {}).get("infraClusterSecretRef"))
 
+async def _wire_tenant_storage(k8s, name: str) -> None:
+    """Create the host side of storage for a tenant that has none.
+
+    Everything the driver talks to lives out here: a service account in the
+    tenant's namespace, its rights, a non-expiring token, a kubeconfig built
+    from it, and the same again for the CAPK identity. The copy inside the
+    tenant follows.
+
+    Best-effort on that copy alone: the credential existing is what unblocks the
+    driver, and the operator places the copy on its next pass regardless.
+    """
+    from app.api.v1.tenants_storage import (
+        create_csi_infrastructure_resources,
+        replicate_csi_credentials_to_tenant,
+    )
+
+    # The creator reads a request for the tenant's name and two quota numbers,
+    # and this is the whole of it. Building a real TenantCreateRequest would
+    # mean inventing a folder, an environment and a worker shape for a tenant
+    # that already has them.
+    shape = SimpleNamespace(
+        name=name,
+        storage_pvc_count=_DEFAULT_STORAGE_PVC_COUNT,
+        storage_quota_gi=_DEFAULT_STORAGE_ALLOWANCE_GI,
+    )
+    await create_csi_infrastructure_resources(k8s, shape)
+    try:
+        await replicate_csi_credentials_to_tenant(k8s, name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Tenant %r: host-side storage is wired; the copy inside the tenant "
+            "did not land (%s), and the operator places it on its next pass",
+            name, exc,
+        )
+
+
+# What a tenant that gains storage later is allowed, when nobody says. The same
+# numbers the create form offers.
+_DEFAULT_STORAGE_PVC_COUNT = 20
+_DEFAULT_STORAGE_ALLOWANCE_GI = 100
+
+
 @router.post("/{name}/addons", status_code=201)
 async def enable_addon(
     request: Request, name: str, addon: TenantAddon,
@@ -2475,20 +3202,51 @@ async def enable_addon(
     # wiring card that would have explained it is hidden in exactly that
     # state. Refused with the reason instead.
     if addon.addon_id in _STORAGE_ADDONS and not await _tenant_storage_enabled(k8s, name):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Tenant '{name}' was created without storage, so the "
-                f"host-side CSI credentials it needs do not exist. The driver "
-                f"would install and then wait for them indefinitely. Recreate "
-                f"the tenant with storage enabled."
-            ),
-        )
+        # This used to refuse, and the refusal was right about the driver and
+        # wrong about the way out. It said "recreate the tenant with storage
+        # enabled", and that was literally the only path: `storage/reconcile`
+        # copies a credential that does not exist yet, and nothing anywhere
+        # creates one after the tenant is built. A product whose answer is
+        # "destroy it and start again" has not answered.
+        #
+        # The host side is created first and the driver enabled after, which
+        # keeps the guarantee the refusal existed for — the driver never
+        # installs into a tenant with nothing for it to talk to.
+        await _wire_tenant_storage(k8s, name)
 
     # Merge defaults with user params
     params: dict[str, str] = {}
     for p in component.parameters:
         params[p.id] = addon.parameters.get(p.id, p.default)
+
+    described = await _described_tenant(k8s, name)
+    if described is not None:
+        # Third writer of this object, retired. The release itself came out the
+        # same shape as the operator's, but this path also appended
+        # `<tenant>-<namespace>` to the namespace list — a namespace nothing
+        # ever installs into, because the release targets `<namespace>` — and,
+        # worse, wrote a release the tenant's own description does not mention.
+        # Measured on the stand: it survives until the next reconcile of the
+        # ManagedTenant and is then deleted within seconds, so the button works
+        # and the addon disappears minutes later.
+        existing = list((described.get("spec") or {}).get("addons") or [])
+        if any(entry.get("id") == addon.addon_id for entry in existing):
+            raise HTTPException(
+                status_code=409, detail=f"Addon '{addon.addon_id}' already enabled",
+            )
+        entry: dict[str, Any] = {"id": addon.addon_id}
+        if addon.parameters:
+            entry["parameters"] = dict(addon.parameters)
+        await _write_described_addons(
+            k8s, name, existing + [entry],
+            (described.get("metadata") or {}).get("resourceVersion"),
+        )
+        return TenantAddonStatus(
+            addon_id=addon.addon_id,
+            name=f"{name}-{addon.addon_id}",
+            ready=False,
+            message="Described, waiting for the operator",
+        )
 
     try:
         # If new addon has a target namespace, patch the namespaces HelmRelease
@@ -2578,6 +3336,20 @@ async def disable_addon(request: Request, name: str, addon_id: str, user: User =
         raise HTTPException(
             status_code=400, detail=f"Cannot disable required addon '{addon_id}'"
         )
+
+    described = await _described_tenant(k8s, name)
+    if described is not None:
+        # Same reason as enabling: the description is what the operator acts on,
+        # and deleting the release here would leave the two disagreeing until
+        # the next pass put it back.
+        existing = list((described.get("spec") or {}).get("addons") or [])
+        remaining = [e for e in existing if e.get("id") != addon_id]
+        if len(remaining) != len(existing):
+            await _write_described_addons(
+                k8s, name, remaining,
+                (described.get("metadata") or {}).get("resourceVersion"),
+            )
+        return
 
     # Delete Flux HelmRelease
     try:

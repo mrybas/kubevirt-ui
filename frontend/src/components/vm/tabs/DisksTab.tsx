@@ -52,13 +52,27 @@ function DiskSnapshotsPanel({
   const [rollbackConfirm, setRollbackConfirm] = useState<string | null>(null);
   const [rollbackMsg, setRollbackMsg] = useState('');
 
+  // The name is a real value, not a placeholder.
+  //
+  // It used to be an empty field showing `<pvc>-snap` as a hint, next to a
+  // button disabled until you typed. A tester pressed Create Snapshot twice
+  // and recorded that the page never called its own backend — which was true
+  // and not the reason: there was nothing to send, and nothing said so. The
+  // suggestion is now the value, editable, and put back after each create
+  // rather than cleared, because clearing it disables the button again.
+  const suggested = `${pvcName}-snap`;
+  useEffect(() => {
+    setSnapshotName(suggested);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pvcName]);
+
   const handleCreate = () => {
     if (!snapshotName) return;
     setSnapshotError('');
     createSnapshot.mutate(
       { namespace, pvcName, data: { display_name: snapshotName } },
       {
-        onSuccess: () => setSnapshotName(''),
+        onSuccess: () => setSnapshotName(suggested),
         onError: (err: any) => setSnapshotError(err?.message || 'Failed to create snapshot'),
       }
     );
@@ -78,7 +92,18 @@ function DiskSnapshotsPanel({
       {
         onSuccess: (res: any) => {
           setRollbackConfirm(null);
-          setRollbackMsg(`Rolled back to ${snapName}. ${res?.was_running ? 'VM is restarting.' : 'VM is stopped.'}`);
+          // Two different answers, and they used to read as one. The path
+          // through the operator returns as soon as the request is written —
+          // the clone is not made, the machine is not stopped, nothing has
+          // been rolled back yet — and saying "Rolled back. VM is
+          // restarting." there is a report of a result that does not exist.
+          setRollbackMsg(
+            res?.status === 'rolling_back'
+              ? `Rolling ${pvcName} back to ${snapName}. The machine stops, `
+                + `its disk is replaced, and it starts again — the VM page `
+                + `shows the progress.`
+              : `Rolled back to ${snapName}. ${res?.was_running ? 'VM is restarting.' : 'VM is stopped.'}`,
+          );
         },
         onError: (err: any) => {
           setRollbackConfirm(null);
@@ -103,7 +128,7 @@ function DiskSnapshotsPanel({
             type="text"
             value={snapshotName}
             onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSnapshotName(e.target.value)}
-            placeholder={`${pvcName}-snap`}
+            placeholder={suggested}
             className="input text-sm py-1 px-2 w-64"
             onKeyDown={(e: React.KeyboardEvent) => e.key === 'Enter' && handleCreate()}
           />

@@ -45,6 +45,7 @@ from app.core.kube_api_url import discover_external_api_url
 from app.models.tenant import TenantCreateRequest, TenantStorageStatus
 
 from app.api.v1.tenants_common import _tenant_ns
+from app.core.operator import tenant_path_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -670,12 +671,25 @@ async def create_csi_infrastructure_resources(
         role_label="capk-infra",
     )
 
-    # 7. ResourceQuota
-    await _ensure_resource_quota(
-        core_api, ns, req.name,
-        pvc_count=req.storage_pvc_count,
-        storage_gi=req.storage_quota_gi,
-    )
+    # 7. ResourceQuota — only where nothing else writes one.
+    #
+    # The operator writes a single quota for the namespace that already
+    # carries this allowance and the PVC cap, summed with what the machines
+    # reserve. Writing a second object here does not add a limit: Kubernetes
+    # enforces the smaller of the two, while the folder ceiling sums both and
+    # charges for the same storage twice. That is what
+    # `QuotaReserved=False (CountedTwice)` has been reporting on every tenant
+    # with storage since the handover — permanently, which is how a condition
+    # stops being read.
+    #
+    # So the older writer stands down where the newer one is in charge, and
+    # the operator absorbs the object this used to leave behind.
+    if not tenant_path_enabled():
+        await _ensure_resource_quota(
+            core_api, ns, req.name,
+            pvc_count=req.storage_pvc_count,
+            storage_gi=req.storage_quota_gi,
+        )
 
     logger.info(
         f"Provisioned kubevirt-csi host-side resources for tenant {req.name!r} "

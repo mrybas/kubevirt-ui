@@ -20,6 +20,7 @@ from app.api.v1.vpcs import create_vpc_peering as create_vpc_peering_v2
 from app.core.vpc_peering import list_vpc_peerings, remove_vpc_peering
 from app.models.vpc import VpcPeeringCreateRequest
 from app.core.groups import get_user_namespaces, is_admin
+from app.core.vpc_access import facts_from_item, visible_vpcs
 from app.models.network import (
     ProviderNetworkCreate,
     ProviderNetworkResponse,
@@ -48,11 +49,14 @@ router = APIRouter()
 async def _user_visible_vpc_names(k8s, user: User) -> set[str]:
     """Return the set of VPC names visible to a non-admin user.
 
-    A VPC is visible if its ``spec.namespaces`` intersects the user's RBAC-
-    allowed namespaces and it is not the built-in system VPC. Admins should
-    not call this — they see everything.
+    The rule is `app.core.vpc_access`, the same one `GET /vpcs` applies.
+
+    This used to ask half of it — whether ``spec.namespaces`` overlapped the
+    user's namespaces — and a VPC nothing is attached to yet has an empty
+    ``spec.namespaces``. So a freshly created VPC was invisible here while
+    `/vpcs` listed it, and the VM wizard, which filters subnets through this,
+    told the user there were no networks in a folder that had three.
     """
-    user_ns = set(await get_user_namespaces(k8s, user))
     try:
         result = await k8s.custom_api.list_cluster_custom_object(
             group=KUBEOVN_API_GROUP, version=KUBEOVN_API_VERSION, plural="vpcs",
@@ -60,15 +64,11 @@ async def _user_visible_vpc_names(k8s, user: User) -> set[str]:
     except ApiException:
         return set()
 
-    visible: set[str] = set()
-    for item in result.get("items", []):
-        name = item.get("metadata", {}).get("name", "")
-        if not name or name == SYSTEM_VPC_NAME:
-            continue
-        vpc_ns = set(item.get("spec", {}).get("namespaces", []) or [])
-        if vpc_ns & user_ns:
-            visible.add(name)
-    return visible
+    return await visible_vpcs(
+        k8s, user,
+        (facts_from_item(item) for item in result.get("items", [])),
+        SYSTEM_VPC_NAME,
+    )
 
 
 

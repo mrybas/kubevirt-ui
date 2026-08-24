@@ -15,6 +15,12 @@ from pydantic import BaseModel, Field
 from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.groups import get_user_namespaces
 from app.core.kubevirt import get_hotplug_mode
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    managed_owner,
+    vm_path_enabled,
+)
 from app.core.naming import (
     DISPLAY_NAME_ANNOTATION,
     SLUG_LABEL,
@@ -29,6 +35,7 @@ from app.models.vm import (
     VMCloudInitResponse,
     VMCreateRequest,
     VMListResponse,
+    VMOperationInfo,
     VMResponse,
     VMUpdateCloudInitFormRequest,
     VMUpdateCloudInitRequest,
@@ -414,10 +421,62 @@ async def _datavolume_blockers(
     return out
 
 
-async def _migration_blockers(
+async def _operation_in_flight(
     k8s_client: Any, namespace: str, vm_name: str,
-) -> list[dict[str, str]]:
-    """A live migration that is not going anywhere.
+) -> VMOperationInfo | None:
+    """The operation this machine is under, while it is under one.
+
+    A rollback, a recreate, an operation-driven migration: the endpoint that
+    asks for one answers as soon as the resource is written, and everything
+    after that happens in the controller. Without this the page reports the
+    request as the result — "Rolled back. VM is restarting." while a clone is
+    still being made and the machine has not been stopped yet.
+
+    Terminal operations are left out: what finished is history, and history
+    that looks like a current state is the thing being fixed.
+    """
+    try:
+        ops = await k8s_client.custom_api.list_namespaced_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            namespace=namespace, plural="managedvmoperations",
+        )
+    except Exception:
+        # An operator that is not installed, or a read that failed. Neither is
+        # a reason to refuse to describe the machine.
+        return None
+
+    newest = None
+    for item in ops.get("items", []):
+        spec = item.get("spec") or {}
+        if spec.get("vmName") != vm_name:
+            continue
+        status = item.get("status") or {}
+        phase = status.get("phase") or "Pending"
+        if phase in ("Succeeded", "Failed"):
+            continue
+        created = (item.get("metadata") or {}).get("creationTimestamp") or ""
+        if newest is None or created > newest[0]:
+            newest = (created, VMOperationInfo(
+                name=(item.get("metadata") or {}).get("name", ""),
+                action=spec.get("action", ""),
+                phase=phase,
+                message=status.get("message", ""),
+            ))
+    return newest[1] if newest else None
+
+
+async def _migration_state(
+    k8s_client: Any, namespace: str, vm_name: str,
+) -> tuple[list[dict[str, str]], str | None]:
+    """What this VM's live migration is doing, and what is stopping it.
+
+    Two answers from one read. The blockers are conditions to show; the phase
+    is what tells a client whether to keep looking — a page that stops asking
+    before the machine arrives goes on naming the node it has left, which is
+    what a fixed refetch schedule did to a migration that took forty-five
+    seconds.
+
+    A live migration that is not going anywhere:
 
     Migration runs a second launcher pod beside the first, so for its duration
     the VM counts twice against the environment's quota. With none to spare
@@ -435,9 +494,10 @@ async def _migration_blockers(
             plural="virtualmachineinstancemigrations",
         )
     except Exception:
-        return []
+        return [], None
 
     out: list[dict[str, str]] = []
+    in_flight: str | None = None
     for m in migrations.get("items", []):
         if (m.get("spec") or {}).get("vmiName") != vm_name:
             continue
@@ -445,6 +505,8 @@ async def _migration_blockers(
         phase = status.get("phase")
         if phase in ("Succeeded", "Failed", None):
             continue
+        # Not finished, so somebody waiting on this VM should keep waiting.
+        in_flight = phase
         rejected = next(
             (c for c in (status.get("conditions") or [])
              if c.get("type") == "migrationRejectedByResourceQuota"
@@ -463,7 +525,7 @@ async def _migration_blockers(
                 f"Migration {m['metadata']['name']} is {phase}."
             ),
         })
-    return out
+    return out, in_flight
 
 
 @router.get("/{name}", response_model=VMResponse)
@@ -505,10 +567,13 @@ async def get_vm(
             pass
 
         resp = vm_from_k8s(vm, vmi, pod_ip=pod_ip)
+        blockers, resp.migration_phase = await _migration_state(
+            k8s_client, namespace, name)
+        resp.operation = await _operation_in_flight(k8s_client, namespace, name)
         resp.conditions = (
             list(resp.conditions or [])
             + await _datavolume_blockers(k8s_client, namespace, vm)
-            + await _migration_blockers(k8s_client, namespace, name)
+            + blockers
         )
         return resp
 
@@ -1268,6 +1333,190 @@ async def create_vm(
         )
 
 
+async def _create_managed_vm(
+    *,
+    k8s_client: Any,
+    request: Request,
+    vm_request: VMFromTemplateRequest,
+    namespace: str,
+    user: User,
+    slug: str,
+) -> VMResponse:
+    """Create the VM as a ManagedVM and let the operator render the machine.
+
+    The response keeps the shape the UI already handles, so the wizard cannot
+    tell which side of the flag it is on. Naming keeps the same rule too:
+    generateName sits on our own resource, so the machine still ends up called
+    ``<slug>-xxxxx``.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+
+    # SSH keys stay a question about a person, so they are resolved here, where
+    # there is a person, and written into the resource explicitly.
+    from app.api.v1.profile import get_user_ssh_keys
+
+    ssh_keys: list[str] = list(await get_user_ssh_keys(k8s_client, user))
+    if vm_request.ssh_key:
+        ssh_keys.append(vm_request.ssh_key)
+
+    spec: dict[str, Any] = {
+        "displayName": vm_request.display_name,
+        "templateRef": {"name": vm_request.template_name},
+        "running": bool(vm_request.start),
+        "networkBinding": vm_request.network_binding,
+    }
+
+    compute: dict[str, Any] = {}
+    if vm_request.cpu_cores:
+        compute["cores"] = vm_request.cpu_cores
+    if vm_request.memory:
+        compute["memory"] = vm_request.memory
+    if compute:
+        # Cores and memory travel together: a resource carrying half of a
+        # compute block would be refused by the schema, and silently dropping
+        # the half that was given is worse than saying so.
+        compute.setdefault("cores", 0)
+        compute.setdefault("memory", "")
+        if compute["cores"] and compute["memory"]:
+            spec["compute"] = compute
+
+    root_disk: dict[str, Any] = {}
+    if vm_request.disk_size:
+        root_disk["size"] = vm_request.disk_size
+    if vm_request.storage_class:
+        root_disk["storageClass"] = vm_request.storage_class
+    if root_disk.get("size"):
+        spec["rootDisk"] = root_disk
+
+    if ssh_keys:
+        spec["ssh"] = {"authorizedKeys": ssh_keys}
+    if vm_request.user_data:
+        spec["cloudInit"] = {"userData": vm_request.user_data}
+
+    nics = vm_request.networks or ([vm_request.network] if vm_request.network else [])
+    networks = [
+        {"subnet": n.subnet, **({"staticIP": n.static_ip} if n.static_ip else {})}
+        for n in nics
+        if n
+    ]
+    if networks:
+        spec["networks"] = networks
+
+    # The password does not travel in the resource. This object lands in etcd
+    # and, for anything managed as code, in a state file.
+    secret_name: str | None = None
+    if vm_request.password:
+        secret_name = await _create_initial_password_secret(
+            k8s_client, namespace, slug, vm_request.password,
+        )
+        spec["initialPasswordSecretRef"] = {"name": secret_name, "key": "password"}
+
+    body = {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedVM",
+        "metadata": {
+            "generateName": f"{slug}-",
+            "namespace": namespace,
+            "annotations": {"kubevirt-ui.io/owner": user.email or user.username},
+        },
+        "spec": spec,
+    }
+
+    try:
+        created = await custom_api.create_namespaced_custom_object(
+            group=OPERATOR_GROUP,
+            version=OPERATOR_VERSION,
+            namespace=namespace,
+            plural="managedvms",
+            body=body,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "VM creation is routed to the operator (OPERATOR_VM_ENABLED), "
+                    "but the ManagedVM CRD is not installed in this cluster"
+                ),
+            )
+        # Admission refusals carry the reason the operator would otherwise have
+        # reported as a condition; pass it through rather than flattening it.
+        raise HTTPException(
+            status_code=e.status or status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=_admission_detail(e),
+        )
+
+    name = created["metadata"]["name"]
+    if secret_name:
+        await _label_secret_owner(k8s_client, namespace, secret_name, name)
+
+    logger.info(
+        f"User {user.username} created ManagedVM {namespace}/{name} "
+        f"(display_name={vm_request.display_name!r}, template={vm_request.template_name})"
+    )
+
+    return VMResponse(
+        name=name,
+        namespace=namespace,
+        display_name=vm_request.display_name,
+        status="Provisioning",
+        ready=False,
+        created=created["metadata"].get("creationTimestamp"),
+    )
+
+
+def _admission_detail(e: ApiException) -> str:
+    """The message an admission webhook produced, or a plain reason."""
+    body = getattr(e, "body", None)
+    if body:
+        try:
+            import json as _json
+
+            parsed = _json.loads(body)
+            if isinstance(parsed, dict) and parsed.get("message"):
+                return str(parsed["message"])
+        except Exception:
+            pass
+    return f"Failed to create VM: {e.reason}"
+
+
+async def _create_initial_password_secret(
+    k8s_client: Any, namespace: str, slug: str, password: str,
+) -> str:
+    """Store the first-boot password so the resource can point at it."""
+    secret = client.V1Secret(
+        metadata=client.V1ObjectMeta(
+            generate_name=f"{slug}-initpw-",
+            namespace=namespace,
+            labels={"kubevirt-ui.io/managed": "true"},
+        ),
+        string_data={"password": password},
+        type="Opaque",
+    )
+    created = await k8s_client.core_api.create_namespaced_secret(
+        namespace=namespace, body=secret,
+    )
+    return created.metadata.name
+
+
+async def _label_secret_owner(
+    k8s_client: Any, namespace: str, secret_name: str, vm_name: str,
+) -> None:
+    """Tie the password secret to its VM so deletion can find it.
+
+    Best-effort on purpose: the VM exists by now, and failing the create over a
+    label would leave a machine nobody asked to lose.
+    """
+    try:
+        await k8s_client.core_api.patch_namespaced_secret(
+            name=secret_name,
+            namespace=namespace,
+            body={"metadata": {"labels": {"platform.kubevirt-ui.io/owner-name": vm_name}}},
+        )
+    except Exception as e:
+        logger.warning(f"Could not tie secret {secret_name} to VM {vm_name}: {e}")
+
+
 @router.post("/from-template", response_model=VMResponse, status_code=status.HTTP_201_CREATED)
 async def create_vm_from_template(
     request: Request,
@@ -1283,25 +1532,21 @@ async def create_vm_from_template(
     k8s_client = request.app.state.k8s_client
     
     try:
-        # 1. Get the template
-        try:
-            cm = await k8s_client.core_api.read_namespaced_config_map(
-                name="kubevirt-ui-templates",
-                namespace="kubevirt-ui-system",
+        # 1. Get the template, from whichever store holds it.
+        #
+        # This used to read the ConfigMap and nothing else, while the list and
+        # the single-template read covered both. With OPERATOR_TEMPLATE_ENABLED
+        # on, a template was written as a ManagedVMTemplate, appeared in the
+        # list, was offered by the wizard, and answered 404 here — the last
+        # click of the flow, and the only one that told you.
+        from app.api.v1.templates import resolve_template
+
+        template = await resolve_template(k8s_client, vm_request.template_name)
+        if template is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Template {vm_request.template_name} not found",
             )
-            if not cm.data or vm_request.template_name not in cm.data:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Template {vm_request.template_name} not found",
-                )
-            template = json.loads(cm.data[vm_request.template_name])
-        except ApiException as e:
-            if e.status == 404:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Templates not configured",
-                )
-            raise
         
         # 2. Extract template values with overrides
         compute = template.get("compute", {})
@@ -1330,6 +1575,21 @@ async def create_vm_from_template(
                 detail="Template has no golden image configured",
             )
         
+        # With the operator owning VMs, the backend stops rendering the machine
+        # and writes the intent. Everything that used to be added silently here
+        # — the profile's SSH keys, the owner annotation, the display name — is
+        # made explicit in the resource, because a controller reconciling a
+        # stored object cannot ask who is holding the mouse.
+        if vm_path_enabled():
+            return await _create_managed_vm(
+                k8s_client=k8s_client,
+                request=request,
+                vm_request=vm_request,
+                namespace=namespace,
+                user=user,
+                slug=sanitize_display_name(vm_request.display_name),
+            )
+
         # 3. Build DataVolume spec for dataVolumeTemplates
         # DV name must be literal (volumes[].dataVolume.name references it by exact
         # match), so we can't use K8s generateName for the DV. Use a client-side
@@ -1718,6 +1978,20 @@ async def create_vm_from_template(
         )
 
 
+async def _managed_vm_owner(custom_api: Any, namespace: str, name: str) -> str | None:
+    """Name of the ManagedVM behind this machine, or None if nothing owns it."""
+    try:
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    return managed_owner(vm, "ManagedVM")
+
+
 @router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_vm(
     request: Request,
@@ -1753,8 +2027,23 @@ async def delete_vm(
         except ApiException:
             pass  # Snapshot CRD may not exist
 
-        # 2. Delete the VM
-        await k8s_client.delete_virtual_machine(name=name, namespace=namespace)
+        # 2. Delete the VM.
+        #
+        # A machine the operator owns is released by deleting its ManagedVM.
+        # Deleting the VirtualMachine directly would only make the controller
+        # render it again, and the user would watch a deleted VM reappear.
+        # Ownership lives on the object, so this stays right after the flag is
+        # turned off.
+        owner = await _managed_vm_owner(custom_api, namespace, name)
+        if owner:
+            # The operator's finalizer removes the machine and the first-boot
+            # password secret with it, so this is the whole deletion.
+            await custom_api.delete_namespaced_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                namespace=namespace, plural="managedvms", name=owner,
+            )
+        else:
+            await k8s_client.delete_virtual_machine(name=name, namespace=namespace)
 
     except ApiException as e:
         if e.status == 404:

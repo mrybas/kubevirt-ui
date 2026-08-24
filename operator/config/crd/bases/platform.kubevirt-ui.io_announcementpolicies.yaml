@@ -1,0 +1,277 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: announcementpolicies.platform.kubevirt-ui.io
+spec:
+  group: platform.kubevirt-ui.io
+  names:
+    kind: AnnouncementPolicy
+    listKind: AnnouncementPolicyList
+    plural: announcementpolicies
+    shortNames:
+    - annpol
+    singular: announcementpolicy
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.borderPeer
+      name: Peer
+      type: string
+    - jsonPath: .status.announced[*]
+      name: Prefixes
+      priority: 1
+      type: integer
+    - jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      name: Accepted
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: AnnouncementPolicy is how this cluster advertises its tenant
+          networks.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              AnnouncementPolicySpec is how tenant networks are advertised to the border.
+
+              It is configuration read from the cluster rather than from the process's
+              environment, which is the point: these values are properties of an
+              installation's addressing plan, and one of them being unset used to mean the
+              whole feature quietly did nothing on an entire stand.
+            properties:
+              borderPeer:
+                description: |-
+                  BorderPeer is the address BGP is spoken to.
+
+                  Deliberately separate from the gateway a VPC's default route points at:
+                  they are different addresses of the same box, and conflating them
+                  produces networks whose default route points at a management address the
+                  external plane cannot reach.
+                minLength: 1
+                type: string
+              configurationName:
+                default: kubevirt-ui-b3
+                description: |-
+                  ConfigurationName is the FRRConfiguration this policy owns.
+
+                  Note what this is *not* for: pointing it at a second name does not
+                  produce a passive copy. frr-k8s merges every configuration it finds in
+                  its namespace into the node's FRR, so a second object is applied to the
+                  dataplane alongside the first — two `router bgp` blocks fighting over one
+                  session. To compare a new renderer against the current one, use dryRun.
+                type: string
+              dryRun:
+                default: false
+                description: |-
+                  DryRun renders everything and writes no FRRConfiguration.
+
+                  This is how ownership is handed over safely. While something else still
+                  writes the live object, a dry run publishes what this controller *would*
+                  produce in status, so the two can be compared byte for byte before the
+                  swap. The swap itself has to be one step — the old writer off and the new
+                  one on — because two writers of one BGP configuration is an outage with
+                  extra steps.
+                type: boolean
+              externalSubnet:
+                default: external
+                description: |-
+                  ExternalSubnet is the kube-ovn subnet the router legs sit in. The next
+                  hops live there, and a VPC counts as routed when its default route points
+                  into it.
+                type: string
+              localASN:
+                description: LocalASN is this cluster's autonomous system number.
+                format: int32
+                minimum: 1
+                type: integer
+              nodes:
+                description: |-
+                  Nodes pins the announcement to named nodes, overriding the automatic
+                  choice.
+
+                  The automatic choice is Ready workers, sorted. Control-plane nodes are
+                  excluded because the border peers with workers: a plain sort over every
+                  node put the control plane first, and every prefix silently vanished from
+                  the border while this object looked perfect.
+                items:
+                  type: string
+                type: array
+              peerASN:
+                description: PeerASN is the border's.
+                format: int32
+                minimum: 1
+                type: integer
+              replicas:
+                default: 2
+                description: |-
+                  Replicas is how many nodes carry the announcement.
+
+                  Redundancy of the announcement, not of the path: every node advertises
+                  the same prefix with the same next hop, so there is no traffic to split.
+                  One node dying must not take a tenant's return path with it; that is all
+                  this is for.
+                format: int32
+                minimum: 1
+                type: integer
+              targetNamespace:
+                default: metallb-system
+                description: |-
+                  TargetNamespace is where the FRRConfiguration is written — wherever
+                  frr-k8s watches.
+                type: string
+            required:
+            - borderPeer
+            - localASN
+            - peerASN
+            type: object
+          status:
+            description: |-
+              AnnouncementPolicyStatus is what is actually being advertised, and whether
+              FRR took it.
+            properties:
+              announced:
+                description: Announced is what the generated configuration advertises.
+                items:
+                  description: AnnouncedPrefix is one advertised network and where
+                    the border should send it.
+                  properties:
+                    cidr:
+                      type: string
+                    nextHop:
+                      type: string
+                    vpc:
+                      type: string
+                  required:
+                  - cidr
+                  - nextHop
+                  - vpc
+                  type: object
+                type: array
+              conditions:
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              nodes:
+                description: Nodes are the nodes carrying it.
+                items:
+                  type: string
+                type: array
+              observedGeneration:
+                format: int64
+                type: integer
+              reloadFailures:
+                description: |-
+                  ReloadFailures are nodes where FRR refused the configuration.
+
+                  A rejected reload is fail-safe in the wrong direction: FRR keeps the
+                  previous configuration, so live announcements survive and a newly
+                  attached network is silently not added — exactly the "attached but not
+                  announced" state this design exists to avoid. Nothing else reports it.
+                items:
+                  description: NodeReloadFailure is FRR refusing what was generated,
+                    in its own words.
+                  properties:
+                    message:
+                      type: string
+                    node:
+                      type: string
+                  required:
+                  - message
+                  - node
+                  type: object
+                type: array
+              renderedConfiguration:
+                description: |-
+                  RenderedConfiguration is what this controller would write, published so a
+                  handover can be compared against the current writer before it happens.
+                  Only set on a dry run.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+        x-kubernetes-validations:
+        - message: there is one announcement policy per cluster and it is called default
+          rule: self.metadata.name == 'default'
+    served: true
+    storage: true
+    subresources:
+      status: {}

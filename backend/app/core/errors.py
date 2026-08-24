@@ -34,6 +34,14 @@ def k8s_error_to_http(e: ApiException, action: str = "operation") -> HTTPExcepti
         404: (404, "Resource not found"),
         409: (409, "Resource conflict"),
         422: (422, "Invalid resource configuration"),
+        # The API server asking to be asked again. Flattened into a 500 it
+        # reads as "this is broken" — seen in UAT run 4, where listing disk
+        # snapshots came back 500 and the very next request succeeded. A
+        # client has no reason to retry a 500 and every reason to retry this.
+        429: (429, "The cluster is rate-limiting this request — try again"),
+        # Likewise for a control plane that is briefly unavailable: retriable,
+        # and nothing about it is internal to us.
+        503: (503, "The cluster API is unavailable — try again"),
     }
     status, detail = status_map.get(e.status, (500, f"Internal error during {action}"))
     logger.warning(f"K8s API error during {action}: {e}")

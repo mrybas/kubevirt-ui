@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+spec:
+  template:
+    spec:
+      serviceAccountName: controller-manager
+      containers:
+        - name: manager
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+            - --metrics-secure=false
+            - --domains=tenant
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # No admission here: the webhook configuration points at the vm
+            # deployment's service, and a second server answering for it would
+            # be a coin toss.
+            - name: ENABLE_WEBHOOKS
+              value: "false"
+            # The same three names the backend reads, deliberately: two
+            # deployments configured by different variable names for the same
+            # fact drift apart in silence, and the silence looks like a check
+            # that passed.
+            - name: TENANTS_CP_METALLB_POOL
+              value: cp-transit-pool
+            - name: TENANTS_CP_METALLB_NAMESPACE
+              value: o0-metallb
+            # Without this the pool-versus-excludeIps invariant does not run at
+            # all, and "no complaint" reads exactly like "checked and fine".
+            - name: TENANTS_CP_TRANSIT_SUBNET
+              value: cp-transit
+            # Where kube-ovn states the resolver a VPC worker uses. Needed for
+            # a VPC the product built, which has no ManagedNetwork to read it
+            # from — the operator must not require the world to be its shape.
+            # o0-kube-ovn on this stand, not the upstream default. Set wrong
+            # the first time, and the tenant that found it was an adopted one
+            # waiting for a resolver that was being looked for in an empty
+            # namespace.
+            - name: KUBE_OVN_NAMESPACE
+              value: o0-kube-ovn
+            # The external name a tenant's apiserver answers to. Without it the
+            # certificate carries no such SAN and kubectl through the ingress
+            # fails TLS — invisible from inside the cluster, which is where
+            # every test looks.
+            - name: TENANTS_INGRESS_DOMAIN
+              value: tenants.lab.beardlabs.cc
+            # The identity provider a tenant may opt into. Same values the
+            # backend reads: two deployments configured by different names for
+            # one fact drift apart in silence.
+            - name: OIDC_ISSUER
+              value: https://kubevirt-ui.lab.beardlabs.cc/dex
+            - name: OIDC_CLIENT_ID
+              value: kubevirt-ui

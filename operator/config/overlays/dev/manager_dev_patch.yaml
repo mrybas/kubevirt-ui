@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: system
+spec:
+  template:
+    spec:
+      containers:
+        - name: manager
+          args:
+            - --leader-elect
+            - --health-probe-bind-address=:8081
+            - --metrics-bind-address=:8080
+            - --metrics-secure=false
+            # Only the VM domain exists so far. Network/tenant/remediation get
+            # their own Deployments as their controllers land, each with its own
+            # service account and its own leader-election lease.
+            - --domains=vm
+          ports:
+            - name: metrics
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # Who may still create a KubeVirt VirtualMachine directly. Every
+            # entry is measured on this cluster rather than assumed:
+            #
+            #   * the operator itself, which renders VMs from ManagedVM;
+            #   * the tenant machinery — tenant namespaces carry
+            #     kubevirt-ui.io/enabled=true, so the guard does police them,
+            #     and CAPK creates worker VMs as this identity. Leaving it out
+            #     would not tighten policy, it would stop tenants from
+            #     provisioning and from replacing an unhealthy worker;
+            #   * the UI backend, which still writes VMs directly until its
+            #     create path moves onto ManagedVM. It comes off this list in
+            #     the same change that moves it;
+            #   * virt-controller, which creates the target of a
+            #     VirtualMachineClone. Found by measurement, not by thinking
+            #     hard: with the guard deployed and this entry missing, cloning
+            #     was refused outright. An allowlist assembled from memory will
+            #     always be missing one, which is why refusals are logged — the
+            #     next missing identity should arrive as a log line rather than
+            #     as a mystery.
+            - name: OPERATOR_RAW_VM_ALLOWED_SUBJECTS
+              value: >-
+                system:serviceaccount:kubevirt-ui-operator-dev:kubevirt-ui-operator-controller-manager,
+                system:serviceaccount:o0-capi:capk-manager,
+                system:serviceaccount:kubevirt-ui-system:kubevirt-ui,
+                system:serviceaccount:o0-kubevirt:kubevirt-controller
+            - name: KUBE_OVN_NAMESPACE
+              value: o0-kube-ovn
+            # The guard fails open, so something has to notice when it is not
+            # in the request path at all. The watchdog reads this configuration
+            # and reports kubevirt_ui_operator_guard_wired.
+            - name: OPERATOR_GUARD_WEBHOOK_CONFIG
+              value: kubevirt-ui-operator-validating-webhook-configuration
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace

@@ -93,6 +93,77 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # -----------------------------------------------------------------------
+  # The operator's custom resources
+  # -----------------------------------------------------------------------
+  # Needed only when an OPERATOR_*_ENABLED flag is on, but granted regardless:
+  # the flags are set on the Deployment and a role that has to be widened at the
+  # same moment a flag is flipped turns a reversible switch into a two-step
+  # migration.
+  #
+  # This block was missing entirely while four of those paths were already
+  # written, and no test or lab run could see it: the development backend talks
+  # to the cluster through an admin kubeconfig, so every RBAC-gated path passes
+  # by construction. It surfaced only when the deployed backend was asked to
+  # read a ManagedUnderlay and answered 403.
+  #
+  # These rows are not kept by memory. tests/test_helm_rbac_contract.py reads
+  # the *_custom_object(plural=...) call sites out of the backend and fails when
+  # its REQUIRED list — and therefore this block — falls behind them.
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedvms
+    verbs: ["get", "list", "create", "patch", "delete"]
+
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedvmoperations
+    verbs: ["list", "create"]
+
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedvmtemplates
+    verbs: ["list", "create", "delete", "patch"]
+
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedimages
+    verbs: ["get", "list", "create", "delete"]
+
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedunderlays
+    verbs: ["get", "create", "patch"]
+
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managednetworks
+    verbs: ["get", "list", "create", "delete", "patch"]
+
+  # A peering is described here and written by the operator. No patch: the
+  # declaration is created or removed, never edited in place — changing which
+  # networks a link joins is a different link.
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managednetworkpeerings
+    verbs: ["get", "list", "create", "delete"]
+
+  # A tenant's addons are described, not written: the Enable button edits this
+  # object and the operator renders the releases.
+  #
+  # `create` and `delete` are here for OPERATOR_TENANT_ENABLED, and only for
+  # it. The rule they replace had neither, on the reasoning that a tenant
+  # becomes described by being adopted and adoption is a deliberate act rather
+  # than a side effect of pressing Enable. That still holds for Enable — it
+  # patches, and patching a tenant that does not exist fails. What changed is
+  # that describing a *new* tenant became a deliberate act too, behind a flag
+  # that is off by default. `delete` is not gated by that flag at all: a tenant
+  # the operator holds must stay deletable after it is turned off again.
+  - apiGroups: ["platform.kubevirt-ui.io"]
+    resources:
+      - managedtenants
+    verbs: ["get", "list", "create", "patch", "delete"]
+
+  # -----------------------------------------------------------------------
   # Core resources
   # -----------------------------------------------------------------------
   # Namespaces — full CRUD for project/environment management
@@ -254,6 +325,19 @@ rules:
       # (bgp.py — BGPCONF_PLURAL).
       - bgp-confs
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+
+  # FRR's own verdict on the config we generated. Cluster-scoped, so it cannot
+  # live in the namespaced -b3 Role below next to `frrconfigurations` — and
+  # that is exactly how it was missed: the write permission was granted, the
+  # read of the result was not, and `reload_failures` swallows the 403 and
+  # returns "no failures". FRR keeps the last good config when it refuses one,
+  # so the session stays up and only VPCs attached after the break go
+  # unannounced — the failure this tier exists to catch is the one it was
+  # blind to (b3_announce.reload_failures).
+  - apiGroups: ["frrk8s.metallb.io"]
+    resources:
+      - frrnodestates
+    verbs: ["get", "list", "watch"]
 
   - apiGroups: ["k8s.cni.cncf.io"]
     resources:
@@ -618,6 +702,14 @@ rules:
   - apiGroups: ["frrk8s.metallb.io"]
     resources: ["frrconfigurations"]
     verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # The session state the page reports. Namespaced, alongside the config it
+  # describes. Without it `GET /bgp/routed-egress` returns `sessions: []` and
+  # the page says "No session state reported yet" while the session has been
+  # Established for hours — the same shape of lie the speaker used to tell,
+  # arriving by a different route (bgp.get_routed_egress).
+  - apiGroups: ["frrk8s.metallb.io"]
+    resources: ["bgpsessionstates"]
+    verbs: ["get", "list", "watch"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

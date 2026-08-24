@@ -1,0 +1,32 @@
+{
+  "labels": {
+    "kubevirt-ui.io/environment": "dev",
+    "kubevirt-ui.io/folder": "poc-transit",
+    "kubevirt-ui.io/managed": "true"
+  },
+  "spec": {
+    "enableExternal": true,
+    "extraExternalSubnets": [
+      "cp-transit",
+      "external"
+    ],
+    "policyRoutes": [
+      {
+        "action": "allow",
+        "match": "ip4.dst == 10.199.0.0/22",
+        "priority": 30000
+      }
+    ],
+    "staticRoutes": [
+      {
+        "bfdId": "",
+        "cidr": "0.0.0.0/0",
+        "ecmpMode": "",
+        "nextHopIP": "10.199.4.254",
+        "policy": "policyDst",
+        "routeTable": ""
+      }
+    ],
+    "vpcPeerings": []
+  }
+}

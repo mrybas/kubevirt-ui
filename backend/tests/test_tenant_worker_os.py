@@ -48,17 +48,42 @@ def _req(**kw: object) -> TenantCreateRequest:
     return TenantCreateRequest(**base)  # type: ignore[arg-type]
 
 
-class TestDefaultIsUnchanged:
-    def test_cloud_init_is_the_default(self) -> None:
-        assert _req().worker_os == "cloud-init"
+class TestTheDefaultIsTalosNow:
+    """It used to be cloud-init, and this class asserted that it stayed so.
 
-    def test_default_still_bootstraps_with_kubeadm(self) -> None:
+    The default moved because the choice went: the operator builds Talos
+    workers only — `reconcileWorkers` answers `CloudInitNotMigrated` and waits —
+    so a cloud-init pool created today is a tenant whose machines never join.
+    The wizard offers one kind and the endpoint refuses the other.
+
+    What did not move is the build path below: the tenants that already run on
+    cloud-init are read, scaled and deleted by the same code, and the tests
+    under `TestCloudInitStillBuilds` are what keeps that true.
+    """
+
+    def test_talos_is_the_default(self) -> None:
+        assert _req().worker_os == "talos"
+
+    def test_the_default_asks_for_the_talos_bootstrap_provider(self) -> None:
         md = _build_machine_deployment_cr(_req())
+        ref = md["spec"]["template"]["spec"]["bootstrap"]["configRef"]
+        assert ref["kind"] == "TalosConfigTemplate"
+
+
+class TestCloudInitStillBuilds:
+    """Creating one is refused; building one is not.
+
+    A tenant that exists on cloud-init is scaled and repaired through these
+    same functions, and removing them would strand it.
+    """
+
+    def test_it_still_bootstraps_with_kubeadm(self) -> None:
+        md = _build_machine_deployment_cr(_req(worker_os="cloud-init"))
         ref = md["spec"]["template"]["spec"]["bootstrap"]["configRef"]
         assert ref["kind"] == "KubeadmConfigTemplate"
 
-    def test_default_control_plane_has_no_signer(self) -> None:
-        spec = _build_kamaji_cp_cr(_req())["spec"]
+    def test_its_control_plane_has_no_signer(self) -> None:
+        spec = _build_kamaji_cp_cr(_req(worker_os="cloud-init"))["spec"]
         assert "additionalContainers" not in spec["deployment"]
         assert "additionalPorts" not in spec["network"]
 
@@ -104,16 +129,33 @@ class TestTalosControlPlane:
         talos = _build_kamaji_cp_cr(_req(worker_os="talos"))["spec"]["network"]["certSANs"]
         assert set(plain) <= set(talos)
 
-    def test_own_vip_publishes_port_50001(self) -> None:
-        spec = _build_kamaji_cp_cr(_req(worker_os="talos"))["spec"]
-        assert spec["network"]["additionalPorts"][0]["port"] == TALOS_TRUSTD_PORT
+    def test_the_control_plane_carries_no_port_fields_at_all(self) -> None:
+        """It used to publish trustd here, and the field does not exist.
 
-    def test_shared_vip_does_not_publish_the_port(self) -> None:
-        # MetalLB refuses identical ports on one shared address.
-        spec = _build_kamaji_cp_cr(
-            _req(worker_os="talos"), advertise_vip="10.198.190.10",
-        )["spec"]
-        assert "additionalPorts" not in spec["network"]
+        `KamajiControlPlane.spec.network` has advertiseAddress, certSANs,
+        dnsServiceIPs, gateway, ingress, loadBalancerConfig, serviceAddress,
+        serviceAnnotations, serviceLabels and serviceType. Anything else the
+        API server prunes without a word — confirmed on two live tenants,
+        whose network carries exactly three of those.
+
+        Where trustd is actually published is the tenant's own Services, and
+        `tenant_cp_ports` is what decides that.
+        """
+        for spec in (
+            _build_kamaji_cp_cr(_req(worker_os="talos"))["spec"],
+            _build_kamaji_cp_cr(
+                _req(worker_os="talos"), advertise_vip="10.198.190.10",
+            )["spec"],
+        ):
+            unknown = set(spec["network"]) - {
+                "advertiseAddress", "certSANs", "dnsServiceIPs", "gateway",
+                "ingress", "loadBalancerConfig", "serviceAddress",
+                "serviceAnnotations", "serviceLabels", "serviceType",
+            }
+            assert not unknown, (
+                f"written into spec.network and dropped by the API server: "
+                f"{sorted(unknown)}"
+            )
 
 
 class TestRequestValidation:

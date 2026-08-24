@@ -72,20 +72,7 @@ function TenantStatusBadge({ status, detail }: { status: string; detail?: string
 // Real tags confirmed on quay.io/capk/* (see T10)
 const K8S_VERSIONS = ['v1.34.1', 'v1.33.5', 'v1.32.1', 'v1.31.5', 'v1.30.1', 'v1.29.5'];
 
-const CAPK_URL_RE = /^quay\.io\/capk\/ubuntu-\d{4}-container-disk:/;
-
-function isCapkUrl(url: string): boolean {
-  return CAPK_URL_RE.test(url);
-}
-
 /** Derive the canonical CAPK worker image URL from a Kubernetes version string. */
-function deriveCapkUrl(version: string): string {
-  const match = version.match(/^v1\.(\d+)\./);
-  if (!match) return '';
-  const minor = parseInt(match[1]!, 10);
-  const ubuntuTag = minor <= 30 ? '2204' : '2404';
-  return `quay.io/capk/ubuntu-${ubuntuTag}-container-disk:${version}`;
-}
 
 interface WizardState {
   name: string;
@@ -93,14 +80,12 @@ interface WizardState {
   kubernetes_version: string;
   control_plane_replicas: number;
   worker_type: 'vm' | 'bare_metal';
-  worker_os: 'cloud-init' | 'talos';
+  worker_os: 'talos';
   talos_version: string;
   worker_count: number;
   worker_vcpu: number;
   worker_memory: string;
   worker_disk: string;
-  worker_image_url: string;
-  worker_image_pull_secrets: string[];
   worker_network_binding: 'bridge' | 'masquerade'; // T11
   pod_cidr: string;
   service_cidr: string;
@@ -130,14 +115,12 @@ const defaultWizard: WizardState = {
   kubernetes_version: 'v1.32.1', // matches latest confirmed CAPK tag (T10)
   control_plane_replicas: 2,
   worker_type: 'vm',
-  worker_os: 'cloud-init',
+  worker_os: 'talos',
   talos_version: '',
   worker_count: 2,
   worker_vcpu: 2,
   worker_memory: '2Gi',
   worker_disk: '20Gi',
-  worker_image_url: deriveCapkUrl('v1.32.1'), // auto-derived on load
-  worker_image_pull_secrets: [],
   worker_network_binding: 'bridge',
   pod_cidr: '10.244.0.0/16',
   // Must stay off the host cluster's own service CIDR (10.96.0.0/12 on both
@@ -164,19 +147,6 @@ const defaultWizard: WizardState = {
   addonParams: {},
 };
 
-// Real CAPK tags — confirmed available on quay.io/capk (T10)
-const capkPresets = [
-  { name: 'Ubuntu 22.04 / k8s 1.29.5', url: 'quay.io/capk/ubuntu-2204-container-disk:v1.29.5' },
-  { name: 'Ubuntu 22.04 / k8s 1.30.1', url: 'quay.io/capk/ubuntu-2204-container-disk:v1.30.1' },
-  { name: 'Ubuntu 24.04 / k8s 1.31.5', url: 'quay.io/capk/ubuntu-2404-container-disk:v1.31.5' },
-  { name: 'Ubuntu 24.04 / k8s 1.32.1', url: 'quay.io/capk/ubuntu-2404-container-disk:v1.32.1' },
-  { name: 'Ubuntu 24.04 / k8s 1.33.5', url: 'quay.io/capk/ubuntu-2404-container-disk:v1.33.5' },
-  { name: 'Ubuntu 24.04 / k8s 1.34.1', url: 'quay.io/capk/ubuntu-2404-container-disk:v1.34.1' },
-];
-
-/** DNS-1123 label: lowercase alphanumeric + hyphen, ≤63 chars, start/end alphanumeric */
-const isDns1123Label = (s: string): boolean =>
-  /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(s);
 
 function DnsServerList({ servers, onChange }: { servers: string[]; onChange: (s: string[]) => void }) {
   const [draft, setDraft] = useState('');
@@ -236,8 +206,6 @@ function DnsServerList({ servers, onChange }: { servers: string[]; onChange: (s:
 export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<WizardState>(defaultWizard);
-  const [secretInput, setSecretInput] = useState('');
-  const [imageAutoFilled, setImageAutoFilled] = useState(true); // default worker_image_url is auto-derived
   const [showNetworkBinding, setShowNetworkBinding] = useState(false);
   const [showCidrSection, setShowCidrSection] = useState(false);
   const { data: catalog } = useAddonCatalog();
@@ -285,16 +253,10 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
   const selectedFolder = allFolders.find(f => f.name === form.folder);
   const folderEnvironments = selectedFolder?.environments ?? [];
 
-  // Autoderive worker_image_url when kubernetes_version changes (T10)
-  useEffect(() => {
-    if (form.worker_os !== 'cloud-init') return;
-    const derived = deriveCapkUrl(form.kubernetes_version);
-    if (derived && (form.worker_image_url === '' || isCapkUrl(form.worker_image_url))) {
-      setForm(prev => ({ ...prev, worker_image_url: derived }));
-      setImageAutoFilled(true);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [form.kubernetes_version]);
+  // The CAPK image URL was derived here from the Kubernetes version, for
+  // cloud-init workers. Talos workers boot the golden image the backend
+  // imports, and there is no other kind now.
+
 
   // Preselect the discovered storage class — once, and only while the field
   // is still untouched, so a deliberate "(cluster default)" choice sticks.
@@ -402,17 +364,9 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
       ...(form.environment ? { environment: form.environment } : {}),
       // Network: explicit VPC choice (empty = default cluster network)
       ...(form.vpc_name ? { vpc_name: form.vpc_name } : {}),
-      // Only the cloud-init path takes a container disk. A Talos worker boots
-      // a raw image the backend imports over HTTP, and sending this field
-      // there makes CDI reject the DataVolume — after the tenant's Talos
-      // secrets and PKI have already been written.
-      ...(form.worker_image_url && form.worker_os === 'cloud-init' ? {
-        worker_image_url: form.worker_image_url,
-        worker_image_source_type: 'registry' as const,
-      } : {}),
-      ...(form.worker_image_pull_secrets.length > 0 ? {
-        worker_image_pull_secrets: form.worker_image_pull_secrets,
-      } : {}),
+      // No container disk: a Talos worker boots a raw image the backend
+      // imports over HTTP, and sending one made CDI reject the DataVolume
+      // after the tenant's secrets and PKI had already been written.
       // T11: network binding (omit if default bridge)
       ...(form.worker_network_binding !== 'bridge' ? {
         worker_network_binding: form.worker_network_binding,
@@ -767,39 +721,24 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
               {/* Worker OS */}
               <div>
                 <label className="block text-sm text-surface-300 mb-2">Worker OS</label>
-                <div className="grid grid-cols-2 gap-3">
-                  {([
-                    {
-                      value: 'cloud-init' as const,
-                      title: 'Standard (cloud-init)',
-                      hint: 'kubeadm join from a CAPK image',
-                    },
-                    {
-                      value: 'talos' as const,
-                      title: 'Talos',
-                      hint: 'Immutable OS, CSR signer on the control plane',
-                    },
-                  ]).map(opt => (
-                    <button
-                      key={opt.value}
-                      type="button"
-                      onClick={() => setForm({ ...form, worker_os: opt.value })}
-                      className={`flex items-center gap-3 p-3 rounded-lg border text-left transition-colors ${
-                        form.worker_os === opt.value
-                          ? 'border-primary-500 bg-primary-500/10'
-                          : 'border-surface-700 bg-surface-800 hover:border-surface-600'
-                      }`}
-                    >
-                      <Server className={`h-5 w-5 shrink-0 ${form.worker_os === opt.value ? 'text-primary-400' : 'text-surface-500'}`} />
-                      <div>
-                        <p className={`text-sm font-medium ${form.worker_os === opt.value ? 'text-primary-300' : 'text-surface-300'}`}>
-                          {opt.title}
-                        </p>
-                        <p className="text-xs text-surface-500">{opt.hint}</p>
-                      </div>
-                    </button>
-                  ))}
+                <div className="flex items-center gap-3 p-3 rounded-lg border border-surface-700 bg-surface-800">
+                  <Server className="h-5 w-5 shrink-0 text-primary-400" />
+                  <div>
+                    <p className="text-sm font-medium text-primary-300">Talos</p>
+                    <p className="text-xs text-surface-500">
+                      Immutable OS, CSR signer on the control plane
+                    </p>
+                  </div>
                 </div>
+                {/*
+                  There was a choice here — cloud-init from a CAPK image, or
+                  Talos. It is gone rather than disabled: the operator builds
+                  Talos workers only, and a picker offering the other one leads
+                  to a tenant whose machines never join, with the reason arriving
+                  later as a condition. The backend refuses it too, because a
+                  choice removed from a screen is not a choice removed from an
+                  API.
+                */}
                 {form.worker_os === 'talos' && (
                   <p className="text-xs text-surface-500 mt-2">
                     Needs the Talos bootstrap provider (CABPT) and cert-manager on the host
@@ -907,137 +846,10 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
                 </p>
               </div>
 
-              {/* T10: Worker Container Image (CAPK OCI disk).
-                  Cloud-init only: a Talos worker boots a raw disk image the
-                  backend imports over HTTP, and a container-disk reference
-                  handed to that path is rejected by CDI after the tenant's
-                  secrets and PKI are already written. */}
-              {form.worker_os === 'cloud-init' && (
-              <div className="space-y-2">
-                <label className="block text-sm text-surface-300">
-                  Worker Image URL
-                  <span className="ml-1 text-surface-500 font-normal">(CAPK container disk)</span>
-                </label>
-                <input
-                  type="text"
-                  value={form.worker_image_url}
-                  onChange={e => {
-                    const val = e.target.value;
-                    setForm({ ...form, worker_image_url: val });
-                    // If user types a custom non-capk URL, clear the auto-fill flag
-                    if (val !== '' && !isCapkUrl(val)) {
-                      setImageAutoFilled(false);
-                    }
-                  }}
-                  placeholder="quay.io/capk/ubuntu-2404-container-disk:v1.32.1"
-                  className="w-full px-3 py-2 bg-surface-800 border border-surface-700 rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none focus:border-primary-500 font-mono text-sm"
-                />
-                {imageAutoFilled && form.worker_image_url && (
-                  <p className="text-xs text-emerald-400 flex items-center gap-1">
-                    <CheckCircle className="h-3 w-3" />
-                    Auto-filled from Kubernetes version
-                  </p>
-                )}
-                <div>
-                  <p className="text-xs text-surface-500 mb-1.5">CAPK presets (quay.io/capk):</p>
-                  <div className="flex flex-wrap gap-2">
-                    {capkPresets.map((preset) => (
-                      <button
-                        key={preset.name}
-                        type="button"
-                        onClick={() => {
-                          setForm({ ...form, worker_image_url: preset.url });
-                          setImageAutoFilled(false);
-                        }}
-                        className={`px-3 py-1.5 text-xs rounded-md border transition-colors ${
-                          form.worker_image_url === preset.url
-                            ? 'border-primary-500 bg-primary-500/10 text-primary-300'
-                            : 'border-surface-700 bg-surface-800 text-surface-400 hover:border-surface-600 hover:text-surface-300'
-                        }`}
-                      >
-                        {preset.name}
-                      </button>
-                    ))}
-                    {form.worker_image_url && !capkPresets.some(p => p.url === form.worker_image_url) && (
-                      <span className="px-3 py-1.5 text-xs rounded-md border border-surface-600 bg-surface-800 text-surface-400 italic">
-                        Custom URL
-                      </span>
-                    )}
-                  </div>
-                </div>
-              </div>
-              )}
+              {/* The worker image URL and its pull secrets lived here, for the
+                  cloud-init path. Talos workers boot the golden image the backend
+                  imports, so there is nothing to choose. */}
 
-              {/* Image Pull Secrets */}
-              <div className="space-y-2">
-                <label className="block text-sm text-surface-300">Image Pull Secrets</label>
-                {/* Existing secrets chips */}
-                {form.worker_image_pull_secrets.length > 0 && (
-                  <div className="flex flex-wrap gap-1.5 mb-1">
-                    {form.worker_image_pull_secrets.map((secret) => (
-                      <span
-                        key={secret}
-                        className="inline-flex items-center gap-1 px-2 py-1 bg-primary-500/10 border border-primary-500/30 text-primary-300 rounded-md text-xs font-mono"
-                      >
-                        {secret}
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setForm({
-                              ...form,
-                              worker_image_pull_secrets: form.worker_image_pull_secrets.filter(s => s !== secret),
-                            })
-                          }
-                          className="ml-0.5 text-primary-400 hover:text-primary-200 transition-colors"
-                          aria-label={`Remove ${secret}`}
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {/* Input for adding a new secret */}
-                <input
-                  type="text"
-                  value={secretInput}
-                  onChange={e => {
-                    // Strip commas live — comma triggers add
-                    const val = e.target.value.replace(/,/g, '');
-                    setSecretInput(val);
-                  }}
-                  onKeyDown={e => {
-                    if (e.key === 'Enter' || e.key === ',') {
-                      e.preventDefault();
-                      const trimmed = secretInput.trim();
-                      if (trimmed && isDns1123Label(trimmed) && !form.worker_image_pull_secrets.includes(trimmed)) {
-                        setForm({ ...form, worker_image_pull_secrets: [...form.worker_image_pull_secrets, trimmed] });
-                      }
-                      setSecretInput('');
-                    } else if (e.key === 'Backspace' && secretInput === '' && form.worker_image_pull_secrets.length > 0) {
-                      // Remove last chip on backspace when input is empty
-                      setForm({
-                        ...form,
-                        worker_image_pull_secrets: form.worker_image_pull_secrets.slice(0, -1),
-                      });
-                    }
-                  }}
-                  placeholder={form.worker_image_pull_secrets.length === 0 ? 'my-registry-secret (Enter or comma to add)' : 'Add another…'}
-                  className={`w-full px-3 py-2 bg-surface-800 border rounded-lg text-surface-100 placeholder-surface-500 focus:outline-none text-sm font-mono ${
-                    secretInput && !isDns1123Label(secretInput)
-                      ? 'border-red-500/60 focus:border-red-500'
-                      : 'border-surface-700 focus:border-primary-500'
-                  }`}
-                />
-                {secretInput && !isDns1123Label(secretInput) && (
-                  <p className="text-xs text-red-400">
-                    Must be lowercase alphanumeric + hyphens, start/end with alphanumeric, ≤63 chars
-                  </p>
-                )}
-                <p className="text-xs text-surface-500">
-                  Secrets must already exist in the tenant namespace; admin creates them.
-                </p>
-              </div>
 
               {/* T11: Network binding (advanced) */}
               <div className="border border-surface-700 rounded-lg overflow-hidden">
@@ -1606,29 +1418,8 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
                       <span className="text-surface-200">{form.worker_disk}</span>
                       <span className="text-surface-500">Worker OS</span>
                       <span className="text-surface-200">
-                        {form.worker_os === 'talos'
-                          ? `Talos ${form.talos_version || talosDefault} / Kubernetes ${form.kubernetes_version}`
-                          : 'Standard (cloud-init)'}
+                        {`Talos ${form.talos_version || talosDefault} / Kubernetes ${form.kubernetes_version}`}
                       </span>
-                      {/* The CAPK disk is only sent for cloud-init workers
-                          (see handleSubmit). Printing it under Talos claimed
-                          the workers would boot an Ubuntu image when they
-                          actually boot the Talos golden DataVolume — the
-                          review naming something the build never uses. */}
-                      {form.worker_os === 'cloud-init' && form.worker_image_url && (
-                        <>
-                          <span className="text-surface-500">Image</span>
-                          <span className="text-surface-200 font-mono truncate" title={form.worker_image_url}>
-                            {form.worker_image_url}
-                          </span>
-                        </>
-                      )}
-                      {form.worker_image_pull_secrets.length > 0 && (
-                        <>
-                          <span className="text-surface-500">Pull Secrets</span>
-                          <span className="text-surface-200">{form.worker_image_pull_secrets.join(', ')}</span>
-                        </>
-                      )}
                       {/* T5: Storage */}
                       <span className="text-surface-500">Storage</span>
                       {form.enable_storage ? (

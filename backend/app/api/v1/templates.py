@@ -10,8 +10,21 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client.rest import ApiException
 
 from app.core.auth import User, require_auth
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    OWNER_KIND_LABEL,
+    OWNER_NAME_LABEL,
+    image_path_enabled,
+    template_path_enabled,
+)
 from app.core.naming import DISPLAY_NAME_ANNOTATION, SLUG_LABEL, sanitize_display_name
+from app.core.storage_headroom import assert_storage_headroom
 from app.models.template import (
+    TemplateCloudInit,
+    TemplateCompute,
+    TemplateConsole,
+    TemplateDisk,
     VMTemplate,
     VMTemplateCreate,
     VMTemplateListResponse,
@@ -80,6 +93,102 @@ async def _resolve_folder_ancestors(k8s_client, folder_name: str) -> list[str]:
 # =============================================================================
 
 
+# ---------------------------------------------------------------------------
+# Templates as custom resources
+# ---------------------------------------------------------------------------
+
+
+def _template_from_cr(cr: dict[str, Any]) -> VMTemplate:
+    """Present a ManagedVMTemplate in the shape the UI already reads.
+
+    The image namespace is taken from status when the controller has resolved
+    it, and from the spec otherwise, so a template is usable before its first
+    reconcile rather than appearing to point nowhere.
+    """
+    meta = cr.get("metadata", {}) or {}
+    spec = cr.get("spec", {}) or {}
+    status = cr.get("status", {}) or {}
+    image = spec.get("imageRef", {}) or {}
+    compute = spec.get("compute", {}) or {}
+    disk = spec.get("rootDisk", {}) or {}
+    console = spec.get("console") or {}
+    cloud_init = spec.get("cloudInit") or None
+
+    return VMTemplate(
+        name=meta.get("name", ""),
+        display_name=spec.get("displayName") or meta.get("name", ""),
+        description=spec.get("description"),
+        category=spec.get("category", "linux"),
+        os_type=spec.get("osType", "linux"),
+        golden_image_name=image.get("name", ""),
+        golden_image_namespace=(
+            status.get("imageNamespace")
+            or image.get("namespace")
+            or meta.get("namespace", "")
+        ),
+        compute=TemplateCompute(
+            cpu_cores=compute.get("cores", 2),
+            cpu_sockets=compute.get("sockets", 1),
+            cpu_threads=compute.get("threads", 1),
+            memory=compute.get("memory", "4Gi"),
+        ),
+        disk=TemplateDisk(size=disk.get("size", "20Gi")),
+        cloud_init=(
+            TemplateCloudInit(user_data=cloud_init.get("userData"))
+            if cloud_init else None
+        ),
+        console=TemplateConsole(
+            vnc_enabled=console.get("vnc", True),
+            serial_console_enabled=console.get("serial", False),
+        ),
+        created=meta.get("creationTimestamp"),
+        labels=meta.get("labels", {}) or {},
+        annotations=meta.get("annotations", {}) or {},
+    )
+
+
+async def _list_template_crs(custom_api: Any) -> list[dict[str, Any]]:
+    """Every ManagedVMTemplate on the cluster, or none if the CRD is absent."""
+    try:
+        result = await custom_api.list_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION, plural="managedvmtemplates",
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return []
+        raise
+    return result.get("items", []) or []
+
+
+async def _find_template_cr(
+    custom_api: Any, name: str, namespace: str | None = None,
+) -> dict[str, Any] | None:
+    """The ManagedVMTemplate with this name, if there is exactly one.
+
+    Names are unique per namespace, not per cluster, so a name alone can be
+    ambiguous. Rather than picking one, an ambiguous name is reported — the
+    old store's collision behaviour was to answer 409 naming a template the
+    user could not see, and guessing is not an improvement on that.
+    """
+    matches = [
+        cr for cr in await _list_template_crs(custom_api)
+        if cr.get("metadata", {}).get("name") == name
+        and (namespace is None or cr.get("metadata", {}).get("namespace") == namespace)
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        where = ", ".join(sorted(m["metadata"]["namespace"] for m in matches))
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"template {name!r} exists in more than one namespace ({where}); "
+                "name the namespace to say which one"
+            ),
+        )
+    return matches[0]
+
+
 @router.get("", response_model=VMTemplateListResponse)
 async def list_templates(
     request: Request,
@@ -114,14 +223,61 @@ async def list_templates(
             except Exception as e:
                 logger.warning(f"Failed to parse template {name}: {e}")
         
+        # Both stores are read during the migration, so a template written
+        # either way is usable from either path. A resource shadows a legacy
+        # entry of the same name: the migration copies one to the other, and
+        # showing both would be showing the same template twice.
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        for cr in await _list_template_crs(custom_api):
+            converted = _template_from_cr(cr)
+            templates = [t for t in templates if t.name != converted.name]
+            templates.append(converted)
+
         return VMTemplateListResponse(items=templates, total=len(templates))
-    
+
+    except HTTPException:
+        raise
     except ApiException as e:
         logger.error(f"Failed to list templates: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list templates: {e.reason}",
         )
+
+
+async def resolve_template(k8s_client: Any, name: str) -> dict[str, Any] | None:
+    """A template by name, from whichever store holds it.
+
+    One owner for the question "what is this template", because the answer was
+    being worked out in three places and one of them only knew about the old
+    store. `GET /templates` merged both, `GET /templates/{name}` read both, and
+    `POST /vms/from-template` read the ConfigMap alone — so with
+    OPERATOR_TEMPLATE_ENABLED on, a template appeared in the list, the wizard
+    offered it, and creating a machine from it answered 404. The pairing of the
+    two flags was unusable, and looked fine until the last click.
+
+    Returns the plain-dict shape the ConfigMap has always held, because that is
+    what the create path reads; a resource is presented in the same shape rather
+    than the caller learning which store it came from.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    existing = await _find_template_cr(custom_api, name)
+    if existing is not None:
+        return _template_from_cr(existing).model_dump()
+
+    try:
+        cm = await k8s_client.core_api.read_namespaced_config_map(
+            name=TEMPLATE_CONFIGMAP_NAME, namespace=TEMPLATE_NAMESPACE,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    if not cm.data or name not in cm.data:
+        return None
+    template = json.loads(cm.data[name])
+    template["name"] = name
+    return template
 
 
 @router.get("/{name}", response_model=VMTemplate)
@@ -132,6 +288,12 @@ async def get_template(
 ) -> VMTemplate:
     """Get a specific VM template."""
     k8s_client = request.app.state.k8s_client
+
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    existing = await _find_template_cr(custom_api, name)
+    if existing is not None:
+        return _template_from_cr(existing)
+
     
     try:
         cm = await k8s_client.core_api.read_namespaced_config_map(
@@ -164,6 +326,83 @@ async def get_template(
         )
 
 
+def _template_spec(template: VMTemplateCreate) -> dict[str, Any]:
+    """The resource's spec, as the request describes it.
+
+    Shared by create and update so an edit writes the same shape a create does.
+    They were separate once and only one of them knew this store existed.
+    """
+    spec: dict[str, Any] = {
+        "displayName": template.display_name,
+        "imageRef": {"name": template.golden_image_name},
+        "compute": {
+            "cores": template.compute.cpu_cores,
+            "sockets": template.compute.cpu_sockets,
+            "threads": template.compute.cpu_threads,
+            "memory": template.compute.memory,
+        },
+        "rootDisk": {"size": template.disk.size},
+        "category": template.category,
+        "osType": template.os_type,
+    }
+    if template.description:
+        spec["description"] = template.description
+    if template.cloud_init and template.cloud_init.user_data:
+        spec["cloudInit"] = {"userData": template.cloud_init.user_data}
+    spec["console"] = {
+        "vnc": template.console.vnc_enabled,
+        "serial": template.console.serial_console_enabled,
+    }
+    return spec
+
+
+async def _create_template_cr(k8s_client: Any, template: VMTemplateCreate) -> VMTemplate:
+    """Write the template as its own object, next to the image it names.
+
+    The namespace is the image's, because that is where the template is usable
+    from and where the picker looks. The old store had no namespace at all —
+    one cluster-wide map keyed by a user-chosen string, which is why a
+    collision could name a template the user was not allowed to see.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    namespace = template.golden_image_namespace
+    spec = _template_spec(template)
+
+    body = {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedVMTemplate",
+        "metadata": {"name": template.name, "namespace": namespace},
+        "spec": spec,
+    }
+
+    try:
+        created = await custom_api.create_namespaced_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            namespace=namespace, plural="managedvmtemplates", body=body,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Template creation is routed to the operator "
+                    "(OPERATOR_TEMPLATE_ENABLED), but the ManagedVMTemplate CRD is "
+                    "not installed in this cluster"
+                ),
+            )
+        if e.status == 409:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Template {template.name!r} already exists in {namespace}",
+            )
+        raise HTTPException(
+            status_code=e.status or status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create template: {e.reason}",
+        )
+
+    return _template_from_cr(created)
+
+
 @router.post("", response_model=VMTemplate, status_code=status.HTTP_201_CREATED)
 async def create_template(
     template: VMTemplateCreate,
@@ -172,7 +411,10 @@ async def create_template(
 ) -> VMTemplate:
     """Create a new VM template."""
     k8s_client = request.app.state.k8s_client
-    
+
+    if template_path_enabled():
+        return await _create_template_cr(k8s_client, template)
+
     try:
         import json
         from datetime import datetime
@@ -293,9 +535,29 @@ async def update_template(
     request: Request,
     user: User = Depends(require_auth),
 ) -> VMTemplate:
-    """Update an existing VM template."""
+    """Update an existing VM template, in whichever store holds it.
+
+    A template that exists as its own object is edited as one, whatever the flag
+    says — the same rule delete already followed. Without it an edit read the
+    ConfigMap alone and answered 404 for a template the list had just shown,
+    which is how create-from-template failed too.
+    """
     k8s_client = request.app.state.k8s_client
-    
+
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    existing_cr = await _find_template_cr(custom_api, name)
+    if existing_cr is not None:
+        patched = await custom_api.patch_namespaced_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            namespace=existing_cr["metadata"]["namespace"],
+            plural="managedvmtemplates", name=name,
+            body={"spec": _template_spec(template)},
+            # A merge body sent as a JSON Patch answers 400, and the contract
+            # test upstairs exists because that has happened.
+            _content_type="application/merge-patch+json",
+        )
+        return _template_from_cr(patched)
+
     try:
         cm = await k8s_client.core_api.read_namespaced_config_map(
             name=TEMPLATE_CONFIGMAP_NAME,
@@ -361,9 +623,24 @@ async def delete_template(
     request: Request,
     user: User = Depends(require_auth),
 ) -> None:
-    """Delete a VM template."""
+    """Delete a VM template.
+
+    A template that exists as its own object is deleted as one, whatever the
+    flag says: the flag decides where new templates are written, not where the
+    old ones live.
+    """
     k8s_client = request.app.state.k8s_client
-    
+
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    existing = await _find_template_cr(custom_api, name)
+    if existing is not None:
+        await custom_api.delete_namespaced_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            namespace=existing["metadata"]["namespace"],
+            plural="managedvmtemplates", name=name,
+        )
+        return
+
     try:
         cm = await k8s_client.core_api.read_namespaced_config_map(
             name=TEMPLATE_CONFIGMAP_NAME,
@@ -621,6 +898,19 @@ async def list_golden_images(
                             has_error_condition = True
                             error_message = cond.get("message")
                             break
+                        # A quota refusal never reaches the Running condition:
+                        # CDI cannot make the PVC at all, so the DataVolume
+                        # sits Pending with `Bound=False` and the reason on an
+                        # event. In UAT run 4 that read as a disk importing
+                        # for ever, next to a quota that was counting it.
+                        if (
+                            cond.get("type") == "Bound"
+                            and cond.get("status") == "False"
+                            and "quota" in (cond.get("reason", "") + cond.get("message", "")).lower()
+                        ):
+                            has_error_condition = True
+                            error_message = cond.get("message") or cond.get("reason")
+                            break
                     
                     if phase in ("Failed", "Error") or has_error_condition:
                         display_status = "Error"
@@ -653,6 +943,7 @@ async def list_golden_images(
                         continue
                     
                     images.append(GoldenImage(
+                        progress=(status_obj.get("progress") or None),
                         name=dv_name,
                         namespace=dv_ns,
                         display_name=annotations.get("kubevirt-ui.io/display-name", dv_name),
@@ -675,6 +966,20 @@ async def list_golden_images(
                 logger.warning(f"Failed to list DataVolumes in {ns}: {e}")
                 continue
         
+        # And the ones that were asked for but not built.
+        #
+        # The list reads DataVolumes, which is what the operator *makes* from a
+        # ManagedImage. Anything it has not made yet — or will never make,
+        # because the request cannot be satisfied — appeared nowhere at all: no
+        # row, no error, no trace. UAT run 4, G3: a disk refused by the
+        # namespace quota was invisible while it consumed the quota that
+        # refused it.
+        images.extend(await _described_but_unbuilt_images(
+            custom_api, namespaces_to_check, namespace,
+            {f"{img.namespace}/{img.name}" for img in images},
+            ns_labels_map,
+        ))
+
         return GoldenImageListResponse(items=images, total=len(images))
     
     except ApiException as e:
@@ -683,6 +988,234 @@ async def list_golden_images(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to list images: {e.reason}",
         )
+
+
+async def _refuse_a_duplicate_image(
+    k8s_client: Any, namespace: str, display_name: str,
+) -> None:
+    """An image with this name in this namespace already exists.
+
+    While images were named by the user, a second one with the same name was
+    refused by Kubernetes for free. Moving to `generateName` — which fixed
+    real collisions and let two people import the same distribution — removed
+    that refusal and put nothing in its place, so importing the same image
+    twice produced two objects with one display name, distinguishable only by
+    a synthetic suffix nobody sees:
+
+        UAT Ubuntu 22.04   uat-ubuntu-dkvpb   10Gi   InUse   1 VM
+        UAT Ubuntu 22.04   uat-ubuntu-x8czz   10Gi   Ready   -
+
+    Both appear in the image picker, identically, and the second one pulls the
+    same gigabyte into Ceph again. Reported as D-2 in UAT run 4.
+
+    Creating a tenant and creating a template both already answer this case in
+    almost these words; images were the only one that did not.
+    """
+    if not display_name:
+        return
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    for plural, group, version in (
+        ("datavolumes", "cdi.kubevirt.io", "v1beta1"),
+        ("managedimages", OPERATOR_GROUP, OPERATOR_VERSION),
+    ):
+        try:
+            existing = await custom_api.list_namespaced_custom_object(
+                group=group, version=version, namespace=namespace, plural=plural,
+            )
+        except ApiException as e:
+            # A CRD that is not installed says nothing about duplicates.
+            if e.status == 404:
+                continue
+            raise
+        for item in existing.get("items", []):
+            meta = item.get("metadata", {}) or {}
+            spec = item.get("spec", {}) or {}
+            name = (
+                (meta.get("annotations") or {}).get(DISPLAY_NAME_ANNOTATION)
+                or spec.get("displayName")
+                or meta.get("name", "")
+            )
+            if name != display_name:
+                continue
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"An image called '{display_name}' already exists in "
+                    f"{namespace} (as '{meta.get('name')}'). Pick another "
+                    f"name, or delete that one first — two images with one "
+                    f"name cannot be told apart in the picker, and the second "
+                    f"import downloads the same content again."
+                ),
+            )
+
+
+async def _described_but_unbuilt_images(
+    custom_api: Any, namespaces: list[str], filter_namespace: str | None,
+    already: set[str], ns_labels_map: dict[str, dict],
+) -> list[GoldenImage]:
+    """Images that exist as a request and not yet as a disk.
+
+    A ManagedImage is the thing the user asked for; the DataVolume is what the
+    operator builds from it. Listing only the second means the seconds between
+    them show nothing — and, when the build cannot happen at all, so does
+    forever.
+
+    The row carries whatever the resource says about itself, so "why is it not
+    there" is answered on the page rather than by reading a controller's log.
+    """
+    out: list[GoldenImage] = []
+    for ns in namespaces:
+        try:
+            described = await custom_api.list_namespaced_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                namespace=ns, plural="managedimages",
+            )
+        except ApiException as e:
+            if e.status != 404:
+                logger.warning(f"Failed to list ManagedImages in {ns}: {e}")
+            continue
+
+        for item in described.get("items", []):
+            meta = item.get("metadata", {}) or {}
+            name = meta.get("name", "")
+            if not name or f"{ns}/{name}" in already:
+                continue
+            spec = item.get("spec", {}) or {}
+            status_obj = item.get("status", {}) or {}
+            labels = meta.get("labels", {}) or {}
+            scope = labels.get("kubevirt-ui.io/scope", "environment")
+            if filter_namespace and ns != filter_namespace and scope not in (
+                "project", "folder",
+            ):
+                continue
+
+            # What the resource says, in the order it becomes knowable: a
+            # refusal first, then a phase, then the honest default.
+            reason, message = "", ""
+            for cond in status_obj.get("conditions", []):
+                if cond.get("status") == "False" and cond.get("reason"):
+                    reason, message = cond["reason"], cond.get("message", "")
+                    break
+            display = "Error" if reason else (status_obj.get("phase") or "Pending")
+            if display not in ("Error", "Ready", "Pending"):
+                display = "Pending"
+
+            ns_labels = ns_labels_map.get(ns, {})
+            source = spec.get("source", {}) or {}
+            out.append(GoldenImage(
+                progress=(status_obj.get("progress") or None),
+                name=name,
+                namespace=ns,
+                display_name=spec.get("displayName") or name,
+                description=spec.get("description"),
+                os_type=labels.get("kubevirt-ui.io/os-type"),
+                os_version=labels.get("kubevirt-ui.io/os-version"),
+                size=spec.get("size", "Unknown"),
+                status=display,
+                error_message=(message or reason) if display == "Error" else None,
+                source_url=source.get("url") or source.get("registry"),
+                created=meta.get("creationTimestamp"),
+                used_by=status_obj.get("usedBy") or None,
+                disk_type=labels.get("kubevirt-ui.io/disk-type", "image"),
+                persistent=labels.get("kubevirt-ui.io/persistent", "false").lower() == "true",
+                scope=scope,
+                project=labels.get("kubevirt-ui.io/project")
+                or ns_labels.get("kubevirt-ui.io/project"),
+                environment=ns_labels.get("kubevirt-ui.io/environment"),
+            ))
+    return out
+
+
+async def _create_managed_image(
+    *,
+    k8s_client: Any,
+    image: GoldenImageCreate,
+    namespace: str,
+    slug: str,
+    display_name_value: str,
+    source: dict[str, Any],
+    source_url_display: str | None,
+    scope: str,
+    project_name: str | None,
+) -> GoldenImage:
+    """Create the image as a ManagedImage and let the operator build the disk.
+
+    The response is deliberately the same shape the DataVolume path returns, so
+    the UI cannot tell which side of the flag it is on. Status starts at Pending
+    because nothing has been imported yet — the operator publishes progress and
+    the terminal state on the resource, and the image lister picks it up from
+    the disk's labels the same way it always has.
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+
+    spec: dict[str, Any] = {
+        "displayName": display_name_value,
+        "source": source,
+        "size": image.size,
+        "scope": scope,
+        "diskType": image.disk_type or "image",
+        "persistent": bool(image.persistent),
+    }
+    if image.storage_class:
+        spec["storageClass"] = image.storage_class
+    if image.description:
+        spec["description"] = image.description
+    if image.os_type:
+        spec["osType"] = image.os_type
+    if image.os_version:
+        spec["osVersion"] = image.os_version
+
+    body = {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedImage",
+        "metadata": {
+            "generateName": f"{slug}-",
+            "namespace": namespace,
+        },
+        "spec": spec,
+    }
+
+    try:
+        created = await custom_api.create_namespaced_custom_object(
+            group=OPERATOR_GROUP,
+            version=OPERATOR_VERSION,
+            namespace=namespace,
+            plural="managedimages",
+            body=body,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            # The flag is on and the CRD is not installed. Saying so beats a
+            # generic 500 that reads as "the import failed".
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "Image creation is routed to the operator "
+                    "(OPERATOR_IMAGE_ENABLED), but the ManagedImage CRD is not "
+                    "installed in this cluster"
+                ),
+            )
+        raise HTTPException(
+            status_code=e.status or status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create image: {e.reason}",
+        )
+
+    return GoldenImage(
+        name=created["metadata"]["name"],
+        namespace=created["metadata"]["namespace"],
+        display_name=display_name_value,
+        description=image.description,
+        os_type=image.os_type,
+        os_version=image.os_version,
+        disk_type=image.disk_type,
+        persistent=image.persistent,
+        size=image.size,
+        status="Pending",
+        source_url=source_url_display,
+        created=created["metadata"].get("creationTimestamp"),
+        scope=scope,
+        project=project_name,
+    )
 
 
 @images_router.post("", response_model=GoldenImage, status_code=status.HTTP_201_CREATED)
@@ -705,6 +1238,21 @@ async def create_golden_image(
     - project: image is labeled as available to all envs in the project
     """
     k8s_client = request.app.state.k8s_client
+
+    # Refused before anything is written, like a tenant and a template with a
+    # name that is taken.
+    await _refuse_a_duplicate_image(k8s_client, namespace, image.display_name)
+
+    # Asked before the DataVolume exists, because the quota counts the PVC
+    # that CDI makes from it and not the DataVolume itself — which is how a
+    # 100Gi disk against a 12Gi quota came back 201 and then never appeared.
+    await assert_storage_headroom(
+        k8s_client, namespace, image.size,
+        # The display name, not `name`: that one is an optional seed for the
+        # kubernetes name and is empty on the ordinary path, so the refusal
+        # read "None asks for 400Gi" — a message about a disk with no name.
+        what=f"{image.display_name or image.name or 'this disk'!r}",
+    )
 
     # At-least-one runtime check (soft contract — matches create_tenant_image).
     if not image.name and not image.display_name:
@@ -757,6 +1305,24 @@ async def create_golden_image(
             source = {"blank": {}}
             source_url_display = "blank"
         
+        # With the operator owning images, the backend stops writing the disk
+        # and writes the intent instead. Same request, same namespace, same
+        # naming: generateName on our own resource, exactly as it was on the
+        # DataVolume — so the disk still ends up named `<slug>-xxxxx` and every
+        # caller that reads a name back keeps working.
+        if image_path_enabled():
+            return await _create_managed_image(
+                k8s_client=k8s_client,
+                image=image,
+                namespace=target_namespace,
+                slug=slug,
+                display_name_value=display_name_value,
+                source=source,
+                source_url_display=source_url_display,
+                scope=image.scope or "environment",
+                project_name=project_name,
+            )
+
         # Build storage spec (new CDI format)
         image_storage: dict[str, Any] = {
             "volumeMode": "Block",  # Required for snapshot-based cloning
@@ -848,6 +1414,79 @@ async def create_golden_image(
         )
 
 
+async def _managed_image_owner(
+    custom_api: Any, namespace: str, dv_name: str,
+) -> str | None:
+    """Name of the ManagedImage owning this disk, or None if nothing owns it."""
+    try:
+        dv = await custom_api.get_namespaced_custom_object(
+            group="cdi.kubevirt.io",
+            version="v1beta1",
+            namespace=namespace,
+            plural="datavolumes",
+            name=dv_name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    labels = (dv.get("metadata", {}) or {}).get("labels", {}) or {}
+    if labels.get(OWNER_KIND_LABEL) != "ManagedImage":
+        return None
+    return labels.get(OWNER_NAME_LABEL) or None
+
+
+async def _delete_managed_image(
+    custom_api: Any, namespace: str, name: str,
+) -> None:
+    """Delete the owning resource, refusing up front if the image is in use.
+
+    The operator would refuse this deletion anyway — its finalizer holds while
+    something is still cloning from the disk — but it refuses asynchronously,
+    which from a browser looks like a delete that did nothing. Reading the
+    holders and answering 409 with their names turns that into an answer.
+    """
+    try:
+        mi = await custom_api.get_namespaced_custom_object(
+            group=OPERATOR_GROUP,
+            version=OPERATOR_VERSION,
+            namespace=namespace,
+            plural="managedimages",
+            name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            # The disk claims an owner that is gone. Nothing left to release —
+            # fall through to deleting the disk itself.
+            mi = None
+        else:
+            raise
+
+    if mi is not None:
+        used_by = (mi.get("status", {}) or {}).get("usedBy") or []
+        if used_by:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Image {name} is still in use by: {', '.join(used_by)}",
+            )
+        await custom_api.delete_namespaced_custom_object(
+            group=OPERATOR_GROUP,
+            version=OPERATOR_VERSION,
+            namespace=namespace,
+            plural="managedimages",
+            name=name,
+        )
+        return
+
+    await custom_api.delete_namespaced_custom_object(
+        group="cdi.kubevirt.io",
+        version="v1beta1",
+        namespace=namespace,
+        plural="datavolumes",
+        name=name,
+    )
+
+
 @images_router.delete("/{name}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_golden_image(
     name: str,
@@ -855,11 +1494,24 @@ async def delete_golden_image(
     user: User = Depends(require_auth),
     namespace: str = "default",
 ) -> None:
-    """Delete an image from a project namespace."""
+    """Delete an image from a project namespace.
+
+    Ownership decides what gets deleted, not the feature flag. A disk the
+    operator owns has to be released by deleting its ManagedImage: deleting the
+    disk directly would only make the controller build it again, and the user
+    would watch a deleted image reappear. Ownership is stamped on the object, so
+    it keeps being true after the flag is turned back off.
+    """
     k8s_client = request.app.state.k8s_client
-    
+
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
+
+        owner = await _managed_image_owner(custom_api, namespace, name)
+        if owner:
+            await _delete_managed_image(custom_api, namespace, owner)
+            return
+
         await custom_api.delete_namespaced_custom_object(
             group="cdi.kubevirt.io",
             version="v1beta1",

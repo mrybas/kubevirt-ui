@@ -13,8 +13,13 @@ WORKDIR /app
 FROM base AS development
 
 COPY package.json package-lock.json* ./
+# npm's optional-dependency resolution skips rollup's native binary when the
+# lockfile was written on another platform, so it is installed explicitly —
+# but for the architecture actually being built, not for x64 only. Building on
+# an arm64 workstation otherwise fails on a package that does not exist there.
 RUN npm install --legacy-peer-deps && \
-    npm install --legacy-peer-deps @rollup/rollup-linux-x64-musl
+    npm install --legacy-peer-deps \
+      "@rollup/rollup-linux-$(uname -m | sed 's/x86_64/x64/; s/aarch64/arm64/')-musl"
 
 COPY . .
 

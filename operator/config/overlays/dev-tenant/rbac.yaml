@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller-manager
+  namespace: system
+---
+# The network half binds to the same ClusterRole as the vm half for now.
+#
+# Splitting the role by domain is the point of the split and comes with the
+# first controller that needs rights the other must not have; today both halves
+# read the same kube-ovn objects, and inventing a second role that happens to be
+# identical would be theatre.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kubevirt-ui-operator-manager-role
+subjects:
+  # Named before the prefix is applied, so kustomize rewrites it along with the
+  # account itself.
+  - kind: ServiceAccount
+    name: controller-manager
+    namespace: system
+---
+# Leader election is per profile, so the account needs the lease Role too.
+#
+# Without it the process starts, reports its domains, and then quietly retries
+# "cannot get resource leases" forever — running no controllers at all while
+# looking healthy from the outside. Found exactly that way.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: leader-election-rolebinding
+  namespace: system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kubevirt-ui-operator-leader-election-role
+subjects:
+  - kind: ServiceAccount
+    name: controller-manager
+    namespace: system

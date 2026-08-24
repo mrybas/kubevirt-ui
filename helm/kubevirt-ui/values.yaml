@@ -29,6 +29,159 @@ backend:
     LOG_LEVEL: INFO
     CORS_ORIGINS: ""
     ENABLE_TENANTS: "false"
+    # -- Route golden-image creation through the operator: the backend writes a
+    # ManagedImage custom resource and the operator creates the DataVolume, the
+    # DataSource and the status. Empty/false → the backend creates the
+    # DataVolume itself, exactly as before. Requires the ManagedImage CRD to be
+    # installed; with the flag on and the CRD absent the create call answers 503
+    # saying so rather than failing as if the import broke.
+    #
+    # Turning the flag back off does not orphan anything: ownership is stamped
+    # on the disk, so images the operator owns keep being deleted through it.
+    OPERATOR_IMAGE_ENABLED: ""
+    # -- Route VM creation through the operator: the backend writes a ManagedVM
+    # and the operator renders the KubeVirt VirtualMachine, its root disk, the
+    # cloud-init and the network annotations. Empty/false → the backend renders
+    # the machine itself, exactly as before.
+    #
+    # Independent of OPERATOR_IMAGE_ENABLED; either can be on alone. As with
+    # images, deletion and power actions follow ownership rather than the flag,
+    # so machines created while it was on keep working after it is turned off.
+    OPERATOR_VM_ENABLED: ""
+    # -- Write new VM templates as ManagedVMTemplate resources instead of JSON
+    # blobs in one cluster-wide ConfigMap. Empty/false → the ConfigMap, as
+    # before. Reading always covers both stores, so a template written either
+    # way stays usable; and a template that already exists as a resource is
+    # edited and deleted as one whatever this says — the flag decides where new
+    # ones are written, not where the old ones live.
+    OPERATOR_TEMPLATE_ENABLED: ""
+    # -- Hand the BGP announcements to the operator: the backend's reconcile
+    # loop stops writing the FRRConfiguration and the operator's
+    # AnnouncementPolicy takes it over. Empty/false → the backend keeps writing
+    # it, as before.
+    #
+    # This is an ownership switch, not a routing choice, and there is no atomic
+    # step for it: this flag lives on a Deployment and the operator's dryRun
+    # lives on a custom resource, so the switch is two API calls. Only one order
+    # is safe — this flag ON first (writers 1 -> 0, the existing configuration
+    # stays and the dataplane does not change), then dryRun off (0 -> 1).
+    # Backwards leaves two writers, and frr-k8s merges every FRRConfiguration in
+    # its namespace into one FRR: two `router bgp` blocks over one session.
+    #
+    # hack/announce-cutover.sh walks it, refuses the wrong order, and compares
+    # what the operator would write against the live object first.
+    OPERATOR_ANNOUNCE_ENABLED: ""
+    # -- Hand the egress underlay to the operator: the backend writes one
+    # ManagedUnderlay describing the site's physical network, and the operator
+    # keeps the ProviderNetwork, Vlan, NAD, Subnet, the gateway node label and
+    # the two workaround DaemonSets in line with it. Empty/false → the POST
+    # builds them itself, as before.
+    #
+    # The point is not where the code runs. With this off, the
+    # `ovn.kubernetes.io/external-gw` node label is repaired only by a GET, so
+    # nothing puts it back unless somebody opens the page. On this lab it sat at
+    # an explicit `false` on all three workers; the link-watcher DaemonSet
+    # selects on it, so it was scheduled nowhere while `kubectl rollout status`
+    # reported success — zero desired pods are all ready. Two hours later both
+    # provider links were down and had taken transit and egress with them.
+    #
+    # Adopting an existing hand-built fabric is safe: the operator merges only
+    # the fields it renders and leaves kube-ovn's own defaults alone. Deleting
+    # a ManagedUnderlay, however, takes its external Subnet and every gateway
+    # attached to it — the children carry ownerReferences on purpose.
+    OPERATOR_UNDERLAY_ENABLED: ""
+    # -- Write VPCs as ManagedNetwork custom resources: the operator creates the
+    # Vpc, its default Subnet, the per-VPC VpcDns, and the service-network route
+    # on that resolver. Empty/false → the endpoint writes those itself, as
+    # before.
+    #
+    # The route is the reason. A VpcDns pod cannot reach the cluster resolver's
+    # ClusterIP without it, and it used to be applied once at create time —
+    # when kube-ovn has not created the Deployment yet — and afterwards only by
+    # a person calling the recreate endpoint.
+    #
+    # What does not move with this flag: the CIDR allocator, namespace
+    # validation, VPC peering, and `Subnet.spec.acls`. The isolation reconciler
+    # keeps its single ownership of the ACL list until the composer can take it
+    # over with a provable no-op.
+    #
+    # Deleting a VPC then removes the ManagedNetwork and the operator cascades
+    # (resolver, subnets, router — in that order, router last). Networks written
+    # down by hand default to `deletionPolicy: Retain` and are unaffected.
+    #
+    # Isolation travels in the object and the operator applies it, so a network
+    # is closed before it is reported ready and stays closed if this process
+    # dies mid-create. That was the one thing blocking this switch: the subnet
+    # is written first and the rules afterwards, and neither waiting nor undoing
+    # afterwards survives a crash in between.
+    #
+    # The operator becomes the single writer of a subnet's ACL list only after
+    # proving it can reproduce the live one exactly; a list carrying a rule it
+    # cannot account for is named and left to whoever wrote it. Subnets it does
+    # own are skipped by the backend's isolation pass — read off the object, not
+    # off this flag, so it stays true after the flag goes off.
+    OPERATOR_NETWORK_ENABLED: ""
+    # -- Hand the worker-bootstrap repair to the operator. Empty/false → the
+    # tenant reconcile loop keeps doing it.
+    #
+    # The repair puts a Kubernetes CA back into a Talos worker template that
+    # has none; without it a worker boots, runs a kubelet, and never joins,
+    # because nothing files its CSR — the VM looks perfectly healthy throughout.
+    #
+    # Running it in both places is not dangerous (create-if-absent and a patch
+    # to the same value) but it is two writers of one thing, so the order is the
+    # usual one: this flag on first, then the operator's tenant domain.
+    # -- Create tenants by describing them: the endpoint writes one
+    # ManagedTenant and the operator builds it. Empty/false → the request
+    # handler builds the whole tenant itself, in one pass, and whatever it does
+    # not finish is not finished by anybody.
+    #
+    # That is the failure this moves. A tenant created by the handler lost the
+    # race with its own transit EIP getting an address; the handler logged
+    # "ACLs deferred to the next reconcile" and there is no reconcile — the
+    # transit wiring has exactly one caller and it is create. Its workers
+    # dialled a control plane an ACL was dropping, indefinitely, while every
+    # condition the product shows stayed green.
+    #
+    # New tenants only. The ones that exist are untouched and stay the
+    # product's — ownership is the ManagedTenant object — so turning this on
+    # rewrites nothing and turning it off orphans nothing.
+    #
+    # The wizard collects more than ManagedTenant has fields for (worker image,
+    # tenant DNS, OIDC group names). With this on, a request carrying one of
+    # them is refused and the field is named, rather than accepted and built
+    # without it.
+    OPERATOR_TENANT_ENABLED: ""
+    OPERATOR_TENANT_BOOTSTRAP_ENABLED: ""
+    # -- Hand the tenant's time source to the operator. Off, the backend writes
+    # the shared chrony Deployment and ConfigMap and the per-tenant NTP Service
+    # on every tenant creation.
+    #
+    # Unlike the flag above, this one is not merely tidiness. The chrony
+    # Deployment would have two renderers the moment both sides run, and any
+    # difference between them rolls it — chrony is what a joining worker asks
+    # for the time, so rolling it during a join is a node that never appears.
+    OPERATOR_TENANT_TIME_ENABLED: ""
+    # -- Hand a tenant's addon releases to the operator. Off, the create path
+    # writes them and the reconcile loop writes any that are missing.
+    #
+    # Those are two renderers of one HelmRelease and they do not agree. The
+    # repair one omits `install.disableWait`, and without it the CNI install
+    # waits for workloads the install is supposed to cause, times out, Flux
+    # remediates by uninstalling, and the release sits in `uninstalling` for
+    # ever — measured on the lab with no nodes registered. It fires only when a
+    # release is missing, which is the state a fresh tenant is in, which is
+    # exactly when omitting it wedges.
+    OPERATOR_TENANT_ADDONS_ENABLED: ""
+    # -- Route new VPC peerings through the operator: the endpoint writes one
+    # object and the controller writes both ends, or neither, and goes on
+    # holding them. Empty/false → the endpoint patches both routers itself and
+    # then forgets, which is where the drift comes from.
+    #
+    # Only new ones. The peerings that exist stay the product's — ownership is
+    # the ManagedNetworkPeering object, so turning this on rewrites nothing and
+    # turning it off orphans nothing.
+    OPERATOR_PEERING_ENABLED: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as
@@ -496,3 +649,118 @@ lldap:
     enabled: false
     size: "1Gi"
     storageClass: ""
+
+# ---------------------------------------------------------------------------
+# The operator
+# ---------------------------------------------------------------------------
+#
+# Its CRDs and its ClusterRole are generated from the operator's own sources by
+# hack/sync-operator-chart.py and checked by a test, so the chart cannot install
+# last year's schema while the code has moved on.
+#
+# The site facts below have no defaults on purpose. Every one of them has
+# already been wrong once, and each time the failure was silent: kube-ovn in a
+# namespace that was not "kube-ovn" left an adopted tenant waiting for a
+# ConfigMap for ever, and a transit-subnet variable spelled differently in two
+# places meant an invariant never ran while "no complaint" read as "checked".
+# A chart that guesses would reproduce both.
+operator:
+  enabled: false
+  image:
+    repository: ghcr.io/mrybas/kubevirt-ui/operator
+    # Defaults to the chart's appVersion, so the operator and the backend that
+    # hands work to it ship as one thing.
+    tag: ""
+    pullPolicy: IfNotPresent
+  crds:
+    # Templated rather than put in crds/, because Helm never upgrades what is in
+    # crds/ — the schema would silently stay at the version first installed.
+    # They carry resource-policy keep, so uninstalling the UI does not
+    # cascade-delete every tenant, network and VM described by them.
+    install: true
+  webhooks:
+    # Admission belongs to one deployment or none: it is served by the vm
+    # deployment, and the chart refuses to render a configuration pointing at a
+    # service that domain would not provide.
+    #
+    # Off by default, and the reason is the failure mode rather than caution:
+    # two of the three webhooks are `failurePolicy: Fail`, so between the
+    # configuration existing and the certificate being issued, every
+    # ManagedTenant and ManagedVM write is rejected. On is right for a cluster
+    # that has cert-manager and wants the validation; the product's create
+    # endpoint passes the webhook's refusal through as a 400, and that message
+    # is the only sentence saying which field is wrong.
+    #
+    # Requires cert-manager: the certificate and the CA injection are its
+    # objects. There is no way to check that from a template, so it is said
+    # here instead.
+    enabled: false
+  domains:
+    vm:
+      enabled: true
+      replicas: 1
+    network:
+      enabled: true
+      replicas: 1
+    tenant:
+      enabled: true
+      replicas: 1
+  config:
+    # The namespace kube-ovn actually runs in. Required by tenant and network.
+    kubeOvnNamespace: ""
+    # Where control-plane VIPs come from. Required by tenant.
+    metallbNamespace: ""
+    metallbPool: ""
+    # The transit subnet those VIPs must sit inside. Required by tenant.
+    cpTransitSubnet: ""
+    # The suffix a tenant apiserver is reached by from outside. Required by
+    # tenant: without it the certificate carries no such SAN.
+    ingressDomain: ""
+    # The aggregate every tenant network is carved from, e.g. 10.200.0.0/14.
+    # Required by the network domain, and for a reason worth the refusal: empty
+    # means no isolation is written at all, and the VPC that results is
+    # attached, routed, healthy-looking and open to every other tenant while the
+    # UI's review step says "Isolated: Yes".
+    #
+    # The same fact the backend reads as TENANT_SUPERNET. Set it in one place —
+    # either here or there — and the chart refuses to render if both are set and
+    # disagree.
+    tenantSupernet: ""
+    # Optional. Prefixes of the management plane, which must not open
+    # connections into a tenant. Empty means each node's own address as a /32,
+    # which is right for a flat management network and too narrow for a routed
+    # one.
+    mgmtCIDRs: []
+    # The address external-dns should publish for tenant API names. Optional
+    # only in the sense that the chart installs without it: external-dns cannot
+    # infer an address from an IngressRouteTCP, so with this empty the route is
+    # written, the name is in the certificate, and nothing resolves it. The
+    # tenant reports that as ExternallyReachable=False rather than looking
+    # healthy while its kubeconfig cannot be used.
+    externalDNSTarget: ""
+    # Traefik entry points, when this cluster names them differently. The
+    # defaults are Traefik's own `websecure` and a `trustd` listener on 50001.
+    traefikEntryPoint: ""
+    traefikTrustdEntryPoint: ""
+    # Optional. The cluster's service network. Read from the cluster when
+    # absent — the kubeadm ConfigMap, else the apiserver's own flag — and needed
+    # explicitly where neither is readable, which is every managed control
+    # plane.
+    serviceCIDR: ""
+    # Optional. A tenant may opt into OIDC (`enableOIDC`), and its apiserver
+    # then trusts this issuer. Empty means the issuer under `auth.oidc` — the
+    # one the UI itself signs in with — which is nearly always the intent.
+    # Set these only to point tenants at a *different* provider.
+    #
+    # The apiserver refuses to start on an http issuer, so a non-https one is
+    # reported on the tenant rather than applied.
+    oidcIssuer: ""
+    oidcClientId: ""
+  extraEnv: {}
+  resources:
+    limits:
+      cpu: 500m
+      memory: 256Mi
+    requests:
+      cpu: 10m
+      memory: 64Mi

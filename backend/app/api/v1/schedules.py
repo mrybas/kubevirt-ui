@@ -236,6 +236,54 @@ async def list_scheduled_actions(
         )
 
 
+async def _own_the_schedule(
+    k8s_client: Any,
+    body: dict[str, Any],
+    req: CreateScheduleRequest,
+    namespace: str,
+) -> None:
+    """Tie the schedule to the machine it acts on, so it dies with it.
+
+    The link between the two was a name in a label and a name in a shell
+    command, which means a schedule outlives its machine: it keeps firing
+    kubectl at something that is not there, and — worse — a new machine created
+    with the same name inherits every schedule the old one had.
+
+    An ownerReference makes the cluster's own garbage collector handle it. No
+    controller, no finalizer, and it still works when nothing of ours is
+    running.
+
+    Best-effort: a schedule that could not be tied to its machine is still a
+    schedule someone asked for. It is created, and the old behaviour is what it
+    falls back to.
+    """
+    if req.vm_namespace != namespace:
+        # An ownerReference cannot cross namespaces; the garbage collector would
+        # read it as an owner that does not exist and delete the schedule at
+        # once. Leaving it untied is the lesser wrong.
+        return
+    try:
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=req.vm_name,
+        )
+        body["metadata"]["ownerReferences"] = [{
+            "apiVersion": "kubevirt.io/v1",
+            "kind": "VirtualMachine",
+            "name": vm["metadata"]["name"],
+            "uid": vm["metadata"]["uid"],
+            # Not blocking: a machine should not wait on its schedules to be
+            # cleaned up before it can be deleted.
+            "blockOwnerDeletion": False,
+        }]
+    except Exception as e:
+        logger.warning(
+            f"Could not tie schedule to VM {namespace}/{req.vm_name}: {e}; "
+            "it will outlive the machine",
+        )
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_scheduled_action(
     request: Request,
@@ -246,10 +294,31 @@ async def create_scheduled_action(
     """Create a scheduled action (CronJob) for a VM."""
     k8s_client = request.app.state.k8s_client
 
+    # The authorization above is on `namespace`; the command inside the CronJob
+    # targets `vm_namespace` from the body, and it runs under a cluster-wide
+    # service account. Nothing tied the two together, so a member of one
+    # environment could schedule `kubectl delete vm` against another.
+    #
+    # Refused rather than authorised against both, because the mismatch has no
+    # legitimate caller: the UI sends the VM's own namespace, and the schedule
+    # is created beside the VM. It was already a degraded case here — an
+    # ownerReference cannot cross namespaces, so a mismatched schedule was
+    # silently left untied and outlived the machine it acts on.
+    if schedule_request.vm_namespace != namespace:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"A schedule lives beside the machine it acts on. This one is "
+                f"being created in '{namespace}' and targets a VM in "
+                f"'{schedule_request.vm_namespace}'."
+            ),
+        )
+
     try:
         batch_api = client.BatchV1Api(k8s_client._api_client)
 
         cronjob_body = _build_cronjob(schedule_request, namespace)
+        await _own_the_schedule(k8s_client, cronjob_body, schedule_request, namespace)
 
         result = await batch_api.create_namespaced_cron_job(
             namespace=namespace,
@@ -374,6 +443,20 @@ async def trigger_scheduled_action(
 
         # Get the CronJob to extract job template
         cj = await batch_api.read_namespaced_cron_job(name=name, namespace=namespace)
+
+        # Creation refuses a cross-namespace target now, but schedules written
+        # before it does not know that. Running one on demand is the same act as
+        # creating it, so it is refused on the same terms — and the label is
+        # read off the object rather than trusted from the caller.
+        target = (cj.metadata.labels or {}).get(NS_LABEL)
+        if target and target != namespace:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Schedule '{name}' targets a VM in '{target}', not in "
+                    f"'{namespace}'. Delete it rather than running it."
+                ),
+            )
 
         # Create a Job from the CronJob template
         job_name = f"{name}-manual-{int(time.time())}"

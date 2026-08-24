@@ -314,7 +314,21 @@ class TestTheAllowListDoesNotFeedItself:
     Inside the tenant supernet the peering is the source now; outside it (a
     corporate network, a service on another range) there is no peering to
     consult and the existing rule is all there is.
+
+    Both cases need the supernet set, and neither said so. `TENANT_SUPERNET`
+    defaults to empty and the stand runs `10.200.0.0/14`, so without it every
+    prefix reads as "outside", nothing is in scope to be isolated from, and the
+    pass takes the branch that only prunes drops. The first test failed on that
+    for as long as it has existed; the second passed for the same reason and
+    proved nothing — it asserts only `if patched`, and nothing was.
     """
+
+    @pytest.fixture(autouse=True)
+    def _supernet(self, monkeypatch):
+        """The configuration the rule is about. Not a detail — the whole rule
+        is "inside the supernet", and there is no inside without one."""
+        settings = vpcs.get_settings()
+        monkeypatch.setattr(settings, "tenant_supernet", "10.200.0.0/14")
 
     @pytest.mark.asyncio
     async def test_an_allow_for_a_departed_vpc_is_dropped(self, monkeypatch) -> None:
@@ -372,7 +386,7 @@ class TestTheAllowListDoesNotFeedItself:
 
         await vpcs.reconcile_isolation_acls(k8s)
 
-        if patched:
-            acls = patched[0]["body"]["spec"]["acls"]
-            assert [a for a in acls if "10.199.128.0/24" in a["match"]
-                    and a["action"] == "allow-related"]
+        assert patched, "no write at all, so this asserted nothing"
+        acls = patched[0]["body"]["spec"]["acls"]
+        assert [a for a in acls if "10.199.128.0/24" in a["match"]
+                and a["action"] == "allow-related"]

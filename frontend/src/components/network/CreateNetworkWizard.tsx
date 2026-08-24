@@ -1462,7 +1462,9 @@ export function CreateNetworkWizard({ onClose, existingProvider, existingVlan }:
                   <dd className="text-surface-200">
                     {state.vpcNamespaces.length > 0
                       ? <span className="font-mono">{state.vpcNamespaces.join(', ')}</span>
-                      : <span className="text-surface-500">Unrestricted</span>
+                      : <span className="text-surface-500">
+                          Any namespace in this folder
+                        </span>
                     }
                   </dd>
                   {/* Chosen two steps earlier and then never shown again, which

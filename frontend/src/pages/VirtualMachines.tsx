@@ -103,6 +103,11 @@ export function VirtualMachines() {
   const { data: vmData, isLoading, error, refetch: refetchVMs } = useVMs(undefined, page, perPage, debouncedSearch || undefined);
   const { data: namespacesData } = useNamespaces();
   const { data: foldersData } = useFoldersFlat();
+  // Whether to offer creating a VM at all. The backend decides it — per
+  // folder, with the predicates that enforce it — and the page reads the
+  // answer. A viewer used to be shown two Create VM buttons, both of which
+  // answer 403 (UAT run 4, B5).
+  const mayCreate = (foldersData?.items ?? []).some(f => f.can_create);
   const startVM = useStartVM();
   const stopVM = useStopVM();
   const restartVM = useRestartVM();
@@ -305,10 +310,12 @@ export function VirtualMachines() {
           <button onClick={() => refetchVMs()} className="btn-secondary" title="Refresh">
             <RefreshCw className="h-4 w-4" />
           </button>
-          <button className="btn-primary" onClick={() => setShowCreateWizard(true)}>
-            <Plus className="h-4 w-4" />
-            Create VM
-          </button>
+          {mayCreate && (
+            <button className="btn-primary" onClick={() => setShowCreateWizard(true)}>
+              <Plus className="h-4 w-4" />
+              Create VM
+            </button>
+          )}
         </div>
       </div>
 
@@ -363,12 +370,12 @@ export function VirtualMachines() {
             icon: <Server className="h-16 w-16" />,
             title: 'No virtual machines',
             description: 'Create your first virtual machine to get started.',
-            action: (
+            action: mayCreate ? (
               <button className="btn-primary" onClick={() => setShowCreateWizard(true)}>
                 <Plus className="h-4 w-4" />
                 Create VM
               </button>
-            ),
+            ) : undefined,
           }}
         />
       ) : (

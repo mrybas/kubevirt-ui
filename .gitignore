@@ -87,3 +87,9 @@ TODO.md
 
 # local run harness (holds lab credentials)
 docker-compose.override.yml
+
+# Throwaway worktree for mutation testing. Deliberately outside the working
+# tree: a mutation applied in place is visible to anything reading the repo
+# while it runs, and a deliberately broken file read by somebody else looks
+# exactly like a defect.
+.mutation/

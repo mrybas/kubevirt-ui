@@ -225,3 +225,59 @@ nothing else shows it.
 That is an ECMP route whose next hops are on the following, tab-indented
 lines. `grep '^10.200'` drops them and makes a healthy multipath route look
 like a black hole. Read the full `ip route show <prefix>` output.
+
+---
+
+## A restore said Completed and nothing came back
+
+Read the warnings, not the errors:
+
+```
+kubectl -n <velero-ns> get restore <name> -o jsonpath='{.status}'
+# phase: Completed  errors: 0  warnings: 66  progress: 279/279
+```
+
+Velero's default `existingResourcePolicy` is `none`: an object the target
+namespace already has is **left exactly as it is** and counted as a warning,
+not an error, and the restore still reports Completed. Restoring a VM onto a
+namespace where it is still running therefore changes nothing at all, and the
+machine keeps whatever disk it had — which reads as "the backup restored an
+empty disk".
+
+The restores list in the product shows this as *Completed with warnings*, with
+the count. To actually replace what is there, choose "Overwrite them from the
+backup" in the restore dialog; to bring a machine back beside the live one,
+restore into a different namespace.
+
+Not the cause, though it looks like one: the restored DataVolumes still say
+`source: pvc <golden image>`. They also carry
+`cdi.kubevirt.io/storage.prePopulated`, which tells CDI to adopt the claim
+rather than clone anything, so that source is inert.
+
+---
+
+## A VPC blackholes for a few seconds, every minute or so
+
+Symptom: from inside a VM, traffic to the VPC gateway and to the external
+subnet never drops, and anything beyond the border does — in bursts of a few
+seconds, tens of seconds apart, with no BGP session flap and no route
+withdrawal. Nothing in the control plane moves, so nothing in the product's
+status or in a BGP monitor shows it.
+
+Look at the border's neighbour table, not at BGP:
+
+```
+ip -s neigh show 10.199.4.10        # the VPC's external-subnet address
+watch -n1 'ip neigh show 10.199.4.10'
+```
+
+Each outage lines up with `REACHABLE → DELAY → PROBE → INCOMPLETE` on that
+entry, and the MAC never changes when it comes back: the address is fine, the
+revalidation is what fails. OVN answers the initial ARP and then does not
+answer the unicast probe, so the border discards the entry and traffic stops
+until a broadcast lookup succeeds again.
+
+This is the underlay, not the tenant: a static neighbour entry on the border
+for the VPC's external address removes it, and is the usual fix on a lab
+border. Measured in UAT run 4: ten outages in ten minutes, each two to ten
+seconds, every 40–115 seconds.

@@ -1,0 +1,112 @@
+{
+  "annotations": null,
+  "labels": {
+    "kubevirt-ui.io/environment": "dev",
+    "kubevirt-ui.io/folder": "poc-transit",
+    "kubevirt-ui.io/managed": "true"
+  },
+  "spec": {
+    "acls": [
+      {
+        "action": "allow-related",
+        "direction": "from-lport",
+        "match": "ip4.dst == 10.200.4.0/22",
+        "priority": 3200
+      },
+      {
+        "action": "allow-related",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.200.4.0/22",
+        "priority": 3200
+      },
+      {
+        "action": "drop",
+        "direction": "from-lport",
+        "match": "ip4.dst == 10.200.8.0/22",
+        "priority": 3000
+      },
+      {
+        "action": "drop",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.200.8.0/22",
+        "priority": 3000
+      },
+      {
+        "action": "drop",
+        "direction": "from-lport",
+        "match": "ip4.dst == 10.200.0.0/22",
+        "priority": 3000
+      },
+      {
+        "action": "drop",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.200.0.0/22",
+        "priority": 3000
+      },
+      {
+        "action": "drop",
+        "direction": "from-lport",
+        "match": "ip4.dst == 10.200.12.0/22",
+        "priority": 3000
+      },
+      {
+        "action": "drop",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.200.12.0/22",
+        "priority": 3000
+      },
+      {
+        "action": "drop",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.198.160.1/32",
+        "priority": 3300
+      },
+      {
+        "action": "drop",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.198.160.2/32",
+        "priority": 3300
+      },
+      {
+        "action": "drop",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.198.160.3/32",
+        "priority": 3300
+      },
+      {
+        "action": "drop",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.198.160.4/32",
+        "priority": 3300
+      },
+      {
+        "action": "drop",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.198.160.5/32",
+        "priority": 3300
+      },
+      {
+        "action": "drop",
+        "direction": "to-lport",
+        "match": "ip4.src == 10.198.160.6/32",
+        "priority": 3300
+      }
+    ],
+    "cidrBlock": "10.200.4.0/22",
+    "default": true,
+    "dhcpV4Options": "lease_time=3600,router=10.200.4.1,server_id=10.200.4.1,dns_server=10.96.0.200",
+    "enableDHCP": true,
+    "enableLb": true,
+    "excludeIps": [
+      "10.200.4.1"
+    ],
+    "gateway": "10.200.4.1",
+    "gatewayNode": "",
+    "natOutgoing": false,
+    "private": false,
+    "protocol": "IPv4",
+    "provider": "ovn",
+    "u2oFeatures": {},
+    "vpc": "uat-net-t1"
+  }
+}

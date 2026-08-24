@@ -9,6 +9,12 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel, Field
 
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    managed_owner,
+    operation_name,
+)
 from app.core.auth import User, require_auth, require_env_member, require_env_viewer
 from app.core.naming import get_display_name, with_synthetic_metadata
 
@@ -183,6 +189,22 @@ async def delete_vm_snapshot(
         )
 
 
+async def _managed_vm_owner_for_restore(
+    custom_api: Any, namespace: str, name: str,
+) -> str | None:
+    """The ManagedVM behind this machine, if the operator owns it."""
+    try:
+        vm = await custom_api.get_namespaced_custom_object(
+            group="kubevirt.io", version="v1",
+            namespace=namespace, plural="virtualmachines", name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+    return managed_owner(vm, "ManagedVM")
+
+
 @router.post("/{name}/snapshots/{snapshot_name}/restore", status_code=status.HTTP_200_OK)
 async def restore_vm_snapshot(
     request: Request,
@@ -194,13 +216,46 @@ async def restore_vm_snapshot(
 ) -> dict[str, Any]:
     """Restore a VM from a VirtualMachineSnapshot.
 
-    Stops the VM if running, creates a VirtualMachineRestore, waits for completion,
-    then restarts if it was running.
+    For a machine the operator owns this asks for an operation and returns; the
+    restore then runs as an object with its own state, and survives this process
+    dying halfway through it.
+
+    The path below is what remains for machines that predate the migration, and
+    it is why this endpoint is being replaced: it stops the VM, polls for two
+    minutes without ever looking for a failure, carries on quietly when the poll
+    times out, and keeps "was it running before" in a local variable — so losing
+    the process leaves the machine stopped for good.
     """
     k8s_client = request.app.state.k8s_client
 
     try:
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
+
+        owner = await _managed_vm_owner_for_restore(custom_api, namespace, name)
+        if owner:
+            op_name = operation_name("Restore", owner)
+            await custom_api.create_namespaced_custom_object(
+                group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+                namespace=namespace, plural="managedvmoperations",
+                body={
+                    "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+                    "kind": "ManagedVMOperation",
+                    "metadata": {"name": op_name, "namespace": namespace},
+                    "spec": {
+                        "vmName": owner,
+                        "action": "Restore",
+                        "restore": {"snapshotName": snapshot_name},
+                    },
+                },
+            )
+            return {
+                "name": op_name,
+                "namespace": namespace,
+                "vm_name": name,
+                "snapshot_name": snapshot_name,
+                "status": "InProgress",
+                "message": f"Restore requested ({op_name})",
+            }
 
         # 1. Stop VM if running
         was_running = False

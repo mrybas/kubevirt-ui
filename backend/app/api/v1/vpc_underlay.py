@@ -28,6 +28,11 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.core.auth import User, require_admin, require_auth
 from app.core.constants import KUBEOVN_API_GROUP, KUBEOVN_API_VERSION
+from app.core.operator import (
+    OPERATOR_GROUP,
+    OPERATOR_VERSION,
+    underlay_path_enabled,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -690,6 +695,253 @@ async def _ensure_daemonset(k8s, body: dict[str, Any]) -> UnderlayObject:
 
 
 # ---------------------------------------------------------------------------
+# Operator path
+#
+# With OPERATOR_UNDERLAY_ENABLED the backend writes one object saying what the
+# site's physical network looks like, and the operator keeps the fabric, the
+# node label and the workaround DaemonSets in line with it. The difference that
+# matters is not where the code lives: it is that the gateway label is checked
+# on a watch instead of on a page view. It used to be healed by the GET below,
+# so on this lab it sat at an explicit `false` on all three workers for two
+# hours while the link watcher that selects on it was scheduled nowhere and
+# every summary called the DaemonSet healthy.
+# ---------------------------------------------------------------------------
+
+UNDERLAY_PLURAL = "managedunderlays"
+
+# Set during a cutover to make the operator a no-op without detaching anything.
+PAUSED_ANNOTATION = "platform.kubevirt-ui.io/paused"
+
+
+def underlay_cr_name(data: VpcUnderlayRequest) -> str:
+    """The custom resource is named after the subnet it builds.
+
+    Derived rather than allocated: the subnet name is what the rest of the UI
+    already looks the fabric up by, it is unique per cluster because the Subnet
+    itself is, and a name nobody has to allocate is a name two concurrent
+    requests cannot disagree about.
+    """
+    return data.subnet_name
+
+
+def build_underlay_cr(data: VpcUnderlayRequest, kubeovn_ns: str) -> dict[str, Any]:
+    """The request, as the object the operator reconciles.
+
+    Cilium is passed through exactly as asked, including "unset": the operator
+    decides that one by reading the cluster, and a backend that resolved it
+    first would freeze today's answer into the object.
+    """
+    spec: dict[str, Any] = {
+        "interface": data.interface,
+        "externalCIDR": data.external_cidr,
+        "externalGateway": data.external_gateway,
+        "vlanID": data.vlan_id,
+        "providerNetworkName": data.provider_network_name,
+        "vlanName": data.vlan_name,
+        "subnetName": data.subnet_name,
+        "kubeOVNNamespace": kubeovn_ns,
+        "linkWatcher": data.link_watcher,
+    }
+    if data.exclude_nodes:
+        spec["excludeNodes"] = list(data.exclude_nodes)
+    if data.exclude_ips:
+        spec["excludeIPs"] = list(data.exclude_ips)
+    if data.link_watcher_image:
+        spec["linkWatcherImage"] = data.link_watcher_image
+    if data.cilium_source_ip_exempt is not None:
+        spec["ciliumSourceIPExempt"] = data.cilium_source_ip_exempt
+    if data.cilium_namespace:
+        spec["ciliumNamespace"] = data.cilium_namespace
+    if data.cilium_image:
+        spec["ciliumImage"] = data.cilium_image
+    return {
+        "apiVersion": f"{OPERATOR_GROUP}/{OPERATOR_VERSION}",
+        "kind": "ManagedUnderlay",
+        "metadata": {"name": underlay_cr_name(data), "labels": dict(MANAGED_LABEL)},
+        "spec": spec,
+    }
+
+
+async def read_underlay_cr(k8s, name: str) -> dict[str, Any] | None:
+    try:
+        return await k8s.custom_api.get_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=UNDERLAY_PLURAL, name=name,
+        )
+    except ApiException as e:
+        if e.status == 404:
+            return None
+        raise
+
+
+def _condition(cr: dict[str, Any], kind: str) -> dict[str, Any]:
+    for cond in ((cr.get("status") or {}).get("conditions") or []):
+        if cond.get("type") == kind:
+            return cond
+    return {}
+
+
+def response_from_cr(cr: dict[str, Any]) -> VpcUnderlayResponse:
+    """The operator's status, in the shape the wizard already reads.
+
+    The four fabric objects are reported from one condition rather than
+    enumerated, because that is exactly what the condition means: the operator
+    sets FabricReady only once all four exist. Inventing four separate states
+    the operator does not publish would be a nicer-looking answer that is not
+    an answer.
+    """
+    spec = cr.get("spec") or {}
+    status = cr.get("status") or {}
+    meta = cr.get("metadata") or {}
+    kubeovn_ns = spec.get("kubeOVNNamespace") or ""
+    paused = (meta.get("annotations") or {}).get(PAUSED_ANNOTATION) == "true"
+
+    fabric_cond = _condition(cr, "FabricReady")
+    fabric_ok = fabric_cond.get("status") == "True"
+    fabric_state = "exists" if fabric_ok else "failed"
+    fabric_detail = "" if fabric_ok else fabric_cond.get("message", "")
+
+    objects = [
+        UnderlayObject(
+            kind="ProviderNetwork", name=spec.get("providerNetworkName", ""),
+            state=fabric_state, detail=fabric_detail,
+        ),
+        UnderlayObject(
+            kind="Vlan", name=spec.get("vlanName", ""),
+            state=fabric_state, detail=fabric_detail,
+        ),
+        UnderlayObject(
+            kind="NetworkAttachmentDefinition", name=spec.get("subnetName", ""),
+            namespace=kubeovn_ns, state=fabric_state, detail=fabric_detail,
+        ),
+        UnderlayObject(
+            kind="Subnet", name=spec.get("subnetName", ""),
+            state=fabric_state, detail=fabric_detail,
+        ),
+    ]
+
+    label_cond = _condition(cr, "NodesLabelled")
+    labelled = status.get("labelledNodes") or []
+    objects.append(UnderlayObject(
+        kind="NodeLabel", name=EXTERNAL_GW_LABEL,
+        state="exists" if label_cond.get("status") == "True" else "missing",
+        detail=label_cond.get("message", ""),
+    ))
+
+    # A count that keeps climbing is the only evidence that something else is
+    # still writing this label, so it is surfaced rather than buried in status.
+    heals = status.get("labelHeals") or 0
+    if heals:
+        objects.append(UnderlayObject(
+            kind="NodeLabel", name=f"{EXTERNAL_GW_LABEL} (heals)",
+            state="exists",
+            detail=(
+                f"restored {heals} time(s) since this underlay was created. "
+                "Something other than the operator writes this label; the "
+                "fabric stays up either way."
+            ),
+        ))
+
+    for entry in status.get("daemonSets") or []:
+        state = {
+            "running": "exists",
+            "skipped": "skipped",
+            "absent": "missing",
+        }.get(entry.get("state", ""), "failed")
+        objects.append(UnderlayObject(
+            kind="DaemonSet", name=entry.get("name", ""),
+            namespace=entry.get("namespace", ""),
+            state=state, workaround=True, detail=entry.get("detail", ""),
+        ))
+
+    if paused:
+        # A paused underlay keeps its last verdict forever, and a frozen status
+        # reads exactly like a healthy one. That is the failure this whole path
+        # was moved to close, so it does not get to reappear in the report of
+        # the thing that closed it.
+        objects.insert(0, UnderlayObject(
+            kind="ManagedUnderlay", name=meta.get("name", ""), state="skipped",
+            detail=(
+                f"reconciliation is paused ({PAUSED_ANNOTATION}=true). Everything "
+                "below is the last verdict the operator reached and may be any "
+                "age; nothing is keeping the fabric or the gateway label in line "
+                "while this is set."
+            ),
+        ))
+        return VpcUnderlayResponse(
+            objects=objects, ready=False,
+            detail=(
+                f"ManagedUnderlay/{meta.get('name', '')} is paused — the status "
+                "shown is frozen, not current."
+            ),
+        )
+
+    ready = fabric_ok and label_cond.get("status") == "True"
+    if ready:
+        detail = (
+            f"Underlay ready — VPC egress gateways can attach. "
+            f"{len(labelled)} node(s) carry the provider NIC."
+        )
+    else:
+        reasons = [c.get("message", "") for c in (fabric_cond, label_cond)
+                   if c.get("status") == "False" and c.get("message")]
+        detail = "; ".join(reasons) or "The operator has not reported on this underlay yet."
+    return VpcUnderlayResponse(objects=objects, ready=ready, detail=detail)
+
+
+async def ensure_underlay_cr(
+    k8s, data: VpcUnderlayRequest, kubeovn_ns: str,
+) -> VpcUnderlayResponse:
+    """Write the object and wait for the operator to answer for it.
+
+    The wait is bounded and its expiry is not an error: the fabric is being
+    built either way, and a request that hangs until a bridge comes up on three
+    nodes is a worse answer than "not ready yet, here is what it says so far".
+    """
+    body = build_underlay_cr(data, kubeovn_ns)
+    name = body["metadata"]["name"]
+    try:
+        await k8s.custom_api.create_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=UNDERLAY_PLURAL, body=body,
+        )
+    except ApiException as e:
+        if e.status != 409:
+            raise
+        # Merge patch on spec only: the operator owns status, and replacing the
+        # whole object would race its writes.
+        await k8s.custom_api.patch_cluster_custom_object(
+            group=OPERATOR_GROUP, version=OPERATOR_VERSION,
+            plural=UNDERLAY_PLURAL, name=name,
+            body={"spec": body["spec"]},
+            _content_type="application/merge-patch+json",
+        )
+
+    for attempt in range(_READY_NODE_POLL_ATTEMPTS):
+        cr = await read_underlay_cr(k8s, name)
+        if cr is None:
+            await asyncio.sleep(_READY_NODE_POLL_SECONDS)
+            continue
+        status = cr.get("status") or {}
+        # Only a status generated from the spec just written says anything
+        # about it. Reading a stale one would report the previous request's
+        # verdict as this one's.
+        fresh = status.get("observedGeneration") == (cr.get("metadata") or {}).get("generation")
+        response = response_from_cr(cr)
+        if fresh and (response.ready or attempt == _READY_NODE_POLL_ATTEMPTS - 1):
+            return response
+        await asyncio.sleep(_READY_NODE_POLL_SECONDS)
+
+    cr = await read_underlay_cr(k8s, name)
+    if cr is None:
+        return VpcUnderlayResponse(
+            objects=[], ready=False,
+            detail=f"ManagedUnderlay/{name} was written but has not been read back yet.",
+        )
+    return response_from_cr(cr)
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -708,6 +960,11 @@ async def ensure_vpc_underlay(
     k8s = request.app.state.k8s_client
     from app.api.v1.network import _find_kubeovn_namespace
     kubeovn_ns = await _find_kubeovn_namespace(k8s)
+
+    if underlay_path_enabled():
+        # One writer per object: with this on, the backend writes intent and
+        # nothing else, so the four objects below are the operator's alone.
+        return await ensure_underlay_cr(k8s, data, kubeovn_ns)
 
     # Both Cilium answers come from the cluster unless the caller insisted.
     chaining, cilium_ns = await detect_cilium(k8s)
@@ -792,6 +1049,17 @@ async def get_vpc_underlay(
     k8s = request.app.state.k8s_client
     from app.api.v1.network import _find_kubeovn_namespace
     kubeovn_ns = await _find_kubeovn_namespace(k8s)
+
+    if underlay_path_enabled():
+        cr = await read_underlay_cr(k8s, subnet_name)
+        if cr is not None:
+            # Note what this branch does *not* do: heal. The operator does that
+            # on a watch, and a reader that also repaired would hide how long
+            # the label had been wrong — which is the number worth seeing.
+            return response_from_cr(cr)
+        # No object yet. Fall through and describe whatever is actually there,
+        # so a fabric applied by hand still shows up instead of reading as
+        # absent.
 
     async def _cluster_state(plural: str, name: str, kind: str) -> UnderlayObject:
         try:

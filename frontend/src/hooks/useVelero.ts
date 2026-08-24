@@ -6,6 +6,7 @@ import {
   createVeleroBackup,
   deleteVeleroBackup,
   restoreVeleroBackup,
+  listVeleroRestores,
   listVeleroSchedules,
   createVeleroSchedule,
   deleteVeleroSchedule,
@@ -18,11 +19,13 @@ import {
 import { listVMs, listVMSnapshots } from '../api/vms';
 import { listSchedules, createSchedule, deleteSchedule, updateSchedule } from '../api/schedules';
 import type { ScheduleInfo, CreateScheduleRequest } from '../api/schedules';
+import { pollWhile } from './settle';
 import { notify } from '../store/notifications';
 import type {
   CreateVeleroBackupRequest,
   CreateVeleroScheduleRequest,
   CreateVeleroRestoreRequest,
+  VeleroRestore,
 } from '../types/velero';
 import type { VMSnapshotInfo } from '../types/vm';
 
@@ -80,6 +83,20 @@ export function useRestoreVeleroBackup() {
 }
 
 // ── Velero Schedules ──────────────────────────────────────────────────────────
+
+export function useVeleroRestores() {
+  return useQuery({
+    queryKey: ['velero', 'restores'],
+    queryFn: listVeleroRestores,
+    // A restore takes a while and its outcome is the whole point of running
+    // one, so the list keeps up with it rather than being read once.
+    refetchInterval: pollWhile<VeleroRestore[]>((restores) =>
+      (restores ?? []).some(
+        (r) => !['Completed', 'Failed', 'PartiallyFailed'].includes(r.phase),
+      ),
+    ),
+  });
+}
 
 export function useVeleroSchedules() {
   return useQuery({

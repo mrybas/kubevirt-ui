@@ -19,8 +19,10 @@ from app.core.k8s_client import K8sClient
 from app.models.tenant import AddonCatalog, AddonComponent
 
 from app.core.b3_announce import ensure_announcements
+from app.core.operator import announce_path_enabled
 
 from app.api.v1.tenants_talos import ensure_worker_bootstrap_ca
+from app.core.operator import tenant_addons_path_enabled, tenant_bootstrap_path_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +264,11 @@ async def _reconcile_tenant(
 
     for component in ordered:
         try:
+            if tenant_addons_path_enabled():
+                # The operator renders these now, from one function, and a
+                # second writer here would put back the disagreement the flag
+                # exists to end.
+                break
             await _create_required_addon(
                 k8s, name, ns, component, catalog, required_components, existing_ids,
             )
@@ -298,23 +305,47 @@ async def reconcile_loop(k8s: K8sClient) -> None:
         logger.info("Tenant addon reconciler stopped")
 
 
+async def _repair_worker_bootstrap(k8s: K8sClient) -> bool:
+    """Repair worker templates missing a Kubernetes CA — unless it moved.
+
+    Returns whether this pass did the work, so the decision is a thing that can
+    be checked rather than a branch buried in a long function.
+
+    The repair is harmless to run twice — create-if-absent and a patch to the
+    same value — but two writers of one thing is what this migration exists to
+    remove, and a cutover that half-happens is how that goes wrong quietly.
+    """
+    if tenant_bootstrap_path_enabled():
+        return False
+    await ensure_worker_bootstrap_ca(k8s)
+    return True
+
+
 async def _reconcile_once(k8s: K8sClient) -> None:
     """Run one reconciliation pass across all tenants."""
     # B3 announcements first, and independently of the addon catalog below:
     # a VPC's return path must not wait on Flux being configured. Failures are
     # logged inside and never abort the pass — an addon reconcile has no
     # business being blocked by BGP, or the reverse.
-    try:
-        await ensure_announcements(k8s)
-    except Exception as e:  # noqa: BLE001 - one subsystem must not stop another
-        logger.error(f"B3 announcement reconcile failed: {e}")
+    # …unless the operator owns them. The FRRConfiguration takes exactly one
+    # writer: frr-k8s merges every configuration in its namespace into the
+    # node's FRR, so a second writer is not a second opinion, it is two
+    # `router bgp` blocks over one session. The switch is one change — this
+    # flag on and the operator's policy out of dry-run together.
+    if announce_path_enabled():
+        logger.debug("B3 announcements are owned by the operator; skipping")
+    else:
+        try:
+            await ensure_announcements(k8s)
+        except Exception as e:  # noqa: BLE001 - one subsystem must not stop another
+            logger.error(f"B3 announcement reconcile failed: {e}")
 
     # A worker bootstrap template written without the Kubernetes CA is a
     # tenant whose kubelet can never start, and the template is immutable —
     # nothing else in the product can repair it. Same guard as above: this
     # must not be blocked by, or block, anything else in the pass.
     try:
-        await ensure_worker_bootstrap_ca(k8s)
+        await _repair_worker_bootstrap(k8s)
     except Exception as e:  # noqa: BLE001 - one subsystem must not stop another
         logger.error(f"worker bootstrap reconcile failed: {e}")
 

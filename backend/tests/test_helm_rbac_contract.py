@@ -114,12 +114,75 @@ REQUIRED: list[tuple[str, str, str, str]] = [
     ("kubeovn.io", "ovn-dnat-rules", "list", "vpcs.delete_vpc (NAT inventory)"),
     ("kubeovn.io", "vpc-egress-gateways", "get",
      "egress_gateway._await_gateway_gone"),
-    ("kubeovn.io", "switch-lb-rules", "create",
-     "tenants_capi._ensure_cp_reachable_in_vpc"),
-    ("kubeovn.io", "switch-lb-rules", "patch",
-     "tenants_capi._ensure_cp_reachable_in_vpc"),
-    ("kubeovn.io", "switch-lb-rules", "delete",
-     "tenants_crud.delete_tenant (cluster-scoped leftover)"),
+    # --- The operator's own custom resources -------------------------------
+    # These went missing while four operator paths were already written, and
+    # nothing here caught it, because this list is kept by hand and nobody
+    # added the rows. `test_every_operator_call_site_is_listed` below now reads
+    # the call sites and fails if that happens again.
+    ("platform.kubevirt-ui.io", "managedvms", "get", "operator.patch_managed_disks"),
+    ("platform.kubevirt-ui.io", "managedvms", "list", "disks (managed VM inventory)"),
+    ("platform.kubevirt-ui.io", "managedvms", "create", "vms._create_managed_vm"),
+    ("platform.kubevirt-ui.io", "managedvms", "patch", "operator.patch_managed_disks"),
+    ("platform.kubevirt-ui.io", "managedvms", "delete", "vms.delete_vm"),
+    ("platform.kubevirt-ui.io", "managedvmoperations", "list",
+     "vms.get_vm — the operation the machine is under, while it is under one"),
+    ("platform.kubevirt-ui.io", "managedvmoperations", "create",
+     "vm_actions._start_operation"),
+    ("platform.kubevirt-ui.io", "managedvmtemplates", "list",
+     "templates._list_template_crs"),
+    ("platform.kubevirt-ui.io", "managedvmtemplates", "create",
+     "templates._create_template_cr"),
+    ("platform.kubevirt-ui.io", "managedvmtemplates", "delete", "templates.delete"),
+    # Editing a template edits it where it lives, and for a CR-backed one that
+    # is a patch — see tests/test_template_readers_agree.py.
+    ("platform.kubevirt-ui.io", "managedvmtemplates", "patch",
+     "templates.update_template"),
+    ("platform.kubevirt-ui.io", "managedimages", "get", "templates (image lookup)"),
+    ("platform.kubevirt-ui.io", "managedimages", "list",
+     "templates.list_golden_images — the images asked for but not yet built"),
+    ("platform.kubevirt-ui.io", "managedimages", "create",
+     "templates._create_managed_image"),
+    ("platform.kubevirt-ui.io", "managedimages", "delete", "templates.delete_image"),
+    ("platform.kubevirt-ui.io", "managedunderlays", "get",
+     "vpc_underlay.read_underlay_cr"),
+    ("platform.kubevirt-ui.io", "managedunderlays", "create",
+     "vpc_underlay.ensure_underlay_cr"),
+    ("platform.kubevirt-ui.io", "managedunderlays", "patch",
+     "vpc_underlay.ensure_underlay_cr"),
+    ("platform.kubevirt-ui.io", "managednetworks", "list",
+     "dns_migration — taking back a resolver address this backend invented"),
+    ("platform.kubevirt-ui.io", "managednetworks", "patch",
+     "dns_migration — the same, one network at a time"),
+    ("platform.kubevirt-ui.io", "managednetworks", "get",
+     "vpcs._managed_network_exists"),
+    ("platform.kubevirt-ui.io", "managednetworks", "create",
+     "vpcs._create_managed_network"),
+    ("platform.kubevirt-ui.io", "managednetworks", "delete",
+     "vpcs.delete_vpc (the operator cascades)"),
+    # Peering under OPERATOR_PEERING_ENABLED: the endpoint describes the link
+    # and the operator writes both ends. List, because deleting a VPC has to
+    # know which of its peerings the operator holds.
+    ("platform.kubevirt-ui.io", "managednetworkpeerings", "get",
+     "vpcs._peering_cr"),
+    ("platform.kubevirt-ui.io", "managednetworkpeerings", "list",
+     "vpcs._claimed_remotes"),
+    ("platform.kubevirt-ui.io", "managednetworkpeerings", "create",
+     "vpcs._describe_peering"),
+    ("platform.kubevirt-ui.io", "managednetworkpeerings", "delete",
+     "vpcs.delete_vpc_peering"),
+    # Enabling an addon edits the tenant's description rather than writing a
+    # second HelmRelease — see tests/test_addons_have_one_writer.py.
+    ("platform.kubevirt-ui.io", "managedtenants", "get",
+     "tenants_crud._described_tenant"),
+    ("platform.kubevirt-ui.io", "managedtenants", "patch",
+     "tenants_crud._write_described_addons"),
+    # Creating a tenant by describing it, under OPERATOR_TENANT_ENABLED.
+    ("platform.kubevirt-ui.io", "managedtenants", "create",
+     "tenants_crud._create_managed_tenant"),
+    # Not gated by that flag: a tenant the operator holds must stay deletable
+    # after it is turned off again.
+    ("platform.kubevirt-ui.io", "managedtenants", "delete",
+     "tenants_crud._delete_managed_tenant"),
 ]
 
 
@@ -191,6 +254,80 @@ def test_chart_grants_permission(
         f"ClusterRole does not grant it — the call will 403 on a live cluster "
         f"while every unit test passes. Add the verb in "
         f"helm/kubevirt-ui/templates/rbac.yaml."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The list above is kept by hand, and for the operator group that is exactly
+# what failed. These call sites are machine-readable, so read them.
+# ---------------------------------------------------------------------------
+
+_OPERATOR_GROUP = "platform.kubevirt-ui.io"
+
+# kubernetes_asyncio method prefix -> the RBAC verb it needs.
+_VERB_OF = {
+    "get": "get", "list": "list", "watch": "watch", "create": "create",
+    "patch": "patch", "replace": "update", "delete": "delete",
+}
+
+_CUSTOM_CALL = re.compile(
+    r"(?P<verb>get|list|watch|create|patch|replace|delete)"
+    r"_(?:namespaced|cluster)_custom_object\s*\((?P<args>[^)]*)\)",
+    re.S,
+)
+_PLURAL_ARG = re.compile(
+    r"plural\s*=\s*(?:\"(?P<literal>[a-z]+)\"|(?P<constant>[A-Z][A-Z_]*))"
+)
+
+
+def _operator_call_sites() -> set[tuple[str, str]]:
+    """(resource, verb) pairs the backend issues against the operator's CRDs."""
+    app = Path(__file__).resolve().parent.parent / "app"
+    sources = {path: path.read_text() for path in app.rglob("*.py")}
+
+    # Some call sites name the plural through a module constant.
+    constants: dict[str, str] = {}
+    for text in sources.values():
+        for name, value in re.findall(
+            r"^([A-Z][A-Z_]*)\s*=\s*\"(managed[a-z]+)\"", text, re.M
+        ):
+            constants[name] = value
+
+    found: set[tuple[str, str]] = set()
+    for text in sources.values():
+        for call in _CUSTOM_CALL.finditer(text):
+            arg = _PLURAL_ARG.search(call.group("args"))
+            if arg is None:
+                continue
+            resource = arg.group("literal") or constants.get(arg.group("constant") or "", "")
+            if not resource.startswith("managed"):
+                continue
+            found.add((resource, _VERB_OF[call.group("verb")]))
+    return found
+
+
+def test_the_operator_call_site_scan_finds_something() -> None:
+    """A scan that matches nothing would pass the next test in silence."""
+    found = _operator_call_sites()
+    assert found, "no operator custom-resource call sites found — the scan is broken"
+    assert ("managedunderlays", "get") in found, sorted(found)
+
+
+def test_every_operator_call_site_is_listed() -> None:
+    """REQUIRED must not fall behind the code for the operator group.
+
+    Every row in REQUIRED is checked against the chart above; this closes the
+    other end, where the code grows a call and the row is never written. That
+    is precisely how the whole group came to be missing from the chart while
+    every test here passed.
+    """
+    listed = {(resource, verb) for group, resource, verb, _ in REQUIRED
+              if group == _OPERATOR_GROUP}
+    missing = _operator_call_sites() - listed
+    assert not missing, (
+        f"the backend calls {sorted(missing)} on the operator's custom resources "
+        f"and REQUIRED does not say so. Add a row (and the chart rule it implies) "
+        f"— otherwise the call 403s on a live cluster while every test here passes."
     )
 
 
@@ -420,4 +557,111 @@ def test_the_b3_role_and_the_backend_env_name_one_namespace() -> None:
     assert "if not (and .Values.backend.env" in deployment, (
         "the env must be skipped when backend.env already carries it, or the "
         "container gets two entries of the same name"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The other half: everything the code calls, not only what somebody remembered
+# ---------------------------------------------------------------------------
+#
+# REQUIRED is a curated list — each row says who calls it and why it matters.
+# The scan above closes the loop for the operator's own group, and only that
+# group, because it keys on the `managed` prefix in the plural.
+#
+# That blind spot is where a real hole lived: the BGP page reads
+# `bgpsessionstates` and `frrnodestates`, the chart granted neither, and both
+# refusals were swallowed — one `logger.debug`, one bare `continue` — so a 403
+# reached the user as "No session state reported yet", a fact about the cluster
+# rather than an error. The chart did grant `frrconfigurations`: permission to
+# write the config and none to read the result.
+#
+# This asks the whole question instead: for every custom-resource call in the
+# backend, is there a rule that allows it? No table to keep in step — the code
+# is the input.
+
+_GROUP_ARG = re.compile(
+    r"group\s*=\s*(?:\"(?P<literal>[a-z0-9.\-]+)\"|(?P<constant>[A-Za-z_][A-Za-z_0-9]*))"
+)
+
+# Call sites whose group or plural is computed at run time. Named one by one,
+# with the reason, because "the scan could not read it" and "the scan found
+# nothing to read" must not look the same.
+_DYNAMIC_CALL_SITES = {
+    ("?", "?"): "velero and cert-manager plurals chosen by the caller",
+    ("?", "virtualmachines"): "group from a module constant built per call",
+    ("cert-manager.io", "?"): "certificates and issuers through one helper",
+    ("kubeovn.io", "?"): "the underlay helper takes the plural as an argument",
+    ("velero.io", "?"): "backup and restore through one helper",
+}
+
+
+def _all_rbac_rules() -> list[dict]:
+    """Every rule the chart grants, from the ClusterRole and the Roles alike.
+
+    Both, because `bgpsessionstates` is namespaced and lives in a Role — read
+    only the ClusterRole and the hole this test exists for stays invisible.
+    """
+    rules: list[dict] = []
+    for doc in _chart_documents():
+        if doc.get("kind") in ("ClusterRole", "Role"):
+            rules.extend(doc.get("rules") or [])
+    return rules
+
+
+def _custom_resource_calls() -> set[tuple[str, str, str]]:
+    """(group, resource, verb) for every custom-object call in the backend."""
+    app = Path(__file__).resolve().parent.parent / "app"
+    sources = {path: path.read_text() for path in app.rglob("*.py")}
+
+    constants: dict[str, str] = {}
+    for text in sources.values():
+        for name, value in re.findall(
+            r"^([A-Z][A-Z_0-9]*)\s*=\s*\"([a-z0-9.\-]+)\"", text, re.M
+        ):
+            constants[name] = value
+
+    found: set[tuple[str, str, str]] = set()
+    for text in sources.values():
+        for call in _CUSTOM_CALL.finditer(text):
+            args = call.group("args")
+            plural = _PLURAL_ARG.search(args)
+            if plural is None:
+                continue
+            group_arg = _GROUP_ARG.search(args)
+            group = "?"
+            if group_arg is not None:
+                group = (group_arg.group("literal")
+                         or constants.get(group_arg.group("constant") or "", "?"))
+            resource = (plural.group("literal")
+                        or constants.get(plural.group("constant") or "", "?"))
+            found.add((group, resource, _VERB_OF[call.group("verb")]))
+    return found
+
+
+def test_the_chart_grants_every_custom_resource_call() -> None:
+    rules = _all_rbac_rules()
+    calls = _custom_resource_calls()
+    assert len(calls) > 100, f"the scan found only {len(calls)} calls — it is broken"
+
+    ungranted = sorted(
+        (group, resource, verb) for group, resource, verb in calls
+        if (group, resource) not in _DYNAMIC_CALL_SITES
+        and not _granted(rules, group, resource, verb)
+    )
+    assert not ungranted, (
+        "the backend makes these calls and the chart grants none of them — each "
+        "403s on a live cluster, and a swallowed 403 reads as an empty answer:\n  "
+        + "\n  ".join(f"{g}/{r}: {v}" for g, r, v in ungranted)
+    )
+
+
+def test_no_new_call_site_hides_behind_a_variable() -> None:
+    """A call whose group or plural the scan cannot read is not covered by the
+    test above, so the set of them is pinned. Growing it is a decision."""
+    calls = _custom_resource_calls()
+    unreadable = {(g, r) for g, r, _ in calls if g == "?" or r == "?"}
+    unexpected = unreadable - set(_DYNAMIC_CALL_SITES)
+    assert not unexpected, (
+        f"new call sites the scan cannot read: {sorted(unexpected)}. Either name "
+        "the group and plural literally, or add them above with the reason."
     )

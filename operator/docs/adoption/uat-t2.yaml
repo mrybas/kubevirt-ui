@@ -1,0 +1,43 @@
+# uat-t2, described from what is live rather than from what uat-t1 looked like.
+#
+# Every field here was read off the cluster: the CIDRs from the Cluster, the
+# worker shape from the KubevirtMachineTemplate, the VPC from the VM's
+# logical_switch annotation, the addon list from the two HelmReleases that
+# exist. The differences from uat-t1 are the whole point of adopting it second:
+# no CSI, no storage class, no OIDC, and no storage allowance at all.
+apiVersion: platform.kubevirt-ui.io/v1alpha1
+kind: ManagedTenant
+metadata:
+  name: uat-t2
+spec:
+  displayName: UAT T2
+  folder: poc-transit
+  environment: dev
+  kubernetesVersion: v1.33.5
+  controlPlaneReplicas: 2
+  network: uat-net-t2
+  podCIDR: 10.244.0.0/16
+  serviceCIDR: 10.112.0.0/12
+  # False, and written rather than left out: the live Cluster carries
+  # kubevirt-ui.io/enable-oidc=false and the apiserver has no OIDC args.
+  enableOIDC: false
+  storage:
+    # Zero, not absent. This tenant has no CSI driver, no credential and no
+    # volumes of its own; the default of 100 would charge its folder for
+    # capacity nothing in it can allocate.
+    allowanceGi: 0
+    # Also zero, which means no claim cap is written — matching the live quota,
+    # which caps cpu, memory and storage and says nothing about claim counts.
+    pvcCount: 0
+    # No class: the live root DataVolume names none and takes the cluster
+    # default, and writing one would be a change dressed as a description.
+    className: ""
+  workers:
+    count: 2
+    vcpu: 2
+    memory: 2Gi
+    disk: 20Gi
+    os: talos
+  # Empty: the namespace holds calico and namespaces, which are the required
+  # ones. uat-t1's CSI release is exactly what this tenant does not have.
+  addons: []

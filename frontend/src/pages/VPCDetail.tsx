@@ -25,6 +25,7 @@ import { useFoldersFlat } from '../hooks/useFolders';
 import { ApiError } from '../api/client';
 import { notify } from '../store/notifications';
 import type { VpcRoute, VpcSubnet, UpdateVpcDnsRequest } from '../types/vpc';
+import { ConfirmDeleteModal } from '../components/common/ConfirmDeleteModal';
 
 type Tab = 'overview' | 'subnets' | 'peerings' | 'routes' | 'dns' | 'dns-policy';
 
@@ -116,11 +117,17 @@ export default function VPCDetail() {
           <button onClick={() => refetch()} className="btn-secondary" title="Refresh">
             <RefreshCw className="h-4 w-4" />
           </button>
+          {/* Named, and not a bare icon: the button beside it removes a
+              peering, this one removes the network the tenants are in. A
+              tester reached for the peering and hit this. */}
           <button
             onClick={() => setShowDeleteModal(true)}
-            className="p-2 text-surface-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
+            title={`Delete the VPC ${vpc.name}`}
+            aria-label={`Delete the VPC ${vpc.name}`}
+            className="flex items-center gap-1.5 px-2.5 py-2 text-sm text-surface-400 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors"
           >
             <Trash2 className="h-4 w-4" />
+            Delete VPC
           </button>
         </div>
       </div>
@@ -497,6 +504,10 @@ function cidrsOverlap(a: string, b: string): boolean {
 function PeeringsTab({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data']> }) {
   const [showAdd, setShowAdd] = useState(false);
   const [remoteVpc, setRemoteVpc] = useState('');
+  // Removing a peering cuts traffic between two VPCs the moment it is
+  // clicked, and it used to do so from a bare icon with no name, two rows
+  // from the button that deletes the network itself.
+  const [peeringToRemove, setPeeringToRemove] = useState<string | null>(null);
   const addPeering = useAddVpcPeering(vpc.name);
   const removePeering = useRemoveVpcPeering(vpc.name);
   const { data: allVpcs } = useVpcs();
@@ -556,8 +567,10 @@ function PeeringsTab({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data
                     </span>
                   </div>
                   <button
-                    onClick={() => removePeering.mutateAsync(p.remote_vpc)}
+                    onClick={() => setPeeringToRemove(p.remote_vpc)}
                     disabled={removePeering.isPending}
+                    title={`Remove the peering with ${p.remote_vpc}`}
+                    aria-label={`Remove the peering with ${p.remote_vpc}`}
                     className="p-1 text-surface-500 hover:text-red-400 rounded transition-colors"
                   >
                     <Trash2 className="w-3.5 h-3.5" />
@@ -646,6 +659,19 @@ function PeeringsTab({ vpc }: { vpc: NonNullable<ReturnType<typeof useVpc>['data
           )}
         </>
       )}
+
+      <ConfirmDeleteModal
+        isOpen={!!peeringToRemove}
+        onClose={() => setPeeringToRemove(null)}
+        onConfirm={async () => {
+          if (!peeringToRemove) return;
+          await removePeering.mutateAsync(peeringToRemove);
+          setPeeringToRemove(null);
+        }}
+        resourceName={`${vpc.name} ↔ ${peeringToRemove ?? ''}`}
+        resourceType="Peering"
+        isDeleting={removePeering.isPending}
+      />
     </div>
   );
 }

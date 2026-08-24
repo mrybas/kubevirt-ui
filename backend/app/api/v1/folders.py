@@ -25,6 +25,15 @@ from app.core.auth import (
     check_folder_access,
 )
 
+from app.core.groups import (
+    get_user_namespaces,
+    is_admin,
+    is_env_member,
+    is_env_viewer,
+    is_folder_member,
+    is_folder_viewer,
+)
+
 from app.models.folder import (
     FolderCreateRequest,
     FolderUpdateRequest,
@@ -450,6 +459,43 @@ _RBAC_ROLE_NAMES: list[tuple[str, str, str]] = [
     ("viewer",  RB_NAME_VIEWER,  ROLE_TO_CLUSTERROLE["viewer"]),
 ]
 
+# The same three roles, for a namespace that holds another cluster's machinery.
+TENANT_CLUSTERROLES = {
+    ROLE_TO_CLUSTERROLE["admin"]: "kubevirt-ui-tenant-admin",
+    ROLE_TO_CLUSTERROLE["editor"]: "kubevirt-ui-tenant-editor",
+    ROLE_TO_CLUSTERROLE["viewer"]: "kubevirt-ui-tenant-viewer",
+}
+
+# The label that says a namespace belongs to a tenant cluster.
+TENANT_NS_LABEL = "kubevirt-ui.io/tenant"
+
+
+def _role_for_namespace(cluster_role: str, ns_labels: dict | None) -> str:
+    """The role to bind here, which is not the folder one in a tenant namespace.
+
+    A tenant namespace *is* a folder namespace — it carries the folder and
+    environment labels so the tenant takes part in folder authorisation — and
+    that is exactly what put the folder roles into it. Measured on a live stand:
+
+        kubectl auth can-i get secret/uat-t1-admin-kubeconfig -n tenant-uat-t1 \
+          --as=someone --as-group=kv-poc-transit-viewers
+        yes
+
+    A folder *viewer* could read the tenant's admin kubeconfig and its cluster
+    CA — cluster-admin on that tenant, handed to anyone with read access to the
+    folder. A member, whose role grants `*` on secrets, could also rewrite them,
+    and could delete the worker VMs that are the tenant's nodes.
+
+    What lives in a tenant namespace is not a user's workloads; it is another
+    cluster's certificates, datastore config and CAPI graph. Every product
+    operation on them runs as the backend behind `require_tenant_access`, so
+    nothing legitimate reads those secrets as the user — the kubeconfig download
+    does not.
+    """
+    if (ns_labels or {}).get(TENANT_NS_LABEL):
+        return TENANT_CLUSTERROLES.get(cluster_role, cluster_role)
+    return cluster_role
+
 
 def _collect_subjects(
     folder_meta: dict, env: str, role: str,
@@ -592,7 +638,8 @@ async def reconcile_folder_rbac(
         for role, rb_name, cluster_role in _RBAC_ROLE_NAMES:
             groups = _collect_subjects(folder_meta, env, role)
             await _apply_phase2_rb(
-                rbac_api, rb_name, ns_name, folder, env, cluster_role, groups,
+                rbac_api, rb_name, ns_name, folder, env,
+                _role_for_namespace(cluster_role, ns_obj.metadata.labels), groups,
             )
 
 
@@ -623,10 +670,27 @@ async def reconcile_namespace_rbac(
     not `<folder>-<env>` shaped so `_ns_name` doesn't apply).
     """
     rbac_api = await _get_rbac_api(k8s_client)
+
+    # Read once, before the loop. The tenant label is the fact; the `tenant-`
+    # prefix is only a convention, and a convention is what an authorisation
+    # decision must not rest on.
+    ns_labels: dict = {}
+    try:
+        ns_obj = await k8s_client.core_api.read_namespace(name=namespace)
+        ns_labels = ns_obj.metadata.labels or {}
+    except ApiException as e:
+        logger.warning(
+            "Could not read namespace %r to decide which roles to bind (%s); "
+            "binding the folder roles, which grant read on this namespace's "
+            "secrets. If this is a tenant namespace, that is too much.",
+            namespace, e,
+        )
+
     for role, rb_name, cluster_role in _RBAC_ROLE_NAMES:
         groups = _collect_subjects(folder_meta, env, role)
         await _apply_phase2_rb(
-            rbac_api, rb_name, namespace, folder, env, cluster_role, groups,
+            rbac_api, rb_name, namespace, folder, env,
+            _role_for_namespace(cluster_role, ns_labels), groups,
         )
 
 
@@ -750,6 +814,81 @@ async def _propagate_folder_access(
 # Folder CRUD
 # ---------------------------------------------------------------------------
 
+def _may_create_in(user: User, meta: dict, env_ns_list: list) -> bool:
+    """Whether this caller may make something in this folder.
+
+    Answered here, by the predicates that enforce it, so that a page showing a
+    create button is reading a fact rather than re-deriving the access rules in
+    TypeScript. The two disagreeing is how a viewer came to be offered two
+    "Create VM" buttons and a "Create Folder" button, each of which answers 403.
+    """
+    if is_admin(user.groups, user):
+        return True
+    if is_folder_member(user, meta):
+        return True
+    return any(
+        is_env_member(user, meta, env)
+        for env in (
+            (ns.metadata.labels or {}).get(ENV_ENVIRONMENT_LABEL)
+            for ns in env_ns_list
+        )
+        if env
+    )
+
+
+def _folders_you_may_see(
+    user: User, folders: dict[str, dict], user_ns: set[str],
+    ns_by_folder: dict[str, list],
+) -> dict[str, dict]:
+    """The folders this user has any business knowing about.
+
+    `GET /folders` filtered nothing. Every authenticated user got every
+    folder — its name, its display name, who is in it, how many VMs it holds
+    and how much storage — and the UI hid the ones that were not theirs by
+    convention. UAT run 4 saw the other folder from two different roles and
+    wrote it down twice before concluding it was the endpoint and not the
+    role. It is also why there was a Create Folder button that answers 403:
+    the page was drawing what it could see rather than what it could use.
+
+    Three ways to see one, matching how access is granted everywhere else:
+
+      * the folder's access block admits you at folder level;
+      * it admits you at the level of one of its environments;
+      * you have RBAC in one of its namespaces — the legacy path, and the
+        only one for a folder made before access blocks existed.
+
+    Ancestors of anything visible come too. A tree cannot render a child
+    whose parent is missing, and the parent's name is implied by the child's
+    path in any case.
+    """
+    visible: set[str] = set()
+    for name, meta in folders.items():
+        if is_folder_viewer(user, meta):
+            visible.add(name)
+            continue
+        envs = [
+            (ns.metadata.labels or {}).get(ENV_ENVIRONMENT_LABEL)
+            or ns.metadata.name.removeprefix(f"{name}-")
+            for ns in ns_by_folder.get(name, [])
+        ]
+        if any(is_env_viewer(user, meta, env) for env in envs if env):
+            visible.add(name)
+            continue
+        if {ns.metadata.name for ns in ns_by_folder.get(name, [])} & user_ns:
+            visible.add(name)
+
+    # Ancestors, so the tree the child hangs from exists.
+    for name in list(visible):
+        parent = (folders.get(name) or {}).get("parent_id")
+        seen = {name}
+        while parent and parent in folders and parent not in seen:
+            visible.add(parent)
+            seen.add(parent)
+            parent = (folders.get(parent) or {}).get("parent_id")
+
+    return {n: m for n, m in folders.items() if n in visible}
+
+
 @router.get("", response_model=FolderTreeResponse)
 async def list_folders(request: Request, flat: bool = False, user: User = Depends(require_auth)):
     """List all folders. Returns tree structure by default, flat list if flat=true."""
@@ -774,6 +913,13 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
         folder = (ns.metadata.labels or {}).get(ENV_FOLDER_LABEL)
         if folder:
             ns_by_folder.setdefault(folder, []).append(ns)
+
+    if not is_admin(user.groups, user):
+        folders = _folders_you_may_see(
+            user, folders,
+            set(await get_user_namespaces(k8s_client, user)),
+            ns_by_folder,
+        )
 
     rbac_api = await _get_rbac_api(k8s_client)
 
@@ -814,6 +960,7 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
             teams=teams,
             users=users,
             access=_build_access_spec(meta),
+            can_create=_may_create_in(user, meta, env_ns_list),
         )
 
     if flat:
@@ -1613,6 +1760,24 @@ async def assert_within_folder_quota(
         }
         ceiling = (folders.get(folder_name) or {}).get("quota") or {}
         free = limit - allocated[field]
+        # Asking for no more than you already hold is never a refusal.
+        #
+        # The comparison is otherwise the whole request against what is free,
+        # and a folder can be over its ceiling without ever having asked this
+        # function — a quota lowered under what is already handed out, or a
+        # tenant namespace that joined the folder after the fact. In that
+        # state `free` is zero, and *every* request fails, including the one
+        # that gives room back: scaling a tenant from three workers down to
+        # two was refused for lack of room to shrink into. Measured on the
+        # stand, where poc-transit capped CPU at 32 with 55 already allocated
+        # elsewhere, and 3→2 workers came back "0 is free and tenant 'test3'
+        # asks for 13".
+        #
+        # The ceiling is still enforced: a request that grows the asker's own
+        # reservation is checked in full, so the way out is down and never
+        # further up.
+        if want <= excluded[field] + 1e-9:
+            continue
         if want > free + 1e-9:
             raise HTTPException(
                 status_code=409,

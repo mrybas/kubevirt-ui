@@ -1,0 +1,300 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: managedimages.platform.kubevirt-ui.io
+spec:
+  group: platform.kubevirt-ui.io
+  names:
+    kind: ManagedImage
+    listKind: ManagedImageList
+    plural: managedimages
+    shortNames:
+    - mimg
+    singular: managedimage
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.progress
+      name: Progress
+      type: string
+    - jsonPath: .spec.size
+      name: Size
+      type: string
+    - jsonPath: .spec.scope
+      name: Scope
+      type: string
+    - jsonPath: .status.dataVolumeName
+      name: DataVolume
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ManagedImage is a disk image the platform owns: one object a user or a
+          Terraform module can name, instead of a generated DataVolume name that had to
+          be read back before anything could reference it.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ManagedImageSpec describes a disk image the platform manages.
+
+              Fields that cannot be changed after the import are marked immutable rather
+              than accepted and ignored: CDI will not re-import a DataVolume because its
+              source changed, and an edit that looks applied but does nothing is the defect
+              this API exists to remove.
+            properties:
+              description:
+                description: Description is free text shown in the UI.
+                maxLength: 512
+                type: string
+              diskType:
+                default: image
+                description: DiskType separates bootable images from plain data disks.
+                enum:
+                - image
+                - data
+                type: string
+              displayName:
+                description: |-
+                  DisplayName is what humans see. Cosmetic only: it never takes part in the
+                  name of anything the controller creates.
+                maxLength: 128
+                type: string
+              osType:
+                description: OSType labels the guest operating system family, e.g.
+                  linux.
+                type: string
+              osVersion:
+                description: OSVersion labels the guest operating system version,
+                  e.g. 24.04.
+                type: string
+              persistent:
+                default: false
+                description: Persistent marks a disk that is attached rather than
+                  cloned.
+                type: boolean
+              scope:
+                default: environment
+                description: |-
+                  Scope decides who may reference this image.
+
+                    environment — this namespace only (the default, and the private case)
+                    project     — every environment of the same project
+                    folder      — the folder and its descendants
+
+                  All three values have always been understood by the image lister; only the
+                  first two were ever writable, so folder-scoped images could until now be
+                  produced only by labelling a DataVolume by hand.
+                enum:
+                - environment
+                - project
+                - folder
+                type: string
+              size:
+                description: Size of the disk to allocate, e.g. 20Gi.
+                pattern: ^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|K|M|G|T|P|k|m)?$
+                type: string
+                x-kubernetes-validations:
+                - message: 'size is immutable: resize the underlying claim deliberately,
+                    not by editing the image'
+                  rule: self == oldSelf
+              source:
+                description: Source of the image content.
+                properties:
+                  blank:
+                    description: BlankSource allocates an empty disk.
+                    type: object
+                  http:
+                    description: HTTPSource imports the image over HTTP(S).
+                    properties:
+                      url:
+                        description: URL of the disk image to download.
+                        minLength: 1
+                        type: string
+                    required:
+                    - url
+                    type: object
+                  pvc:
+                    description: PVCSource clones an existing PersistentVolumeClaim.
+                    properties:
+                      name:
+                        description: Name of the source PersistentVolumeClaim.
+                        minLength: 1
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace of the source claim. Empty means this image's own namespace.
+                          A foreign namespace additionally requires the CDI clone gate
+                          (create on datavolumes/source in the source namespace), which the
+                          controller reports rather than silently hanging on.
+                        type: string
+                    required:
+                    - name
+                    type: object
+                  registry:
+                    description: RegistrySource imports the image from a container
+                      registry.
+                    properties:
+                      url:
+                        description: URL of the container image, e.g. docker://quay.io/org/image:tag.
+                        minLength: 1
+                        type: string
+                    required:
+                    - url
+                    type: object
+                type: object
+                x-kubernetes-validations:
+                - message: 'source is immutable: create a new ManagedImage instead
+                    — CDI does not re-import an existing disk'
+                  rule: self == oldSelf
+                - message: exactly one of http, registry, pvc or blank must be set
+                  rule: '[has(self.http), has(self.registry), has(self.pvc), has(self.blank)].exists_one(x,
+                    x)'
+              storageClass:
+                default: ""
+                description: StorageClass to allocate from. Empty means the cluster
+                  default.
+                type: string
+                x-kubernetes-validations:
+                - message: 'storageClass is immutable: the disk already exists on
+                    a class'
+                  rule: self == oldSelf
+            required:
+            - size
+            - source
+            type: object
+          status:
+            description: ManagedImageStatus is what the UI and Terraform read back.
+            properties:
+              conditions:
+                description: Conditions carry the reasons. A blocked image always
+                  names its blocker.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              dataSourceName:
+                description: |-
+                  DataSourceName is the CDI DataSource published for this image, so that
+                  KubeVirt-native consumers can reference it without knowing about us.
+                type: string
+              dataVolumeName:
+                description: |-
+                  DataVolumeName is the DataVolume backing this image. Read it from here —
+                  never reconstruct it from the image name.
+                type: string
+              observedGeneration:
+                description: ObservedGeneration is the spec generation this status
+                  was computed from.
+                format: int64
+                type: integer
+              phase:
+                description: 'Phase is the coarse state: Pending, Importing, Ready
+                  or Failed.'
+                enum:
+                - Pending
+                - Importing
+                - Ready
+                - Failed
+                type: string
+              progress:
+                description: Progress is CDI's import progress, passed through verbatim,
+                  e.g. "42%".
+                type: string
+              usedBy:
+                description: |-
+                  UsedBy lists the workloads currently cloning from or attached to this
+                  image, as namespace/name. Deletion is refused while it is not empty:
+                  removing a clone source mid-clone leaves an orphaned disk behind.
+                items:
+                  type: string
+                type: array
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

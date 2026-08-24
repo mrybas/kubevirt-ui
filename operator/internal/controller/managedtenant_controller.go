@@ -1,0 +1,808 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"sort"
+	"strings"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
+	"github.com/mrybas/kubevirt-ui/operator/internal/kube"
+	"github.com/mrybas/kubevirt-ui/operator/internal/talos"
+	"github.com/mrybas/kubevirt-ui/operator/internal/tenant"
+)
+
+const (
+	tenantControllerName = "managedtenant"
+
+	// What kube-ovn reads to place a namespace's pods.
+	logicalSwitchAnnotation = "ovn.kubernetes.io/logical_switch"
+
+	// pendingRequeue is how often a tenant comes back to look at the two things
+	// nobody wakes it for: the signer's secret and the shared image's import.
+	pendingRequeue = 10 * time.Second
+
+	// tenantCatalogEnv is where a deployment states its Talos releases — the
+	// same variable the endpoint and the webhook read, so all three answer with
+	// one list.
+	tenantCatalogEnv = "TENANTS_TALOS_CATALOG"
+)
+
+// ManagedTenantReconciler builds the namespace a tenant lives in.
+//
+// This is phases 7 and 8 of the create it replaces: the namespace with its
+// labels, one quota, and the LimitRange without which that quota stops the
+// control plane from starting at all.
+type ManagedTenantReconciler struct {
+	client.Client
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
+
+	// APIReader reads straight from the API server, for the two occasional
+	// lookups — the MetalLB pool and the transit subnet — that are not worth a
+	// cluster-wide watch apiece.
+	APIReader client.Reader
+
+	// Where tenant addresses come from, and the subnet that must exclude them.
+	// Fields rather than environment reads at the point of use: the value
+	// belongs to the deployment, and a test that has to set a process variable
+	// to exercise one controller sets it for every other one running beside it.
+	// Empty falls back to the environment, so the deployment can keep
+	// configuring it the way the product always has.
+	MetalLBPool      string
+	MetalLBNamespace string
+	TransitSubnet    string
+
+	// KubeOVNNamespace is where kube-ovn states the resolver a VPC worker uses.
+	// Read when the tenant's network is not one of ours — a VPC the product
+	// built has no ManagedNetwork, and refusing to build workers in one would
+	// be this operator insisting the world be its own shape.
+	KubeOVNNamespace string
+
+	// TenantClient opens a client to a tenant's own API server. Replaced in
+	// tests, where there is no second cluster to talk to.
+	TenantClient TenantClientFor
+
+	// CatalogNamespace holds the addon catalogue. Empty falls back to the
+	// environment, then to where the product keeps it.
+	CatalogNamespace string
+}
+
+// +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedtenants/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups="",resources=namespaces;limitranges,verbs=get;list;watch;create;update;patch
+// Quotas alone carry delete, for taking over the one the backend used to
+// write. Namespaces and LimitRanges deliberately do not: this controller has
+// no business removing either, and a verb granted for one purpose is a verb
+// available for every other.
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedimages,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch
+// Held so it can be granted: Kubernetes refuses to create a Role conferring
+// permissions the writer does not have itself, and this controller's whole job
+// here is handing `datavolumes/source` to each tenant's ServiceAccount. Nothing
+// in the lab could show this — envtest and the dev backend both run as admin,
+// where an escalation check never fires.
+// +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes/source,verbs=create
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// Delete is for the host-API publication, which is withdrawn when a tenant
+// stops having storage. Without it the withdrawal fails on a Forbidden and
+// takes the whole transit reconcile with it.
+// +kubebuilder:rbac:groups=metallb.io,resources=ipaddresspools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cert-manager.io,resources=issuers;certificates,verbs=get;list;watch;create;update;patch
+// The machine secrets are written here — once, and never rewritten — so this
+// needs create as well as read. Nothing in the suite could have caught the
+// omission: envtest runs as admin, where no RBAC check ever fires.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=create;update;patch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=traefik.io,resources=ingressroutetcps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
+// The write half is new with the host-API publication: a Service with no
+// selector has no endpoints unless somebody writes them, and the somebody is
+// this controller mirroring the host apiserver's own record.
+// +kubebuilder:rbac:groups=helm.toolkit.fluxcd.io,resources=helmreleases,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machinehealthchecks;machinedeployments,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=talosconfigtemplates,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=kubevirtclusters;kubevirtmachinetemplates,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=kubeovn.io,resources=subnets;vpcs,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=kubeovn.io,resources=ovn-eips;ovn-snat-rules,verbs=get;list;watch;create;update;patch;delete
+
+// Reconcile brings the tenant's namespace into line with the declaration.
+func (r *ManagedTenantReconciler) Reconcile(
+	ctx context.Context, req ctrl.Request,
+) (ctrl.Result, error) {
+	obj := &platformv1alpha1.ManagedTenant{}
+	if err := r.Get(ctx, req.NamespacedName, obj); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if obj.Annotations[pausedAnnotation] == "true" || !obj.DeletionTimestamp.IsZero() {
+		return ctrl.Result{}, nil
+	}
+
+	before := obj.DeepCopy()
+	namespace := tenant.NamespaceOf(obj.Name)
+	obj.Status.Namespace = namespace
+
+	release, refusal := r.resolveRelease(obj)
+	if refusal != "" {
+		// Admission refuses this too, but an object can predate the webhook or
+		// arrive while it is unreachable, and a tenant nobody can build should
+		// say so rather than half-exist.
+		r.setTenantCondition(obj, platformv1alpha1.ConditionTenantAccepted,
+			false, "IncompatibleVersions", refusal)
+		obj.Status.ObservedGeneration = obj.Generation
+		return ctrl.Result{}, kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+	}
+	obj.Status.TalosRelease = release
+	r.setTenantCondition(obj, platformv1alpha1.ConditionTenantAccepted, true, "Accepted",
+		"the request can be built as written")
+
+	reservation, err := tenant.Reserve(tenant.SizingOf(obj))
+	if err != nil {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved,
+			false, "Unsizeable", err.Error())
+		obj.Status.ObservedGeneration = obj.Generation
+		return ctrl.Result{}, kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+	}
+	if err := r.ensureNamespace(ctx, obj, namespace); err != nil {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady,
+			false, "WriteFailed", err.Error())
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+
+	// The LimitRange goes in before the quota, and the order is the whole
+	// point. A quota on requests makes requests mandatory, and Kamaji's
+	// control-plane containers declare none — with the quota in place first,
+	// every pod in the namespace is refused until the defaults arrive.
+	if err := r.ensureLimitRange(ctx, obj, namespace); err != nil {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady,
+			false, "WriteFailed", err.Error())
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	// What else caps storage here decides what this quota may say, so it is
+	// read before the quota is written and not after.
+	redundant, absorb, err := r.redundantStorageQuotas(ctx, namespace, obj)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// One counter, two intents. The workers' disks and the allowance for the
+	// tenant's own workloads both spend `requests.storage` in this namespace,
+	// and Kubernetes requires every quota to be satisfied — so two objects mean
+	// the effective cap is the smaller of the two while the folder ceiling,
+	// which sums every quota it finds, charges for both.
+	//
+	// Measured on this stand: a tenant with `tenant-storage` at 100Gi and its
+	// own quota at 120Gi was charged 220Gi against its folder and could use
+	// 100. A 110Gi claim in that shape is refused by the smaller object; under
+	// a single 220Gi quota the same claim is admitted. So one object, summed:
+	// enforcement loosens from 100 to 220 deliberately, because 220 is what was
+	// already being charged, and charging for capacity you forbid is the worse
+	// of the two.
+	//
+	// Unless somebody else's quota is still there. Then adding the allowance
+	// here would take the folder charge to 320 and change nothing about what is
+	// enforced, since the other object still binds at its own number. In that
+	// case this writes what the product writes today — the machines only — and
+	// says what is wrong rather than making it worse.
+	total := reservation
+	if len(redundant) == 0 {
+		total = tenant.WithStorageAllowance(reservation, storageAllowanceOf(obj))
+	}
+	obj.Status.Reservation = &platformv1alpha1.TenantReservation{
+		CPU:     total.CPU.String(),
+		Memory:  total.Memory.String(),
+		Storage: total.Storage.String(),
+	}
+
+	// The folder ceiling, asked here and not only by the API.
+	//
+	// `ConditionQuotaReserved` has always been documented as the ceiling's
+	// answer and nothing ever gave it one: the API refused a tenant that did
+	// not fit and this reconciler wrote the same quota from the same
+	// description without asking, so `spec.workers.count` edited on the CR
+	// went through with nothing in the way.
+	//
+	// A refusal withholds the *growth*, not the tenant. `CheckCeiling` returns
+	// room whenever the reservation does not exceed what the namespace already
+	// holds, so a refusal always means growth, and the quota and the worker
+	// shape are the two writes that carry it. Everything else about a running
+	// tenant — its address, its PKI, its transit, its addons — goes on being
+	// reconciled, because a number somebody typed is not a reason to stop
+	// maintaining a cluster that exists.
+	//
+	// Withholding both matters. Letting the shape through while holding the
+	// quota is the state this whole area keeps producing: machines that exist
+	// and pods the quota refuses, reported as "namespace quota has no room for
+	// the replacement pod".
+	overCeiling, err := r.ceilingRefusal(ctx, obj, namespace, total)
+	if err != nil {
+		// Failing to *ask* is not a refusal. A ceiling that cannot be read has
+		// not said no, and treating the two alike would freeze every tenant in
+		// the cluster on one unreadable ConfigMap.
+		logf.FromContext(ctx).Error(err, "could not read the folder ceiling",
+			"tenant", obj.Name, "folder", obj.Spec.Folder)
+	}
+	// The condition itself is set at the end, with the rest of the quota's
+	// answer: a setter here is overwritten by that one, which is how the first
+	// version of this passed its own reading and none of its tests.
+	if overCeiling == nil {
+		if err := r.ensureQuota(ctx, obj, namespace, total, len(redundant) == 0); err != nil {
+			r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved,
+				false, "WriteFailed", err.Error())
+			obj.Status.ObservedGeneration = obj.Generation
+			_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Taking over the quota the backend used to write, now that ours carries
+	// the same allowance. This order never leaves the namespace uncapped:
+	// while both exist Kubernetes enforces the smaller, which is what was
+	// enforced a moment ago, and removing the second widens the cap to the
+	// figure the folder was already being charged for.
+	if overCeiling == nil {
+		for _, name := range absorb {
+			old := &corev1.ResourceQuota{}
+			old.Name, old.Namespace = name, namespace
+			if err := kube.Delete(ctx, r.Client, tenantControllerName, old); err != nil {
+				return ctrl.Result{}, fmt.Errorf("absorbing ResourceQuota/%s: %w", name, err)
+			}
+		}
+	}
+
+	obj.Status.RedundantQuotas = redundant
+
+	// After the namespace, because the Service lives in it.
+	vip, addressNeeded, addressReady, addressMessage, err := r.reconcileAddress(
+		ctx, obj, namespace)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			addressCondition(false, err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	// Kept even while pending: an address that has been handed out is not
+	// withdrawn because one read came back empty.
+	if vip != "" {
+		obj.Status.ControlPlaneVIP = vip
+	}
+	if addressNeeded {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			addressCondition(addressReady, addressMessage))
+	}
+
+	// Two of the things below are waited for rather than watched: cert-manager
+	// writes the signer's secret, and the image controller finishes an import.
+	// Watching either would mean caching every Secret and every ManagedImage in
+	// the cluster to notice one object apiece, so the tenant comes back and
+	// looks instead. It stops as soon as they are ready.
+	pending := false
+
+	// After the address, which the signer's certificate carries as an IP SAN.
+	pkiReady, pkiReason, pkiMessage, err := r.reconcilePKI(
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP, addressNeeded)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			pkiCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if pkiMessage != "" || obj.Spec.Workers.OS == "talos" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			pkiCondition(pkiReady, pkiReason, pkiMessage))
+		pending = pending || !pkiReady
+	}
+
+	// On the same address as the API server, which is what makes it reachable
+	// from a VPC with no egress at all.
+	timeReady, timeReason, timeMessage := false, "", ""
+	if addressNeeded {
+		timeReady, timeReason, timeMessage, err = r.reconcileTime(
+			ctx, obj, obj.Status.ControlPlaneVIP)
+	}
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			timeCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if addressNeeded {
+		// Only a tenant with an address of its own has anywhere to serve the
+		// time. On the default overlay a worker reaches the public servers the
+		// same way it reaches everything else.
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			timeCondition(timeReady, timeReason, timeMessage))
+		pending = pending || !timeReady
+	}
+
+	// After the PKI, because the control plane mounts the signer's secrets, and
+	// after the address, because that is what the workers will be told to join.
+	cpReady, cpReason, cpMessage, err := r.reconcileControlPlane(
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP, addressNeeded)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			controlPlaneCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	apimeta.SetStatusCondition(&obj.Status.Conditions,
+		controlPlaneCondition(cpReady, cpReason, cpMessage))
+	pending = pending || !cpReady
+
+	// Before the workers: their config names the address they will dial, and
+	// this is what makes that address reachable from inside the VPC.
+	transitReady, transitReason, transitMessage, err := r.reconcileTransit(
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			transitCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if obj.Spec.Network != "" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			transitCondition(transitReady, transitReason, transitMessage))
+		pending = pending || !transitReady
+	}
+
+	// After the control plane: the worker config carries the Kubernetes CA that
+	// Kamaji only mints once the control plane exists.
+	if overCeiling != nil {
+		// The shape is held back with the quota. Written now, CAPI would
+		// create machines whose pods the unchanged quota refuses.
+		apimeta.SetStatusCondition(&obj.Status.Conditions, workersCondition(
+			false, "HeldByFolderQuota", overCeiling.Error()))
+		pending = true
+	} else {
+		workersReady, workersReason, workersMessage, err := r.reconcileWorkers(
+			ctx, obj, namespace, obj.Status.ControlPlaneVIP, release, addressNeeded)
+		if err != nil {
+			apimeta.SetStatusCondition(&obj.Status.Conditions,
+				workersCondition(false, "WriteFailed", err.Error()))
+			obj.Status.ObservedGeneration = obj.Generation
+			_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+			return ctrl.Result{}, err
+		}
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			workersCondition(workersReady, workersReason, workersMessage))
+		pending = pending || !workersReady
+	}
+
+	// The name the certificate already answers for, and the address the
+	// kubeconfig hands out: both were written before anything routed them.
+	routesReady, routesReason, routesMessage, err := r.reconcileExternalRoutes(
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			routesCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if routesReason != "" || routesMessage != "" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			routesCondition(routesReady, routesReason, routesMessage))
+		pending = pending || !routesReady
+	}
+
+	// Last, and against a different API server: what goes here can only be
+	// placed once the tenant's own control plane answers.
+	insideReady, insideReason, insideMessage, err := r.reconcileInsideTheTenant(
+		ctx, obj, namespace, obj.Status.ControlPlaneVIP)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			insideCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if obj.Spec.Workers.OS == "talos" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			insideCondition(insideReady, insideReason, insideMessage))
+		pending = pending || !insideReady
+	}
+
+	// After the tenant answers: these install into its cluster, not this one.
+	addonsReady, addonsReason, addonsMessage, err := r.reconcileAddons(ctx, obj, namespace)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			addonsCondition(false, "WriteFailed", err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if addonsReason != "" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			addonsCondition(addonsReady, addonsReason, addonsMessage))
+		pending = pending || !addonsReady
+	}
+
+	// After the namespace, because the clone grant names it as its subject.
+	goldenReady, goldenMessage, err := r.reconcileGolden(ctx, obj, namespace, release)
+	if err != nil {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			goldenCondition(false, err.Error()))
+		obj.Status.ObservedGeneration = obj.Generation
+		_ = kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+		return ctrl.Result{}, err
+	}
+	if goldenMessage != "" || obj.Spec.Workers.OS == "talos" {
+		apimeta.SetStatusCondition(&obj.Status.Conditions,
+			goldenCondition(goldenReady, goldenMessage))
+		pending = pending || !goldenReady
+	}
+
+	if overCeiling != nil {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady, true, "Ready",
+			fmt.Sprintf("%s has its LimitRange; its quota is unchanged while "+
+				"the folder ceiling refuses the growth", namespace))
+	} else {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionNamespaceReady, true, "Ready",
+			fmt.Sprintf("%s has its quota and its LimitRange", namespace))
+	}
+	// Said whether or not it is good news: a request that was accepted and not
+	// delivered is the thing this condition exists to make visible.
+	apimeta.SetStatusCondition(&obj.Status.Conditions, singleSignOnCondition(obj))
+
+	if overCeiling != nil {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved,
+			false, "DoesNotFit", overCeiling.Error())
+	} else if len(redundant) > 0 {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved,
+			false, "CountedTwice",
+			fmt.Sprintf("%s also caps storage in this namespace. Kubernetes "+
+				"requires every quota to be satisfied, so what is actually "+
+				"enforced is the smaller of them, while the folder ceiling sums "+
+				"them and charges for both. This quota therefore carries the "+
+				"machines only, without the workload allowance, which would "+
+				"raise the charge and change nothing about the limit. Left in "+
+				"place: something else wrote it",
+				strings.Join(redundant, ", ")))
+	} else {
+		r.setTenantCondition(obj, platformv1alpha1.ConditionQuotaReserved, true, "Reserved",
+			fmt.Sprintf("cpu %s, memory %s, storage %s",
+				total.CPU.String(), total.Memory.String(), total.Storage.String()))
+	}
+
+	obj.Status.ObservedGeneration = obj.Generation
+	result := ctrl.Result{}
+	if pending {
+		result.RequeueAfter = pendingRequeue
+	}
+	return result, kube.UpdateStatus(ctx, r.Client, tenantControllerName, obj, before)
+}
+
+// resolveRelease answers which Talos release this tenant builds from, or why
+// it cannot.
+func (r *ManagedTenantReconciler) resolveRelease(
+	obj *platformv1alpha1.ManagedTenant,
+) (release, refusal string) {
+	if obj.Spec.Workers.OS != "talos" {
+		return "", ""
+	}
+	entries, _ := talos.Catalog(os.Getenv(tenantCatalogEnv))
+	version := obj.Spec.Workers.TalosVersion
+	if version == "" {
+		chosen, ok := talos.DefaultRelease(entries)
+		if !ok {
+			return "", "this deployment offers no Talos release at all"
+		}
+		version = chosen.Talos
+	}
+	if refusal := talos.Refusal(entries, version, obj.Spec.KubernetesVersion); refusal != "" {
+		return "", refusal
+	}
+	return version, ""
+}
+
+// ensureNamespace writes the namespace a tenant's objects live in.
+func (r *ManagedTenantReconciler) ensureNamespace(
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant, name string,
+) error {
+	live := &corev1.Namespace{}
+	live.Name = name
+
+	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
+		if live.Labels == nil {
+			live.Labels = map[string]string{}
+		}
+		for key, value := range tenant.NamespaceLabels(obj) {
+			live.Labels[key] = value
+		}
+		// **No logical switch on the namespace.** An earlier version stamped
+		// the tenant's VPC subnet here, reasoning that a pod born in this
+		// namespace should land in the tenant's network. Exactly backwards, and
+		// the stand said so: the control plane lands there too, and from inside
+		// a VPC it cannot resolve the datastore —
+		//
+		//   failed to connect to host=kamaji-postgres-rw.o0-cnpg.svc:
+		//   lookup ... on 10.96.0.10:53: i/o timeout
+		//
+		// — so kine never opens its socket, the apiserver dies on "error
+		// creating leases", and six containers crash-loop with nothing naming
+		// the network. The namespace stays on the cluster overlay, where the
+		// control plane can reach Postgres, the ingress and the rest of the
+		// platform; it is the worker *launcher pods* that cross into the VPC,
+		// by the annotation on their own template.
+		//
+		// Ceasing to write it does not undo it. A namespace stamped by the
+		// version that did keeps the annotation for ever, and its control plane
+		// stays unreachable after the upgrade that fixed the cause — so the
+		// stamp is removed when it is found, and only when it is *our* stamp:
+		// the tenant's own VPC subnet. Anything else there was put there by
+		// somebody else, `ovn-default` included, which is kube-ovn's own claim
+		// and the value a healthy tenant namespace carries.
+		if switchName := tenant.LogicalSwitchOf(obj); switchName != "" {
+			if live.Annotations[logicalSwitchAnnotation] == switchName {
+				delete(live.Annotations, logicalSwitchAnnotation)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("Namespace/%s: %w", name, err)
+	}
+	return nil
+}
+
+// ensureLimitRange supplies the requests Kamaji's containers do not declare.
+//
+// Only `defaultRequest`. A defaulted *limit* would throttle the apiserver at
+// whatever number was picked here.
+func (r *ManagedTenantReconciler) ensureLimitRange(
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace string,
+) error {
+	live := &corev1.LimitRange{}
+	live.Name = namespace + "-limits"
+	live.Namespace = namespace
+
+	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
+		if live.Labels == nil {
+			live.Labels = map[string]string{}
+		}
+		live.Labels["kubevirt-ui.io/managed"] = "true"
+		live.Labels["kubevirt-ui.io/tenant"] = obj.Name
+		live.Spec.Limits = []corev1.LimitRangeItem{{
+			Type: corev1.LimitTypeContainer,
+			DefaultRequest: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("50m"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
+			},
+		}}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("LimitRange/%s: %w", live.Name, err)
+	}
+	return nil
+}
+
+// ensureQuota writes the one quota.
+//
+// Requests only, never limits. A ResourceQuota that caps a limit makes the API
+// server *require* that limit on every pod in the namespace, and the Kamaji
+// control plane declares none — every tenant created in a folder simply had no
+// control plane, the TenantControlPlane sat NotReady with zero pods, and the
+// page reported Provisioning forever.
+func (r *ManagedTenantReconciler) ensureQuota(
+	ctx context.Context, obj *platformv1alpha1.ManagedTenant,
+	namespace string, total tenant.Quota, ownsPVCCount bool,
+) error {
+	live := &corev1.ResourceQuota{}
+	live.Name = namespace + "-quota"
+	live.Namespace = namespace
+
+	_, err := kube.Ensure(ctx, r.Client, tenantControllerName, live, func() error {
+		if live.Labels == nil {
+			live.Labels = map[string]string{}
+		}
+		live.Labels["kubevirt-ui.io/managed"] = "true"
+		live.Labels["kubevirt-ui.io/tenant"] = obj.Name
+		live.Spec.Hard = corev1.ResourceList{
+			corev1.ResourceRequestsCPU:     total.CPU,
+			corev1.ResourceRequestsMemory:  total.Memory,
+			corev1.ResourceRequestsStorage: total.Storage,
+		}
+		// The PVC count lives here too, rather than in a second object — but
+		// only when there is no second object. Two caps on the same counter is
+		// the thing being undone, not something to add another instance of.
+		if count := pvcCountOf(obj); ownsPVCCount && count > 0 {
+			live.Spec.Hard[corev1.ResourcePersistentVolumeClaims] =
+				*resource.NewQuantity(int64(count), resource.DecimalSI)
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("ResourceQuota/%s: %w", live.Name, err)
+	}
+	return nil
+}
+
+// redundantStorageQuotas is every other quota in the namespace that also caps
+// storage.
+//
+// Kubernetes applies quotas independently, so two storage caps mean the
+// effective one is the smaller — but the folder ceiling sums every quota it
+// finds, so the tenant is charged for its storage once per object. Measured on
+// this stand: one tenant carrying both was counted 220Gi against its folder
+// while reserving 120Gi, and the tenant beside it had only one, so the
+// double-count was not even consistent.
+func (r *ManagedTenantReconciler) redundantStorageQuotas(
+	ctx context.Context, namespace string, obj *platformv1alpha1.ManagedTenant,
+) (foreign, absorb []string, err error) {
+	list := &corev1.ResourceQuotaList{}
+	if err := r.List(ctx, list, client.InNamespace(namespace)); err != nil {
+		return nil, nil, fmt.Errorf("listing quotas in %s: %w", namespace, err)
+	}
+	ours := namespace + "-quota"
+	for i := range list.Items {
+		q := &list.Items[i]
+		if q.Name == ours {
+			continue
+		}
+		if _, caps := q.Spec.Hard[corev1.ResourceRequestsStorage]; !caps {
+			continue
+		}
+		// One of ours from before the handover is not a second opinion to
+		// defer to — it is the product's older writer, still writing. Deferring
+		// to it left `QuotaReserved=False (CountedTwice)` on every tenant with
+		// storage, permanently, and a condition that is always false teaches
+		// people to stop reading conditions.
+		if oursFromBefore(q, obj) {
+			absorb = append(absorb, q.Name)
+			continue
+		}
+		foreign = append(foreign, q.Name)
+	}
+	sort.Strings(foreign)
+	sort.Strings(absorb)
+	return foreign, absorb, nil
+}
+
+// legacyCSIQuotaName is what the backend calls the quota it writes when it
+// wires a tenant's storage — `tenants_storage.CSI_RESOURCE_QUOTA_NAME`. Named
+// here because this controller has to recognise its predecessor's work.
+const legacyCSIQuotaName = "tenant-storage"
+
+// oursFromBefore recognises the storage quota the backend wrote for this
+// tenant before the operator owned the namespace.
+//
+// Three labels, all three required. Anything less would let the operator
+// delete a quota somebody else put there deliberately, which is the whole
+// reason the redundant-quota path exists.
+func oursFromBefore(q *corev1.ResourceQuota, obj *platformv1alpha1.ManagedTenant) bool {
+	return q.Name == legacyCSIQuotaName &&
+		q.Labels["kubevirt-ui.io/managed"] == "true" &&
+		q.Labels["kubevirt-ui.io/role"] == "csi-infra" &&
+		q.Labels["kubevirt-ui.io/tenant"] == obj.Name
+}
+
+// storageAllowanceOf is what the tenant's own workloads may provision.
+//
+// Zero is an answer, not a missing value: a tenant whose storage was never
+// wired has no driver to make a volume with, and an allowance charges its
+// folder for capacity nothing can use. The CRD defaults the field to 100, so
+// saying none takes writing it.
+func storageAllowanceOf(obj *platformv1alpha1.ManagedTenant) int64 {
+	if obj.Spec.Storage.AllowanceGi == nil {
+		return int64(defaultAllowanceGi) << 30
+	}
+	return int64(*obj.Spec.Storage.AllowanceGi) << 30
+}
+
+// pvcCountOf is the cap, and zero means write none at all.
+//
+// Not the same as a cap of zero, which would be a different and much worse
+// thing: the workers' root disks are claims in this namespace, and refusing
+// them leaves the tenant unable to replace a node.
+func pvcCountOf(obj *platformv1alpha1.ManagedTenant) int32 {
+	if obj.Spec.Storage.PVCCount == nil {
+		return defaultPVCCount
+	}
+	return *obj.Spec.Storage.PVCCount
+}
+
+// The CRD carries these as defaults too; they are here for an object that
+// reached this process without passing through admission.
+const (
+	defaultAllowanceGi = 100
+	defaultPVCCount    = 20
+)
+
+func (r *ManagedTenantReconciler) setTenantCondition(
+	obj *platformv1alpha1.ManagedTenant, kind string, ok bool, reason, message string,
+) {
+	status := metav1.ConditionTrue
+	if !ok {
+		status = metav1.ConditionFalse
+	}
+	apimeta.SetStatusCondition(&obj.Status.Conditions, metav1.Condition{
+		Type:               kind,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: obj.Generation,
+	})
+}
+
+// SetupWithManager wires the controller to what it writes, and to what other
+// writers put in the same namespace.
+func (r *ManagedTenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Ownership is not enough here. A quota this controller does not own is
+	// exactly the one worth hearing about — it is what makes the folder charge
+	// the tenant twice — and `Owns` would never deliver it, so the redundancy
+	// would sit unnoticed until somebody read the namespace by hand.
+	toTenant := handler.EnqueueRequestsFromMapFunc(
+		func(ctx context.Context, obj client.Object) []reconcile.Request {
+			name := strings.TrimPrefix(obj.GetNamespace(), "tenant-")
+			if name == obj.GetNamespace() || name == "" {
+				return nil
+			}
+			return []reconcile.Request{{
+				NamespacedName: types.NamespacedName{Name: name},
+			}}
+		})
+
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&platformv1alpha1.ManagedTenant{}).
+		Watches(&corev1.ResourceQuota{}, toTenant).
+		Watches(&corev1.LimitRange{}, toTenant).
+		// The address arrives on the Service's status, written by MetalLB long
+		// after this controller asked for it. Without this watch the tenant
+		// would carry "no address yet" until something unrelated woke it —
+		// which, with a ten-hour resync, is indistinguishable from never.
+		Watches(&corev1.Service{}, toTenant).
+		// The control plane's readiness is CAPI's answer and arrives on the
+		// Cluster's status, long after this controller declared it. The
+		// requeue while pending would catch the rising edge within ten
+		// seconds, but nothing at all would catch the falling one — a control
+		// plane that stops answering would leave the tenant reading Ready
+		// until something unrelated woke it.
+		Watches(clusterObject(), toTenant).
+		Named(tenantControllerName).
+		Complete(r)
+}
