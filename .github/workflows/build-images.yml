@@ -16,7 +16,10 @@ name: Build Images
 on:
   push:
     tags: ['20*']
-    branches: ['operator-dev']
+    # `main` is where the work happens now. `operator-dev` stays for a while:
+    # a build that stops running is discovered by a tag that produces no
+    # image, which is the worst moment to discover it.
+    branches: ['main', 'operator-dev']
   workflow_dispatch:
 
 env:
