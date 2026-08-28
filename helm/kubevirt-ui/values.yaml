@@ -706,6 +706,20 @@ operator:
       enabled: true
       replicas: 1
   config:
+    # What a machine's root disk is filled from: "snapshot" (the default) or
+    # "pvc".
+    #
+    # With "snapshot" each image keeps one permanent VolumeSnapshot and every
+    # clone is a restore from it. With "pvc" CDI takes a throwaway snapshot per
+    # clone instead — twice the storage operations per machine, which is what
+    # drove the RBD node plugin into restarting under load on the pilot.
+    #
+    # This is a kill switch, not a tuning knob: set it to "pvc" only to get the
+    # previous behaviour back without waiting for a release. Storage that cannot
+    # snapshot needs no setting here — the operator falls back on its own and
+    # says so on the image, in `status.cloneSource` and the SnapshotReady
+    # condition.
+    imageCloneSource: ""
     # The namespace kube-ovn actually runs in. Required by tenant and network.
     kubeOvnNamespace: ""
     # Where control-plane VIPs come from. Required by tenant.

@@ -113,6 +113,17 @@ type Input struct {
 	GoldenPVCName      string
 	GoldenPVCNamespace string
 
+	// GoldenDataSourceName/Namespace is the image's published DataSource, when
+	// it has one. Preferred over the claim: the DataSource is where the image
+	// says what clones should come from, and it can move from the claim to a
+	// permanent snapshot — which costs half the storage operations per
+	// machine — without a single consumer changing.
+	//
+	// Empty for a legacy template, which names a DataVolume directly and has no
+	// ManagedImage behind it to publish anything.
+	GoldenDataSourceName      string
+	GoldenDataSourceNamespace string
+
 	// CPUOvercommit is the cluster-wide ratio; 1 or 0 means none.
 	CPUOvercommit int
 
@@ -234,16 +245,38 @@ func RootDiskTemplate(in Input) (kubevirtv1.DataVolumeTemplateSpec, error) {
 				vmDiskLabel:         "true",
 			},
 		},
-		Spec: cdiv1.DataVolumeSpec{
-			Source: &cdiv1.DataVolumeSource{
-				PVC: &cdiv1.DataVolumeSourcePVC{
-					Name:      in.GoldenPVCName,
-					Namespace: in.GoldenPVCNamespace,
-				},
+		Spec: rootDiskSource(in, storage),
+	}, nil
+}
+
+// rootDiskSource points the disk at the image, in whichever form the image
+// publishes.
+//
+// One place decides this for the whole renderer, because the two forms are not
+// interchangeable to read: `sourceRef` hands the choice to the ManagedImage,
+// `source.pvc` hard-codes the claim here. Anything that guessed per call site
+// would eventually guess differently in two of them.
+func rootDiskSource(in Input, storage *cdiv1.StorageSpec) cdiv1.DataVolumeSpec {
+	if in.GoldenDataSourceName != "" {
+		ns := in.GoldenDataSourceNamespace
+		return cdiv1.DataVolumeSpec{
+			SourceRef: &cdiv1.DataVolumeSourceRef{
+				Kind:      "DataSource",
+				Name:      in.GoldenDataSourceName,
+				Namespace: &ns,
 			},
 			Storage: storage,
+		}
+	}
+	return cdiv1.DataVolumeSpec{
+		Source: &cdiv1.DataVolumeSource{
+			PVC: &cdiv1.DataVolumeSourcePVC{
+				Name:      in.GoldenPVCName,
+				Namespace: in.GoldenPVCNamespace,
+			},
 		},
-	}, nil
+		Storage: storage,
+	}
 }
 
 // VirtualMachine renders the whole object.

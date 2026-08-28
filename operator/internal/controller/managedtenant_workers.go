@@ -31,6 +31,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
@@ -500,10 +501,20 @@ func (r *ManagedTenantReconciler) workerTimeServers(vip string) []string {
 func (r *ManagedTenantReconciler) ensureMachineTemplate(
 	ctx context.Context, obj *platformv1alpha1.ManagedTenant, namespace, release string,
 ) (string, error) {
-	want, err := r.machineTemplateSpec(obj, release)
+	want, err := r.machineTemplateSpec(obj, release, r.goldenDataSource(ctx, release))
 	if err != nil {
 		return "", err
 	}
+	// How the root disk is filled is not part of what the machine IS, so it is
+	// normalised out of both the comparison and the digest.
+	//
+	// Without that, moving the disk from `source.pvc` to `sourceRef` would read
+	// as a new shape, mint a new template name, and roll every worker of every
+	// tenant on the first pass after the upgrade — and these workers keep their
+	// identity on their root disk, so a roll is not a restart, it is a rebuild.
+	// The golden's own name stays inside the canonical form, so upgrading Talos
+	// still rolls the pool, which is the change that should.
+	shape := canonicalTemplateShape(want)
 
 	// Whatever the pool points at now, kept if it already has this shape.
 	if current := r.currentTemplateName(ctx, obj, namespace); current != "" {
@@ -516,13 +527,13 @@ func (r *ManagedTenantReconciler) ensureMachineTemplate(
 			// Derivative rather than equal: the live object carries defaults
 			// nobody here sets, and comparing everything would rotate the
 			// template on every pass — a rolling update per reconcile.
-			if equality.Semantic.DeepDerivative(want, spec) {
+			if equality.Semantic.DeepDerivative(shape, canonicalTemplateShape(spec)) {
 				return current, nil
 			}
 		}
 	}
 
-	name := fmt.Sprintf("%s-workers-%s", obj.Name, shapeDigest(want))
+	name := fmt.Sprintf("%s-workers-%s", obj.Name, shapeDigest(shape))
 	live := &unstructured.Unstructured{}
 	live.SetGroupVersionKind(kubevirtMachineTemplateGVK)
 	live.SetName(name)
@@ -571,7 +582,7 @@ func shapeDigest(spec map[string]any) string {
 
 // machineTemplateSpec is the shape itself, without the object around it.
 func (r *ManagedTenantReconciler) machineTemplateSpec(
-	obj *platformv1alpha1.ManagedTenant, release string,
+	obj *platformv1alpha1.ManagedTenant, release, goldenDataSource string,
 ) (map[string]any, error) {
 	// The map has to exist: this is built standalone rather than on an object
 	// read from the cluster, and SetNestedMap on a nil Object panics.
@@ -603,7 +614,7 @@ func (r *ManagedTenantReconciler) machineTemplateSpec(
 			// with two it is two writers on one block device; and deleting
 			// worker A takes the DataVolume with it — blockOwnerDeletion —
 			// which silently wipes worker B's root during a rolling update.
-			"dataVolumeTemplates": []any{r.workerRootDisk(obj, release)},
+			"dataVolumeTemplates": []any{r.workerRootDisk(obj, release, goldenDataSource)},
 			"template": map[string]any{
 				"metadata": map[string]any{
 					"labels": map[string]any{
@@ -664,13 +675,19 @@ func (r *ManagedTenantReconciler) machineTemplateSpec(
 
 // workerRootDisk is the per-worker clone of the shared golden.
 //
-// `source.pvc` with `storage` — not `pvc` — so CDI takes the clone strategy
-// from the target's storage profile rather than being told one the backend may
-// not support. The size follows the golden unless the tenant asked for more: a
+// `storage` rather than `pvc` — so CDI takes the clone strategy from the
+// target's storage profile rather than being told one the backend may not
+// support. The size follows the golden unless the tenant asked for more: a
 // clone smaller than its source is refused at admission, which would fail every
 // worker with an error nobody would connect to a disk-size field.
+//
+// The source is the golden image's own DataSource when it publishes one, and
+// the golden claim otherwise. That indirection is the point: the image decides
+// whether workers restore from a permanent snapshot or clone from the claim,
+// and neither this template nor the workers stamped from it change when it
+// does.
 func (r *ManagedTenantReconciler) workerRootDisk(
-	obj *platformv1alpha1.ManagedTenant, release string,
+	obj *platformv1alpha1.ManagedTenant, release, goldenDataSource string,
 ) map[string]any {
 	size := tenant.LargerSize(obj.Spec.Workers.Disk, goldenSize)
 	storage := map[string]any{
@@ -684,6 +701,25 @@ func (r *ManagedTenantReconciler) workerRootDisk(
 	if class := obj.Spec.Storage.ClassName; class != "" {
 		storage["storageClassName"] = class
 	}
+
+	// Either form crosses into the golden's namespace, and CDI gates both on
+	// exactly the same `datavolumes/source` in that namespace — measured, one
+	// subject differing by that one rule. So the grant the tenant already has
+	// covers this without change.
+	spec := map[string]any{"storage": storage}
+	if goldenDataSource != "" {
+		spec["sourceRef"] = map[string]any{
+			"kind":      "DataSource",
+			"name":      goldenDataSource,
+			"namespace": goldenNamespace(),
+		}
+	} else {
+		spec["source"] = map[string]any{"pvc": map[string]any{
+			"name":      talos.GoldenName(release),
+			"namespace": goldenNamespace(),
+		}}
+	}
+
 	return map[string]any{
 		"metadata": map[string]any{
 			"name": workerRootTemplate,
@@ -693,17 +729,82 @@ func (r *ManagedTenantReconciler) workerRootDisk(
 				"kubevirt-ui.io/worker-root": "true",
 			},
 		},
-		"spec": map[string]any{
-			// The shared golden, in its own namespace. Crossing that boundary
-			// is what CDI gates on `datavolumes/source`, and it is the whole
-			// point: one import per Talos release instead of one per tenant.
-			"source": map[string]any{"pvc": map[string]any{
-				"name":      talos.GoldenName(release),
-				"namespace": goldenNamespace(),
-			}},
-			"storage": storage,
-		},
+		"spec": spec,
 	}
+}
+
+// goldenDataSource is the image's published indirection, or "" while it has
+// none. A miss is not an error: the claim form works, and a tenant is not held
+// up because the image has not got round to publishing.
+func (r *ManagedTenantReconciler) goldenDataSource(ctx context.Context, release string) string {
+	if release == "" {
+		return ""
+	}
+	img := &platformv1alpha1.ManagedImage{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Namespace: goldenNamespace(), Name: talos.GoldenName(release),
+	}, img); err != nil {
+		return ""
+	}
+	return img.Status.DataSourceName
+}
+
+// canonicalTemplateShape rewrites every root-disk source into the identity of
+// what it names, so that two templates differing only in HOW the disk is filled
+// compare equal.
+//
+// It answers one question — which golden does this machine come from — and
+// deliberately loses the rest, because the rest is a storage decision the image
+// owns and can change at any time.
+func canonicalTemplateShape(spec map[string]any) map[string]any {
+	copied := runtime.DeepCopyJSON(spec)
+	templates, found, err := unstructured.NestedSlice(copied,
+		"template", "spec", "virtualMachineTemplate", "spec", "dataVolumeTemplates")
+	if !found || err != nil {
+		return copied
+	}
+	for i := range templates {
+		tpl, ok := templates[i].(map[string]any)
+		if !ok {
+			continue
+		}
+		dvSpec, ok := tpl["spec"].(map[string]any)
+		if !ok {
+			continue
+		}
+		identity := goldenIdentity(dvSpec)
+		if identity == "" {
+			continue
+		}
+		delete(dvSpec, "source")
+		delete(dvSpec, "sourceRef")
+		dvSpec["cloneFrom"] = identity
+	}
+	_ = unstructured.SetNestedSlice(copied, templates,
+		"template", "spec", "virtualMachineTemplate", "spec", "dataVolumeTemplates")
+	return copied
+}
+
+// goldenIdentity is namespace/name of whatever a disk clones from, in either
+// form, or "" for a disk that clones from nothing.
+func goldenIdentity(dvSpec map[string]any) string {
+	if ref, ok := dvSpec["sourceRef"].(map[string]any); ok {
+		ns, _ := ref["namespace"].(string)
+		name, _ := ref["name"].(string)
+		if name != "" {
+			return ns + "/" + name
+		}
+	}
+	if source, ok := dvSpec["source"].(map[string]any); ok {
+		if pvc, ok := source["pvc"].(map[string]any); ok {
+			ns, _ := pvc["namespace"].(string)
+			name, _ := pvc["name"].(string)
+			if name != "" {
+				return ns + "/" + name
+			}
+		}
+	}
+	return ""
 }
 
 // ensureMachineDeployment scales the pool.

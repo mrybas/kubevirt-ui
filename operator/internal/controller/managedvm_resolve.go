@@ -277,6 +277,14 @@ func (r *ManagedVMReconciler) resolveImage(
 	}
 	in.GoldenPVCName = claim
 	in.GoldenPVCNamespace = ns
+	// The image publishes a DataSource once its disk exists, and that is what
+	// the root disk should name: it is the image's own statement of what to
+	// clone from, and it moves to a permanent snapshot without the VM knowing.
+	// An image that has not published one yet — or an installation where the
+	// feature is off — leaves this empty and the claim is used, which is what
+	// every VM did before.
+	in.GoldenDataSourceName = img.Status.DataSourceName
+	in.GoldenDataSourceNamespace = ns
 	in.VNC, in.Serial = true, false
 	return nil
 }
@@ -405,6 +413,17 @@ func (r *ManagedVMReconciler) resolveNetworks(
 		}
 	}
 	return nil
+}
+
+// cloningFrom names what the root disk is filled from, in the form actually
+// written. Reporting the claim while the disk names a DataSource would describe
+// a spec nobody wrote.
+func cloningFrom(in kubevirt.Input) string {
+	if in.GoldenDataSourceName != "" {
+		return fmt.Sprintf("cloning from DataSource %s/%s",
+			in.GoldenDataSourceNamespace, in.GoldenDataSourceName)
+	}
+	return fmt.Sprintf("cloning from %s/%s", in.GoldenPVCNamespace, in.GoldenPVCName)
 }
 
 // resolvableCondition says whether this machine has a name server it can reach.

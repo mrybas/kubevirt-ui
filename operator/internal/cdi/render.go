@@ -23,6 +23,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	cdiv1 "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
@@ -157,11 +159,34 @@ func DesiredDataVolume(
 //
 // It exists so that KubeVirt-native consumers — and a future DataImportCron —
 // can reference the image by a stable name without knowing this operator
-// exists. It points at the claim the DataVolume produced.
+// exists.
+//
+// snapshotName, when set, makes it point at the permanent snapshot instead of
+// the claim. That is the whole of the cost difference on the consumer side:
+// cloning from a claim makes CDI take a temporary snapshot per clone and throw
+// it away (measured: one `tmp-snapshot-*` object per clone, median 7s against
+// 3s from a snapshot on the same cluster), while cloning from a snapshot that
+// already exists is a restore. Consumers reference this object either way and
+// never learn which form is in effect.
 func DesiredDataSource(
 	img *platformv1alpha1.ManagedImage,
 	projectName string,
+	snapshotName string,
 ) *cdiv1.DataSource {
+	source := cdiv1.DataSourceSource{
+		PVC: &cdiv1.DataVolumeSourcePVC{
+			Name:      img.Name,
+			Namespace: img.Namespace,
+		},
+	}
+	if snapshotName != "" {
+		source = cdiv1.DataSourceSource{
+			Snapshot: &cdiv1.DataVolumeSourceSnapshot{
+				Name:      snapshotName,
+				Namespace: img.Namespace,
+			},
+		}
+	}
 	return &cdiv1.DataSource{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        img.Name,
@@ -169,13 +194,60 @@ func DesiredDataSource(
 			Labels:      ImageLabels(img, projectName),
 			Annotations: ImageAnnotations(img),
 		},
-		Spec: cdiv1.DataSourceSpec{
-			Source: cdiv1.DataSourceSource{
-				PVC: &cdiv1.DataVolumeSourcePVC{
-					Name:      img.Name,
-					Namespace: img.Namespace,
-				},
-			},
-		},
+		Spec: cdiv1.DataSourceSpec{Source: source},
 	}
+}
+
+// VolumeSnapshotGVK is the snapshot API this operator talks to unstructured.
+// The external-snapshotter client is not a dependency of this module, and one
+// object type does not justify becoming one.
+var VolumeSnapshotGVK = schema.GroupVersionKind{
+	Group: "snapshot.storage.k8s.io", Version: "v1", Kind: "VolumeSnapshot",
+}
+
+// SourceClaimUIDAnnotation records which claim the snapshot was taken from.
+//
+// Not the claim's name: names come back. The image's disk can be deleted and
+// re-imported under the same name, and a snapshot of the previous volume stays
+// perfectly usable afterwards — measured, it keeps cloning at the same speed —
+// so nothing about it looks wrong while it serves content that no longer
+// matches the image. The UID is what distinguishes the two, so it is what the
+// controller compares before trusting the snapshot it finds.
+const SourceClaimUIDAnnotation = "kubevirt-ui.io/source-claim-uid"
+
+// SnapshotClassByDefault means "take the snapshot without naming a class". It
+// is a sentinel rather than an empty string because empty already means "do not
+// take a snapshot at all" on the calling side.
+const SnapshotClassByDefault = "\x00default"
+
+// DesiredVolumeSnapshot renders the permanent snapshot clones are taken from.
+func DesiredVolumeSnapshot(
+	img *platformv1alpha1.ManagedImage,
+	projectName string,
+	claimName, claimUID, snapshotClass string,
+) *unstructured.Unstructured {
+	snap := &unstructured.Unstructured{Object: map[string]any{}}
+	snap.SetGroupVersionKind(VolumeSnapshotGVK)
+	snap.SetName(img.Name)
+	snap.SetNamespace(img.Namespace)
+	snap.SetLabels(ImageLabels(img, projectName))
+
+	annotations := map[string]string{}
+	for k, v := range ImageAnnotations(img) {
+		annotations[k] = v
+	}
+	annotations[SourceClaimUIDAnnotation] = claimUID
+	snap.SetAnnotations(annotations)
+
+	spec := map[string]any{
+		"source": map[string]any{"persistentVolumeClaimName": claimName},
+	}
+	// No class named means the snapshot controller picks its default for the
+	// driver — which is what CDI does too when the StorageProfile names none.
+	// Naming one we chose ourselves would be a second opinion.
+	if snapshotClass != "" && snapshotClass != SnapshotClassByDefault {
+		spec["volumeSnapshotClassName"] = snapshotClass
+	}
+	_ = unstructured.SetNestedMap(snap.Object, spec, "spec")
+	return snap
 }

@@ -472,12 +472,32 @@ func TestAProjectScopedImageIsShareableInsideItsProject(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		src := got.Spec.DataVolumeTemplates[0].Spec.Source.PVC
-		if src == nil || src.Namespace != "vm-shared-src" || src.Name != "shared-image" {
-			return fmt.Errorf("clone source = %+v", src)
+		// Whichever form the image publishes, what this test guards is the
+		// crossing: a VM in one namespace filling its disk from an image in
+		// another, because they share a project.
+		ns, name := vmCloneSource(got.Spec.DataVolumeTemplates[0].Spec)
+		if ns != "vm-shared-src" || name != "shared-image" {
+			return fmt.Errorf("clone source = %s/%s (spec = %+v)",
+				ns, name, got.Spec.DataVolumeTemplates[0].Spec)
 		}
 		return nil
 	})
+}
+
+// vmCloneSource is namespace/name of whatever a rendered root disk clones from,
+// in either of the two forms. Tests assert the identity, not the spelling: the
+// image owns the choice between them and changes it on its own.
+func vmCloneSource(spec cdiv1.DataVolumeSpec) (namespace, name string) {
+	if spec.SourceRef != nil {
+		if spec.SourceRef.Namespace != nil {
+			namespace = *spec.SourceRef.Namespace
+		}
+		return namespace, spec.SourceRef.Name
+	}
+	if spec.Source != nil && spec.Source.PVC != nil {
+		return spec.Source.PVC.Namespace, spec.Source.PVC.Name
+	}
+	return "", ""
 }
 
 // A typo in a subnet name must be reported. The handler this replaces treated a

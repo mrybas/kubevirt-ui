@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	platformv1alpha1 "github.com/mrybas/kubevirt-ui/operator/api/v1alpha1"
+	"github.com/mrybas/kubevirt-ui/operator/internal/talos"
 )
 
 // mustKubeOVNResolver plants the address kube-ovn states for VPC workloads.
@@ -238,11 +239,31 @@ func TestEachWorkerClonesItsOwnRootFromTheSharedGolden(t *testing.T) {
 	}
 	disk, _ := disks[0].(map[string]any)
 	spec, _ := disk["spec"].(map[string]any)
-	source, _ := spec["source"].(map[string]any)
-	pvc, _ := source["pvc"].(map[string]any)
-	if pvc["name"] != "talos-golden-1-13-8" || pvc["namespace"] != "kubevirt-ui-system" {
-		t.Errorf("source = %v — it clones the shared golden, and crossing that "+
-			"namespace is the whole point of one import per release", pvc)
+
+	// Either form is correct, and which one is in effect belongs to the image:
+	// it publishes a DataSource that can move from the claim to a permanent
+	// snapshot without the workers changing. What must not change is WHICH
+	// golden, and that it lives in the shared namespace — crossing that
+	// boundary is the whole point of one import per release.
+	//
+	// Asserting the literal `source.pvc` here would have been a test guarding
+	// the past: it would fail the day the indirection was introduced, while the
+	// property it exists to protect held.
+	var name, namespace string
+	if ref, ok := spec["sourceRef"].(map[string]any); ok {
+		if ref["kind"] != "DataSource" {
+			t.Errorf("sourceRef kind = %v", ref["kind"])
+		}
+		name, _ = ref["name"].(string)
+		namespace, _ = ref["namespace"].(string)
+	} else if source, ok := spec["source"].(map[string]any); ok {
+		pvc, _ := source["pvc"].(map[string]any)
+		name, _ = pvc["name"].(string)
+		namespace, _ = pvc["namespace"].(string)
+	}
+	if name != "talos-golden-1-13-8" || namespace != "kubevirt-ui-system" {
+		t.Errorf("the root disk clones %s/%s, want the shared golden "+
+			"kubevirt-ui-system/talos-golden-1-13-8 (spec = %v)", namespace, name, spec)
 	}
 	// `storage`, not `pvc`: CDI then takes the clone strategy from the target's
 	// storage profile rather than being told one it may not support.
@@ -567,7 +588,7 @@ func TestAdoptingATenantDoesNotRollItsWorkers(t *testing.T) {
 	reconciler := workerReconciler()
 
 	// What the operator would write, under the name the product uses.
-	want, err := reconciler.machineTemplateSpec(obj, "1.13.8")
+	want, err := reconciler.machineTemplateSpec(obj, "1.13.8", "")
 	if err != nil {
 		t.Fatalf("building the shape: %v", err)
 	}
@@ -592,5 +613,152 @@ func TestAdoptingATenantDoesNotRollItsWorkers(t *testing.T) {
 	}
 	if got != "trs2-workers" {
 		t.Errorf("adoption renamed the template to %q, which rolls every worker", got)
+	}
+}
+
+// TestMovingTheRootDiskSourceDoesNotRollExistingWorkers.
+//
+// The template's name is a digest of its shape, and CAPI rolls a pool whenever
+// the template it points at changes name. Worker roots are persistent — a Talos
+// node keeps its identity on that disk — so a roll is not a restart, it is a
+// rebuild of every worker of every tenant.
+//
+// How the disk is filled is therefore deliberately not part of the shape. The
+// golden it is filled FROM still is, which is why the case below it still
+// rolls.
+//
+// Two things make this test non-vacuous, and both were missing from its first
+// version. The desired shape has to genuinely use the new form, or the test
+// compares the old form with itself. And the live template has to carry the
+// name the OLD digest formula produced — which is what an upgraded cluster
+// actually has — or the test cannot tell "kept because the shapes match" from
+// "recomputed to the same name by luck".
+func TestMovingTheRootDiskSourceDoesNotRollExistingWorkers(t *testing.T) {
+	mustNamespace(t, "tenant-trs3", "")
+	obj := talosTenant("trs3")
+	reconciler := workerReconciler()
+
+	// The image has published its DataSource, so the operator would now write
+	// `sourceRef`. Without this the whole case is the old form twice over.
+	mustGoldenImage(t, "1.13.8")
+	if reconciler.goldenDataSource(testCtx, "1.13.8") == "" {
+		t.Fatalf("the golden publishes no DataSource, so this test would " +
+			"compare the old form against itself")
+	}
+
+	// The pool as it stands today: written before the change, by the digest
+	// formula of the time, over the raw shape.
+	before, err := reconciler.machineTemplateSpec(obj, "1.13.8", "")
+	if err != nil {
+		t.Fatalf("building the old shape: %v", err)
+	}
+	name := "trs3-workers-" + shapeDigest(before)
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(kubevirtMachineTemplateGVK)
+	existing.SetName(name)
+	existing.SetNamespace("tenant-trs3")
+	if err := unstructured.SetNestedMap(existing.Object, before, "spec"); err != nil {
+		t.Fatalf("setting the spec: %v", err)
+	}
+	if err := k8sClient.Create(testCtx, existing); err != nil {
+		t.Fatalf("creating the old template: %v", err)
+	}
+	if err := reconciler.ensureMachineDeployment(
+		testCtx, obj, "tenant-trs3", name, name); err != nil {
+		t.Fatalf("the pool: %v", err)
+	}
+
+	// Guard against the digest change being a one-time roll of its own: the
+	// name that would be minted today is NOT the name on the cluster, so the
+	// only way to return it is to have compared the shapes and kept it.
+	after, err := reconciler.machineTemplateSpec(obj, "1.13.8",
+		reconciler.goldenDataSource(testCtx, "1.13.8"))
+	if err != nil {
+		t.Fatalf("building the new shape: %v", err)
+	}
+	if minted := "trs3-workers-" + shapeDigest(canonicalTemplateShape(after)); minted == name {
+		t.Fatalf("the two formulas produced the same name (%s), so this test "+
+			"cannot tell keeping from re-minting", minted)
+	}
+
+	got, err := reconciler.ensureMachineTemplate(testCtx, obj, "tenant-trs3", "1.13.8")
+	if err != nil {
+		t.Fatalf("reconciling: %v", err)
+	}
+	if got != name {
+		t.Errorf("the disk source rolled the pool: template %q, was %q", got, name)
+	}
+
+	// And the pool still points where it did — the property CAPI acts on.
+	if current := reconciler.currentTemplateName(testCtx, obj, "tenant-trs3"); current != name {
+		t.Errorf("the pool moved to %q, was %q", current, name)
+	}
+}
+
+// mustGoldenImage puts the shared image where the tenant controller would, and
+// waits for the DataSource the image controller publishes for it. The name and
+// label are the ones that controller uses, so this is the same object rather
+// than a second golden.
+func mustGoldenImage(t *testing.T, release string) {
+	t.Helper()
+	img := &platformv1alpha1.ManagedImage{}
+	img.Name = talos.GoldenName(release)
+	img.Namespace = "kubevirt-ui-system"
+	img.Labels = map[string]string{
+		"kubevirt-ui.io/managed":       "true",
+		"kubevirt-ui.io/talos-golden":  "true",
+		"kubevirt-ui.io/talos-version": release,
+	}
+	img.Spec.Source = platformv1alpha1.ManagedImageSource{
+		HTTP: &platformv1alpha1.HTTPSource{URL: "https://example.invalid/talos.raw.xz"},
+	}
+	img.Spec.Size = goldenSize
+	if err := k8sClient.Create(testCtx, img); err != nil && !apierrors.IsAlreadyExists(err) {
+		t.Fatalf("declaring the golden: %v", err)
+	}
+	eventually(t, "the golden to publish its DataSource", func() error {
+		live := &platformv1alpha1.ManagedImage{}
+		if err := k8sClient.Get(testCtx, types.NamespacedName{
+			Namespace: "kubevirt-ui-system", Name: talos.GoldenName(release),
+		}, live); err != nil {
+			return err
+		}
+		if live.Status.DataSourceName == "" {
+			return fmt.Errorf("status.dataSourceName is empty")
+		}
+		return nil
+	})
+}
+
+// TestANewGoldenStillRollsThePool proves the exemption above is about the form
+// and not about the golden: an upgrade to another Talos release has to reach
+// the workers, and it reaches them by rolling.
+func TestANewGoldenStillRollsThePool(t *testing.T) {
+	obj := talosTenant("trs4")
+	reconciler := workerReconciler()
+
+	oldShape, err := reconciler.machineTemplateSpec(obj, "1.13.8", "")
+	if err != nil {
+		t.Fatalf("building 1.13.8: %v", err)
+	}
+	newShape, err := reconciler.machineTemplateSpec(obj, "1.14.0", "talos-golden-1-14-0")
+	if err != nil {
+		t.Fatalf("building 1.14.0: %v", err)
+	}
+	if shapeDigest(canonicalTemplateShape(oldShape)) ==
+		shapeDigest(canonicalTemplateShape(newShape)) {
+		t.Errorf("a different golden produced the same template name, so an " +
+			"upgrade would never reach the workers")
+	}
+
+	// And the same golden through either form is one shape, whichever way it
+	// is named.
+	sameByRef, err := reconciler.machineTemplateSpec(obj, "1.13.8", "talos-golden-1-13-8")
+	if err != nil {
+		t.Fatalf("building the ref form: %v", err)
+	}
+	if shapeDigest(canonicalTemplateShape(oldShape)) !=
+		shapeDigest(canonicalTemplateShape(sameByRef)) {
+		t.Errorf("the same golden named two ways produced two shapes")
 	}
 }

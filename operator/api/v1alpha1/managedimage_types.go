@@ -149,6 +149,11 @@ const (
 const (
 	// ConditionReady is true only when the disk is importable-from.
 	ConditionReady = "Ready"
+	// ConditionSnapshotReady reports the permanent snapshot the clones are
+	// taken from. False is not a failure: an installation whose storage has no
+	// VolumeSnapshotClass keeps cloning from the claim, and the condition says
+	// so rather than leaving the difference invisible.
+	ConditionSnapshotReady = "SnapshotReady"
 	// ConditionDeleting is true while deletion is being held back, and its
 	// message names what is holding it.
 	//
@@ -184,6 +189,19 @@ type ManagedImageStatus struct {
 	// +optional
 	DataSourceName string `json:"dataSourceName,omitempty"`
 
+	// SnapshotName is the permanent VolumeSnapshot clones are taken from, when
+	// there is one.
+	// +optional
+	SnapshotName string `json:"snapshotName,omitempty"`
+
+	// CloneSource names the form the DataSource currently takes: `snapshot`
+	// when clones come from the permanent snapshot, `pvc` when they come from
+	// the claim itself. Both work; they cost differently, and which one is in
+	// effect was previously visible only by reading the DataSource by hand.
+	// +kubebuilder:validation:Enum=pvc;snapshot
+	// +optional
+	CloneSource string `json:"cloneSource,omitempty"`
+
 	// UsedBy lists the workloads currently cloning from or attached to this
 	// image, as namespace/name. Deletion is refused while it is not empty:
 	// removing a clone source mid-clone leaves an orphaned disk behind.
@@ -204,6 +222,7 @@ type ManagedImageStatus struct {
 // +kubebuilder:printcolumn:name="Progress",type=string,JSONPath=`.status.progress`
 // +kubebuilder:printcolumn:name="Size",type=string,JSONPath=`.spec.size`
 // +kubebuilder:printcolumn:name="Scope",type=string,JSONPath=`.spec.scope`
+// +kubebuilder:printcolumn:name="Source",type=string,JSONPath=`.status.cloneSource`
 // +kubebuilder:printcolumn:name="DataVolume",type=string,JSONPath=`.status.dataVolumeName`,priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 

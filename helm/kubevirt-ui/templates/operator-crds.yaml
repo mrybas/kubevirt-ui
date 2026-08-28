@@ -312,6 +312,9 @@ spec:
     - jsonPath: .spec.scope
       name: Scope
       type: string
+    - jsonPath: .status.cloneSource
+      name: Source
+      type: string
     - jsonPath: .status.dataVolumeName
       name: DataVolume
       priority: 1
@@ -476,6 +479,16 @@ spec:
           status:
             description: ManagedImageStatus is what the UI and Terraform read back.
             properties:
+              cloneSource:
+                description: |-
+                  CloneSource names the form the DataSource currently takes: `snapshot`
+                  when clones come from the permanent snapshot, `pvc` when they come from
+                  the claim itself. Both work; they cost differently, and which one is in
+                  effect was previously visible only by reading the DataSource by hand.
+                enum:
+                - pvc
+                - snapshot
+                type: string
               conditions:
                 description: Conditions carry the reasons. A blocked image always
                   names its blocker.
@@ -564,6 +577,11 @@ spec:
               progress:
                 description: Progress is CDI's import progress, passed through verbatim,
                   e.g. "42%".
+                type: string
+              snapshotName:
+                description: |-
+                  SnapshotName is the permanent VolumeSnapshot clones are taken from, when
+                  there is one.
                 type: string
               usedBy:
                 description: |-

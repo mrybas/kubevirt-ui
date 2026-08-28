@@ -212,7 +212,7 @@ func (r *ManagedVMReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		Type:               platformv1alpha1.ConditionImageReady,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Available",
-		Message:            fmt.Sprintf("cloning from %s/%s", in.GoldenPVCNamespace, in.GoldenPVCName),
+		Message:            cloningFrom(in),
 		ObservedGeneration: vm.Generation,
 	})
 	apimeta.SetStatusCondition(&vm.Status.Conditions, resolvableCondition(vm, in))

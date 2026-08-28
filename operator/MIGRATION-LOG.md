@@ -3609,3 +3609,72 @@ Acceptance is on a cluster, not in a test: the operator's first pass repairs
 `coredns-vip` in place on a stand that has the empty one, kube-ovn builds the
 Deployment, the policy appears per VPC, a restarted launcher carries the VIP,
 and a guest resolves a name.
+
+## The disk source: one indirection, and what it cost to introduce
+
+The operator wrote `source.pvc` on every root disk — a VM's, a tenant worker's.
+It works, and on an idle cluster it is quick. Under load it is a failure mode:
+CDI takes a throwaway `VolumeSnapshot` for each clone from a claim, so every
+machine costs four storage operations instead of two, and on the pilot's
+load runs that flow is what kept the RBD node plugin restarting — 314 fresh
+`FailedMapVolume`, 0.6 clones a minute against 37.9 with a permanent snapshot.
+
+The change is small to describe: the ManagedImage takes one snapshot after its
+import, publishes it through the DataSource it already had, and consumers name
+that DataSource instead of the claim. Nobody downstream learns which form is
+behind it, which is the point — the image can move between them.
+
+Most of the work was in the parts that are not that.
+
+### The deletion guard that would have stopped guarding
+
+`usedBy` answered "who would break if this disk went away" from an index on
+`spec.source.pvc`. Consumers that name a DataSource have no `source.pvc`. The
+index would have kept working, kept returning nothing, and an image cloned by
+every machine in the cluster would have read as used by none — deletion
+unblocked, with no error anywhere. One index now covers both forms, and the
+event mapping reads it through the same function, because they are the same
+question asked twice.
+
+### The upgrade that would have rebuilt every tenant's workers
+
+A tenant's machine template is named after a digest of its shape, and CAPI
+rolls a pool when the template it points at changes name. Changing the disk
+source changes the shape. So the first pass after the upgrade would have rolled
+every worker of every tenant — and since T3 these workers keep their identity
+on their root disk, a roll is not a restart, it is a rebuild.
+
+How a disk is filled is not part of what a machine is, so it is normalised out
+of both the comparison and the digest — reduced to the identity of the golden
+it names, which both forms carry. Same golden, same shape, no roll. A different
+golden still rolls, which is how a Talos upgrade reaches the workers, and there
+is a test for each half.
+
+### What was measured rather than assumed
+
+Three things, on the cluster where the load runs happened:
+
+- the exact shape this produces — a DataSource on a snapshot in one namespace,
+  a DataVolume with `sourceRef` in another — resolves and clones:
+  `CloneFromSnapshotSourceInProgress` → `Succeeded`, no `tmp-snapshot-*`;
+- `sourceRef` across namespaces is gated by the same `datavolumes/source` the
+  tenants are already granted, so no RBAC changes for them. One subject, one
+  rule difference, both arms run;
+- a snapshot whose source claim was deleted keeps cloning, at the same speed
+  (44s against 43s). The danger was never that it breaks. It is that it works
+  while serving the previous volume's content, and the image would still say
+  Ready — so the snapshot records the claim's UID, not its name, and is retaken
+  when the volume behind the name changes.
+
+### What is reported rather than decided quietly
+
+Every reason to keep cloning from the claim is a condition on the image, with
+the storage class and provisioner named in it: no snapshot class for this
+provisioner, no StorageProfile, no snapshot type in the cluster at all, a
+snapshot that failed. `status.cloneSource` says which form is in effect. An
+installation on the slow path is a supported installation — but it is not an
+invisible one, and it was invisible before this change as much as after it.
+
+`IMAGE_CLONE_SOURCE=pvc` returns the old behaviour without a release. It stops
+using the snapshot; it deliberately does not delete it, because a clone may be
+restoring from it at that moment.

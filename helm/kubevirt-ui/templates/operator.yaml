@@ -230,6 +230,13 @@ spec:
             # for one webhook configuration is a coin toss.
             - name: ENABLE_WEBHOOKS
               value: {{ if and (eq $domain "vm") $top.Values.operator.webhooks.enabled }}"true"{{ else }}"false"{{ end }}
+            {{- if $cfg.imageCloneSource }}
+            # Only ever set to turn the permanent snapshot off. Every other
+            # reason to clone from the claim is decided by the operator from
+            # what the storage can do, and reported on the image.
+            - name: IMAGE_CLONE_SOURCE
+              value: {{ $cfg.imageCloneSource | quote }}
+            {{- end }}
             {{- if or (eq $domain "tenant") (eq $domain "network") }}
             # Where kube-ovn states the resolver a VPC worker uses. Set wrong
             # once, and the tenant that found it sat waiting for a ConfigMap in

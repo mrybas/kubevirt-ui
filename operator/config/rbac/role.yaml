@@ -37,6 +37,7 @@ rules:
 - apiGroups:
   - ""
   resources:
+  - persistentvolumeclaims
   - pods
   verbs:
   - get
@@ -124,6 +125,14 @@ rules:
   - datavolumes/source
   verbs:
   - create
+- apiGroups:
+  - cdi.kubevirt.io
+  resources:
+  - storageprofiles
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - cert-manager.io
   resources:
@@ -381,10 +390,22 @@ rules:
 - apiGroups:
   - snapshot.storage.k8s.io
   resources:
-  - volumesnapshots
+  - volumesnapshotclasses
   verbs:
   - get
   - list
+  - watch
+- apiGroups:
+  - snapshot.storage.k8s.io
+  resources:
+  - volumesnapshots
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
   - watch
 - apiGroups:
   - traefik.io

@@ -281,3 +281,35 @@ This is the underlay, not the tenant: a static neighbour entry on the border
 for the VPC's external address removes it, and is the usual fix on a lab
 border. Measured in UAT run 4: ten outages in ten minutes, each two to ten
 seconds, every 40–115 seconds.
+
+## Machines take much longer to create than they should, and the CSI plugin restarts
+
+Symptom: creating machines in batches is slow, `csi-rbdplugin` pods show a
+climbing restart count, and events carry `FailedMapVolume`. Nothing in the
+product reports an error — the machines do come up, eventually.
+
+Look at what the image clones from:
+
+```
+kubectl -n <ns> get managedimage <name> \
+  -o jsonpath='{.status.cloneSource}{"\n"}'
+kubectl -n <ns> get managedimage <name> \
+  -o jsonpath='{range .status.conditions[?(@.type=="SnapshotReady")]}{.reason}: {.message}{"\n"}{end}'
+```
+
+`cloneSource: pvc` means every clone makes CDI take a throwaway snapshot first —
+twice the storage operations per machine, which is what drives the node plugin
+into restarting under load. The condition says why: no VolumeSnapshotClass for
+the provisioner, no CDI StorageProfile for the class, no snapshot type in the
+cluster, or a snapshot that failed to be taken.
+
+`cloneSource: snapshot` means the fast path is in effect and the slowness is
+somewhere else — check whether the machine's disk is larger than the image, in
+which case CDI runs an extra pod per machine purely to trigger the expansion.
+
+Two more checks worth having:
+
+```
+kubectl get volumesnapshot -A | grep -c tmp-snapshot   # should be 0 at rest
+kubectl get storageprofile <class> -o jsonpath='{.status.cloneStrategy}{"\n"}'
+```

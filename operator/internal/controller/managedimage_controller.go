@@ -20,12 +20,14 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
@@ -57,15 +59,38 @@ const (
 	// live object.
 	pausedAnnotation = "platform.kubevirt-ui.io/paused"
 
-	// sourcePVCIndex indexes DataVolumes by the claim they clone from, so
-	// "who is using this image" is a cache lookup and not a cluster-wide scan
-	// on every pass.
-	sourcePVCIndex = "spec.source.pvc"
+	// cloneSourceIndex indexes DataVolumes by what they clone from, so "who is
+	// using this image" is a cache lookup and not a cluster-wide scan on every
+	// pass.
+	//
+	// Both forms land in one index. A consumer names either the claim
+	// (`source.pvc`) or the image's DataSource (`sourceRef`), and an index that
+	// knew only the first would have turned the move to `sourceRef` into a
+	// silent loss of the deletion guard: an image in use by fifty machines
+	// would have read as used by none.
+	cloneSourceIndex = "spec.cloneSource"
 
 	// blockedRequeue is how often a deletion held back by live consumers looks
 	// again. Consumers disappear through their own deletions, which the watch
 	// also sees; this is the backstop, not the mechanism.
 	blockedRequeue = 30 * time.Second
+
+	// snapshotPoll is how often an image looks again while its snapshot is
+	// being taken. Nothing here watches VolumeSnapshots — the type is optional
+	// in a cluster, and a watch on a type that may not exist stops the manager
+	// from starting at all — so readiness is polled, and a snapshot takes
+	// seconds rather than minutes.
+	snapshotPoll = 5 * time.Second
+
+	// snapshotRecheck bounds how long an image can keep serving a snapshot of a
+	// volume that is no longer its own.
+	//
+	// The real replacement path recreates the DataVolume, which this controller
+	// watches, so the usual detection is immediate. This is for the paths that
+	// produce no event we see — a claim restored underneath us, an adoption —
+	// because the failure it guards is silent by construction: the stale
+	// snapshot keeps working, at full speed, serving the previous content.
+	snapshotRecheck = 10 * time.Minute
 )
 
 // ManagedImageReconciler turns a ManagedImage into a CDI DataVolume plus the
@@ -81,6 +106,10 @@ type ManagedImageReconciler struct {
 // +kubebuilder:rbac:groups=platform.kubevirt-ui.io,resources=managedimages/finalizers,verbs=update
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datavolumes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=datasources,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=cdi.kubevirt.io,resources=storageprofiles,verbs=get;list;watch
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshots,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=snapshot.storage.k8s.io,resources=volumesnapshotclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
@@ -152,7 +181,28 @@ func (r *ManagedImageReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	// is harmless earlier and CDI reports its own readiness — publish it as soon
 	// as the disk exists so consumers never have to wait on us to notice.
 	if dv != nil {
-		ds, err := r.reconcileDataSource(ctx, img, projectName)
+		// The snapshot decides what the DataSource points at, so it is settled
+		// first. The DataSource never names a snapshot that is not usable yet:
+		// consumers read this one object, and a window where it resolves to
+		// nothing would be an outage they could not explain.
+		snap, err := r.reconcileSnapshot(ctx, img, dv, projectName)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		apimeta.SetStatusCondition(&img.Status.Conditions, snap.Condition)
+		img.Status.SnapshotName = snap.Name
+		img.Status.CloneSource = "pvc"
+		if snap.Name != "" {
+			img.Status.CloneSource = "snapshot"
+		}
+		switch {
+		case snap.Requeue && result.RequeueAfter == 0:
+			result.RequeueAfter = snapshotPoll
+		case snap.Name != "" && result.RequeueAfter == 0:
+			result.RequeueAfter = snapshotRecheck
+		}
+
+		ds, err := r.reconcileDataSource(ctx, img, projectName, snap.Name)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -286,8 +336,9 @@ func (r *ManagedImageReconciler) reconcileDataSource(
 	ctx context.Context,
 	img *platformv1alpha1.ManagedImage,
 	projectName string,
+	snapshotName string,
 ) (*cdiv1.DataSource, error) {
-	desired := cdi.DesiredDataSource(img, projectName)
+	desired := cdi.DesiredDataSource(img, projectName, snapshotName)
 	ds := desired.DeepCopy()
 	if _, err := kube.Ensure(ctx, r.Client, imageControllerName, ds, func() error {
 		if ds.Labels == nil {
@@ -347,6 +398,11 @@ func (r *ManagedImageReconciler) reconcileDelete(
 	if err := r.deleteIfOwned(ctx, img, &cdiv1.DataSource{}, img.Name); err != nil {
 		return ctrl.Result{}, err
 	}
+	snapshot := &unstructured.Unstructured{}
+	snapshot.SetGroupVersionKind(cdi.VolumeSnapshotGVK)
+	if err := r.deleteIfOwned(ctx, img, snapshot, img.Name); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.deleteIfOwned(ctx, img, &cdiv1.DataVolume{}, dvName); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -366,7 +422,9 @@ func (r *ManagedImageReconciler) deleteIfOwned(
 ) error {
 	key := types.NamespacedName{Namespace: img.Namespace, Name: name}
 	if err := r.Get(ctx, key, obj); err != nil {
-		if apierrors.IsNotFound(err) {
+		// A type this cluster does not have holds nothing of ours, which is
+		// the same situation as an object that is not there.
+		if apierrors.IsNotFound(err) || noSuchType(err) {
 			return nil
 		}
 		return fmt.Errorf("reading %s for deletion: %w", key, err)
@@ -392,11 +450,21 @@ func (r *ManagedImageReconciler) usedBy(
 		claim = img.Name
 	}
 
-	consumers := &cdiv1.DataVolumeList{}
-	if err := r.List(ctx, consumers,
-		client.MatchingFields{sourcePVCIndex: img.Namespace + "/" + claim},
-	); err != nil {
-		return nil, err
+	// Two keys, one for each way a consumer can name this image. The
+	// DataSource carries the image's own name; the claim may differ from it
+	// when the disk was adopted.
+	keys := []string{img.Namespace + "/" + claim}
+	if img.Name != claim {
+		keys = append(keys, img.Namespace+"/"+img.Name)
+	}
+
+	var consumers cdiv1.DataVolumeList
+	for _, key := range keys {
+		page := &cdiv1.DataVolumeList{}
+		if err := r.List(ctx, page, client.MatchingFields{cloneSourceIndex: key}); err != nil {
+			return nil, err
+		}
+		consumers.Items = append(consumers.Items, page.Items...)
 	}
 
 	seen := map[string]struct{}{}
@@ -487,20 +555,16 @@ func setBlockedCondition(img *platformv1alpha1.ManagedImage, reason, message str
 // image" cheap.
 func (r *ManagedImageReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(
-		context.Background(), &cdiv1.DataVolume{}, sourcePVCIndex,
+		context.Background(), &cdiv1.DataVolume{}, cloneSourceIndex,
 		func(obj client.Object) []string {
 			dv, ok := obj.(*cdiv1.DataVolume)
-			if !ok || dv.Spec.Source == nil || dv.Spec.Source.PVC == nil {
+			if !ok {
 				return nil
 			}
-			ns := dv.Spec.Source.PVC.Namespace
-			if ns == "" {
-				ns = dv.Namespace
-			}
-			return []string{ns + "/" + dv.Spec.Source.PVC.Name}
+			return cloneSourceKeys(dv)
 		},
 	); err != nil {
-		return fmt.Errorf("indexing DataVolumes by source claim: %w", err)
+		return fmt.Errorf("indexing DataVolumes by clone source: %w", err)
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
@@ -527,20 +591,43 @@ func mapDataVolumeToImages(_ context.Context, obj client.Object) []reconcile.Req
 		out = append(out, req)
 	}
 	dv, ok := obj.(*cdiv1.DataVolume)
-	if !ok || dv.Spec.Source == nil || dv.Spec.Source.PVC == nil {
+	if !ok {
 		return out
 	}
-	ns := dv.Spec.Source.PVC.Namespace
-	if ns == "" {
-		ns = dv.Namespace
+	// The claim and the DataSource both share their name with the ManagedImage
+	// that produced them, so either names the candidate directly. A request for
+	// an image that does not exist costs one cache miss.
+	for _, key := range cloneSourceKeys(dv) {
+		ns, name, found := strings.Cut(key, "/")
+		if !found {
+			continue
+		}
+		out = append(out, reconcile.Request{
+			NamespacedName: types.NamespacedName{Namespace: ns, Name: name},
+		})
 	}
-	// The claim shares its name with the ManagedImage that produced it, so the
-	// source claim names the candidate directly. A request for an image that
-	// does not exist costs one cache miss.
-	out = append(out, reconcile.Request{
-		NamespacedName: types.NamespacedName{Namespace: ns, Name: dv.Spec.Source.PVC.Name},
-	})
 	return out
+}
+
+// cloneSourceKeys is what a DataVolume clones from, as namespace/name, in
+// whichever of the two forms it uses. One function so the index and the event
+// mapping cannot drift apart — they are the same question asked twice.
+func cloneSourceKeys(dv *cdiv1.DataVolume) []string {
+	if dv.Spec.Source != nil && dv.Spec.Source.PVC != nil {
+		ns := dv.Spec.Source.PVC.Namespace
+		if ns == "" {
+			ns = dv.Namespace
+		}
+		return []string{ns + "/" + dv.Spec.Source.PVC.Name}
+	}
+	if dv.Spec.SourceRef != nil && dv.Spec.SourceRef.Kind == "DataSource" {
+		ns := dv.Namespace
+		if dv.Spec.SourceRef.Namespace != nil && *dv.Spec.SourceRef.Namespace != "" {
+			ns = *dv.Spec.SourceRef.Namespace
+		}
+		return []string{ns + "/" + dv.Spec.SourceRef.Name}
+	}
+	return nil
 }
 
 func mapOwnedToImage(_ context.Context, obj client.Object) []reconcile.Request {
