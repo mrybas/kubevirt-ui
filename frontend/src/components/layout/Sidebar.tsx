@@ -102,10 +102,14 @@ const navigation: NavItem[] = [
   },
   { name: 'Backups', href: '/backups', icon: Archive, requiresAdmin: true },
   { name: 'Cluster', href: '/cluster', icon: Box, requiresAdmin: true },
+  // Tenants sat under "Admin" and so did its routes, which meant the one role
+  // the backend has always allowed to create a tenant — folder-admin — could
+  // not reach the page at all. The list endpoint scopes itself to folders the
+  // caller may at least view, so the menu does not need to guess.
+  { name: 'Tenants', href: '/tenants', icon: Layers },
 ];
 
 const adminNavigation: NavItem[] = [
-  { name: 'Tenants', href: '/tenants', icon: Layers },
   {
     name: 'Users',
     href: '/users',
@@ -384,9 +388,11 @@ export function Sidebar() {
 
         {/* Navigation */}
         <nav className="flex-1 overflow-y-auto space-y-1 p-2">
-          {filteredNavigation.map((item) => (
-            <NavItemComponent key={item.href} item={item} />
-          ))}
+          {filteredNavigation
+            .filter((item) => item.href !== '/tenants' || features?.enableTenants)
+            .map((item) => (
+              <NavItemComponent key={item.href} item={item} />
+            ))}
 
           {/* Folders Section */}
           {!collapsed && (
@@ -403,11 +409,9 @@ export function Sidebar() {
                   Admin
                 </p>
               )}
-              {filteredAdminNavigation
-                .filter((item) => item.href !== '/tenants' || features?.enableTenants)
-                .map((item) => (
-                  <NavItemComponent key={item.href} item={item} />
-                ))}
+              {filteredAdminNavigation.map((item) => (
+                <NavItemComponent key={item.href} item={item} />
+              ))}
             </div>
           )}
         </nav>

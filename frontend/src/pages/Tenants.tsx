@@ -1606,6 +1606,13 @@ export default function Tenants() {
   const deleteTenantMutation = useDeleteTenant();
   const { selectedNamespace } = useAppStore();
 
+  // Whether to offer creation at all, answered by the backend per folder
+  // rather than re-derived here. Someone with viewer access on a folder can
+  // see its tenants and cannot make one; a button that only ever returns 403
+  // is the defect this project has a standing rule against.
+  const { data: foldersForCreate } = useFoldersFlat();
+  const mayCreate = (foldersForCreate?.items ?? []).some(f => f.can_create_tenant);
+
   const allTenants = tenantsData?.items ?? [];
   const filteredTenants = allTenants.filter((t: Tenant) => {
     // Global namespace scope: a tenant belongs to the env namespace
@@ -1706,10 +1713,12 @@ export default function Tenants() {
         <button onClick={() => refetch()} className="btn-secondary" title="Refresh">
           <RefreshCw className="h-4 w-4" />
         </button>
-        <button onClick={() => setShowCreate(true)} className="btn-primary">
-          <Plus className="w-4 h-4" />
-          Create Tenant
-        </button>
+        {mayCreate && (
+          <button onClick={() => setShowCreate(true)} className="btn-primary">
+            <Plus className="w-4 h-4" />
+            Create Tenant
+          </button>
+        )}
       </ActionBar>
 
       <DataTable
@@ -1725,13 +1734,17 @@ export default function Tenants() {
         emptyState={{
           icon: <Box className="h-16 w-16" />,
           title: 'No tenants found',
-          description: 'Create your first virtual Kubernetes cluster.',
-          action: (
+          description: mayCreate
+            ? 'Create your first virtual Kubernetes cluster.'
+            : 'No tenant clusters here that you can see. Creating one takes '
+              + 'folder-admin, or folder-member where an administrator has '
+              + 'enabled it.',
+          action: mayCreate ? (
             <button onClick={() => setShowCreate(true)} className="btn-primary">
               <Plus className="w-4 h-4" />
               Create Tenant
             </button>
-          ),
+          ) : undefined,
         }}
       />
 

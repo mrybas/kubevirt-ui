@@ -219,7 +219,14 @@ function AppRoutes() {
                     <Route path="/folders" element={<Folders />} />
                     <Route path="/folders/new" element={<Navigate to="/folders?create=true" replace />} />
                     <Route path="/folders/:name" element={<FolderDetail />} />
-                    {/* Tenants — admin only, and only when feature enabled.
+                    {/* Tenants — only when the feature is enabled. NOT admin
+                        only: the list endpoint scopes itself to folders the
+                        caller may at least view, and creating one is answered
+                        per folder by `can_create_tenant`. Wrapping these in
+                        RequireAdmin meant folder-admin — the role the backend
+                        has always allowed to create a tenant — was bounced to
+                        the dashboard, so the right existed and could not be
+                        used by anyone who had it.
                         While the flag is still being fetched the route must
                         render nothing rather than redirect: a `<Navigate>`
                         here races the features request, and opening /tenants
@@ -233,8 +240,8 @@ function AppRoutes() {
                       </>
                     ) : features?.enableTenants ? (
                       <>
-                        <Route path="/tenants" element={<RequireAdmin><Tenants /></RequireAdmin>} />
-                        <Route path="/tenants/:name" element={<RequireAdmin><TenantDetail /></RequireAdmin>} />
+                        <Route path="/tenants" element={<Tenants />} />
+                        <Route path="/tenants/:name" element={<TenantDetail />} />
                       </>
                     ) : (
                       <>
