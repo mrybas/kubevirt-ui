@@ -31,7 +31,6 @@ import { useTenants, useCreateTenant, useDeleteTenant, useAddonCatalog, useDisco
 import { useStorageClasses } from '../hooks/useStorage';
 import { useFoldersFlat } from '../hooks/useFolders';
 import { useVpcs } from '../hooks/useVpcs';
-import { useAuthStore } from '../store/auth';
 import { useAppStore } from '../store';
 import type { Tenant, TenantCreateRequest, TenantAddon, AddonComponent, TalosRelease } from '../types/tenant';
 import { WizardStepIndicator } from '../components/common/WizardStepIndicator';
@@ -230,7 +229,6 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
       ? { folder: form.folder, environment: form.environment }
       : undefined
   );
-  const user = useAuthStore(s => s.user);
   const createTenant = useCreateTenant();
 
   // Storage classes for T5 picker
