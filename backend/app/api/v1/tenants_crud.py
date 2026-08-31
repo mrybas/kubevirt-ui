@@ -26,6 +26,8 @@ from app.core.groups import (
     is_admin,
     is_env_viewer,
     is_folder_admin,
+    may_create_tenant,
+    tenant_create_role,
     load_folder,
     load_folders,
     resolve_env,
@@ -1937,7 +1939,7 @@ async def _folder_you_may_build_in(k8s, user: User, folder: str) -> dict:
     """
     folders = await load_folders(k8s)
     meta = folders.get(folder)
-    if meta is not None and is_folder_admin(user, meta):
+    if meta is not None and may_create_tenant(user, meta):
         return meta
     if is_admin(user.groups, user) and meta is None:
         raise HTTPException(
@@ -1948,7 +1950,7 @@ async def _folder_you_may_build_in(k8s, user: User, folder: str) -> dict:
         status_code=status.HTTP_403_FORBIDDEN,
         detail=(
             f"You cannot create a tenant in folder '{folder}'. It takes "
-            f"folder-admin on that folder, or platform admin."
+            f"{tenant_create_role()} on that folder, or platform admin."
         ),
     )
 

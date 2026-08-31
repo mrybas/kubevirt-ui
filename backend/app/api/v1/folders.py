@@ -32,6 +32,7 @@ from app.core.groups import (
     is_env_viewer,
     is_folder_member,
     is_folder_viewer,
+    may_create_tenant,
 )
 
 from app.models.folder import (
@@ -961,6 +962,7 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
             users=users,
             access=_build_access_spec(meta),
             can_create=_may_create_in(user, meta, env_ns_list),
+            can_create_tenant=may_create_tenant(user, meta),
         )
 
     if flat:
@@ -1168,6 +1170,7 @@ async def get_folder(request: Request, name: str, user: User = Depends(require_a
         teams=teams,
         users=users,
         access=_build_access_spec(meta),
+        can_create_tenant=may_create_tenant(user, meta),
     )
 
 

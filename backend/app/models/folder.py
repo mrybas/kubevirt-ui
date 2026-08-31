@@ -157,6 +157,11 @@ class FolderResponse(BaseModel):
     # two "Create VM" buttons and a "Create Folder" button, all of which answer
     # 403 (UAT run 4, B5 and R-2).
     can_create: bool = False
+    # Whether this caller may create a TENANT here, which is a different and
+    # narrower question than can_create: a tenant takes cluster-wide things a
+    # VM does not. Published so the page reads the fact the endpoint enforces
+    # instead of re-deriving it.
+    can_create_tenant: bool = False
 
 
 class FolderTreeResponse(BaseModel):

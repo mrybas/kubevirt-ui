@@ -56,6 +56,9 @@ export interface Folder {
    * a fact rather than from the access rules re-derived in TypeScript.
    */
   can_create?: boolean;
+  /** May this caller create a TENANT here — a narrower right than can_create,
+   *  answered by the backend predicate that enforces it. */
+  can_create_tenant?: boolean;
 }
 
 export interface FolderTreeResponse {

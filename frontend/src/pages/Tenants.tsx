@@ -243,11 +243,13 @@ export function CreateTenantWizard({ onClose, onCreated }: { onClose: () => void
       .find(s => s.type === 'ceph')
       ?.storage_classes.find(sc => sc.suggested)?.name ?? '';
 
-  // Folder list — admins see all, non-admins see folders where they're listed
+  // Folder list — the backend already scopes what you can see, and says per
+  // folder whether you may create a tenant in it. This used to filter on
+  // `users.includes(username)`, which is a list of individually-named subjects:
+  // access granted by group put nobody in it, so a member with the right saw an
+  // empty dropdown and could not even try.
   const allFolders = foldersData?.items ?? [];
-  const visibleFolders = user?.is_admin
-    ? allFolders
-    : allFolders.filter(f => f.users.includes(user?.username ?? ''));
+  const visibleFolders = allFolders.filter(f => f.can_create_tenant !== false);
 
   // Environments from selected folder
   const selectedFolder = allFolders.find(f => f.name === form.folder);

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from app.core.lldap_client import LLDAP_ENABLED, get_lldap_client
@@ -158,6 +159,45 @@ def is_folder_member(user: "User", folder_meta: dict) -> bool:
     if is_folder_admin(user, folder_meta):
         return True
     return _has_group(user.groups, _access_block(folder_meta).get("members"))
+
+
+# TENANTS_CREATE_ROLE decides which folder role may create a tenant:
+# "folder-admin" (the default) or "member".
+#
+# It is a knob and not a code change because widening this reaches every
+# install, while the reason to widen it is usually one stand. Read on every
+# call rather than bound at import: a value captured once is a value nobody can
+# change, and this repository has shipped one of those.
+#
+# What it does NOT do is make tenant creation safe to hand out. A tenant takes
+# things no namespace quota counts — one address from a pool of twenty, a public
+# DNS name that lands in a certificate, a namespace, a share of the one datastore
+# every tenant control plane writes to — and the folder ceiling binds only where
+# somebody set one. Until those are counted, this is a switch for testing.
+TENANTS_CREATE_ROLE_ENV = "TENANTS_CREATE_ROLE"
+
+
+def tenant_create_role() -> str:
+    """The folder role a tenant create currently demands."""
+    if (os.getenv(TENANTS_CREATE_ROLE_ENV) or "").strip().lower() == "member":
+        return "folder-member"
+    return "folder-admin"
+
+
+def may_create_tenant(user: "User", folder_meta: dict) -> bool:
+    """Whether this caller may create a tenant in this folder.
+
+    One predicate, two readers: the endpoint that refuses and the folder list
+    that decides whether to offer the folder at all. They disagreed once
+    already — the tenants page re-derived access in TypeScript from a list of
+    named users, which is empty when access is granted by group, so a member
+    with the right saw an empty folder dropdown.
+    """
+    if may := is_folder_admin(user, folder_meta):
+        return may
+    if tenant_create_role() == "folder-member":
+        return is_folder_member(user, folder_meta)
+    return False
 
 
 def is_folder_viewer(user: "User", folder_meta: dict) -> bool:

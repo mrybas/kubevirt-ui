@@ -216,6 +216,13 @@ backend:
     # (*.<domain> → the ingress/Traefik VIP); used for the tenant API
     # IngressRouteTCP HostSNI + apiserver certSANs, so it must match the
     # kubeconfig server host exactly or TLS passthrough breaks.
+    # Which folder role may create a tenant: "" / "folder-admin" (default) or
+    # "member". A tenant is not a big VM — it takes an address from a pool of
+    # twenty, a public DNS name, a namespace and a share of one shared control-
+    # plane datastore, and the folder ceiling only binds if somebody set one. Set
+    # this to "member" to let a folder's members try tenant creation on a test
+    # stand; leave it alone anywhere those things are not yet counted.
+    TENANTS_CREATE_ROLE: ""
     TENANTS_INGRESS_DOMAIN: ""
     # IP external-dns publishes for tenant API hostnames (stamped as
     # external-dns.alpha.kubernetes.io/target on the apiserver ingress —
