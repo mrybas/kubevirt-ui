@@ -161,8 +161,13 @@ def is_folder_member(user: "User", folder_meta: dict) -> bool:
     return _has_group(user.groups, _access_block(folder_meta).get("members"))
 
 
-# TENANTS_CREATE_ROLE decides which folder role may create a tenant:
-# "folder-admin" (the default) or "member".
+# TENANTS_CREATE_ROLE is the LOWEST folder role admitted to tenant creation:
+# "folder-admin" (the default) or "member" / "folder-member".
+#
+# Roles add up, they do not replace each other: a folder admin and a platform
+# admin may create a tenant in either position. Setting this to "member" lets
+# the folder's members in as well, and lets nobody else — a viewer still may
+# not.
 #
 # It is a knob and not a code change because widening this reaches every
 # install, while the reason to widen it is usually one stand. Read on every
@@ -178,8 +183,15 @@ TENANTS_CREATE_ROLE_ENV = "TENANTS_CREATE_ROLE"
 
 
 def tenant_create_role() -> str:
-    """The folder role a tenant create currently demands."""
-    if (os.getenv(TENANTS_CREATE_ROLE_ENV) or "").strip().lower() == "member":
+    """The lowest folder role a tenant create currently admits.
+
+    Both spellings are accepted, because the refusal below tells people they
+    need "folder-member" and someone will paste that back into the variable.
+    A knob that rejects the word its own error message used is a knob that
+    silently does nothing.
+    """
+    value = (os.getenv(TENANTS_CREATE_ROLE_ENV) or "").strip().lower()
+    if value in {"member", "folder-member"}:
         return "folder-member"
     return "folder-admin"
 
@@ -193,8 +205,8 @@ def may_create_tenant(user: "User", folder_meta: dict) -> bool:
     named users, which is empty when access is granted by group, so a member
     with the right saw an empty folder dropdown.
     """
-    if may := is_folder_admin(user, folder_meta):
-        return may
+    if is_folder_admin(user, folder_meta):
+        return True
     if tenant_create_role() == "folder-member":
         return is_folder_member(user, folder_meta)
     return False

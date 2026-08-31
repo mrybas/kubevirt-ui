@@ -66,6 +66,20 @@ class TestWhoMayCreateATenant:
     async def test_a_member_may_when_the_knob_says_so(self) -> None:
         assert await _build_in(_user("folder-members"), "member") is FOLDER
 
+    async def test_both_spellings_are_accepted(self) -> None:
+        """The refusal says "folder-member"; someone will paste that back in.
+        A knob that rejects the word its own error message used is a knob that
+        silently does nothing."""
+        assert await _build_in(_user("folder-members"), "folder-member") is FOLDER
+
+    async def test_the_roles_add_up_rather_than_replace_each_other(self) -> None:
+        """"member" is the lowest role admitted, not the only one."""
+        for role in ("member", "folder-member"):
+            assert await _build_in(_user("folder-admins"), role) is FOLDER
+            assert await _build_in(_user("folder-members"), role) is FOLDER
+            with pytest.raises(HTTPException):
+                await _build_in(_user("folder-viewers"), role)
+
     async def test_the_refusal_names_the_role_actually_required(self) -> None:
         """With the knob on, telling a stranger to get folder-admin sends them
         to ask for a grant they do not need."""
