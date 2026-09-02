@@ -54,7 +54,10 @@ export function buildAuthorizationUrl(config: AuthConfig, redirectUri: string): 
     response_type: 'code',
     client_id: config.client_id,
     redirect_uri: redirectUri,
-    scope: 'openid profile email groups',
+    // From the backend, not hardcoded: dex cross-client auth needs an extra
+    // `audience:server:client_id:<peer>` scope, and a token minted for this
+    // client alone is rejected by any peer that validates its own audience.
+    scope: config.scope || 'openid profile email groups',
     state: generateState(),
   });
 

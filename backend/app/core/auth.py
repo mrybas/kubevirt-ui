@@ -18,6 +18,7 @@ AUTH_TYPE = os.getenv("AUTH_TYPE", "none")  # none, oidc, token
 OIDC_ISSUER = os.getenv("OIDC_ISSUER", "")  # Public URL (for frontend/token validation)
 OIDC_INTERNAL_URL = os.getenv("OIDC_INTERNAL_URL", "")  # Internal URL for backend->DEX communication
 OIDC_CLIENT_ID = os.getenv("OIDC_CLIENT_ID", "kubevirt-ui")
+OIDC_SCOPE = os.getenv("OIDC_SCOPE", "openid profile email groups")
 OIDC_CLIENT_SECRET = os.getenv("OIDC_CLIENT_SECRET", "")
 
 
@@ -42,6 +43,13 @@ class AuthConfig:
     authorization_endpoint: str | None = None
     token_endpoint: str | None = None
     userinfo_endpoint: str | None = None
+    # Scopes the login request asks for. Configurable because dex's
+    # cross-client auth needs an extra one: a token minted for THIS client is
+    # rejected by any other relying party that validates its own audience, so
+    # asking for `audience:server:client_id:<peer>` is the only way one login
+    # can produce a token a peer will accept. Hardcoding the scopes meant that
+    # was impossible without a rebuild.
+    scope: str = "openid profile email groups"
     user_management: str = "none"  # "lldap", "external", "none"
 
 
@@ -134,6 +142,7 @@ async def get_auth_config() -> AuthConfig:
                 authorization_endpoint=oidc_config.get("authorization_endpoint"),
                 token_endpoint=oidc_config.get("token_endpoint"),
                 userinfo_endpoint=oidc_config.get("userinfo_endpoint"),
+                scope=OIDC_SCOPE,
                 user_management=user_mgmt,
             )
         except HTTPException:

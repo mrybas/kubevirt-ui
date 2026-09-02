@@ -555,6 +555,15 @@ auth:
     issuerInternal: ""
     # -- OIDC client ID
     clientId: "kubevirt-ui"
+    # -- Scopes the login request asks for. Empty keeps what the UI has always
+    # sent: "openid profile email groups".
+    #
+    # Add `audience:server:client_id:<peer>` to make dex mint a token another
+    # relying party will accept. A token minted for THIS client is refused by
+    # any peer that validates its own audience -- Harbor answers 401 on every
+    # call, which reads as a permissions problem and is not one. The peer must
+    # list this client in its dex trustedPeers for the request to be honoured.
+    scope: ""
     # -- Reference to an existing secret that holds the client secret
     clientSecretRef:
       name: ""
