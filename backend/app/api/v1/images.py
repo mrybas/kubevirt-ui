@@ -13,7 +13,9 @@ from kubernetes_asyncio.client.rest import ApiException
 
 from app.api.v1.images_catalog import catalog_images, merge
 from app.core.auth import User, require_auth
+from app.core.errors import validate_k8s_name
 from app.core.harbor_client import HarborUnauthorized, HarborUnavailable
+from app.core.image_publish import assert_tag_is_free, publish_dependents, publish_job
 from app.core.operator import (
     OPERATOR_GROUP,
     OPERATOR_VERSION,
@@ -30,6 +32,7 @@ from app.models.template import (
     GoldenImageListResponse,
     GoldenImageUpdate,
     CreateImageFromDiskRequest,
+    ImagePublishRequest,
 )
 
 images_router = APIRouter()
@@ -1287,3 +1290,107 @@ async def create_golden_image_from_disk(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create image from disk: {e.reason}",
         )
+
+
+# ---------------------------------------------------------------------------
+# Publish (snapshot-then-publish a running VM's disk to the catalogue)
+# ---------------------------------------------------------------------------
+
+async def create_object(k8s_client: Any, obj: dict[str, Any]) -> dict[str, Any]:
+    """Create a k8s object described as a plain dict, and return it as one.
+
+    `publish_job`/`publish_dependents` describe three different kinds — Job,
+    PersistentVolumeClaim, VolumeSnapshot — that live behind three different
+    client APIs (BatchV1Api, CoreV1Api, CustomObjectsApi). Dispatching on
+    `kind` here lets the handler treat all three the same way, and matters
+    because the Job's UID has to be read back from the object this returns
+    before the dependents that name it as their owner can be created.
+    """
+    kind = obj["kind"]
+    namespace = obj["metadata"]["namespace"]
+
+    if kind == "Job":
+        batch_api = client.BatchV1Api(k8s_client._api_client)
+        result = await batch_api.create_namespaced_job(namespace=namespace, body=obj)
+        return result.to_dict()
+
+    if kind == "PersistentVolumeClaim":
+        result = await k8s_client.core_api.create_namespaced_persistent_volume_claim(
+            namespace=namespace, body=obj
+        )
+        return result.to_dict()
+
+    if kind == "VolumeSnapshot":
+        # Named literally (not read off obj["apiVersion"]) so the RBAC
+        # contract scan (tests/test_helm_rbac_contract.py) can see this call
+        # site and check the chart grants it.
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        return await custom_api.create_namespaced_custom_object(
+            group="snapshot.storage.k8s.io",
+            version="v1",
+            namespace=namespace,
+            plural="volumesnapshots",
+            body=obj,
+        )
+
+    raise ValueError(f"create_object: unsupported kind {kind!r}")
+
+
+async def unsuspend_job(k8s_client: Any, namespace: str, name: str) -> None:
+    """Flip a suspended Job on, once its dependents exist and are owned by it."""
+    batch_api = client.BatchV1Api(k8s_client._api_client)
+    await batch_api.patch_namespaced_job(
+        name=name, namespace=namespace, body={"spec": {"suspend": False}},
+    )
+
+
+async def delete_job(k8s_client: Any, namespace: str, name: str) -> None:
+    """Delete the publish Job — its ownerReferences take the dependents with it."""
+    batch_api = client.BatchV1Api(k8s_client._api_client)
+    await batch_api.delete_namespaced_job(
+        name=name, namespace=namespace, propagation_policy="Background",
+    )
+
+
+@images_router.post("/publish", status_code=status.HTTP_202_ACCEPTED)
+async def publish_image(
+    request: Request,
+    req: ImagePublishRequest,
+    user: User = Depends(require_auth),
+) -> dict[str, str]:
+    """Publish a disk to the catalogue without stopping the VM using it."""
+    if not harbor_image_path_enabled():
+        raise HTTPException(status_code=501, detail="Harbor image path is disabled")
+
+    validate_k8s_name(req.namespace, "namespace")
+    validate_k8s_name(req.disk_name, "disk_name")
+    validate_k8s_name(req.tag, "tag")
+
+    harbor = request.app.state.harbor_client
+    try:
+        await assert_tag_is_free(
+            harbor, user.raw_token or "", req.project, req.repository, req.tag
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    k8s_client = request.app.state.k8s_client
+    ref = f"{req.project}/{req.repository}:{req.tag}"
+
+    # Suspended first, so its UID can own the snapshot and the temporary PVC.
+    job = await create_object(k8s_client, publish_job(req.namespace, req.disk_name, ref))
+    job_name = job["metadata"]["name"]
+    try:
+        for obj in publish_dependents(
+            req.namespace, req.disk_name, job_name, job["metadata"]["uid"]
+        ):
+            await create_object(k8s_client, obj)
+        await unsuspend_job(k8s_client, req.namespace, job_name)
+    except ApiException as exc:
+        # Deleting the Job takes its owned dependents with it.
+        await delete_job(k8s_client, req.namespace, job_name)
+        raise HTTPException(
+            status_code=422, detail=f"publish could not start: {exc.reason}"
+        ) from exc
+
+    return {"job": job_name, "ref": ref}

@@ -321,3 +321,18 @@ class CreateImageFromDiskRequest(BaseModel):
     description: str | None = None
     os_type: str = "linux"
     os_version: str | None = None
+
+
+class ImagePublishRequest(BaseModel):
+    """Publish a VM's disk to the Harbor catalogue without stopping the VM.
+
+    The disk is snapshotted rather than read live, so `namespace`/`disk_name`
+    name the source PVC and the VM using it keeps running throughout.
+    `project`/`repository`/`tag` name where the pushed image lands in Harbor.
+    """
+
+    namespace: str
+    disk_name: str
+    project: str
+    repository: str
+    tag: str
