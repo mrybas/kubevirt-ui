@@ -90,7 +90,22 @@ func Source(img *platformv1alpha1.ManagedImage) (*cdiv1.DataVolumeSource, error)
 		return &cdiv1.DataVolumeSource{HTTP: &cdiv1.DataVolumeSourceHTTP{URL: s.HTTP.URL}}, nil
 	case s.Registry != nil:
 		url := s.Registry.URL
-		return &cdiv1.DataVolumeSource{Registry: &cdiv1.DataVolumeSourceRegistry{URL: &url}}, nil
+		registry := &cdiv1.DataVolumeSourceRegistry{URL: &url}
+		// Carried through, not dropped. These two are what make a pull against
+		// a private project work at all, and rendering only the URL is
+		// indistinguishable — from here, from the CR, and from the DataVolume
+		// — from an image that legitimately needs no credential. The failure
+		// surfaces much later, inside CDI, as an import error that never names
+		// a credential.
+		if s.Registry.SecretRef != "" {
+			secretRef := s.Registry.SecretRef
+			registry.SecretRef = &secretRef
+		}
+		if s.Registry.CertConfigMap != "" {
+			certConfigMap := s.Registry.CertConfigMap
+			registry.CertConfigMap = &certConfigMap
+		}
+		return &cdiv1.DataVolumeSource{Registry: registry}, nil
 	case s.PVC != nil:
 		ns := s.PVC.Namespace
 		if ns == "" {

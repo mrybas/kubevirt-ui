@@ -11,10 +11,12 @@ from the resolved registry host now, so every test here configures HARBOR_URL
 and the convention names instead of passing them in the body.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 from fastapi import HTTPException
 from kubernetes_asyncio.client.rest import ApiException
 
@@ -132,22 +134,92 @@ async def test_a_missing_robot_secret_is_named_in_the_refusal(
     api.create_namespaced_custom_object.assert_not_called()
 
 
-async def test_the_managed_image_writer_carries_the_secret_and_ca_too(
+# ---------------------------------------------------------------------------
+# What actually survives being written to the cluster
+# ---------------------------------------------------------------------------
+#
+# The test that used to sit here asserted `secretRef` and `certConfigMap` on
+# the ManagedImage body the handler passed to a MagicMock. A MagicMock has no
+# schema, so it accepted a body the real API server did not: ManagedImage's CRD
+# is a STRUCTURAL schema with no x-kubernetes-preserve-unknown-fields, and
+# `RegistrySource` carried only `url` — so the API server PRUNED both fields on
+# write. Every catalogue materialise with OPERATOR_IMAGE_ENABLED on passed the
+# 422 pre-flight (the Secret does exist), returned 201, and then pulled
+# ANONYMOUSLY, failing inside CDI with an error that never mentions a
+# credential — verbatim the failure `_harbor_credentials_for` exists to prevent.
+#
+# A test that asserts a field production discards is worse than no test: it is
+# the reason this shipped. So the assertion is made against the real CRD now,
+# by pruning the body exactly as the API server would.
+
+_CRD = Path("kubevirt-ui") / "templates" / "operator-crds.yaml"
+# In the test container only ./backend is mounted at /app; the chart comes in
+# separately at /helm (see docker-compose.yml). Outside it, walk up.
+_CRD_CANDIDATES = [Path("/helm") / _CRD, Path(__file__).resolve().parents[2] / "helm" / _CRD]
+CRD_FILE = next((c for c in _CRD_CANDIDATES if c.is_file()), None)
+
+
+def _managed_image_spec_schema() -> dict:
+    """ManagedImage's `spec` schema, out of the chart's own CRD.
+
+    The chart's copy rather than `operator/config/crd/bases`, deliberately: it
+    is what actually gets applied to a cluster, and it is generated from the
+    Go markers by `go run ./cmd/chartsync`, so reading it also catches the two
+    drifting apart. The file is a Helm template, but only its first and last
+    lines are directives — everything between is plain YAML.
+    """
+    text = "\n".join(
+        line for line in CRD_FILE.read_text().splitlines()
+        if not line.lstrip().startswith("{{")
+    )
+    for doc in yaml.safe_load_all(text):
+        if doc and doc.get("spec", {}).get("names", {}).get("kind") == "ManagedImage":
+            version = doc["spec"]["versions"][0]
+            return version["schema"]["openAPIV3Schema"]["properties"]["spec"]
+    raise AssertionError("no ManagedImage CRD in the chart")
+
+
+def _prune(value, schema: dict):
+    """Drop what a structural schema drops, the way the API server does.
+
+    An object whose schema declares `properties` and does not set
+    `x-kubernetes-preserve-unknown-fields` keeps only the declared keys.
+    Everything else is discarded silently — no error, no warning, no trace in
+    the stored object.
+    """
+    if schema.get("x-kubernetes-preserve-unknown-fields"):
+        return value
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        if properties is None:
+            extra = schema.get("additionalProperties")
+            if isinstance(extra, dict):
+                return {k: _prune(v, extra) for k, v in value.items()}
+            return value
+        return {
+            k: _prune(v, properties[k]) for k, v in value.items() if k in properties
+        }
+    if isinstance(value, list):
+        return [_prune(item, schema.get("items", {})) for item in value]
+    return value
+
+
+@pytest.mark.skipif(
+    CRD_FILE is None,
+    reason=(
+        "Helm chart not reachable; mount it at /helm to run the CRD pruning "
+        f"test (looked in: {', '.join(str(c) for c in _CRD_CANDIDATES)})"
+    ),
+)
+async def test_the_managed_image_writer_carries_the_secret_and_ca_past_the_crd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both writers must carry the credential, not just the DataVolume one.
+    """The credential must survive the CRD, not merely reach the client call.
 
-    Today they do — `create_golden_image` builds `source` once via
-    `build_registry_source` before branching on `image_path_enabled()`, and
-    both the DataVolume path and `_create_managed_image` consume that same
-    dict. But that sharing is an implementation detail, not a guarantee: a
-    later refactor could split the two writers' source construction without
-    anything failing loudly. A ManagedImage missing `secretRef` still gets
-    created — the operator would build a DataVolume from it, and only then,
-    inside CDI, would an anonymous pull against a private project fail, with
-    an error that never mentions the credential that quietly went missing.
-    This test pins the ManagedImage's actual `spec.source.registry` shape so
-    that regression fails here instead.
+    Both writers have to carry it — `create_golden_image` builds `source` once
+    and the DataVolume path and `_create_managed_image` consume the same dict —
+    but on the operator path the CR is an extra hop through a schema, and that
+    hop is where it was being lost.
     """
     from app.api.v1 import images
 
@@ -156,11 +228,7 @@ async def test_the_managed_image_writer_carries_the_secret_and_ca_too(
     monkeypatch.setenv("HARBOR_CA_CONFIGMAP", "harbor-ca")
 
     k8s = _k8s_with_namespace()
-    # The Secret exists this time — the pre-flight check must pass through
-    # so the create actually happens and there is a body to inspect.
     k8s.core_api.read_namespaced_secret = AsyncMock(return_value=MagicMock())
-    # And so does the CA ConfigMap, which is attached only when it really is
-    # there (CDI refuses an import whose certConfigMap names nothing).
     k8s.core_api.read_namespaced_config_map = AsyncMock(return_value=MagicMock())
 
     captured: dict = {}
@@ -182,7 +250,7 @@ async def test_the_managed_image_writer_carries_the_secret_and_ca_too(
 
     image = GoldenImageCreate(
         display_name="Tenant A Ubuntu",
-        source_registry="docker://harbor.example/vm-images-tenant-a/ubuntu:1",
+        catalog_ref="vm-images-tenant-a/ubuntu:1",
         size="10Gi",
     )
 
@@ -195,6 +263,32 @@ async def test_the_managed_image_writer_carries_the_secret_and_ca_too(
     assert captured["plural"] == "managedimages"
     assert captured["body"]["kind"] == "ManagedImage"
 
-    registry = captured["body"]["spec"]["source"]["registry"]
-    assert registry["secretRef"] == "harbor-robot-tenant-a"
+    stored = _prune(captured["body"]["spec"], _managed_image_spec_schema())
+    registry = stored["source"]["registry"]
+
+    assert registry["url"].startswith("docker://")
+    assert registry["secretRef"] == "harbor-robot-tenant-a", (
+        "secretRef was pruned by the CRD: the ManagedImage would be stored "
+        "without it and the operator would render an anonymous pull"
+    )
     assert registry["certConfigMap"] == "harbor-ca"
+
+
+@pytest.mark.skipif(CRD_FILE is None, reason="Helm chart not reachable")
+def test_the_crd_declares_every_field_the_registry_source_carries() -> None:
+    """The direct form of the same contract, so a failure names the cause.
+
+    The test above fails with "secretRef was pruned"; this one says which
+    field the schema is missing, which is the thing to go and add.
+    """
+    schema = _managed_image_spec_schema()
+    registry = schema["properties"]["source"]["properties"]["registry"]
+
+    for field in ("url", "secretRef", "certConfigMap"):
+        assert field in registry["properties"], (
+            f"RegistrySource has no {field!r} in the CRD, so the API server "
+            "prunes it on write and it never reaches the operator. Add it to "
+            "operator/api/v1alpha1/managedimage_types.go, re-run "
+            "`make manifests` and `go run ./cmd/chartsync`, and render it in "
+            "operator/internal/cdi/render.go"
+        )

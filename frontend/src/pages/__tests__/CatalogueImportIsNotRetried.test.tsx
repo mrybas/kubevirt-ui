@@ -222,42 +222,15 @@ describe('the template form does not re-import an already-materialised catalogue
     });
   });
 
-  it('picks a merged cluster row up by its catalogue ref on a fresh submit', async () => {
-    // The same lookup, with no prior submit at all: a user who imported the
-    // image in an earlier session sees one merged row whose select value is
-    // its disk name, so this is really about the select still holding a ref
-    // (edit mode, a restored draft) — the resolution must not depend on the
-    // in-memory cache a fresh mount does not have.
-    const MERGED: GoldenImage = {
-      name: 'rocky-9-1-abc12',
-      namespace: 'acme-dev',
-      display_name: 'Rocky 9',
-      size: '20Gi',
-      status: 'Ready',
-      disk_type: 'image',
-      persistent: false,
-      scope: 'environment',
-      origin: 'cluster',
-      catalog_ref: 'p/rocky-9:1',
-    };
-
-    const user = userEvent.setup();
-    mockCreateTemplate.mockResolvedValue({});
-
-    const { onClose } = renderModal([MERGED]);
-
-    await fillCommonFields(user);
-    await pickFromSelect(user, 'Select a project...', 'Acme Dev');
-    await pickFromSelect(user, 'Select an image...', 'Rocky 9 (20Gi)');
-
-    await submit(user);
-
-    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
-    expect(mockCreateImage).not.toHaveBeenCalled();
-    expect(mockCreateTemplate.mock.calls[0][0]).toMatchObject({
-      golden_image_name: 'rocky-9-1-abc12',
-    });
-  });
+  // REMOVED: 'picks a merged cluster row up by its catalogue ref on a fresh
+  // submit'. It passed unchanged against the pre-fix code and so proved
+  // nothing. `imageOptions.ts` gives a CLUSTER row its disk name as the
+  // option's value, so picking one from the select can never put a catalogue
+  // ref into `goldenImageName` — the old `img.name ===` branch matched and the
+  // `catalog_ref` branch it claimed to cover was never reached. The only way
+  // `goldenImageName` holds a ref while the list shows the merged cluster row
+  // is the refetch above, which is where that branch is actually exercised;
+  // the by-disk-name path is covered by the cluster-row test below.
 
   it('never attempts template creation when the import itself fails, and surfaces the failure', async () => {
     const user = userEvent.setup();

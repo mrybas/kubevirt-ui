@@ -272,6 +272,16 @@ class TestTheGateAndTheRefusals:
             {"repository": "with space"},
             {"tag": "with space"},
             {"tag": "-leading-dash"},
+            # A trailing newline. `$` matches immediately before one, so
+            # `.match` accepted every one of these and only `.fullmatch`
+            # refuses them — the defect the validators' own docstrings
+            # promised was already handled.
+            {"tag": "20260902\n"},
+            {"project": "vm-images-tenant-a\n"},
+            {"repository": "ubuntu-2204\n"},
+            {"namespace": "tenant-a\n"},
+            {"disk_name": "ubuntu-disk\n"},
+            {"secret_name": "harbor-robot-tenant-a\n"},
         ],
     )
     def test_a_coordinate_that_is_not_a_coordinate_is_refused_with_422(

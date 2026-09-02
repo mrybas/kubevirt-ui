@@ -13,11 +13,18 @@ _K8S_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 def validate_k8s_name(value: str, field: str = "name") -> str:
     """Validate value matches Kubernetes resource name rules.
 
-    Raises HTTPException(422) if invalid. This prevents shell injection
-    when names are interpolated into commands or YAML.
-    # Attack vector blocked: value='foo; rm -rf /' or 'foo\nmalicious: yaml'
+    Raises HTTPException(422) if invalid. The alphabet is narrow enough that a
+    value passing this cannot carry a shell metacharacter, a space, a quote or
+    a colon, which is what makes it safe to interpolate into a command or into
+    YAML.
+
+    `fullmatch`, not `match`: `$` also matches immediately before a trailing
+    newline, so `re.match(r"^...$", "foo\n")` SUCCEEDS. The interior of
+    `'foo\nmalicious: yaml'` was always refused — `$` only ever matches at the
+    very end — but `'foo\n'` was not, and a validator whose docstring promises
+    to stop newline injection should not have a newline it accepts.
     """
-    if not value or len(value) > 253 or not _K8S_NAME_RE.match(value):
+    if not value or len(value) > 253 or not _K8S_NAME_RE.fullmatch(value):
         raise HTTPException(
             status_code=422,
             detail=f"Invalid {field}: must match regex ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ (got {value!r})",
@@ -35,6 +42,9 @@ def validate_k8s_name(value: str, field: str = "name") -> str:
 # safety rule here: what these strings need is to be safe to interpolate into a
 # registry reference and into a Harbor API path, which means no `/` where one is
 # not allowed, no `..`, no `:`, no whitespace, no scheme.
+#
+# `fullmatch` throughout, for the reason spelled out on validate_k8s_name:
+# `$` matches before a trailing newline, so `.match` accepts "latest\n".
 #
 # Shapes below follow the OCI distribution spec:
 #   tag             [A-Za-z0-9_][A-Za-z0-9._-]{0,127}
@@ -55,7 +65,7 @@ def validate_oci_tag(value: str, field: str = "tag") -> str:
 
     Raises HTTPException(422) if invalid.
     """
-    if not value or not _OCI_TAG_RE.match(value):
+    if not value or not _OCI_TAG_RE.fullmatch(value):
         raise HTTPException(
             status_code=422,
             detail=(
@@ -72,7 +82,7 @@ def validate_oci_repository(value: str, field: str = "repository") -> str:
 
     Raises HTTPException(422) if invalid.
     """
-    if not value or len(value) > 255 or not _OCI_REPOSITORY_RE.match(value):
+    if not value or len(value) > 255 or not _OCI_REPOSITORY_RE.fullmatch(value):
         raise HTTPException(
             status_code=422,
             detail=(
@@ -88,7 +98,7 @@ def validate_harbor_project(value: str, field: str = "project") -> str:
 
     Raises HTTPException(422) if invalid.
     """
-    if not value or len(value) > 255 or not _HARBOR_PROJECT_RE.match(value):
+    if not value or len(value) > 255 or not _HARBOR_PROJECT_RE.fullmatch(value):
         raise HTTPException(
             status_code=422,
             detail=(

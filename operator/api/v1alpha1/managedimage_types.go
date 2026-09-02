@@ -33,6 +33,25 @@ type RegistrySource struct {
 	// URL of the container image, e.g. docker://quay.io/org/image:tag.
 	// +kubebuilder:validation:MinLength=1
 	URL string `json:"url"`
+	// SecretRef names a Secret in THIS image's namespace holding the registry
+	// credential, in CDI's accessKeyId/secretKey shape. CDI resolves it in the
+	// DataVolume's own namespace and nowhere else.
+	//
+	// This field is not optional decoration: without it a private registry
+	// pull is anonymous. This is a structural schema with no
+	// x-kubernetes-preserve-unknown-fields, so while the field did not exist
+	// here the API server PRUNED it on write — the backend built a source dict
+	// carrying secretRef, passed every check, wrote the CR, and the credential
+	// was silently discarded before it was ever stored. The import then failed
+	// inside CDI with an error that never mentioned a credential.
+	// +optional
+	SecretRef string `json:"secretRef,omitempty"`
+	// CertConfigMap names a ConfigMap in this image's namespace holding the
+	// registry's CA, for a registry behind a private certificate. Set it only
+	// when such a ConfigMap really exists: CDI refuses an import outright when
+	// certConfigMap names nothing.
+	// +optional
+	CertConfigMap string `json:"certConfigMap,omitempty"`
 }
 
 // PVCSource clones an existing PersistentVolumeClaim.
