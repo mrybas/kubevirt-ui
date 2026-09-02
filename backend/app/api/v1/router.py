@@ -15,7 +15,8 @@ from app.api.v1.profile import router as profile_router
 from app.api.v1.folders import router as folders_router
 from app.api.v1.projects import router as projects_router, teams_router
 from app.api.v1.storage import router as storage_router
-from app.api.v1.templates import router as templates_router, images_router
+from app.api.v1.templates import router as templates_router
+from app.api.v1.images import images_router
 from app.api.v1.metrics import router as metrics_router
 from app.api.v1.schedules import router as schedules_router
 from app.api.v1.tenants_crud import router as tenants_router

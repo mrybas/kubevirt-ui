@@ -44,7 +44,7 @@ async def _create_image(
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[dict[str, Any], Any]:
     """Call the create endpoint and return (captured create call, response)."""
-    from app.api.v1 import templates
+    from app.api.v1 import images
 
     monkeypatch.setenv("OPERATOR_IMAGE_ENABLED", "true" if flag_on else "")
 
@@ -71,8 +71,8 @@ async def _create_image(
     request = MagicMock()
     request.app.state.k8s_client = _k8s_with_namespace()
 
-    with patch.object(templates.client, "CustomObjectsApi", return_value=api):
-        response = await templates.create_golden_image(
+    with patch.object(images.client, "CustomObjectsApi", return_value=api):
+        response = await images.create_golden_image(
             image=image, request=request, user=MagicMock(), namespace="opdev-dev",
         )
     return captured, response
@@ -230,12 +230,12 @@ def _delete_harness(
 
 
 async def _delete_image(api: MagicMock, name: str = "ubuntu-x7k2p") -> None:
-    from app.api.v1 import templates
+    from app.api.v1 import images
 
     request = MagicMock()
     request.app.state.k8s_client = MagicMock()
-    with patch.object(templates.client, "CustomObjectsApi", return_value=api):
-        await templates.delete_golden_image(
+    with patch.object(images.client, "CustomObjectsApi", return_value=api):
+        await images.delete_golden_image(
             name=name, request=request, user=MagicMock(), namespace="opdev-dev",
         )
 

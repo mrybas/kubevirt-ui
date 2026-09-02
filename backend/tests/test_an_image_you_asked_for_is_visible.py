@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.api.v1.templates import _described_but_unbuilt_images
+from app.api.v1.images import _described_but_unbuilt_images
 
 
 def _described(name: str, *, phase: str = "", conditions: list | None = None,
@@ -102,7 +102,7 @@ def test_the_lister_asks_for_both() -> None:
     """The property is that the list is a union, not that a helper exists."""
     import inspect
 
-    from app.api.v1.templates import list_golden_images
+    from app.api.v1.images import list_golden_images
 
     source = inspect.getsource(list_golden_images)
     assert "_described_but_unbuilt_images" in source

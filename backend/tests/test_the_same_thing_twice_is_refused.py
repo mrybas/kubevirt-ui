@@ -26,7 +26,7 @@ import pytest
 from fastapi import HTTPException
 from kubernetes_asyncio.client.rest import ApiException
 
-from app.api.v1.templates import _refuse_a_duplicate_image
+from app.api.v1.images import _refuse_a_duplicate_image
 
 
 def _dv(name: str, display: str) -> dict:
@@ -98,7 +98,8 @@ def test_all_three_creates_refuse_what_already_exists() -> None:
     import inspect
 
     from app.api.v1.tenants_crud import create_tenant
-    from app.api.v1.templates import create_golden_image, create_template
+    from app.api.v1.templates import create_template
+    from app.api.v1.images import create_golden_image
 
     for fn in (create_tenant, create_template):
         assert "already exists" in inspect.getsource(fn), fn.__name__
