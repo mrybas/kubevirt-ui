@@ -23,13 +23,15 @@ import {
   LayoutGrid,
   List,
 } from 'lucide-react';
-import { useTemplates, useGoldenImages, useCreateTemplate, useUpdateTemplate, useDeleteTemplate } from '../hooks/useTemplates';
-import type { VMTemplate, VMTemplateCreate, GoldenImage } from '../types/template';
+import { useTemplates, useGoldenImages, useCreateTemplate, useUpdateTemplate, useDeleteTemplate, useCreateImage } from '../hooks/useTemplates';
+import type { VMTemplate, VMTemplateCreate, GoldenImage, GoldenImageCreate } from '../types/template';
 import { useNamespaces } from '../hooks/useNamespaces';
 import { useAppStore } from '../store';
 import { CustomSelect } from '../components/common/CustomSelect';
 import { CreateVMWizard } from '../components/vm/CreateVMWizard';
 import { ConfirmDeleteModal } from '../components/common/ConfirmDeleteModal';
+import { imageOptions } from './imageOptions';
+import { matchesStorageFilters } from './storageFilters';
 
 const osIcons: Record<string, string> = {
   ubuntu: '🐧',
@@ -402,10 +404,25 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
   
   const createTemplate = useCreateTemplate();
   const updateTemplate = useUpdateTemplate();
-  
-  // Filter images by selected project
-  const projectImages = goldenImages.filter(img => img.namespace === selectedProject);
-  
+  const createImageFromCatalog = useCreateImage();
+  const [importError, setImportError] = useState<string | null>(null);
+
+  // Filter images by selected project. Catalogue rows (`origin: 'catalog'`)
+  // arrive with no namespace — they are import candidates for any project,
+  // not placed in one yet — so they are exempted from this filter the same
+  // way Storage.tsx exempts them from its own folder/environment filters.
+  // Reusing that predicate here (instead of a second `namespace === project`
+  // check) keeps the one rule in one place.
+  const projectImages = goldenImages.filter((img) =>
+    matchesStorageFilters(img, {
+      searchQuery: '',
+      filterProject: '',
+      filterEnv: '',
+      filterFolder: selectedProject,
+      folderNamespaces: new Set(selectedProject ? [selectedProject] : []),
+    })
+  );
+
   // Reset image selection when project changes (only in create mode)
   const handleProjectChange = (project: string) => {
     setSelectedProject(project);
@@ -413,19 +430,53 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
       setGoldenImageName('');
     }
   };
-  
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    
+
     if (!selectedProject || !goldenImageName) return;
-    
+
+    // The select's value is a disk name for a cluster row and a Harbor
+    // reference for a catalogue row (see imageOptions.ts). Resolved back
+    // against the filtered list by `origin`, not by guessing at the
+    // string's shape — a catalogue ref like "p/rocky-9:1" is not reliably
+    // distinguishable from a disk name by pattern alone.
+    const selectedImage = projectImages.find((img) =>
+      img.origin === 'catalog' ? img.catalog_ref === goldenImageName : img.name === goldenImageName
+    );
+
+    setImportError(null);
+    let imageName = goldenImageName;
+
+    if (selectedImage?.origin === 'catalog') {
+      // A catalogue row is not a disk yet — materialise it first so the
+      // template can reference a real DataVolume. The disk starts Pending;
+      // useImages already polls while any image is Pending, so the caller
+      // sees it turn Ready without a reload.
+      try {
+        const created = await createImageFromCatalog.mutateAsync({
+          data: {
+            display_name: selectedImage.display_name || selectedImage.name,
+            source_registry: selectedImage.catalog_ref!,
+            disk_type: 'image',
+            persistent: false,
+          } as GoldenImageCreate,
+          namespace: selectedProject,
+        });
+        imageName = created.name;
+      } catch (err) {
+        setImportError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+    }
+
     const data: VMTemplateCreate = {
       name: isEditMode ? editTemplate.name : name,
       display_name: displayName,
       description: description || undefined,
       category,
       os_type: osType,
-      golden_image_name: goldenImageName,
+      golden_image_name: imageName,
       golden_image_namespace: selectedProject,
       compute: {
         cpu_cores: cpuCores,
@@ -445,7 +496,7 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
         serial_console_enabled: serialConsoleEnabled,
       },
     };
-    
+
     try {
       if (isEditMode) {
         await updateTemplate.mutateAsync({ name: editTemplate.name, data });
@@ -457,9 +508,9 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
       console.error(`Failed to ${isEditMode ? 'update' : 'create'} template:`, error);
     }
   };
-  
+
   const isValid = (isEditMode || name.length > 0) && displayName.length > 0 && selectedProject.length > 0 && goldenImageName.length > 0;
-  const isPending = createTemplate.isPending || updateTemplate.isPending;
+  const isPending = createTemplate.isPending || updateTemplate.isPending || createImageFromCatalog.isPending;
   const error = createTemplate.error || updateTemplate.error;
   
   return (
@@ -488,7 +539,7 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
         </div>
         
         <form onSubmit={handleSubmit} className="p-6 space-y-4">
-          {error && (
+          {(error || importError) && (
             <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-red-400 text-sm">
               {/*
                 The server's reason, not a shrug. "Please try again" was the
@@ -496,8 +547,12 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
                 exists" — advice that could not work, for a conflict with a
                 template the wizard filters out of its own list.
               */}
-              Failed to {isEditMode ? 'update' : 'create'} template:{' '}
-              {error instanceof Error ? error.message : String(error)}
+              {importError
+                ? <>Failed to import the catalogue image: {importError}</>
+                : <>
+                    Failed to {isEditMode ? 'update' : 'create'} template:{' '}
+                    {error instanceof Error ? error.message : String(error)}
+                  </>}
             </div>
           )}
           
@@ -612,7 +667,7 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
                 value={goldenImageName}
                 onChange={setGoldenImageName}
                 placeholder="Select an image..."
-                options={[{ value: '', label: 'Select an image...' }, ...projectImages.map(img => ({ value: img.name, label: `${img.display_name || img.name} (${img.size || 'N/A'})` }))]}
+                options={[{ value: '', label: 'Select an image...' }, ...imageOptions(projectImages)]}
               />
             )}
           </div>
@@ -734,7 +789,9 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
               {isPending ? (
                 <>
                   <Loader2 className="h-4 w-4 animate-spin" />
-                  {isEditMode ? 'Saving...' : 'Creating...'}
+                  {createImageFromCatalog.isPending
+                    ? 'Importing image...'
+                    : isEditMode ? 'Saving...' : 'Creating...'}
                 </>
               ) : (
                 <>
