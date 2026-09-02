@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from app.api.health import router as health_router
 from app.api.v1.router import router as api_v1_router
 from app.config import get_settings
+from app.core.harbor_client import HarborClient
 from app.core.k8s_client import K8sClient
 from app.core.vm_cache import VMCacheRegistry
 
@@ -37,6 +38,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Watch-backed VM list cache (lazy per namespace; populated on first request).
     app.state.vm_cache = VMCacheRegistry(k8s_client)
+
+    # Harbor catalogue client — holds no credential; every call carries the
+    # caller's own token. Safe to construct even when HARBOR_IMAGE_ENABLED is
+    # off, since nothing calls it in that case.
+    app.state.harbor_client = HarborClient()
 
     # Ensure system namespace exists (needed for SA tokens, settings, templates)
     SYSTEM_NAMESPACE = "kubevirt-ui-system"

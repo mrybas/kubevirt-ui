@@ -11,12 +11,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client.rest import ApiException
 
+from app.api.v1.images_catalog import catalog_images, merge
 from app.core.auth import User, require_auth
+from app.core.harbor_client import HarborUnauthorized, HarborUnavailable
 from app.core.operator import (
     OPERATOR_GROUP,
     OPERATOR_VERSION,
     OWNER_KIND_LABEL,
     OWNER_NAME_LABEL,
+    harbor_image_path_enabled,
     image_path_enabled,
 )
 from app.core.naming import DISPLAY_NAME_ANNOTATION, SLUG_LABEL, sanitize_display_name
@@ -383,8 +386,26 @@ async def list_golden_images(
             ns_labels_map,
         ))
 
-        return GoldenImageListResponse(items=images, total=len(images))
-    
+        # --- catalogue half -------------------------------------------------
+        # Off by default: with the flag unset this block does nothing and the
+        # response is byte-identical to before.
+        catalog_available = True
+        if harbor_image_path_enabled():
+            harbor = request.app.state.harbor_client
+            try:
+                catalog = await catalog_images(harbor, user.raw_token or "")
+                images = merge(images, catalog)
+            except HarborUnauthorized:
+                logger.info("harbor rejected the caller's token; listing cluster images only")
+                catalog_available = False
+            except HarborUnavailable as exc:
+                logger.warning("harbor unreachable (%s); listing cluster images only", exc)
+                catalog_available = False
+
+        return GoldenImageListResponse(
+            items=images, total=len(images), catalog_available=catalog_available
+        )
+
     except ApiException as e:
         logger.error(f"Failed to list images: {e}")
         raise HTTPException(

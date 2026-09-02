@@ -60,6 +60,26 @@ def mock_k8s_client() -> MagicMock:
 
 
 @pytest.fixture
+def mock_harbor_client() -> MagicMock:
+    """A Harbor that answers with one project, one repository, one tag.
+
+    Note this fake accepts ANY bearer token. That is fine for merge and
+    degradation tests and useless for proving token forwarding — a mock will
+    happily confirm an identity scheme that does not work. The e2e test in
+    Task 9 covers that claim against a real Harbor.
+    """
+    mock = MagicMock()
+    mock.list_projects = AsyncMock(return_value=[{"name": "vm-images-public"}])
+    mock.list_repositories = AsyncMock(
+        return_value=[{"name": "vm-images-public/ubuntu-2204"}]
+    )
+    mock.list_artifacts = AsyncMock(
+        return_value=[{"size": 2147483648, "tags": [{"name": "20260901"}]}]
+    )
+    return mock
+
+
+@pytest.fixture
 def mock_vm_cache(mock_k8s_client: MagicMock) -> MagicMock:
     """VM cache mock — delegates to ``mock_k8s_client.list_virtual_machines``.
 
