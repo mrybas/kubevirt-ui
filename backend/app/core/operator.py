@@ -221,6 +221,16 @@ def peering_path_enabled() -> bool:
     return _enabled("OPERATOR_PEERING_ENABLED")
 
 
+def harbor_image_path_enabled() -> bool:
+    """True when images may also come from a Harbor catalogue.
+
+    Off: the image list is exactly the cluster's DataVolumes, as before.
+    On: the list additionally carries Harbor artifacts the requesting user is
+    allowed to see, and the publish and materialise endpoints are mounted.
+    """
+    return _enabled("HARBOR_IMAGE_ENABLED")
+
+
 # The group the operator's custom resources live in.
 OPERATOR_GROUP = "platform.kubevirt-ui.io"
 OPERATOR_VERSION = "v1alpha1"

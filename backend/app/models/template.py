@@ -151,6 +151,13 @@ class VMImage(BaseModel):
     scope: str = "environment"  # "environment" (single ns) or "project" (all envs)
     project: str | None = None  # Project name (set for project-scoped images)
     environment: str | None = None  # Environment name (from namespace label)
+    # Where this row came from. "cluster" is a DataVolume that exists; "catalog"
+    # is a Harbor artifact that has not been materialised yet.
+    origin: str = "cluster"
+    # "<project>/<repository>:<tag>" when the row has a Harbor counterpart.
+    # Present on catalog rows and on cluster rows imported from Harbor, which is
+    # what lets the two be merged into one row.
+    catalog_ref: str | None = None
 
 
 class VMImageCreate(BaseModel):
@@ -205,6 +212,10 @@ class VMImageListResponse(BaseModel):
 
     items: list[VMImage]
     total: int
+    # False when the catalogue could not be read. The cluster rows are still
+    # correct and complete; only the catalogue half is missing. The list must
+    # never fail outright because Harbor is down.
+    catalog_available: bool = True
 
 
 class VMImageUpdate(BaseModel):

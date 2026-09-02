@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from app.config import get_settings
 from app.core.auth import require_auth
+from app.core.operator import harbor_image_path_enabled
 from app.api.v1.auth import router as auth_router
 from app.api.v1.cluster import router as cluster_router
 from app.api.v1.users import users_router, groups_router
@@ -45,7 +46,10 @@ settings = get_settings()
 
 @router.get("/features", tags=["Features"])
 async def get_features():
-    return {"enableTenants": settings.enable_tenants}
+    return {
+        "enableTenants": settings.enable_tenants,
+        "enableHarborImages": harbor_image_path_enabled(),
+    }
 
 
 # Everything except /auth sits behind authentication.
