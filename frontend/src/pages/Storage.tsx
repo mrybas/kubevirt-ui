@@ -39,6 +39,7 @@ import { useGoldenImages, useCreateGoldenImage, useDeleteGoldenImage } from '../
 import { useNamespaces } from '../hooks/useNamespaces';
 import { useFoldersFlat } from '../hooks/useFolders';
 import { FolderBreadcrumb } from '../components/folders/FolderBreadcrumb';
+import { ImageRows, type ImageRowItem } from '../components/images/ImageRows';
 import { LoadingSkeleton } from '../components/common/LoadingSkeleton';
 import { usePagination } from '../hooks/usePagination';
 import { Pagination } from '../components/common/Pagination';
@@ -68,7 +69,7 @@ export function Storage() {
   const [deleteModalDisk, setDeleteModalDisk] = useState<Disk | null>(null);
   useEffect(() => { setPage(1); }, [searchQuery, filterProject, filterEnv, filterFolder, activeTab]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const { data: imagesData, isLoading, refetch: refetchImages } = useGoldenImages(selectedNamespace || undefined);
+  const { data: imagesData, catalogAvailable, isLoading, refetch: refetchImages } = useGoldenImages(selectedNamespace || undefined);
   const { data: namespacesData } = useNamespaces();
   const { data: scData } = useStorageClasses();
   const { data: foldersData } = useFoldersFlat();
@@ -149,6 +150,32 @@ export function Storage() {
     await createMutation.mutateAsync({ data: createData as any, namespace });
     setShowImportImageModal(false);
     setShowNewDiskModal(false);
+  };
+
+  // Materialise a catalogue-only row into a real disk. Unlike handleCreate,
+  // this has no form to show a refusal inline, so it reports one itself —
+  // createMutation's errors are `handledLocally` and would otherwise be
+  // silently dropped.
+  const handleCreateFromCatalog = async (item: ImageRowItem) => {
+    if (!item.catalog_ref) return;
+    if (!selectedNamespace) {
+      notify.error('Select a project', 'Choose a project/environment before creating a disk from the catalog.');
+      return;
+    }
+    try {
+      await createMutation.mutateAsync({
+        data: {
+          display_name: item.display_name || item.name,
+          source_registry: item.catalog_ref,
+          disk_type: 'image',
+          persistent: false,
+        } as GoldenImageCreate & { disk_type: DiskType; persistent: boolean },
+        namespace: selectedNamespace,
+      });
+      notify.success('Import started', `Creating a disk from ${item.catalog_ref}.`);
+    } catch (e) {
+      notify.error('Could not create disk', e instanceof Error ? e.message : String(e));
+    }
   };
 
   const handleDelete = (disk: Disk) => {
@@ -426,7 +453,16 @@ export function Storage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-surface-800">
-              {paginatedDisks.map((disk) => {
+              {activeTab === 'images' ? (
+                <ImageRows
+                  items={paginatedDisks}
+                  catalogAvailable={catalogAvailable}
+                  onRowClick={(item) => navigate(`/storage/${item.namespace}/${item.name}`)}
+                  onDelete={(item) => handleDelete(item as Disk)}
+                  onCreateFromCatalog={handleCreateFromCatalog}
+                />
+              ) : (
+              paginatedDisks.map((disk) => {
                 const status = mapStatus(disk.status, disk.used_by);
                 const vmCount = disk.used_by?.length || 0;
                 return (
@@ -502,7 +538,8 @@ export function Storage() {
                     </td>
                   </tr>
                 );
-              })}
+              })
+              )}
             </tbody>
           </table>
           <Pagination

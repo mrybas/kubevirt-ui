@@ -94,6 +94,14 @@ export interface GoldenImage {
   scope: ImageScope;  // environment (single ns) or project (all envs)
   project?: string;  // Project name (for project-scoped images)
   environment?: string;  // Environment name (from namespace label)
+  // Where this row came from. "cluster" is a DataVolume that exists; "catalog"
+  // is a Harbor artifact that has not been materialised into a disk yet.
+  // Optional here (the backend always sends it, defaulting to "cluster") so
+  // it stays compatible with anything that builds a GoldenImage by hand.
+  origin?: 'cluster' | 'catalog';
+  // "<project>/<repository>:<tag>" when the row has a Harbor counterpart —
+  // present on catalog rows and on cluster rows imported from Harbor.
+  catalog_ref?: string | null;
 }
 
 export interface GoldenImageCreate {
@@ -123,6 +131,12 @@ export interface GoldenImageUpdate {
 export interface GoldenImageListResponse {
   items: GoldenImage[];
   total: number;
+  // False when the catalogue could not be read (Harbor down, or the caller's
+  // token was rejected). The cluster rows above are still correct and
+  // complete — this is only a signal to show a non-blocking warning.
+  // Optional/defaulted true so a response from before this flag existed is
+  // still read as "the catalogue is fine".
+  catalog_available?: boolean;
 }
 
 export interface CreateImageFromDiskRequest {
