@@ -237,20 +237,23 @@ class TestTheHappyPathOrderingAndOwnership:
         assert response.status_code == 202
         assert response.json()["job"] == "publish-ubuntu-disk"
 
-        # Job created before either dependent.
+        # Job created before any dependent.
         assert batch_api.create_namespaced_job.call_count == 1
         assert custom_api.create_namespaced_custom_object.call_count == 1
-        assert mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_count == 1
+        # Two PVC creates: the temporary clone and, because the default fake
+        # source disk is Block-mode, the scratch PVC too.
+        assert mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_count == 2
 
         snapshot_body = custom_api.create_namespaced_custom_object.call_args.kwargs["body"]
-        pvc_body = mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_args.kwargs["body"]
-        for owned in (snapshot_body, pvc_body):
+        pvc_calls = mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_args_list
+        pvc_bodies = [call.kwargs["body"] for call in pvc_calls]
+        for owned in (snapshot_body, *pvc_bodies):
             owner = owned["metadata"]["ownerReferences"][0]
             assert owner["kind"] == "Job"
             assert owner["uid"] == "the-real-uid-from-the-cluster"
             assert owner["controller"] is True
 
-        # Unsuspended only after both dependents exist.
+        # Unsuspended only after every dependent exists.
         batch_api.patch_namespaced_job.assert_called_once()
         assert batch_api.patch_namespaced_job.call_args.kwargs["body"] == {
             "spec": {"suspend": False}
@@ -295,7 +298,12 @@ class TestTheHappyPathOrderingAndOwnership:
             response = _post(client)
 
         assert response.status_code == 202
-        pvc_body = mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_args.kwargs["body"]
+        # The FIRST PVC create is the temporary clone (the one built from the
+        # snapshot); a second one — the scratch PVC, since the default fake
+        # source disk here is Block-mode — follows it and is sized from the
+        # source capacity, not the snapshot's restoreSize.
+        first_call = mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_args_list[0]
+        pvc_body = first_call.kwargs["body"]
         assert pvc_body["spec"]["resources"]["requests"]["storage"] == "45Gi"
 
     def test_the_job_pushes_with_the_robot_secret_and_never_the_callers_token(
@@ -342,6 +350,82 @@ class TestTheHappyPathOrderingAndOwnership:
 
         import json
         assert "caller-oidc-token-must-not-leak" not in json.dumps(job_body)
+
+    def test_a_block_source_disk_gets_volume_devices_and_a_scratch_pvc(
+        self, client: TestClient, mock_k8s_client: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Critical 5: a Block PVC has no filesystem for volumeMounts to
+        attach to at all — Kubernetes leaves such a Pod stuck in
+        ContainerCreating/FailedMount rather than refusing it up front, so
+        this has to be right, not just plausible-looking.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        mock_k8s_client.core_api.read_namespaced_persistent_volume_claim = AsyncMock(
+            return_value=_fake_source_pvc(volume_mode="Block", capacity="20Gi")
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202
+        job_body = batch_api.create_namespaced_job.call_args.kwargs["body"]
+        container = job_body["spec"]["template"]["spec"]["containers"][0]
+
+        assert container["volumeDevices"] == [
+            {"name": "disk", "devicePath": "/dev/publish-disk"}
+        ]
+        # No volumeMounts entry names the "disk" volume — only the scratch
+        # PVC is mounted as a filesystem.
+        mounted_names = {vm["name"] for vm in container.get("volumeMounts", [])}
+        assert "disk" not in mounted_names
+        assert "scratch" in mounted_names
+
+        script = " ".join(container.get("args", []))
+        assert "/dev/publish-disk" in script
+        assert "dd " in script or "dd if=" in script
+
+        # The scratch PVC is among the dependents, owned by the Job like the
+        # others, and created (cleanup still covers everything).
+        pvc_calls = mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_args_list
+        pvc_bodies = [call.kwargs["body"] for call in pvc_calls]
+        scratch_bodies = [b for b in pvc_bodies if b["metadata"]["name"].endswith("-scratch")]
+        assert len(scratch_bodies) == 1
+        scratch_body = scratch_bodies[0]
+        assert scratch_body["spec"]["volumeMode"] == "Filesystem"
+        owner = scratch_body["metadata"]["ownerReferences"][0]
+        assert owner["kind"] == "Job"
+        assert owner["controller"] is True
+
+    def test_a_filesystem_source_disk_gets_volume_mounts_and_no_scratch_pvc(
+        self, client: TestClient, mock_k8s_client: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        mock_k8s_client.core_api.read_namespaced_persistent_volume_claim = AsyncMock(
+            return_value=_fake_source_pvc(volume_mode="Filesystem", capacity="20Gi")
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202
+        job_body = batch_api.create_namespaced_job.call_args.kwargs["body"]
+        container = job_body["spec"]["template"]["spec"]["containers"][0]
+
+        assert "volumeDevices" not in container
+        assert container["volumeMounts"] == [
+            {"name": "disk", "mountPath": "/work/disk", "readOnly": True}
+        ]
+
+        script = " ".join(container.get("args", []))
+        assert "cd /work" in script
+        assert "dd " not in script and "dd if=" not in script
+
+        # Exactly one PVC create — no scratch PVC for a Filesystem source.
+        assert mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_count == 1
 
 
 class TestCleanupOnFailure:

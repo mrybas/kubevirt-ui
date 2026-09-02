@@ -1437,17 +1437,25 @@ async def publish_image(
         publish_job(
             req.namespace, req.disk_name, ref,
             registry=registry, secret_name=req.secret_name,
+            volume_mode=volume_mode,
         ),
     )
     job_name = job["metadata"]["name"]
     job_uid = job["metadata"]["uid"]
 
     try:
-        snapshot_obj, pvc_obj = publish_dependents(
+        # [snapshot, temporary PVC] always; a third element — a Filesystem
+        # scratch PVC the Job `dd`s the raw device into before tarring —
+        # only when the source is Block. A Block PVC has no filesystem for
+        # `volumeMounts` to attach to, so `publish_job` attaches it as a raw
+        # device instead; see `image_publish.py` for the container-spec side
+        # of this same branch.
+        dependents = publish_dependents(
             req.namespace, req.disk_name, job_name, job_uid,
             storage_class=storage_class, volume_mode=volume_mode,
             access_modes=access_modes, storage_size=source_capacity,
         )
+        snapshot_obj, pvc_obj, *extra_dependents = dependents
         created_snapshot = await create_object(k8s_client, snapshot_obj)
 
         # The snapshot's own restoreSize when the storage backend already
@@ -1462,6 +1470,8 @@ async def publish_image(
         pvc_obj["spec"]["resources"]["requests"]["storage"] = restore_size
 
         await create_object(k8s_client, pvc_obj)
+        for extra in extra_dependents:
+            await create_object(k8s_client, extra)
         await unsuspend_job(k8s_client, req.namespace, job_name)
     except Exception as exc:
         # Cleanup here has to be unconditional, not just for ApiException: a

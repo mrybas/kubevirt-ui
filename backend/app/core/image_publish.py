@@ -12,13 +12,20 @@ from typing import Any
 
 PUBLISH_IMAGE = "gcr.io/go-containerregistry/crane:debug"
 
-# The lab's existing publish pattern: pack the mounted disk into a single-layer
-# OCI image and append it to an empty base — the shape both CDI's
-# `source.registry` and KubeVirt's `containerDisk` can consume. Mounted at
-# `/work/disk` (not `/disk`) so `tar -cf layer.tar disk`, run from `/work`,
-# produces a layer with the disk file under `disk/`, matching that pattern
-# exactly rather than a bare disk file at the tar root.
-_PUSH_SCRIPT = (
+# Where the raw block device is attached when the source disk is Block-mode.
+# volumeDevices (not volumeMounts) is the only way Kubernetes exposes a Block
+# PVC to a container — there is no filesystem underneath it to mount.
+_BLOCK_DEVICE_PATH = "/dev/publish-disk"
+
+# The lab's existing publish pattern: pack the disk into a single-layer OCI
+# image and append it to an empty base — the shape both CDI's
+# `source.registry` and KubeVirt's `containerDisk` can consume, a directory
+# called `disk/` holding the image file, whatever it is named inside.
+#
+# Filesystem source: the temporary PVC mounts as a filesystem at `/work/disk`
+# (not `/disk`), so `disk` is already that directory and `tar -cf layer.tar
+# disk`, run from `/work`, needs nothing else.
+_FILESYSTEM_PUSH_SCRIPT = (
     "set -eu; "
     "cd /work && "
     "tar -cf layer.tar disk && "
@@ -26,15 +33,44 @@ _PUSH_SCRIPT = (
     'crane append --oci-empty-base -f layer.tar -t "$REF"'
 )
 
+# Block source: there is no filesystem to mount, so the temporary PVC is
+# attached as a raw block device instead (`volumeDevices`), and `dd` copies it
+# into a regular file — a block device cannot be tarred directly, and crane
+# needs a regular file — on a scratch PVC (never emptyDir: a disk this size
+# on node ephemeral storage risks evicting unrelated pods through disk
+# pressure). The scratch PVC is written to (and the layer built) entirely on
+# that persistent volume, not the container's own ephemeral writable layer,
+# for the same reason.
+_BLOCK_PUSH_SCRIPT = (
+    "set -eu; "
+    "mkdir -p /scratch/disk && "
+    f'dd if="{_BLOCK_DEVICE_PATH}" of=/scratch/disk/disk.img bs=4M && '
+    "cd /scratch && "
+    "tar -cf layer.tar disk && "
+    'crane auth login "$REGISTRY" -u "$ROBOT_USER" -p "$ROBOT_PASS" && '
+    'crane append --oci-empty-base -f layer.tar -t "$REF"'
+)
+
 
 def cleanup_names(job_name: str) -> tuple[str, str]:
-    """Names of the two objects a publish leaves behind if it dies.
+    """Names of the two objects every publish leaves behind if it dies.
 
     Derived from the Job name so cleanup never has to guess, and never has to
     be told the source disk's name — deleting that would destroy the very disk
     the user asked to publish.
     """
     return f"{job_name}-snap", f"{job_name}-tmp"
+
+
+def scratch_pvc_name(job_name: str) -> str:
+    """Name of the Filesystem-mode scratch PVC a Block-mode publish needs.
+
+    A Block source PVC has no filesystem to mount, so the Job `dd`s it into a
+    regular file on this PVC before tarring. Named off the Job like the other
+    dependents — see `cleanup_names` — so cleanup never has to be told this
+    name either, and this one is created only when the source disk is Block.
+    """
+    return f"{job_name}-scratch"
 
 
 def publish_job(
@@ -45,6 +81,7 @@ def publish_job(
     registry: str = "",
     secret_name: str = "",
     active_deadline_seconds: int = 1800,
+    volume_mode: str = "Block",
 ) -> dict[str, Any]:
     """The publish Job, created SUSPENDED so it can own its dependents.
 
@@ -52,17 +89,28 @@ def publish_job(
     is created. Creating the snapshot and PVC first would leave them ownerless
     and therefore un-reaped when the Job fails.
 
-    The container actually pushes: it packs the read-only-mounted disk into
-    the containerDisk layout and pushes it with crane, authenticating with the
-    tenant's robot credential — a Secret in the target namespace holding
-    CDI's own `accessKeyId`/`secretKey` shape, the same Secret CDI pulls with.
-    Pushing is a registry operation, the one place a robot account works.
+    The container actually pushes: it packs the disk into the containerDisk
+    layout and pushes it with crane, authenticating with the tenant's robot
+    credential — a Secret in the target namespace holding CDI's own
+    `accessKeyId`/`secretKey` shape, the same Secret CDI pulls with. Pushing
+    is a registry operation, the one place a robot account works.
 
-    `registry`/`secret_name` default empty so the existing unit tests here,
-    which only assert on the Job's shape (suspend flag, naming), do not have
-    to supply them. A real publish always passes both — without a registry
-    host the push has nowhere to go, and without a secret it has nothing to
-    authenticate with.
+    `volume_mode` picks how the temporary PVC (named via `cleanup_names`) is
+    attached, because that decision belongs to the container spec, not the
+    PVC's own spec: `"Block"` (this codebase's convention for VM disk PVCs —
+    see `images.py`'s "Required for snapshot-based cloning" DataVolume specs)
+    gets `volumeDevices` plus a `dd`-then-tar script reading from
+    `_BLOCK_DEVICE_PATH`, backed by a scratch PVC (see `scratch_pvc_name`) for
+    the copy `dd` produces, since a Block volume has no filesystem for
+    `volumeMounts` to attach to at all — Kubernetes leaves such a Pod stuck in
+    `ContainerCreating`/`FailedMount` rather than refusing it up front.
+    Anything else (`"Filesystem"`) keeps the original `volumeMounts` path
+    unchanged.
+
+    `registry`/`secret_name` default empty so callers that only assert on the
+    Job's shape (suspend flag, naming) do not have to supply them. A real
+    publish always passes both — without a registry host the push has
+    nowhere to go, and without a secret it has nothing to authenticate with.
 
     `activeDeadlineSeconds` bounds a publish that hangs (a snapshot restore
     that never binds, a registry that never answers) so it fails loudly
@@ -87,10 +135,48 @@ def publish_job(
             },
         })
 
+    job_name = f"publish-{pvc}"
+    tmp_name = cleanup_names(job_name)[1]
+
+    container: dict[str, Any] = {
+        "name": "publish",
+        "image": PUBLISH_IMAGE,
+        "command": ["/bin/sh", "-c"],
+        "env": env,
+    }
+
+    if volume_mode == "Block":
+        container["args"] = [_BLOCK_PUSH_SCRIPT]
+        container["volumeDevices"] = [
+            {"name": "disk", "devicePath": _BLOCK_DEVICE_PATH}
+        ]
+        container["volumeMounts"] = [{"name": "scratch", "mountPath": "/scratch"}]
+        volumes = [
+            {
+                "name": "disk",
+                "persistentVolumeClaim": {"claimName": tmp_name, "readOnly": True},
+            },
+            {
+                "name": "scratch",
+                "persistentVolumeClaim": {"claimName": scratch_pvc_name(job_name)},
+            },
+        ]
+    else:
+        container["args"] = [_FILESYSTEM_PUSH_SCRIPT]
+        container["volumeMounts"] = [
+            {"name": "disk", "mountPath": "/work/disk", "readOnly": True}
+        ]
+        volumes = [
+            {
+                "name": "disk",
+                "persistentVolumeClaim": {"claimName": tmp_name, "readOnly": True},
+            },
+        ]
+
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {"name": f"publish-{pvc}", "namespace": namespace},
+        "metadata": {"name": job_name, "namespace": namespace},
         "spec": {
             "suspend": True,
             "backoffLimit": 1,
@@ -99,31 +185,8 @@ def publish_job(
             "template": {
                 "spec": {
                     "restartPolicy": "Never",
-                    "containers": [
-                        {
-                            "name": "publish",
-                            "image": PUBLISH_IMAGE,
-                            "command": ["/bin/sh", "-c"],
-                            "args": [_PUSH_SCRIPT],
-                            "env": env,
-                            "volumeMounts": [
-                                {
-                                    "name": "disk",
-                                    "mountPath": "/work/disk",
-                                    "readOnly": True,
-                                }
-                            ],
-                        }
-                    ],
-                    "volumes": [
-                        {
-                            "name": "disk",
-                            "persistentVolumeClaim": {
-                                "claimName": cleanup_names(f"publish-{pvc}")[1],
-                                "readOnly": True,
-                            },
-                        }
-                    ],
+                    "containers": [container],
+                    "volumes": volumes,
                 }
             },
         },
@@ -141,7 +204,8 @@ def publish_dependents(
     access_modes: list[str] | None = None,
     storage_size: str = "1Gi",
 ) -> list[dict[str, Any]]:
-    """The snapshot and the temporary PVC, both owned by the Job.
+    """The snapshot, the temporary PVC, and — for a Block source — the scratch
+    PVC the Job's `dd` writes into. All owned by the Job.
 
     Ownership is what makes cleanup unconditional: Kubernetes reaps these when
     the Job goes, whether it succeeded, failed, or was deleted by hand.
@@ -151,8 +215,15 @@ def publish_dependents(
     `disks.py`'s `rollback_snapshot` — and asks for a real size rather than a
     placeholder. Most CSI provisioners silently refuse (leave the PVC
     `Pending` forever, no `ApiException` this handler could ever see) a
-    request smaller than the snapshot's `restoreSize`. `storage_class`/
-    `access_modes`/`storage_size` default to values that keep the existing
+    request smaller than the snapshot's `restoreSize`.
+
+    The scratch PVC (present only when `volume_mode == "Block"`) is always
+    `Filesystem` — `dd` needs somewhere to write a regular file — sized the
+    same as the temporary PVC, since it holds a full copy of the same disk.
+    Accepted cost: a Block publish transiently needs roughly twice the disk's
+    size (the thin snapshot clone plus this scratch copy).
+
+    `storage_class`/`access_modes`/`storage_size` default to values that keep
     planner-only unit tests working without a live disk to read from; a real
     publish always supplies the source PVC's own values.
     """
@@ -167,7 +238,7 @@ def publish_dependents(
             "blockOwnerDeletion": False,
         }
     ]
-    return [
+    dependents: list[dict[str, Any]] = [
         {
             "apiVersion": "snapshot.storage.k8s.io/v1",
             "kind": "VolumeSnapshot",
@@ -199,6 +270,25 @@ def publish_dependents(
             },
         },
     ]
+
+    if volume_mode == "Block":
+        dependents.append({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": scratch_pvc_name(job_name),
+                "namespace": namespace,
+                "ownerReferences": owner,
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": storage_class,
+                "volumeMode": "Filesystem",
+                "resources": {"requests": {"storage": storage_size}},
+            },
+        })
+
+    return dependents
 
 
 async def assert_tag_is_free(
