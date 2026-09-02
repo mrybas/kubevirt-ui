@@ -14,6 +14,24 @@ import pytest
 from app.api.v1.vms import VMFromTemplateRequest
 from app.models.template import CreateImageFromDiskRequest
 
+@pytest.fixture(autouse=True)
+def _namespace_access_is_not_what_these_prove(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These call the image handlers directly to inspect what they WRITE.
+
+    The handlers refuse a namespace the caller has no binding in, which needs a
+    cluster's worth of RBAC to satisfy and has nothing to do with the object
+    under inspection here. It is proven once, deliberately, in
+    `test_an_image_endpoint_refuses_someone_elses_namespace.py`; making thirty
+    more tests re-prove it would only mean thirty places to weaken it from.
+    """
+    from app.api.v1 import images
+
+    async def _allow(request, user, namespace) -> None:
+        return None
+
+    monkeypatch.setattr(images, "require_namespace_access", _allow)
+
+
 
 def _source_pvc(storage_class: str = "ceph-block-ec") -> MagicMock:
     pvc = MagicMock()

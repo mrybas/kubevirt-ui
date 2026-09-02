@@ -23,6 +23,7 @@ from kubernetes_asyncio.client.rest import ApiException
 
 from app.core.auth import User
 from app.core.harbor_client import HarborNotFound, HarborUnauthorized, HarborUnavailable
+from app.core.harbor_client import harbor_robot_secret_name
 
 PUBLISH_BODY = {
     "namespace": "tenant-a",
@@ -30,7 +31,6 @@ PUBLISH_BODY = {
     "project": "vm-images-tenant-a",
     "repository": "ubuntu-2204",
     "tag": "20260902",
-    "secret_name": "harbor-robot-tenant-a",
 }
 
 
@@ -281,7 +281,6 @@ class TestTheGateAndTheRefusals:
             {"repository": "ubuntu-2204\n"},
             {"namespace": "tenant-a\n"},
             {"disk_name": "ubuntu-disk\n"},
-            {"secret_name": "harbor-robot-tenant-a\n"},
         ],
     )
     def test_a_coordinate_that_is_not_a_coordinate_is_refused_with_422(
@@ -341,7 +340,10 @@ class TestTheGateAndTheRefusals:
             response = _post(client)
 
         assert response.status_code == 422
-        assert "harbor-robot-tenant-a" in response.json()["detail"]
+        # The derived name, not one the request chose: naming it in the
+        # refusal is only useful if it is the name the server will actually
+        # read.
+        assert harbor_robot_secret_name() in response.json()["detail"]
         batch_api.create_namespaced_job.assert_not_called()
 
     def test_a_missing_disk_is_reported_as_404_before_anything_is_created(
@@ -500,7 +502,7 @@ class TestTheHappyPathOrderingAndOwnership:
 
         Pins the container's command (crane push, not an idle default
         entrypoint), the credential source (a secretKeyRef naming the
-        request's `secret_name`, in CDI's own accessKeyId/secretKey shape —
+        server-derived robot Secret, in CDI's own accessKeyId/secretKey shape —
         never a docker config, never inline creds), and the absence of the
         caller's own OIDC token anywhere in the Job body — that token is for
         Harbor's management API only, and must never reach the registry
@@ -524,10 +526,10 @@ class TestTheHappyPathOrderingAndOwnership:
 
         env_by_name = {e["name"]: e for e in container["env"]}
         assert env_by_name["ROBOT_USER"]["valueFrom"]["secretKeyRef"] == {
-            "name": "harbor-robot-tenant-a", "key": "accessKeyId",
+            "name": harbor_robot_secret_name(), "key": "accessKeyId",
         }
         assert env_by_name["ROBOT_PASS"]["valueFrom"]["secretKeyRef"] == {
-            "name": "harbor-robot-tenant-a", "key": "secretKey",
+            "name": harbor_robot_secret_name(), "key": "secretKey",
         }
         assert "harbor.example" in env_by_name["REF"]["value"]
 

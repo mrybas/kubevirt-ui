@@ -10,7 +10,7 @@ import os
 from typing import Any
 from urllib.parse import urlparse
 
-from app.core.harbor_client import harbor_registry_host
+from app.core.harbor_client import HarborNotFound, harbor_registry_host
 from app.models.template import VMImage
 
 logger = logging.getLogger(__name__)
@@ -254,3 +254,39 @@ async def catalog_images(harbor: Any, token: str) -> tuple[list[VMImage], bool]:
         raise first
 
     return rows, failed == 0
+
+
+async def assert_catalogue_ref_visible(harbor: Any, token: str, catalog_ref: str) -> None:
+    """The caller must be able to see the artifact they are about to pull.
+
+    The two identities in this feature are deliberately different: the
+    catalogue is READ as the caller, and the image is PULLED as the namespace's
+    robot. Nothing joined them, so materialise accepted any `catalog_ref` that
+    matched the pattern and let the robot fetch it — and the robot's read
+    covers the whole registry, not the caller's slice of it.
+
+    Concretely, before this: a user whose token cannot list project `finance`,
+    so that project never appears in their `GET /images`, could still post
+    `catalog_ref: "finance/db-golden:1"` and receive that private disk in their
+    own namespace. Nothing in the request was invalid; the pattern was the only
+    thing checked.
+
+    So the caller's own token asks Harbor for the artifact. Harbor answers per
+    user, which is why this file does no visibility filtering of its own — a
+    404 here is Harbor's answer, not ours.
+    """
+    project, _, rest = catalog_ref.partition("/")
+    repository, _, tag = rest.rpartition(":")
+
+    rows = await harbor.list_artifacts(token, project, repository)
+    for artifact in rows:
+        for entry in artifact.get("tags") or []:
+            if entry.get("name") == tag:
+                return
+
+    # The repository is visible and the tag is not, which is a different fact
+    # from "no such repository" — but only to us. Both answer the same way, so
+    # that a caller cannot map another project's contents by elimination.
+    raise HarborNotFound(
+        f"Harbor has no artifact {catalog_ref} visible to this caller"
+    )

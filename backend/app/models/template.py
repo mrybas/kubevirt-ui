@@ -360,12 +360,19 @@ class ImagePublishRequest(BaseModel):
     name the source PVC and the VM using it keeps running throughout.
     `project`/`repository`/`tag` name where the pushed image lands in Harbor.
 
-    `secret_name` names the tenant's robot credential Secret, in this same
-    `namespace` — the harbor-robots chart provisions it there. Required:
-    Harbor never accepts an anonymous push. Unlike the pull direction, naming
-    it here leaks nothing: the push target is always
-    `harbor_registry_host()`, never a caller-supplied URL, and `namespace` is
-    checked against the caller's own bindings before this Secret is read.
+    The robot credential Secret is NOT named here. It is derived server-side
+    from `harbor_robot_secret_name()`, in this same `namespace` — the
+    harbor-robots chart provisions it there, and Harbor never accepts an
+    anonymous push.
+
+    It used to be a field, defended on the grounds that naming it leaks
+    nothing: the push target is always `harbor_registry_host()` and the
+    namespace is checked first. Both true, and neither is the point — any
+    Secret in a namespace the caller holds that happens to carry
+    accessKeyId/secretKey could be selected and handed to `crane auth login`.
+    The pull direction had already settled this the other way, and two halves
+    of one feature disagreeing about who names a credential is how one of them
+    ends up being the wrong half.
     """
 
     namespace: str
@@ -373,4 +380,3 @@ class ImagePublishRequest(BaseModel):
     project: str
     repository: str
     tag: str
-    secret_name: str

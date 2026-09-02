@@ -12,7 +12,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client.rest import ApiException
 
-from app.api.v1.images_catalog import catalog_images, merge
+from app.api.v1.images_catalog import (
+    assert_catalogue_ref_visible,
+    catalog_images,
+    merge,
+)
 # One implementation of the namespace guard, not two. storage.py is where it
 # was written and where its docstring records the bug class it exists for
 # (a namespace in a query string is not an authorisation); importing it keeps
@@ -26,6 +30,7 @@ from app.core.errors import (
     validate_oci_tag,
 )
 from app.core.harbor_client import (
+    HarborNotFound,
     HarborUnauthorized,
     HarborUnavailable,
     harbor_ca_configmap_name,
@@ -174,7 +179,18 @@ async def list_golden_images(
             logger.warning(f"Failed to list project namespaces: {e}")
     
     if not namespaces_to_check:
-        return GoldenImageListResponse(items=[], total=0)
+        # `catalog_available` defaults to True, so returning the bare response
+        # here asserted that the catalogue was complete while Harbor had not
+        # been asked at all — an empty list that sounds authoritative. A caller
+        # with no enabled namespace, or one whose namespace listing failed
+        # above (logged and continued), got exactly that.
+        #
+        # False is the honest answer: nothing was read, so nothing is claimed.
+        # Serving the catalogue rows here instead would be better still —
+        # they do not depend on a namespace — and is left out deliberately,
+        # because doing it properly means moving the Harbor block above this
+        # return and that is a change to the shape of this handler, not a fix.
+        return GoldenImageListResponse(items=[], total=0, catalog_available=False)
     
     try:
         # Pre-fetch namespace labels for project/environment resolution
@@ -449,8 +465,14 @@ async def list_golden_images(
                 )
                 catalog_available = False
             else:
-                harbor = request.app.state.harbor_client
                 try:
+                    # Inside the try, not above it. `app.state.harbor_client`
+                    # is absent if the lifespan never ran or ran partially,
+                    # and an AttributeError raised one line higher is not an
+                    # ApiException — it escaped every handler here and became
+                    # a 500 on the whole list, which is the one thing this
+                    # block promises cannot happen.
+                    harbor = request.app.state.harbor_client
                     catalog, complete = await catalog_images(harbor, user.raw_token)
                     images = merge(images, catalog)
                     catalog_available = complete
@@ -942,6 +964,19 @@ async def create_golden_image(
     - environment (default): image lives in this namespace only
     - project: image is labeled as available to all envs in the project
     """
+    # The namespace arrives as a query parameter and is read with the UI's own
+    # ServiceAccount, which can read every namespace. Until this line the only
+    # thing between a caller and someone else's project was knowing its name.
+    #
+    # It predates the catalogue, and the catalogue is what made it load-bearing:
+    # this handler now attaches THAT namespace's Harbor robot credential to the
+    # pull, so an unchecked namespace spends another tenant's credential, hits
+    # another tenant's quota, and leaves the disk where they can see it.
+    #
+    # 404 rather than 403, matching storage.py and the VM path: whether a
+    # namespace exists is not this caller's business either.
+    await require_namespace_access(request, user, namespace)
+
     k8s_client = request.app.state.k8s_client
 
     # Refused before anything is written, like a tenant and a template with a
@@ -1039,6 +1074,44 @@ async def create_golden_image(
                         "cannot be turned into a disk"
                     ),
                 )
+            # The catalogue is read as the caller and pulled as the robot, and
+            # until this line nothing joined the two: any `catalog_ref` that
+            # matched the pattern was fetched with the namespace robot, whose
+            # read covers the whole registry rather than the caller's slice of
+            # it. Harbor answers per user, so the caller's own token is what
+            # decides — and a rejected identity is refused rather than being
+            # handed the disk anyway.
+            raw_token = getattr(user, "raw_token", None)
+            if not raw_token:
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        "a catalogue image needs your own identity to check "
+                        "what you may see, and this request carries none"
+                    ),
+                )
+            try:
+                await assert_catalogue_ref_visible(
+                    request.app.state.harbor_client, raw_token, image.catalog_ref,
+                )
+            except HarborUnauthorized as exc:
+                raise HTTPException(
+                    status_code=403, detail="Harbor rejected your identity",
+                ) from exc
+            except HarborNotFound as exc:
+                # Same answer for "no such artifact" and "not yours", so the
+                # catalogue cannot be mapped by elimination.
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No catalogue image '{image.catalog_ref}'",
+                ) from exc
+            except HarborUnavailable as exc:
+                # Never a pull on a guess: if Harbor cannot say, we do not act.
+                raise HTTPException(
+                    status_code=503,
+                    detail="Harbor is unreachable, so this cannot be checked",
+                ) from exc
+
             registry_url = f"docker://{host}/{image.catalog_ref}"
 
         # THE CREDENTIAL FOLLOWS THE HOST, AND ONLY THE HOST.
@@ -1283,6 +1356,11 @@ async def delete_golden_image(
     would watch a deleted image reappear. Ownership is stamped on the object, so
     it keeps being true after the flag is turned back off.
     """
+    # See create_golden_image: the namespace is a query parameter read with a
+    # ServiceAccount that can see every namespace. Deleting is the reading
+    # gap's louder half — it does not leak someone else's image, it removes it.
+    await require_namespace_access(request, user, namespace)
+
     k8s_client = request.app.state.k8s_client
 
     try:
@@ -1325,6 +1403,10 @@ async def update_golden_image(
     
     Patches labels and annotations on the DataVolume in-place.
     """
+    # See create_golden_image. Renaming someone else's image is quieter than
+    # deleting it and harder to notice afterwards.
+    await require_namespace_access(request, user, namespace)
+
     k8s_client = request.app.state.k8s_client
     custom_api = client.CustomObjectsApi(k8s_client._api_client)
     
@@ -1465,6 +1547,14 @@ async def create_golden_image_from_disk(
 
     # Target namespace - use namespace from request, default to source_namespace
     target_namespace = req.target_namespace or req.source_namespace
+
+    # Both ends, and both for their own reason: the source is what gets read
+    # and copied, the target is where the copy lands and whose quota pays. A
+    # check on one of them is a hole with extra steps — read someone else's
+    # disk into your own namespace, or push a disk into theirs.
+    await require_namespace_access(request, user, req.source_namespace)
+    if target_namespace != req.source_namespace:
+        await require_namespace_access(request, user, target_namespace)
 
     # At-least-one runtime check (soft contract — matches create_tenant_image).
     if not req.name and not req.display_name:
@@ -1750,7 +1840,14 @@ async def publish_image(
 
     validate_k8s_name(req.namespace, "namespace")
     validate_k8s_name(req.disk_name, "disk_name")
-    validate_k8s_name(req.secret_name, "secret_name")
+    # The Secret is named by the server, not by the caller — the same rule the
+    # pull direction adopted, and the same reason: a credential a request can
+    # name is a credential a request can pick. `namespace` is checked against
+    # the caller's own bindings below, but any Secret in a namespace you hold
+    # that happens to carry accessKeyId/secretKey could be selected and used
+    # for `crane auth login`. One convention, one name, both directions.
+    secret_name = harbor_robot_secret_name()
+    validate_k8s_name(secret_name, "secret_name")
     # NOT validate_k8s_name. A Kubernetes name and an image coordinate are
     # different alphabets: the k8s rule has no dots, no underscores and no
     # uppercase, so `v1.0.0`, `24.04` and `ubuntu_22` were all refused with a
@@ -1784,14 +1881,14 @@ async def publish_image(
     # never names the Secret.
     try:
         await k8s_client.core_api.read_namespaced_secret(
-            name=req.secret_name, namespace=req.namespace,
+            name=secret_name, namespace=req.namespace,
         )
     except ApiException as exc:
         if exc.status == 404:
             raise HTTPException(
                 status_code=422,
                 detail=(
-                    f"Secret '{req.secret_name}' not found in namespace "
+                    f"Secret '{secret_name}' not found in namespace "
                     f"'{req.namespace}'. Publishing pushes as the tenant "
                     "robot; the harbor-robots chart provisions its "
                     "credential there."
@@ -1894,7 +1991,7 @@ async def publish_image(
             k8s_client,
             publish_job(
                 req.namespace, req.disk_name, ref,
-                registry=registry, secret_name=req.secret_name,
+                registry=registry, secret_name=secret_name,
                 volume_mode=volume_mode,
                 # The deadline follows the disk: everything the Job does is
                 # proportional to the number of bytes it has to move.

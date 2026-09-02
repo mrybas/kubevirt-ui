@@ -32,6 +32,43 @@ from kubernetes_asyncio.client.rest import ApiException
 from app.api.v1.images_catalog import catalog_ref_from_source_url
 from app.models.template import GoldenImageCreate
 
+@pytest.fixture(autouse=True)
+def a_visible_catalogue_artifact(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Materialise now asks Harbor, as the caller, whether they may see the ref.
+
+    Patched out here, deliberately and only here: these tests are about what
+    the handler WRITES, and satisfying the check for real would mean a fake
+    Harbor in every one of them. The rule itself is proven in
+    `test_a_catalogue_ref_you_cannot_see_is_not_yours_to_pull.py`, which is
+    also the file to change if it ever moves — a check patched away in two
+    places is a check that can be deleted without a test noticing.
+    """
+    from app.api.v1 import images
+
+    async def _visible(harbor, token, catalog_ref):
+        return None
+
+    monkeypatch.setattr(images, "assert_catalogue_ref_visible", _visible)
+
+
+@pytest.fixture(autouse=True)
+def _namespace_access_is_not_what_these_prove(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These call the image handlers directly to inspect what they WRITE.
+
+    The handlers refuse a namespace the caller has no binding in, which needs a
+    cluster's worth of RBAC to satisfy and has nothing to do with the object
+    under inspection here. It is proven once, deliberately, in
+    `test_an_image_endpoint_refuses_someone_elses_namespace.py`; making thirty
+    more tests re-prove it would only mean thirty places to weaken it from.
+    """
+    from app.api.v1 import images
+
+    async def _allow(request, user, namespace) -> None:
+        return None
+
+    monkeypatch.setattr(images, "require_namespace_access", _allow)
+
+
 
 def _k8s(*, secret_exists: bool = True, ca_exists: bool = False) -> MagicMock:
     k8s = MagicMock()
