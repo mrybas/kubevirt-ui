@@ -14,7 +14,7 @@ from kubernetes_asyncio.client.rest import ApiException
 from app.api.v1.images_catalog import catalog_images, merge
 from app.core.auth import User, require_auth
 from app.core.errors import validate_k8s_name
-from app.core.harbor_client import HarborUnauthorized, HarborUnavailable
+from app.core.harbor_client import HarborUnauthorized, HarborUnavailable, harbor_registry_host
 from app.core.image_publish import assert_tag_is_free, publish_dependents, publish_job
 from app.core.operator import (
     OPERATOR_GROUP,
@@ -1365,6 +1365,57 @@ async def publish_image(
     validate_k8s_name(req.namespace, "namespace")
     validate_k8s_name(req.disk_name, "disk_name")
     validate_k8s_name(req.tag, "tag")
+    validate_k8s_name(req.secret_name, "secret_name")
+
+    k8s_client = request.app.state.k8s_client
+
+    # The Job pushes as the tenant robot, whose credential lives in a Secret
+    # in this same namespace (the harbor-robots chart provisions it there —
+    # the same Secret CDI pulls with). Refused here, before anything is
+    # created, for the same reason Task 5's pull-direction check runs first:
+    # a Job that dies for a missing Secret reports a container failure that
+    # never names the Secret.
+    try:
+        await k8s_client.core_api.read_namespaced_secret(
+            name=req.secret_name, namespace=req.namespace,
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Secret '{req.secret_name}' not found in namespace "
+                    f"'{req.namespace}'. Publishing pushes as the tenant "
+                    "robot; the harbor-robots chart provisions its "
+                    "credential there."
+                ),
+            ) from exc
+        raise
+
+    # Read the source PVC before anything is created. This both confirms the
+    # disk exists (a 404 rather than a snapshot pointed at nothing) and
+    # supplies the storage class / volume mode / access modes the temporary
+    # PVC must match to have any real chance of binding — see
+    # disks.py's rollback_snapshot, which restores from a snapshot the same
+    # way.
+    try:
+        source_pvc = await k8s_client.core_api.read_namespaced_persistent_volume_claim(
+            name=req.disk_name, namespace=req.namespace,
+        )
+    except ApiException as exc:
+        if exc.status == 404:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Disk '{req.disk_name}' not found in namespace '{req.namespace}'",
+            ) from exc
+        raise
+
+    access_modes = source_pvc.spec.access_modes or ["ReadWriteOnce"]
+    storage_class = source_pvc.spec.storage_class_name or ""
+    volume_mode = source_pvc.spec.volume_mode or "Block"
+    source_capacity = "10Gi"
+    if source_pvc.status and source_pvc.status.capacity:
+        source_capacity = source_pvc.status.capacity.get("storage", source_capacity)
 
     harbor = request.app.state.harbor_client
     try:
@@ -1374,23 +1425,62 @@ async def publish_image(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    k8s_client = request.app.state.k8s_client
+    # catalog_ref shape (no host) — matches images_catalog.py's merge key, and
+    # is what the response and Harbor's own project/repository/tag naming use.
+    # The registry host is added only for the Job's own push target, below.
     ref = f"{req.project}/{req.repository}:{req.tag}"
+    registry = harbor_registry_host()
 
     # Suspended first, so its UID can own the snapshot and the temporary PVC.
-    job = await create_object(k8s_client, publish_job(req.namespace, req.disk_name, ref))
+    job = await create_object(
+        k8s_client,
+        publish_job(
+            req.namespace, req.disk_name, ref,
+            registry=registry, secret_name=req.secret_name,
+        ),
+    )
     job_name = job["metadata"]["name"]
+    job_uid = job["metadata"]["uid"]
+
     try:
-        for obj in publish_dependents(
-            req.namespace, req.disk_name, job_name, job["metadata"]["uid"]
-        ):
-            await create_object(k8s_client, obj)
+        snapshot_obj, pvc_obj = publish_dependents(
+            req.namespace, req.disk_name, job_name, job_uid,
+            storage_class=storage_class, volume_mode=volume_mode,
+            access_modes=access_modes, storage_size=source_capacity,
+        )
+        created_snapshot = await create_object(k8s_client, snapshot_obj)
+
+        # The snapshot's own restoreSize when the storage backend already
+        # reports one (rare, immediately after creation), the source disk's
+        # own capacity otherwise — never "0", which most CSI provisioners
+        # refuse by leaving the PVC Pending forever, a failure with no
+        # ApiException this handler could ever see.
+        restore_size = (
+            (created_snapshot.get("status") or {}).get("restoreSize")
+            or source_capacity
+        )
+        pvc_obj["spec"]["resources"]["requests"]["storage"] = restore_size
+
+        await create_object(k8s_client, pvc_obj)
         await unsuspend_job(k8s_client, req.namespace, job_name)
-    except ApiException as exc:
-        # Deleting the Job takes its owned dependents with it.
-        await delete_job(k8s_client, req.namespace, job_name)
-        raise HTTPException(
-            status_code=422, detail=f"publish could not start: {exc.reason}"
-        ) from exc
+    except Exception as exc:
+        # Cleanup here has to be unconditional, not just for ApiException: a
+        # suspended Job never reaches a terminal phase, so a timeout or a
+        # connection reset in this window would otherwise leave the Job —
+        # and everything it owns — permanently un-reaped. That is the exact
+        # orphan the whole suspended-Job-as-owner design exists to prevent,
+        # arriving through the one door it didn't cover.
+        try:
+            await delete_job(k8s_client, req.namespace, job_name)
+        except Exception:
+            logger.error(
+                "publish %s: failed to roll back the Job after %r",
+                job_name, exc, exc_info=True,
+            )
+        if isinstance(exc, ApiException):
+            raise HTTPException(
+                status_code=422, detail=f"publish could not start: {exc.reason}"
+            ) from exc
+        raise
 
     return {"job": job_name, "ref": ref}

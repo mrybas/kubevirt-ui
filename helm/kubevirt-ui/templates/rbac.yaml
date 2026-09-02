@@ -461,11 +461,14 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # -----------------------------------------------------------------------
-  # Batch (CronJobs for scheduled VM actions)
+  # Batch (CronJobs for scheduled VM actions; Jobs for on-demand runs and
+  # for the image-publish path, which creates one directly rather than
+  # through a CronJob)
   # -----------------------------------------------------------------------
   - apiGroups: ["batch"]
     resources:
       - cronjobs
+      - jobs
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
   # -----------------------------------------------------------------------

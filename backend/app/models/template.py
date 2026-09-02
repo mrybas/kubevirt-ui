@@ -329,6 +329,11 @@ class ImagePublishRequest(BaseModel):
     The disk is snapshotted rather than read live, so `namespace`/`disk_name`
     name the source PVC and the VM using it keeps running throughout.
     `project`/`repository`/`tag` name where the pushed image lands in Harbor.
+
+    `secret_name` names the tenant's robot credential Secret, in this same
+    `namespace` — the harbor-robots chart provisions it there, same as the
+    pull-direction `source_registry_secret`. Required, unlike that one: Harbor
+    never accepts an anonymous push.
     """
 
     namespace: str
@@ -336,3 +341,4 @@ class ImagePublishRequest(BaseModel):
     project: str
     repository: str
     tag: str
+    secret_name: str
