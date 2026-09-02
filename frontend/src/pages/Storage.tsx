@@ -40,6 +40,7 @@ import { useNamespaces } from '../hooks/useNamespaces';
 import { useFoldersFlat } from '../hooks/useFolders';
 import { FolderBreadcrumb } from '../components/folders/FolderBreadcrumb';
 import { ImageRows, type ImageRowItem } from '../components/images/ImageRows';
+import { matchesStorageFilters } from './storageFilters';
 import { LoadingSkeleton } from '../components/common/LoadingSkeleton';
 import { usePagination } from '../hooks/usePagination';
 import { Pagination } from '../components/common/Pagination';
@@ -54,6 +55,20 @@ interface Disk extends GoldenImage {
   disk_type: DiskType;
   persistent: boolean;
 }
+
+// Single source of truth for the Images/Data Disks table's columns. Both the
+// header row and ImageRows' warning-banner colSpan are derived from this, so
+// a column added or removed here cannot silently desync the banner's span
+// from the header (see __tests__/storageTableColumns.test.tsx).
+export const STORAGE_TABLE_COLUMNS: { label: string; className?: string }[] = [
+  { label: 'Name' },
+  { label: 'Namespace' },
+  { label: 'Size' },
+  { label: 'Status' },
+  { label: 'VMs' },
+  { label: 'Scope' },
+  { label: 'Actions', className: 'text-right' },
+];
 
 export function Storage() {
   const { selectedNamespace } = useAppStore();
@@ -111,15 +126,12 @@ export function Storage() {
       })()
     : new Set<string>();
 
-  // Filter disks
-  const filteredDisks = currentDisks.filter((disk) => {
-    const matchesSearch = disk.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (disk.display_name?.toLowerCase().includes(searchQuery.toLowerCase()));
-    const matchesProject = !filterProject || disk.project === filterProject;
-    const matchesEnv = !filterEnv || disk.environment === filterEnv;
-    const matchesFolder = !filterFolder || folderNamespaces.has(disk.namespace);
-    return matchesSearch && matchesProject && matchesEnv && matchesFolder;
-  });
+  // Filter disks. See storageFilters.ts for the placement-filter exemption
+  // catalogue rows get (folder/environment do not apply to something not
+  // materialised yet) and its tests.
+  const filteredDisks = currentDisks.filter((disk) =>
+    matchesStorageFilters(disk, { searchQuery, filterProject, filterEnv, filterFolder, folderNamespaces })
+  );
 
   const paginatedDisks = filteredDisks.slice((page - 1) * perPage, page * perPage);
   const totalPages = Math.max(1, Math.ceil(filteredDisks.length / perPage));
@@ -443,13 +455,9 @@ export function Storage() {
           <table className="w-full">
             <thead className="bg-surface-800/50">
               <tr>
-                <th className="table-header">Name</th>
-                <th className="table-header">Namespace</th>
-                <th className="table-header">Size</th>
-                <th className="table-header">Status</th>
-                <th className="table-header">VMs</th>
-                <th className="table-header">Scope</th>
-                <th className="table-header text-right">Actions</th>
+                {STORAGE_TABLE_COLUMNS.map((col) => (
+                  <th key={col.label} className={clsx('table-header', col.className)}>{col.label}</th>
+                ))}
               </tr>
             </thead>
             <tbody className="divide-y divide-surface-800">
@@ -457,6 +465,7 @@ export function Storage() {
                 <ImageRows
                   items={paginatedDisks}
                   catalogAvailable={catalogAvailable}
+                  colSpan={STORAGE_TABLE_COLUMNS.length}
                   onRowClick={(item) => navigate(`/storage/${item.namespace}/${item.name}`)}
                   onDelete={(item) => handleDelete(item as Disk)}
                   onCreateFromCatalog={handleCreateFromCatalog}
@@ -483,7 +492,13 @@ export function Storage() {
                           <p className="font-medium text-surface-100">
                             {disk.display_name || disk.name}
                           </p>
-                          <p className="text-xs text-surface-500">{disk.name}</p>
+                          {/* Matches ImageRows' rule for the Images tab: only
+                              show the raw name a second time when it differs
+                              from the display name, so a disk with no display
+                              name does not show its own name twice. */}
+                          {disk.display_name && disk.display_name !== disk.name && (
+                            <p className="text-xs text-surface-500">{disk.name}</p>
+                          )}
                         </div>
                       </div>
                     </td>
