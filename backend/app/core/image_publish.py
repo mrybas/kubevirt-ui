@@ -12,6 +12,15 @@ from typing import Any
 
 PUBLISH_IMAGE = "gcr.io/go-containerregistry/crane:debug"
 
+# The image's shell lives at `/busybox/sh`, not `/bin/sh` — a hardcoded
+# `/bin/sh` here left every publish Job unable to start at all (kubelet
+# CreateContainerError: exec: "/bin/sh": no such file or directory), never
+# caught by this suite because a mocked Kubernetes API never execs anything.
+# Bare `sh` resolves through PATH (busybox symlinks it there) and keeps working
+# if the base image is ever swapped for one with a conventional /bin/sh layout.
+# One constant, so the decision can never drift between two call sites.
+_SHELL = "sh"
+
 # Where the raw block device is attached when the source disk is Block-mode.
 # volumeDevices (not volumeMounts) is the only way Kubernetes exposes a Block
 # PVC to a container — there is no filesystem underneath it to mount.
@@ -57,7 +66,7 @@ _FILESYSTEM_PUSH_SCRIPT = (
 # `pipefail` matters here specifically because the pipeline's default exit
 # status (under plain `set -e`) is `crane`'s, not `tar`'s — a `tar` that
 # died output-starved would otherwise not fail the script at all. If this
-# image's `/bin/sh` does not support `-o pipefail` the `set` line itself
+# image's shell does not support `-o pipefail` the `set` line itself
 # fails immediately, which is a clear failure at the very first line rather
 # than a silent partial push.
 _BLOCK_PUSH_SCRIPT = (
@@ -159,7 +168,7 @@ def publish_job(
     container: dict[str, Any] = {
         "name": "publish",
         "image": PUBLISH_IMAGE,
-        "command": ["/bin/sh", "-c"],
+        "command": [_SHELL, "-c"],
         "env": env,
     }
 

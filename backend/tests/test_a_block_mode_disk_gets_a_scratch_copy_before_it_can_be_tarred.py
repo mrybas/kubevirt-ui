@@ -12,6 +12,29 @@ per-mode shape can be pinned without a cluster to prove it against.
 from app.core.image_publish import publish_dependents, publish_job, scratch_pvc_name
 
 
+def test_the_shell_the_job_invokes_actually_exists_in_the_image():
+    """The Job's `command` must resolve inside `PUBLISH_IMAGE`'s own userland.
+
+    `gcr.io/go-containerregistry/crane:debug` has no `/bin/sh` at all — its
+    shell lives at `/busybox/sh`, reachable as bare `sh` through PATH. A
+    hardcoded `/bin/sh` left every publish Job unable to start
+    (CreateContainerError, before a single line of the push script ran),
+    invisible to every test here because a mocked Kubernetes API never
+    execs anything — the object is well-formed and the mock accepts it
+    either way. This assertion fails the moment `/bin/sh` (or any other
+    absolute path this image lacks) reappears in `command`, in either mode.
+    """
+    for volume_mode in ("Block", "Filesystem"):
+        job = publish_job("tenant-a", "ubuntu-disk", "p/u:1", volume_mode=volume_mode)
+        container = job["spec"]["template"]["spec"]["containers"][0]
+
+        assert container["command"][0] != "/bin/sh"
+        # Bare `sh`, resolved through PATH — not any other absolute path
+        # either, since this image's whole userland is BusyBox under
+        # `/busybox/`, not a conventional FHS layout.
+        assert not container["command"][0].startswith("/")
+
+
 def test_a_block_source_gets_volume_devices_and_no_disk_volume_mount():
     job = publish_job("tenant-a", "ubuntu-disk", "p/u:1", volume_mode="Block")
     container = job["spec"]["template"]["spec"]["containers"][0]
