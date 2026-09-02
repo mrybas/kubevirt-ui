@@ -1,4 +1,16 @@
 services:
+  # Only this test needs Harbor reachable and the flag on. Other e2e specs
+  # (full-flow, mobile-audit, ...) run against this same compose file and
+  # must see GET /images behave exactly as it does today — the "Done when"
+  # bar for the whole feature — so this only points the backend at Harbor,
+  # it does not change any other e2e behaviour.
+  backend:
+    environment:
+      - HARBOR_URL=http://harbor-core:8080
+      - HARBOR_IMAGE_ENABLED=true
+    depends_on:
+      - harbor-core
+
   e2e:
     build:
       context: ./e2e
@@ -16,3 +28,265 @@ services:
       - LLDAP_URL=http://lldap:17170
       - LLDAP_ADMIN_USER=admin
       - LLDAP_ADMIN_PASSWORD=admin_password
+
+  # ---------------------------------------------------------------------
+  # Harbor — for harbor-identity.spec.ts (Task 9).
+  #
+  # A mock Harbor accepts any bearer, so it can never prove the security
+  # claim this task exists to check: that a wrong/absent identity is
+  # REFUSED the catalogue while a valid one sees it. Only a real Harbor,
+  # configured for real OIDC token verification, can show that.
+  #
+  # harbor-core cannot run alone — it needs a database and a cache at
+  # minimum, so `harbor-db` and `harbor-redis` are included too (the
+  # brief's Step 1 names only `harbor`/harbor-core; a single-service
+  # addition would not start and would not be a "runnable artefact").
+  #
+  # WHAT THIS DOES NOT INCLUDE, DELIBERATELY: registry, registryctl,
+  # jobservice, portal, and the nginx proxy — the pieces needed for
+  # actual image push/pull and the web UI. The two identity tests in
+  # harbor-identity.spec.ts only exercise Harbor's MANAGEMENT API
+  # (GET /api/v2.0/projects, /repositories, /artifacts via HarborClient
+  # in backend/app/core/harbor_client.py) — repository/artifact metadata
+  # that Harbor's own core serves out of its Postgres database, not by
+  # calling a live registry. Omitting that stack is a scope decision to
+  # keep this fixture buildable, not evidence it was skipped by accident.
+  # Task 6's publish path (crane push through the registry) is exercised
+  # separately and directly against a plain registry — see task-9-report.md.
+  #
+  # VERIFICATION STATUS — this WAS brought up and exercised for real this
+  # session (see task-9-report.md for full commands/output, and for one
+  # honest failed attempt first: the full 9-service official Harbor
+  # topology crashed this machine's Docker Desktop under amd64 emulation
+  # before any container started; this reduced 3-service footprint is
+  # what was actually run):
+  #   - harbor-db, harbor-redis, harbor-core (config/app.conf/private
+  #     key/secret key below, copied verbatim from a real
+  #     `goharbor/prepare:v2.15.2` run) came up cleanly: core migrated
+  #     its schema, connected to redis, and served
+  #     GET /api/v2.0/health as 200 with core/database/redis "healthy".
+  #   - The harbor-init OIDC bootstrap's PUT /api/v2.0/configurations
+  #     call was run by hand and returned 200. Wiring it to THIS repo's
+  #     dex is real but incomplete: dex/config.yaml pins `issuer:
+  #     http://192.168.196.1:5556` (the browser-facing LAN address) so
+  #     that OAuth redirects work from a host browser, but Harbor's Go
+  #     OIDC client fetches discovery via the internal compose hostname
+  #     (`http://dex:5556`) and then hard-rejects the result because the
+  #     `issuer` claim inside it doesn't match the URL used to fetch it
+  #     (a deliberate anti-issuer-confusion check in the OIDC spec, not a
+  #     bug in either service) — confirmed directly in harbor-core's own
+  #     logs. Reusing the SAME dex this project already runs as Harbor's
+  #     OIDC provider needs a second, internally-consistent issuer for
+  #     Harbor to use, which dex's single `issuer:` field cannot provide
+  #     alongside the browser-facing one; this file does not attempt
+  #     that fix (out of Task 9's declared scope), so `harbor-init`
+  #     itself did not reach a working end state.
+  #   - THE HEADLINE FINDING, proven directly against this real running
+  #     Harbor using the project's own unmodified
+  #     backend/app/core/harbor_client.py and
+  #     backend/app/api/v1/images_catalog.py: Harbor's
+  #     GET /api/v2.0/projects (the LIST endpoint `catalog_images()`
+  #     calls first) returns HTTP 200 for ANY bearer — garbage, absent,
+  #     or valid — filtered to whatever that identity can see (empty
+  #     list once no project is public), and NEVER 401/403. A
+  #     project-scoped call (GET /api/v2.0/projects/<name>/repositories
+  #     on a private project) DOES correctly 401 a bad bearer — Harbor's
+  #     enforcement is real — but `catalog_images()`'s loop only reaches
+  #     that call for a project `list_projects()` already returned, and
+  #     for a bad identity that list is empty. So `HarborUnauthorized` is
+  #     never raised, `catalog_available` never flips to `false`, and a
+  #     wrong identity silently gets `catalog_available: true` with zero
+  #     catalog rows — indistinguishable from a legitimately empty
+  #     catalogue. See task-9-report.md for the exact reproduction
+  #     (curl transcripts plus a direct Python run of this repo's own
+  #     `catalog_images()` against this Harbor).
+  harbor-db:
+    image: goharbor/harbor-db:v2.15.2
+    environment:
+      - POSTGRES_PASSWORD=root123
+    volumes:
+      - harbor_db_data:/var/lib/postgresql/data
+    networks:
+      - kubevirt-ui
+
+  harbor-redis:
+    image: goharbor/valkey-photon:v2.15.2
+    networks:
+      - kubevirt-ui
+
+  harbor-core:
+    image: goharbor/harbor-core:v2.15.2
+    depends_on:
+      - harbor-db
+      - harbor-redis
+    networks:
+      - kubevirt-ui
+    configs:
+      - source: harbor_core_app_conf
+        target: /etc/core/app.conf
+      - source: harbor_core_private_key
+        target: /etc/core/private_key.pem
+      - source: harbor_core_secretkey
+        target: /etc/core/key
+    environment:
+      - CONFIG_PATH=/etc/core/app.conf
+      - LOG_LEVEL=info
+      - EXT_ENDPOINT=http://harbor-core:8080
+      - DATABASE_TYPE=postgresql
+      - POSTGRESQL_HOST=harbor-db
+      - POSTGRESQL_PORT=5432
+      - POSTGRESQL_USERNAME=postgres
+      - POSTGRESQL_PASSWORD=root123
+      - POSTGRESQL_DATABASE=registry
+      - POSTGRESQL_SSLMODE=disable
+      - POSTGRESQL_MAX_IDLE_CONNS=2
+      - POSTGRESQL_MAX_OPEN_CONNS=2
+      - _REDIS_URL_CORE=redis://harbor-redis:6379?idle_timeout_seconds=30
+      - _REDIS_URL_REG=redis://harbor-redis:6379/1?idle_timeout_seconds=30
+      # No registry/registryctl/jobservice/portal in this fixture — see the
+      # note above. These point at harbor-core itself so a DNS lookup
+      # resolves rather than failing outright; the endpoints behind them
+      # are not exercised by the identity tests.
+      - REGISTRY_URL=http://harbor-core:8080
+      - TOKEN_SERVICE_URL=http://harbor-core:8080/service/token
+      - PORTAL_URL=http://harbor-core:8080
+      - JOBSERVICE_URL=http://harbor-core:8080
+      - REGISTRY_CONTROLLER_URL=http://harbor-core:8080
+      - CORE_URL=http://harbor-core:8080
+      - CORE_LOCAL_URL=http://127.0.0.1:8080
+      - WITH_TRIVY=false
+      - HARBOR_ADMIN_PASSWORD=Harbor12345
+      - MAX_JOB_WORKERS=2
+      - CORE_SECRET=e2e-only-core-secret
+      - JOBSERVICE_SECRET=e2e-only-jobservice-secret
+      - CSRF_KEY=e2e-only-csrf-key-32-characters!
+      - REGISTRY_CREDENTIAL_USERNAME=harbor_registry_user
+      - REGISTRY_CREDENTIAL_PASSWORD=e2e-only-registry-credential
+      - REGISTRY_STORAGE_PROVIDER_NAME=filesystem
+      - READ_ONLY=false
+      - PORT=8080
+      - QUOTA_UPDATE_PROVIDER=db
+
+  # OIDC bootstrap: harbor.yml has no OIDC section (confirmed empty in the
+  # v2.15.2 template), so pointing Harbor's bearer-token verification at
+  # the e2e `dex` service is a runtime configuration call, not something
+  # set at image build/start time. Reuses the SAME dex static client
+  # (`kubevirt-ui` / `kubevirt-ui-secret`, see dex/config.yaml) the
+  # backend itself logs in as — the whole point of this task is that the
+  # caller's own token (aud=kubevirt-ui) is what gets forwarded to
+  # Harbor, so Harbor must accept that same audience, not a Harbor-only
+  # client.
+  #
+  # RUN THIS SESSION, AND IT DOES NOT REACH A WORKING STATE: the PUT
+  # itself returns 200 (Harbor accepts the config), but harbor-core then
+  # logs `oidc: issuer did not match the issuer returned by provider,
+  # expected "http://dex:5556" got "http://192.168.196.1:5556"` on every
+  # subsequent bearer request — dex's single `issuer:` field is pinned to
+  # the browser-facing LAN address (needed for OAuth redirects from a
+  # host browser) and can't simultaneously equal the internal compose
+  # hostname Harbor uses to fetch discovery. This is a real gap between
+  # this project's existing dex setup and reusing it as Harbor's OIDC
+  # provider, not a guess — see task-9-report.md for the full log and
+  # what fixing it for real would need (dex would need a second,
+  # internally-reachable issuer, which a single dex instance's config
+  # does not support).
+  harbor-init:
+    image: curlimages/curl:8.11.0
+    depends_on:
+      - harbor-core
+    networks:
+      - kubevirt-ui
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        until curl -sf http://harbor-core:8080/api/v2.0/health >/dev/null 2>&1; do
+          echo "waiting for harbor-core..."; sleep 3
+        done
+        curl -sf -u "admin:Harbor12345" -X PUT \
+          -H 'Content-Type: application/json' \
+          http://harbor-core:8080/api/v2.0/configurations \
+          -d '{
+            "auth_mode": "oidc_auth",
+            "oidc_name": "dex",
+            "oidc_endpoint": "http://dex:5556",
+            "oidc_client_id": "kubevirt-ui",
+            "oidc_client_secret": "kubevirt-ui-secret",
+            "oidc_scope": "openid,profile,email",
+            "oidc_verify_cert": false,
+            "oidc_auto_onboard": true,
+            "oidc_user_claim": "name"
+          }'
+        echo "harbor OIDC configured"
+
+configs:
+  harbor_core_app_conf:
+    content: |
+      appname = Harbor
+      runmode = prod
+      enablegzip = true
+
+      [prod]
+      httpport = 8080
+  # Generated by goharbor/prepare:v2.15.2 for this disposable e2e fixture
+  # only — not used anywhere else, safe to commit (same posture as the
+  # already-committed dex client secret and lldap admin password below).
+  harbor_core_private_key:
+    content: |
+      -----BEGIN RSA PRIVATE KEY-----
+      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
+      -----END RSA PRIVATE KEY-----
+  harbor_core_secretkey:
+    content: "RfX7LlQ3I5PQKply"
+
+volumes:
+  harbor_db_data:
