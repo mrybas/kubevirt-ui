@@ -192,6 +192,11 @@ class VMImageCreate(BaseModel):
     # Source - one of these
     source_url: str | None = Field(None, description="HTTP URL to download image")
     source_registry: str | None = Field(None, description="Container registry URL")
+    # Secret in the TARGET namespace holding the Harbor robot credential.
+    # CDI resolves secretRef in the DataVolume's own namespace and nowhere else.
+    source_registry_secret: str | None = None
+    # ConfigMap holding the registry's CA, while Harbor uses a private one.
+    source_registry_ca_configmap: str | None = None
     source_pvc: str | None = Field(None, description="PVC name to clone from")
     source_pvc_namespace: str | None = Field(None, description="PVC namespace to clone from")
     

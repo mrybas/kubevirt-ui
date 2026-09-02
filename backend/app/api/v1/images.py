@@ -657,6 +657,24 @@ async def _create_managed_image(
     )
 
 
+def build_registry_source(
+    url: str, secret_ref: str | None, cert_config_map: str | None
+) -> dict[str, Any]:
+    """Render spec.source.registry for a DataVolume.
+
+    secret_ref names a Secret in the DataVolume's own namespace holding the
+    tenant's Harbor robot credential; CDI will not look in any other namespace.
+    Pulling is a registry operation, which is the one place robot accounts do
+    work — the user's own token is for browsing and is useless here.
+    """
+    registry: dict[str, Any] = {"url": url}
+    if secret_ref:
+        registry["secretRef"] = secret_ref
+    if cert_config_map:
+        registry["certConfigMap"] = cert_config_map
+    return {"registry": registry}
+
+
 @images_router.post("", response_model=GoldenImage, status_code=status.HTTP_201_CREATED)
 async def create_golden_image(
     image: GoldenImageCreate,
@@ -732,7 +750,11 @@ async def create_golden_image(
             source = {"http": {"url": image.source_url}}
             source_url_display = image.source_url
         elif image.source_registry:
-            source = {"registry": {"url": image.source_registry}}
+            source = build_registry_source(
+                image.source_registry,
+                image.source_registry_secret,
+                image.source_registry_ca_configmap,
+            )
             source_url_display = image.source_registry
         elif image.source_pvc:
             # Clone from existing PVC
@@ -743,7 +765,33 @@ async def create_golden_image(
             # Blank disk (for data disks)
             source = {"blank": {}}
             source_url_display = "blank"
-        
+
+        # A registry pull whose robot Secret does not exist in this namespace
+        # is refused here, before anything is created. CDI resolves secretRef
+        # in the DataVolume's own namespace and nowhere else; created with a
+        # secretRef that does not resolve, the DataVolume fails later inside
+        # CDI as an import error that never mentions the Secret — the user
+        # would learn nothing useful from it. Checked ahead of the
+        # image_path_enabled() branch so both writers (DataVolume and
+        # ManagedImage) get the same refusal.
+        if image.source_registry_secret:
+            try:
+                await k8s_client.core_api.read_namespaced_secret(
+                    name=image.source_registry_secret, namespace=target_namespace
+                )
+            except ApiException as exc:
+                if exc.status == 404:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"Secret '{image.source_registry_secret}' not found in "
+                            f"namespace '{target_namespace}'. CDI resolves secretRef "
+                            "in the DataVolume's own namespace; the harbor-robots "
+                            "chart provisions it there."
+                        ),
+                    ) from exc
+                raise
+
         # With the operator owning images, the backend stops writing the disk
         # and writes the intent instead. Same request, same namespace, same
         # naming: generateName on our own resource, exactly as it was on the
