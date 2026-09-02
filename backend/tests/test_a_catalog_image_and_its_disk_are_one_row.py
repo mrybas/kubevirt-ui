@@ -63,6 +63,9 @@ def test_a_local_disk_with_no_catalog_counterpart_still_appears():
 class _MultiSegmentHarbor:
     """A repository whose name is itself multi-segment: "team/subimage"."""
 
+    async def verify_identity(self, token):
+        return None
+
     async def list_projects(self, token):
         return [{"name": "vm-images-public"}]
 
@@ -71,6 +74,59 @@ class _MultiSegmentHarbor:
 
     async def list_artifacts(self, token, project, repository):
         return [{"size": 2147483648, "tags": [{"name": "20260901"}]}]
+
+
+class _VerifiedButEmpty:
+    """A real identity whose catalogue genuinely has nothing in it.
+
+    This is the case a wrong identity must not be confused with:
+    verify_identity succeeds (this is a real user), list_projects legitimately
+    returns nothing. catalog_images must return an empty list here, not raise
+    — an empty catalogue is not a failure.
+    """
+
+    async def verify_identity(self, token):
+        return None
+
+    async def list_projects(self, token):
+        return []
+
+
+async def test_a_verified_identity_with_nothing_to_see_returns_an_empty_list_not_an_error():
+    """Same empty result as a rejected identity at the list level — the two
+    are told apart by whether catalog_images raises, not by what it returns.
+    The endpoint is what turns "did not raise" into catalog_available: true
+    and "raised HarborUnauthorized" into catalog_available: false; see
+    test_the_image_endpoint_wires_the_catalogue_and_the_callers_token.py.
+    """
+    rows = await catalog_images(_VerifiedButEmpty(), "tok")
+    assert rows == []
+
+
+class _OrderSensitiveHarbor:
+    """Raises if project enumeration is ever reached before identity is verified.
+
+    Pins the ordering itself, independent of any particular exception type —
+    a refactor that reordered the two calls would trip this even if it kept
+    verify_identity's exception behaviour otherwise intact.
+    """
+
+    def __init__(self):
+        self.verified = False
+
+    async def verify_identity(self, token):
+        self.verified = True
+
+    async def list_projects(self, token):
+        if not self.verified:
+            raise AssertionError("list_projects ran before verify_identity")
+        return []
+
+
+async def test_identity_is_verified_before_any_project_is_listed():
+    harbor = _OrderSensitiveHarbor()
+    await catalog_images(harbor, "tok")
+    assert harbor.verified is True
 
 
 async def test_a_multi_segment_repository_name_still_joins_with_its_disk():

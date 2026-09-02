@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.auth import User
-from app.core.harbor_client import HarborUnavailable
+from app.core.harbor_client import HarborUnauthorized, HarborUnavailable
 
 
 def _no_cluster_resources():
@@ -152,6 +152,89 @@ class TestTheCatalogueHalf:
             client.get("/api/v1/images")
 
         mock_harbor_client.list_projects.assert_called_once_with("caller-token-abc")
+
+    def test_a_garbage_or_rejected_bearer_gets_no_catalogue_not_an_empty_one(
+        self,
+        client: TestClient,
+        fake_user: User,
+        mock_harbor_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The headline finding from the real-Harbor e2e run (Task 9).
+
+        GET /api/v2.0/projects returns 200 for ANY bearer, so a wrong
+        identity used to come back catalog_available: true with zero rows —
+        identical to a valid, legitimately-empty catalogue. verify_identity()
+        is what makes these distinguishable: a rejected identity must fail
+        before any project is even listed.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        fake_user.raw_token = "not-a-real-token"
+        mock_harbor_client.verify_identity = AsyncMock(
+            side_effect=HarborUnauthorized("harbor rejected the caller's identity")
+        )
+
+        with _no_cluster_resources():
+            response = client.get("/api/v1/images")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["catalog_available"] is False
+        assert [i for i in data["items"] if i.get("origin") == "catalog"] == []
+        # The rejection must be caught before enumeration is ever attempted.
+        mock_harbor_client.list_projects.assert_not_called()
+
+    def test_a_valid_identity_with_a_genuinely_empty_catalogue_is_still_available(
+        self,
+        client: TestClient,
+        fake_user: User,
+        mock_harbor_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The other half of the same distinction.
+
+        Same observable shape as an empty catalogue used to be for a wrong
+        identity too (zero catalog rows) — the two must now be told apart by
+        catalog_available, not conflated back into one case.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        fake_user.raw_token = "caller-token-abc"
+        mock_harbor_client.list_projects = AsyncMock(return_value=[])
+
+        with _no_cluster_resources():
+            response = client.get("/api/v1/images")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["catalog_available"] is True
+        assert [i for i in data["items"] if i.get("origin") == "catalog"] == []
+
+    def test_identity_is_verified_before_projects_are_enumerated(
+        self,
+        client: TestClient,
+        fake_user: User,
+        mock_harbor_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pins the call order so a later refactor cannot silently reorder it
+        back to the pre-fix behaviour (list_projects first, probe second/never).
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        fake_user.raw_token = "caller-token-abc"
+
+        calls: list[str] = []
+        mock_harbor_client.verify_identity = AsyncMock(
+            side_effect=lambda token: calls.append("verify_identity")
+        )
+        mock_harbor_client.list_projects = AsyncMock(
+            side_effect=lambda token: calls.append("list_projects") or []
+        )
+
+        with _no_cluster_resources():
+            response = client.get("/api/v1/images")
+
+        assert response.status_code == 200
+        assert calls == ["verify_identity", "list_projects"]
 
     def test_no_token_on_the_request_skips_harbor_entirely(
         self,

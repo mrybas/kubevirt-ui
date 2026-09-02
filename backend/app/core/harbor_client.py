@@ -81,6 +81,48 @@ class HarborClient:
 
         return body if isinstance(body, list) else []
 
+    async def verify_identity(self, token: str) -> None:
+        """Confirm the bearer names a real Harbor identity before listing anything.
+
+        `GET /projects` — where catalog_images() used to start — returns 200
+        for ANY bearer, garbage or absent included: it just filters to what
+        that identity can see, which is empty for an anonymous caller. A
+        wrong identity and a legitimately empty catalogue are indistinguishable
+        from that endpoint alone. Measured against a real Harbor 2.15.2 (Task
+        9's e2e run) — the earlier belief that /projects/{x}/repositories's
+        401 generalised to /projects was the bug this method exists to close.
+
+        `GET /users/current` is auth-gated and does not have that problem:
+
+            401/403  no bearer, or one Harbor does not recognise      -> reject
+            200      a Dex-issued id_token, mapped to its OIDC user   -> proceed
+            412      a robot account — a real identity, just not a
+                     user account (this API is for browsing anyway,
+                     which robots do not do)                          -> proceed
+
+        Raises HarborUnauthorized or HarborUnavailable; returns None on
+        success. Callers must run this before enumerating anything.
+        """
+        url = f"{self._base_url}/api/v2.0/users/current"
+        try:
+            async with httpx.AsyncClient(
+                transport=self._transport, timeout=HARBOR_TIMEOUT_SECONDS
+            ) as client:
+                resp = await client.get(
+                    url, headers={"Authorization": f"Bearer {token}"}
+                )
+        except httpx.HTTPError as exc:
+            raise HarborUnavailable(str(exc)) from exc
+
+        if resp.status_code in (401, 403):
+            raise HarborUnauthorized("Harbor rejected the caller's identity")
+        if resp.status_code == 200 or resp.status_code == 412:
+            # 412: recognised as a robot account, not a rejection.
+            return
+        raise HarborUnavailable(
+            f"Harbor returned {resp.status_code} for /users/current"
+        )
+
     async def list_projects(self, token: str) -> list[dict[str, Any]]:
         return await self._get(token, "/projects?page_size=100")
 

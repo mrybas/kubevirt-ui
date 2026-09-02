@@ -10,13 +10,21 @@ from app.core.harbor_client import HarborUnauthorized, HarborUnavailable
 
 
 class _Down:
+    async def verify_identity(self, token):
+        raise HarborUnavailable("no route to host")
+
     async def list_projects(self, token):
         raise HarborUnavailable("no route to host")
 
 
 class _Rejecting:
-    async def list_projects(self, token):
+    async def verify_identity(self, token):
         raise HarborUnauthorized("token expired")
+
+    async def list_projects(self, token):
+        raise AssertionError(
+            "list_projects must not run once verify_identity has rejected the token"
+        )
 
 
 async def test_an_unreachable_harbor_raises_rather_than_returning_nothing():

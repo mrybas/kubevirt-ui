@@ -69,6 +69,9 @@ def mock_harbor_client() -> MagicMock:
     Task 9 covers that claim against a real Harbor.
     """
     mock = MagicMock()
+    # Accepts identity verification unconditionally — tests that need to
+    # prove the reverse (a rejected identity) override this per-test.
+    mock.verify_identity = AsyncMock(return_value=None)
     mock.list_projects = AsyncMock(return_value=[{"name": "vm-images-public"}])
     mock.list_repositories = AsyncMock(
         return_value=[{"name": "vm-images-public/ubuntu-2204"}]

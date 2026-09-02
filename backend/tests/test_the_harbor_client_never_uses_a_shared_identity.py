@@ -94,6 +94,73 @@ async def test_a_not_found_response_is_still_one_of_the_designed_exceptions():
         await _client(handler).list_projects("fine-token")
 
 
+async def test_verify_identity_hits_the_auth_gated_probe():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("Authorization")
+        return httpx.Response(200, json={"username": "someone"})
+
+    await _client(handler).verify_identity("user-token-abc")
+
+    assert seen["path"] == "/api/v2.0/users/current"
+    assert seen["auth"] == "Bearer user-token-abc"
+
+
+async def test_verify_identity_accepts_a_valid_user():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"username": "someone"})
+
+    # Must not raise.
+    await _client(handler).verify_identity("fine-token")
+
+
+async def test_verify_identity_accepts_a_recognised_robot_account():
+    """412 from /users/current: a real identity, just not a user account.
+
+    Robots do not browse (see the module docstring), but recognising one here
+    is still not the same thing as rejecting an unknown bearer — 412 must not
+    be folded into the 401/403 branch.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(412, json={"errors": [{"code": "PRECONDITION"}]})
+
+    await _client(handler).verify_identity("robot-token")
+
+
+async def test_verify_identity_rejects_an_anonymous_or_invalid_bearer():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"errors": [{"code": "UNAUTHORIZED"}]})
+
+    with pytest.raises(HarborUnauthorized):
+        await _client(handler).verify_identity("not-a-real-token")
+
+
+async def test_verify_identity_reports_a_403_the_same_as_a_401():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"errors": [{"code": "FORBIDDEN"}]})
+
+    with pytest.raises(HarborUnauthorized):
+        await _client(handler).verify_identity("forbidden-token")
+
+
+async def test_verify_identity_reports_a_5xx_as_an_outage_not_a_rejection():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    with pytest.raises(HarborUnavailable):
+        await _client(handler).verify_identity("fine-token")
+
+
+async def test_verify_identity_reports_a_transport_failure_as_an_outage():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host")
+
+    with pytest.raises(HarborUnavailable):
+        await _client(handler).verify_identity("fine-token")
+
+
 async def test_a_repository_name_with_a_slash_is_a_single_path_segment():
     """Harbor repository names are frequently multi-segment (team/subimage).
 

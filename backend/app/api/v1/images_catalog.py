@@ -54,7 +54,19 @@ async def catalog_images(harbor: Any, token: str) -> list[VMImage]:
     Raises HarborUnavailable or HarborUnauthorized. The caller decides how to
     degrade; this function does not swallow the difference, because "Harbor is
     down" and "your session expired" need different user actions.
+
+    Identity is checked with `verify_identity()` before anything is
+    enumerated. `list_projects()` alone cannot be trusted for this: it
+    returns 200 for any bearer, including garbage or none, filtered to
+    whatever that identity can see — an anonymous caller and a legitimately
+    empty catalogue both come back as zero projects. Without the probe, a
+    rejected identity would silently look like an authenticated user with
+    nothing to show, which is the opposite of what "catalog_available" is
+    supposed to mean. This must stay the first call the function makes; a
+    fake that raises if enumeration runs before it pins that order in tests.
     """
+    await harbor.verify_identity(token)
+
     rows: list[VMImage] = []
     for project in await harbor.list_projects(token):
         pname = project.get("name")
