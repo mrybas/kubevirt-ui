@@ -104,3 +104,68 @@ async def test_a_missing_robot_secret_is_named_in_the_refusal(
     assert "absent-secret" in exc_info.value.detail
     assert "opdev-dev" in exc_info.value.detail
     api.create_namespaced_custom_object.assert_not_called()
+
+
+async def test_the_managed_image_writer_carries_the_secret_and_ca_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both writers must carry the credential, not just the DataVolume one.
+
+    Today they do — `create_golden_image` builds `source` once via
+    `build_registry_source` before branching on `image_path_enabled()`, and
+    both the DataVolume path and `_create_managed_image` consume that same
+    dict. But that sharing is an implementation detail, not a guarantee: a
+    later refactor could split the two writers' source construction without
+    anything failing loudly. A ManagedImage missing `secretRef` still gets
+    created — the operator would build a DataVolume from it, and only then,
+    inside CDI, would an anonymous pull against a private project fail, with
+    an error that never mentions the credential that quietly went missing.
+    This test pins the ManagedImage's actual `spec.source.registry` shape so
+    that regression fails here instead.
+    """
+    from app.api.v1 import images
+
+    monkeypatch.setenv("OPERATOR_IMAGE_ENABLED", "true")
+
+    k8s = _k8s_with_namespace()
+    # The Secret exists this time — the pre-flight check must pass through
+    # so the create actually happens and there is a body to inspect.
+    k8s.core_api.read_namespaced_secret = AsyncMock(return_value=MagicMock())
+
+    captured: dict = {}
+
+    async def _create(**kwargs):
+        captured.update(kwargs)
+        body = dict(kwargs["body"])
+        body["metadata"] = dict(body["metadata"])
+        body["metadata"]["name"] = body["metadata"].get("generateName", "") + "x7k2p"
+        body["metadata"]["creationTimestamp"] = "2026-08-20T00:00:00Z"
+        return body
+
+    api = MagicMock()
+    api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
+    api.list_namespaced_custom_object = AsyncMock(return_value={"items": []})
+
+    request = MagicMock()
+    request.app.state.k8s_client = k8s
+
+    image = GoldenImageCreate(
+        display_name="Tenant A Ubuntu",
+        source_registry="docker://harbor.example/vm-images-tenant-a/ubuntu:1",
+        source_registry_secret="harbor-robot-tenant-a",
+        source_registry_ca_configmap="harbor-ca",
+        size="10Gi",
+    )
+
+    with patch.object(images.client, "CustomObjectsApi", return_value=api):
+        await images.create_golden_image(
+            image=image, request=request, user=MagicMock(), namespace="opdev-dev",
+        )
+
+    # Proves the operator path, not the DataVolume path, is what got exercised.
+    assert captured["plural"] == "managedimages"
+    assert captured["body"]["kind"] == "ManagedImage"
+
+    registry = captured["body"]["spec"]["source"]["registry"]
+    assert registry["secretRef"] == "harbor-robot-tenant-a"
+    assert registry["certConfigMap"] == "harbor-ca"
