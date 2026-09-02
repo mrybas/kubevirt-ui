@@ -592,6 +592,19 @@ dex:
     #     clientSecret: $GITHUB_CLIENT_SECRET
     #     redirectURI: https://kubevirt-ui.example.com/dex/callback
 
+  # -- Additional OIDC clients to register with Dex, beyond KubeVirt UI's own.
+  # Lets one Dex and one admin group serve other applications on the cluster
+  # (Harbor, Grafana, ...) instead of standing up a second identity provider.
+  # Entries are appended after the built-in client and passed to Dex verbatim.
+  # Prefer `secretEnv` over an inline `secret` so the value stays out of the
+  # rendered ConfigMap; supply the variable via dex.extraEnv or dex.envFrom.
+  staticClients: []
+  #  - id: harbor
+  #    name: Harbor
+  #    redirectURIs:
+  #      - "https://harbor.example.com/c/oidc/callback"
+  #    secretEnv: HARBOR_CLIENT_SECRET
+
   staticPasswords: []
     # - email: "admin@local"
     #   hash: "$2a$10$..."

@@ -44,6 +44,19 @@ data:
           {{- else }}
           - "http://localhost:3333/auth/callback"
           {{- end }}
+      {{- /*
+        Additional static clients, appended AFTER the built-in one so that
+        enabling SSO for another application cannot displace KubeVirt UI's own
+        client. Each entry is passed through verbatim, so it takes any field
+        Dex accepts on a client.
+
+        Give an entry `secretEnv` naming a variable supplied through
+        dex.extraEnv or dex.envFrom rather than an inline `secret`, so client
+        secrets stay out of the rendered ConfigMap.
+      */}}
+      {{- with .Values.dex.staticClients }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
 
     connectors:
     {{- if and .Values.lldap.enabled (not .Values.dex.connectors) }}
