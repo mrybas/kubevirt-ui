@@ -5,6 +5,8 @@ export interface AuthConfig {
   authorization_endpoint?: string;
   token_endpoint?: string;
   userinfo_endpoint?: string;
+  /** Login scopes, served by the backend so a peer audience can be requested. */
+  scope?: string;
   user_management?: 'lldap' | 'external' | 'none';
 }
 

@@ -71,6 +71,10 @@ spec:
               {{- end }}
             - name: OIDC_CLIENT_ID
               value: {{ .Values.auth.oidc.clientId | quote }}
+            {{- with .Values.auth.oidc.scope }}
+            - name: OIDC_SCOPE
+              value: {{ . | quote }}
+            {{- end }}
             {{- if .Values.auth.oidc.clientSecretRef.name }}
             - name: OIDC_CLIENT_SECRET
               valueFrom:
