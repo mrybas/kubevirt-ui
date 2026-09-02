@@ -82,6 +82,10 @@ The chart deploys the following components:
 | `backend.env.LOG_LEVEL` | Log level | `INFO` |
 | `backend.env.CORS_ORIGINS` | Allowed CORS origins (comma-separated) | `""` |
 | `backend.env.ENABLE_TENANTS` | Enable multi-tenant mode | `"false"` |
+| `backend.env.HARBOR_IMAGE_ENABLED` | Enable the Harbor image catalogue (list, materialise, publish) | `""` |
+| `backend.env.HARBOR_URL` | Harbor base URL with scheme, e.g. `https://harbor.example.com`. Required when `HARBOR_IMAGE_ENABLED` is on | `""` |
+| `backend.env.HARBOR_ROBOT_SECRET` | Secret name in each tenant namespace holding the Harbor robot credential | `""` (→ `harbor-robot`) |
+| `backend.env.HARBOR_CA_CONFIGMAP` | ConfigMap name holding Harbor's CA, for a private certificate | `""` (→ `harbor-ca`) |
 | `backend.env.TENANTS_VPCDNS_FORWARD_DNS` | kube-dns/coredns Service ClusterIP override (tenant VPC DNS) | `""` |
 | `backend.env.TENANTS_VPCDNS_VIP` | VPC DNS VIP within service CIDR (default: `<service-cidr>.200`) | `""` |
 | `backend.env.TENANTS_KONNECTIVITY_PROXY_IMAGE` | Konnectivity proxy-server image override | `""` |

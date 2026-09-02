@@ -122,6 +122,29 @@ def _post(client: TestClient, body: dict | None = None):
 
 
 @pytest.fixture(autouse=True)
+def _the_callers_namespace(mock_k8s_client: MagicMock) -> None:
+    """The caller can reach tenant-a, and nothing else.
+
+    `publish_image` now binds the body's `namespace` to the caller's own
+    bindings (`require_namespace_access`, storage.py's guard) before it reads
+    a Secret, reads a PVC and creates a Job that exports that PVC's bytes to
+    an external registry. `get_user_namespaces` resolves an admin to every
+    ENABLED namespace, so the fixture's default list — which contains only
+    "default" — would 404 every request here. Listing tenant-a is what makes
+    the happy-path tests below exercise the handler rather than the guard.
+    """
+    mock_k8s_client.list_namespaces = AsyncMock(
+        return_value=[
+            {
+                "name": "tenant-a",
+                "status": "Active",
+                "labels": {"kubevirt-ui.io/enabled": "true"},
+            },
+        ]
+    )
+
+
+@pytest.fixture(autouse=True)
 def _a_caller_who_is_actually_signed_in(fake_user: User) -> None:
     """Every test below fires as a caller with a real token.
 
@@ -153,6 +176,141 @@ class TestTheGateAndTheRefusals:
         response = _post(client, {"namespace": "Not_Valid"})
 
         assert response.status_code == 422
+
+    def test_a_namespace_the_caller_cannot_reach_is_refused_before_anything_is_read(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """BLOCKER: the namespace came from the request body and was trusted.
+
+        `validate_k8s_name` says the string is a legal Kubernetes name, not
+        that it is the caller's. Everything past it runs with the UI's own
+        ServiceAccount, which can reach every namespace: a Secret is read, a
+        PVC is read, and a Job is created that copies that PVC's bytes to an
+        external registry. `assert_tag_is_free` does not stop it either — it
+        reads a Harbor 404 as "the tag is free", so a project the caller
+        cannot see is not a refusal.
+
+        404 rather than 403, for storage.py's reason: whether that namespace
+        exists is not this caller's business either.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        mock_k8s_client.list_namespaces = AsyncMock(
+            return_value=[
+                {
+                    "name": "someone-elses",
+                    "status": "Active",
+                    "labels": {"kubevirt-ui.io/enabled": "true"},
+                },
+            ]
+        )
+        mock_k8s_client.core_api.read_namespaced_secret = AsyncMock(
+            side_effect=AssertionError("must not read a Secret in a namespace "
+                                       "the caller has no binding in")
+        )
+        mock_k8s_client.core_api.read_namespaced_persistent_volume_claim = AsyncMock(
+            side_effect=AssertionError("must not read a PVC either")
+        )
+        batch_api = MagicMock()
+        batch_api.create_namespaced_job = AsyncMock(
+            side_effect=AssertionError("must not create anything past the refusal")
+        )
+
+        with patch("app.api.v1.images.client.BatchV1Api", return_value=batch_api):
+            response = _post(client)
+
+        assert response.status_code == 404
+        mock_k8s_client.core_api.read_namespaced_secret.assert_not_called()
+        mock_k8s_client.core_api.read_namespaced_persistent_volume_claim.assert_not_called()
+        batch_api.create_namespaced_job.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field,value",
+        [
+            ("tag", "v1.0.0"),
+            ("tag", "24.04"),
+            ("tag", "ubuntu_22"),
+            ("tag", "LTS"),
+        ],
+    )
+    def test_an_ordinary_image_tag_is_not_refused_as_if_it_were_a_k8s_name(
+        self,
+        field: str,
+        value: str,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`validate_k8s_name` is the wrong alphabet for an OCI tag.
+
+        It allows no dots, no underscores and no uppercase — so `v1.0.0`,
+        `24.04` and `ubuntu_22`, every one of them an ordinary tag, came back
+        422 blaming the caller for a legal value.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client, {field: value})
+
+        assert response.status_code == 202, response.json()
+        assert response.json()["ref"].endswith(f":{value}")
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            # Interpolated into a Harbor API path and into the Job's push ref,
+            # and previously not validated at all.
+            {"project": "../../etc"},
+            {"project": "with space"},
+            {"project": "a/b"},
+            {"repository": "../escape"},
+            {"repository": "UPPER"},
+            {"repository": "with space"},
+            {"tag": "with space"},
+            {"tag": "-leading-dash"},
+        ],
+    )
+    def test_a_coordinate_that_is_not_a_coordinate_is_refused_with_422(
+        self,
+        body: dict,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api = MagicMock()
+        batch_api.create_namespaced_job = AsyncMock(
+            side_effect=AssertionError("must not create anything past the refusal")
+        )
+
+        with patch("app.api.v1.images.client.BatchV1Api", return_value=batch_api):
+            response = _post(client, body)
+
+        assert response.status_code == 422
+        batch_api.create_namespaced_job.assert_not_called()
+
+    def test_a_multi_segment_repository_is_accepted(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Harbor repository names are frequently "team/subimage"."""
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client, {"repository": "team/subimage"})
+
+        assert response.status_code == 202, response.json()
+        assert response.json()["ref"] == (
+            "vm-images-tenant-a/team/subimage:20260902"
+        )
 
     def test_a_missing_robot_secret_is_named_in_the_refusal_before_anything_is_created(
         self,
@@ -788,3 +946,182 @@ class TestTheScratchPvcCanHoldWhatIsWrittenToIt:
         assert response.status_code == 202
         first = mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_args_list[0]
         assert first.kwargs["body"]["spec"]["resources"]["requests"]["storage"] == "100Gi"
+
+
+class TestTheSizeThePublishIsPlannedAround:
+    """Every number the plan derives comes from the source disk's capacity.
+
+    Get the capacity wrong and every one of them is wrong together: the
+    temporary clone, the scratch PVC and the deadline. All three failures
+    arrive asynchronously, inside a Job nobody is watching, well after the
+    202 the caller already got.
+    """
+
+    def test_a_pending_disk_is_sized_from_what_it_asked_for(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """`status.capacity` is empty for the whole of a Pending PVC's life.
+
+        Reading only that gave a 200Gi disk the 10Gi fallback: a 10Gi
+        temporary clone (which the CSI layer refuses against a 200Gi
+        snapshot, leaving it Pending forever) and a 12Gi scratch (ENOSPC
+        inside `dd`, ~25 minutes in). `spec.resources.requests.storage`
+        exists from creation and is the number that was actually asked for.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        mock_k8s_client.core_api.read_namespaced_persistent_volume_claim = AsyncMock(
+            return_value=SimpleNamespace(
+                spec=SimpleNamespace(
+                    storage_class_name="ceph-rbd",
+                    volume_mode="Block",
+                    access_modes=["ReadWriteOnce"],
+                    resources=SimpleNamespace(requests={"storage": "200Gi"}),
+                ),
+                # Still WaitForFirstConsumer: nothing bound, nothing reported.
+                status=SimpleNamespace(capacity=None),
+            )
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202, response.json()
+
+        pvcs = {
+            call.kwargs["body"]["metadata"]["name"]:
+                call.kwargs["body"]["spec"]["resources"]["requests"]["storage"]
+            for call in
+            mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_args_list
+        }
+        clone = next(v for k, v in pvcs.items() if k.endswith("-tmp"))
+        scratch = next(v for k, v in pvcs.items() if k.endswith("-scratch"))
+        assert clone == "200Gi"
+        # 1.15x + 512Mi, rounded up to whole Gi — never the 10Gi fallback.
+        assert scratch == "231Gi"
+
+    def test_a_bound_disks_reported_capacity_still_wins(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """After an expand, status is larger than the original request."""
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        mock_k8s_client.core_api.read_namespaced_persistent_volume_claim = AsyncMock(
+            return_value=SimpleNamespace(
+                spec=SimpleNamespace(
+                    storage_class_name="ceph-rbd",
+                    volume_mode="Filesystem",
+                    access_modes=["ReadWriteOnce"],
+                    resources=SimpleNamespace(requests={"storage": "20Gi"}),
+                ),
+                status=SimpleNamespace(capacity={"storage": "50Gi"}),
+            )
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202
+        clone = mock_k8s_client.core_api.create_namespaced_persistent_volume_claim \
+            .call_args_list[0].kwargs["body"]
+        assert clone["spec"]["resources"]["requests"]["storage"] == "50Gi"
+
+    def test_the_deadline_grows_with_the_disk(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A fixed 1800s cannot copy AND push a large disk.
+
+        The Job reads the whole disk twice — once into the scratch file, once
+        over the network — so half an hour was a guaranteed DeadlineExceeded
+        for anything past a test image, reported as a timeout rather than as
+        "too slow".
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+
+        def _deadline_for(capacity: str) -> int:
+            batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+            mock_k8s_client.core_api.read_namespaced_persistent_volume_claim = AsyncMock(
+                return_value=_fake_source_pvc(capacity=capacity)
+            )
+            p1, p2, p3 = _patches(batch_api, custom_api)
+            with p1, p2, p3:
+                assert _post(client).status_code == 202
+            body = batch_api.create_namespaced_job.call_args.kwargs["body"]
+            return body["spec"]["activeDeadlineSeconds"]
+
+        small = _deadline_for("10Gi")
+        large = _deadline_for("500Gi")
+
+        assert small == 1800 + 10 * 120
+        assert large > small
+        # Still finite: activeDeadlineSeconds is the only thing that reaps a
+        # Job that hangs.
+        assert large <= 86400
+
+    def test_the_snapshot_names_a_class_rather_than_hoping_for_a_default(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """disks.py detects one explicitly; publish assumed a default.
+
+        A VolumeSnapshot created with no class and no cluster default sits
+        Pending with a `no VolumeSnapshotClass found` event — no
+        ApiException, nothing this handler can see — so the temporary PVC
+        never binds and the Job runs out its deadline.
+
+        The class whose `driver` matches the source StorageClass's
+        provisioner wins, because a cluster with two CSI drivers has two
+        classes and the first one alphabetically is a coin flip.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": [
+            {"metadata": {"name": "csi-hostpath-snapclass"}, "driver": "hostpath.csi.k8s.io"},
+            {"metadata": {"name": "csi-rbdplugin-snapclass"}, "driver": "rbd.csi.ceph.com"},
+        ]})
+        storage_api = MagicMock()
+        storage_api.read_storage_class = AsyncMock(
+            return_value=SimpleNamespace(provisioner="rbd.csi.ceph.com")
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3, patch(
+            "app.api.v1.images.client.StorageV1Api", return_value=storage_api
+        ):
+            response = _post(client)
+
+        assert response.status_code == 202
+        snapshot = custom_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        assert snapshot["spec"]["volumeSnapshotClassName"] == "csi-rbdplugin-snapclass"
+
+    def test_a_cluster_with_no_snapshot_classes_omits_the_field(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Naming an empty string would be worse than naming nothing."""
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        custom_api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202
+        snapshot = custom_api.create_namespaced_custom_object.call_args.kwargs["body"]
+        assert "volumeSnapshotClassName" not in snapshot["spec"]

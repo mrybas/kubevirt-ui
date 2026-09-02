@@ -214,12 +214,19 @@ class VMImageCreate(BaseModel):
             "(no registry host — the backend adds it)"
         ),
     )
-    # Secret in the TARGET namespace holding the Harbor robot credential.
-    # CDI resolves secretRef in the DataVolume's own namespace and nowhere else.
-    # Optional: a catalog_ref fills this in by convention when it is omitted.
-    source_registry_secret: str | None = None
-    # ConfigMap holding the registry's CA, while Harbor uses a private one.
-    source_registry_ca_configmap: str | None = None
+    # DELIBERATELY ABSENT: source_registry_secret / source_registry_ca_configmap.
+    #
+    # They used to be here, and a caller could set BOTH `source_registry` (any
+    # URL at all) and `source_registry_secret` — so a request naming
+    # `docker://attacker.tld/x:1` plus the tenant's Harbor robot Secret made
+    # CDI authenticate to the attacker's registry with the tenant's robot
+    # password. Validating the URL and keeping the field is the wrong shape:
+    # an allow-list on a caller-supplied string that gates a credential is one
+    # bypass away from the same bug. The credential is derived server-side from
+    # the RESOLVED registry host instead, and is attached only when that host
+    # is the configured Harbor (see images.py's create_golden_image). A
+    # `source_registry` pointing anywhere else gets an anonymous pull, which is
+    # exactly what it got before the catalogue existed.
     source_pvc: str | None = Field(None, description="PVC name to clone from")
     source_pvc_namespace: str | None = Field(None, description="PVC namespace to clone from")
     
@@ -354,9 +361,11 @@ class ImagePublishRequest(BaseModel):
     `project`/`repository`/`tag` name where the pushed image lands in Harbor.
 
     `secret_name` names the tenant's robot credential Secret, in this same
-    `namespace` — the harbor-robots chart provisions it there, same as the
-    pull-direction `source_registry_secret`. Required, unlike that one: Harbor
-    never accepts an anonymous push.
+    `namespace` — the harbor-robots chart provisions it there. Required:
+    Harbor never accepts an anonymous push. Unlike the pull direction, naming
+    it here leaks nothing: the push target is always
+    `harbor_registry_host()`, never a caller-supplied URL, and `namespace` is
+    checked against the caller's own bindings before this Secret is read.
     """
 
     namespace: str

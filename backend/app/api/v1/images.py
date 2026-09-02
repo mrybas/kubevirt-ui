@@ -6,14 +6,25 @@ images are separate concerns that happened to share a file.
 
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client.rest import ApiException
 
 from app.api.v1.images_catalog import catalog_images, merge
+# One implementation of the namespace guard, not two. storage.py is where it
+# was written and where its docstring records the bug class it exists for
+# (a namespace in a query string is not an authorisation); importing it keeps
+# a second copy from drifting away from that one.
+from app.api.v1.storage import require_namespace_access
 from app.core.auth import User, require_auth
-from app.core.errors import validate_k8s_name
+from app.core.errors import (
+    validate_harbor_project,
+    validate_k8s_name,
+    validate_oci_repository,
+    validate_oci_tag,
+)
 from app.core.harbor_client import (
     HarborUnauthorized,
     HarborUnavailable,
@@ -408,8 +419,19 @@ async def list_golden_images(
         ))
 
         # --- catalogue half -------------------------------------------------
-        # Off by default: with the flag unset this block does nothing and the
-        # response is byte-identical to before.
+        # Off by default. With the flag unset nothing below runs, no Harbor
+        # call is made, and `images` is exactly the cluster list built above.
+        #
+        # `catalog_available` is assigned here rather than inside the branch,
+        # and the reason is worth being precise about because the comment that
+        # used to sit here claimed a "byte-identical response" that the code
+        # does not produce on its own: the field is always present in the
+        # response body, flag or no flag. What makes that harmless is that
+        # `VMImageListResponse.catalog_available` defaults to True, so the
+        # value serialised with the flag off is the model's own default — the
+        # same body a build without this assignment would emit. What the flag
+        # actually guarantees is the absence of the Harbor round trip and of
+        # any catalogue row, not the absence of the field.
         catalog_available = True
         if harbor_image_path_enabled():
             if not user.raw_token:
@@ -429,13 +451,31 @@ async def list_golden_images(
             else:
                 harbor = request.app.state.harbor_client
                 try:
-                    catalog = await catalog_images(harbor, user.raw_token)
+                    catalog, complete = await catalog_images(harbor, user.raw_token)
                     images = merge(images, catalog)
+                    catalog_available = complete
                 except HarborUnauthorized:
                     logger.info("harbor rejected the caller's token; listing cluster images only")
                     catalog_available = False
                 except HarborUnavailable as exc:
                     logger.warning("harbor unreachable (%s); listing cluster images only", exc)
+                    catalog_available = False
+                except Exception:
+                    # Deliberately broad, and it is the promise this endpoint
+                    # makes: "GET /images never fails because Harbor failed".
+                    # Catching only the two designed exceptions kept that
+                    # promise for the two failures we thought of — an
+                    # AttributeError off a row Harbor returned as something
+                    # other than a dict, or a ValueError out of a zip(),
+                    # escaped past `except ApiException` below and 500'd the
+                    # whole page, cluster rows and all. The catalogue is an
+                    # enrichment; nothing about it is worth losing the disks
+                    # the user already has.
+                    logger.error(
+                        "catalogue read failed unexpectedly; listing cluster "
+                        "images only",
+                        exc_info=True,
+                    )
                     catalog_available = False
 
         return GoldenImageListResponse(
@@ -760,6 +800,111 @@ async def _configmap_exists(k8s_client: Any, namespace: str, name: str) -> bool:
         return False
 
 
+def registry_host_of(url: str) -> str:
+    """The bare host[:port] a `docker://host/path:tag` URL resolves against.
+
+    Deliberately conservative. Anything that is not a `docker://` URL with a
+    plain `host[:port]` authority returns "" — no scheme of another kind, no
+    userinfo (`docker://harbor.example@attacker.tld/...` authenticates to
+    attacker.tld, and reading the host off the wrong side of the `@` is the
+    classic way to be fooled here), no empty authority. "" never equals a
+    configured Harbor host, so anything unparseable gets no credential.
+    """
+    if not url or not url.startswith("docker://"):
+        return ""
+    parsed = urlparse(url)
+    netloc = parsed.netloc
+    if not netloc or "@" in netloc:
+        return ""
+    return netloc
+
+
+async def _harbor_credentials_for(
+    k8s_client: Any, namespace: str, registry_url: str, *, required: bool
+) -> tuple[str | None, str | None]:
+    """(secretRef, certConfigMap) for a registry URL — Harbor's host only.
+
+    THE CREDENTIAL IS DERIVED FROM THE RESOLVED HOST, NEVER FROM THE REQUEST.
+    A caller used to be able to send `source_registry_secret` alongside an
+    arbitrary `source_registry`, which handed the tenant's Harbor robot
+    password to whatever registry the caller named. There is no field to send
+    any more, and this function is the only thing that attaches one: if the
+    URL does not resolve to `harbor_registry_host()`, both halves are None and
+    the pull is anonymous — the behaviour every registry source had before the
+    catalogue existed.
+
+    The Secret is named by convention (`harbor_robot_secret_name()`): one name,
+    the same in every tenant namespace, and what makes it "the tenant's" is
+    which namespace it is in — which is also the only namespace CDI resolves it
+    in. Checked here, before anything is created: created with a `secretRef`
+    that does not resolve, the DataVolume fails much later inside CDI as an
+    import error that never mentions the Secret.
+
+    `required` says what an absent Secret means. For a CATALOGUE selection it
+    is a refusal (422 naming the Secret and the namespace) — the credential is
+    the whole point, and silently pulling anonymously is the defect this
+    replaces. For a caller-supplied `source_registry` that merely happens to
+    point at Harbor it is not: that request pulled anonymously before this
+    feature existed and still does, because a deployment with a public Harbor
+    project and no robot Secret is not misconfigured.
+
+    The CA is genuinely optional — a Harbor behind a publicly trusted
+    certificate has no ConfigMap to name, and CDI refuses the import outright
+    if `certConfigMap` points at nothing — so it is attached only when a
+    ConfigMap by that name is really there.
+    """
+    harbor_host = harbor_registry_host()
+    if not harbor_host or registry_host_of(registry_url) != harbor_host:
+        return None, None
+
+    secret: str | None = harbor_robot_secret_name() or None
+    if secret and not await _secret_exists(k8s_client, namespace, secret):
+        if required:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Secret '{secret}' not found in namespace "
+                    f"'{namespace}'. CDI resolves secretRef in the "
+                    "DataVolume's own namespace; the harbor-robots chart "
+                    "provisions it there."
+                ),
+            )
+        logger.info(
+            "no %s Secret in %s; pulling %s anonymously",
+            secret, namespace, registry_url,
+        )
+        secret = None
+
+    # Independent of the credential: the CA is about trusting the registry's
+    # TLS, which an anonymous pull needs just as much as an authenticated one.
+    ca_name = harbor_ca_configmap_name()
+    ca = (
+        ca_name
+        if ca_name and await _configmap_exists(k8s_client, namespace, ca_name)
+        else None
+    )
+    return secret, ca
+
+
+async def _secret_exists(k8s_client: Any, namespace: str, name: str) -> bool:
+    """Whether a Secret by this name is in this namespace.
+
+    Unlike the optional CA, only a clean 404 counts as "not there": anything
+    else is propagated. Treating a transport error as absence here would
+    downgrade an authenticated pull to an anonymous one on a hiccup, which is
+    the silent failure this whole path exists to avoid.
+    """
+    try:
+        await k8s_client.core_api.read_namespaced_secret(
+            name=name, namespace=namespace
+        )
+        return True
+    except ApiException as exc:
+        if exc.status == 404:
+            return False
+        raise
+
+
 def build_registry_source(
     url: str, secret_ref: str | None, cert_config_map: str | None
 ) -> dict[str, Any]:
@@ -861,15 +1006,30 @@ async def create_golden_image(
         #     source_url to re-join this disk with its catalogue row. Without
         #     it the unified list shows one image as two rows, forever.
         #
-        #   the credential — by convention (see harbor_robot_secret_name):
-        #     one Secret name, the same in every tenant namespace, which is
-        #     the only namespace CDI resolves it in. Without it every
-        #     materialise is an anonymous pull that works only against public
-        #     projects.
+        #   the credential — see _harbor_credentials_for below. It is derived
+        #     from the RESOLVED host, never named by the caller.
         registry_url = image.source_registry
-        registry_secret = image.source_registry_secret
-        registry_ca = image.source_registry_ca_configmap
-        if image.catalog_ref and not registry_url:
+        if image.catalog_ref:
+            # The catalogue path is the Harbor path. Gated with the same flag
+            # the list and publish paths use, so "HARBOR_IMAGE_ENABLED unset
+            # means Harbor is not reachable from this API" is true of all
+            # three, not two of three.
+            if not harbor_image_path_enabled():
+                raise HTTPException(
+                    status_code=501, detail="Harbor image path is disabled"
+                )
+            if registry_url:
+                # Two different sources for one disk. Refused rather than
+                # silently preferring one — the old code preferred
+                # source_registry, which is how a caller-chosen registry came
+                # to be paired with a Harbor credential in the first place.
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "send either 'catalog_ref' or 'source_registry', not "
+                        "both — they name two different images"
+                    ),
+                )
             host = harbor_registry_host()
             if not host:
                 raise HTTPException(
@@ -880,20 +1040,24 @@ async def create_golden_image(
                     ),
                 )
             registry_url = f"docker://{host}/{image.catalog_ref}"
-            registry_secret = registry_secret or harbor_robot_secret_name()
-            # The CA is genuinely optional — a Harbor behind a publicly
-            # trusted certificate has no ConfigMap to name, and CDI refuses
-            # the import outright if certConfigMap points at nothing. So it
-            # is attached only when it is really there. The Secret gets the
-            # opposite treatment on purpose: it is required, and its absence
-            # is refused loudly below rather than degraded into an anonymous
-            # pull that fails much later inside CDI.
-            if not registry_ca:
-                ca_name = harbor_ca_configmap_name()
-                if ca_name and await _configmap_exists(
-                    k8s_client, target_namespace, ca_name
-                ):
-                    registry_ca = ca_name
+
+        # THE CREDENTIAL FOLLOWS THE HOST, AND ONLY THE HOST.
+        #
+        # `source_registry` is a caller-supplied URL and always has been. What
+        # changed — and what had to change back — is that the request also used
+        # to carry `source_registry_secret`, so `source_registry:
+        # docker://attacker.tld/x:1` plus `source_registry_secret:
+        # harbor-robot` made CDI authenticate to an attacker's registry with
+        # the tenant's Harbor robot password. Deriving the credential from the
+        # resolved host removes the class: a URL that does not resolve to the
+        # configured Harbor gets no credential at all, which is an anonymous
+        # pull — precisely what it got before this feature existed.
+        registry_secret, registry_ca = (None, None)
+        if registry_url:
+            registry_secret, registry_ca = await _harbor_credentials_for(
+                k8s_client, target_namespace, registry_url,
+                required=bool(image.catalog_ref),
+            )
 
         # Determine source
         source_url_display = None
@@ -917,31 +1081,10 @@ async def create_golden_image(
             source = {"blank": {}}
             source_url_display = "blank"
 
-        # A registry pull whose robot Secret does not exist in this namespace
-        # is refused here, before anything is created. CDI resolves secretRef
-        # in the DataVolume's own namespace and nowhere else; created with a
-        # secretRef that does not resolve, the DataVolume fails later inside
-        # CDI as an import error that never mentions the Secret — the user
-        # would learn nothing useful from it. Checked ahead of the
-        # image_path_enabled() branch so both writers (DataVolume and
-        # ManagedImage) get the same refusal.
-        if registry_secret:
-            try:
-                await k8s_client.core_api.read_namespaced_secret(
-                    name=registry_secret, namespace=target_namespace
-                )
-            except ApiException as exc:
-                if exc.status == 404:
-                    raise HTTPException(
-                        status_code=422,
-                        detail=(
-                            f"Secret '{registry_secret}' not found in "
-                            f"namespace '{target_namespace}'. CDI resolves secretRef "
-                            "in the DataVolume's own namespace; the harbor-robots "
-                            "chart provisions it there."
-                        ),
-                    ) from exc
-                raise
+        # NB: the robot Secret's existence was already checked, above, by
+        # `_harbor_credentials_for` — before `source` was built and therefore
+        # before either writer runs, so the DataVolume path and the
+        # ManagedImage path get the same refusal.
 
         # With the operator owning images, the backend stops writing the disk
         # and writes the intent instead. Same request, same namespace, same
@@ -1444,6 +1587,101 @@ async def create_golden_image_from_disk(
 # Publish (snapshot-then-publish a running VM's disk to the catalogue)
 # ---------------------------------------------------------------------------
 
+# The last-resort disk size, used only when a PVC reports neither a bound
+# capacity nor a requested one — which should not happen, and did not stay
+# hypothetical: `status.capacity` alone is empty for the whole of a Pending
+# PVC's life, so a 200Gi disk waiting on WaitForFirstConsumer was published
+# into a 10Gi temporary PVC and a 12Gi scratch. The failure arrives ~25
+# minutes in, as an ENOSPC inside `dd`, on a Job nobody is watching.
+_FALLBACK_DISK_CAPACITY = "10Gi"
+
+
+def _source_pvc_capacity(source_pvc: Any) -> str:
+    """The size of the disk being published, as a Kubernetes quantity.
+
+    `status.capacity` is authoritative once a PVC is Bound, and empty until
+    then. `spec.resources.requests.storage` is what was asked for and exists
+    from creation, so it is the right fallback: for a Bound PVC the two agree
+    (or status is larger, after an expand), and for a Pending one it is the
+    only number there is.
+    """
+    status = getattr(source_pvc, "status", None)
+    capacity = getattr(status, "capacity", None) or {}
+    bound = capacity.get("storage") if hasattr(capacity, "get") else None
+    if bound:
+        return str(bound)
+
+    spec = getattr(source_pvc, "spec", None)
+    resources = getattr(spec, "resources", None)
+    requests = getattr(resources, "requests", None) or {}
+    requested = requests.get("storage") if hasattr(requests, "get") else None
+    if requested:
+        return str(requested)
+
+    logger.warning(
+        "publish: source PVC reports neither a bound nor a requested "
+        "capacity; falling back to %s", _FALLBACK_DISK_CAPACITY,
+    )
+    return _FALLBACK_DISK_CAPACITY
+
+
+async def _volume_snapshot_class_for(
+    k8s_client: Any, storage_class_name: str
+) -> str:
+    """The VolumeSnapshotClass to snapshot a PVC on `storage_class_name` with.
+
+    Omitting `volumeSnapshotClassName` only works where the cluster has a
+    class annotated as default, and this codebase already knows better:
+    `disks.py`'s create_disk_snapshot detects one explicitly rather than
+    assuming. A snapshot created against no class is left Pending with a
+    `no VolumeSnapshotClass found` event — no ApiException, nothing the
+    publish handler can see — so the temporary PVC never binds and the Job
+    runs out its deadline.
+
+    Preference is a class whose `driver` matches the source StorageClass's
+    provisioner, because a cluster with more than one CSI driver has more than
+    one class and the first one alphabetically is a coin flip. Falls back to
+    the first class, then to "" (leave the field off, and let a cluster-default
+    class apply if there is one).
+    """
+    custom_api = client.CustomObjectsApi(k8s_client._api_client)
+    try:
+        listed = await custom_api.list_cluster_custom_object(
+            group="snapshot.storage.k8s.io",
+            version="v1",
+            plural="volumesnapshotclasses",
+        )
+    except Exception:
+        logger.warning(
+            "publish: could not list VolumeSnapshotClasses; creating the "
+            "snapshot without one", exc_info=True,
+        )
+        return ""
+
+    classes = [c for c in listed.get("items", []) if isinstance(c, dict)]
+    if not classes:
+        return ""
+
+    provisioner = ""
+    if storage_class_name:
+        try:
+            storage_api = client.StorageV1Api(k8s_client._api_client)
+            sc = await storage_api.read_storage_class(name=storage_class_name)
+            provisioner = getattr(sc, "provisioner", "") or ""
+        except Exception:
+            logger.info(
+                "publish: could not read StorageClass %r; picking a snapshot "
+                "class without matching its provisioner", storage_class_name,
+            )
+
+    if provisioner:
+        for candidate in classes:
+            if candidate.get("driver") == provisioner:
+                return candidate.get("metadata", {}).get("name", "") or ""
+
+    return classes[0].get("metadata", {}).get("name", "") or ""
+
+
 async def create_object(k8s_client: Any, obj: dict[str, Any]) -> dict[str, Any]:
     """Create a k8s object described as a plain dict, and return it as one.
 
@@ -1512,10 +1750,31 @@ async def publish_image(
 
     validate_k8s_name(req.namespace, "namespace")
     validate_k8s_name(req.disk_name, "disk_name")
-    validate_k8s_name(req.tag, "tag")
     validate_k8s_name(req.secret_name, "secret_name")
+    # NOT validate_k8s_name. A Kubernetes name and an image coordinate are
+    # different alphabets: the k8s rule has no dots, no underscores and no
+    # uppercase, so `v1.0.0`, `24.04` and `ubuntu_22` were all refused with a
+    # 422 blaming the caller for perfectly ordinary tags — while `project` and
+    # `repository`, which are interpolated into Harbor API paths and into the
+    # Job's push reference, were not checked at all.
+    validate_harbor_project(req.project, "project")
+    validate_oci_repository(req.repository, "repository")
+    validate_oci_tag(req.tag, "tag")
 
     k8s_client = request.app.state.k8s_client
+
+    # The namespace comes from the request body, and everything below reads or
+    # writes in it with the UI's own ServiceAccount, which can reach every
+    # namespace: a Secret is read, a PVC is read, and a Job is created that
+    # exports that PVC's bytes to an external registry. `validate_k8s_name`
+    # says the string is a legal name, not that it is the caller's.
+    #
+    # The pre-existing image endpoints never checked either, so this branch
+    # regressed nothing — but publish is the one endpoint here that copies disk
+    # contents OUT of the cluster, which makes it the wrong place to inherit
+    # the weaker convention. Same check, same 404-not-403 reasoning, as
+    # storage.py's routes.
+    await require_namespace_access(request, user, req.namespace)
 
     # The Job pushes as the tenant robot, whose credential lives in a Secret
     # in this same namespace (the harbor-robots chart provisions it there —
@@ -1561,9 +1820,7 @@ async def publish_image(
     access_modes = source_pvc.spec.access_modes or ["ReadWriteOnce"]
     storage_class = source_pvc.spec.storage_class_name or ""
     volume_mode = source_pvc.spec.volume_mode or "Block"
-    source_capacity = "10Gi"
-    if source_pvc.status and source_pvc.status.capacity:
-        source_capacity = source_pvc.status.capacity.get("storage", source_capacity)
+    source_capacity = _source_pvc_capacity(source_pvc)
 
     # No token, no publish. `user.raw_token or ""` used to stand here, which
     # sent Harbor an empty bearer: against a public project Harbor answers
@@ -1639,6 +1896,9 @@ async def publish_image(
                 req.namespace, req.disk_name, ref,
                 registry=registry, secret_name=req.secret_name,
                 volume_mode=volume_mode,
+                # The deadline follows the disk: everything the Job does is
+                # proportional to the number of bytes it has to move.
+                source_size=source_capacity,
             ),
         )
     except ApiException as exc:
@@ -1669,6 +1929,9 @@ async def publish_image(
             req.namespace, req.disk_name, job_name, job_uid,
             storage_class=storage_class, volume_mode=volume_mode,
             access_modes=access_modes, storage_size=source_capacity,
+            snapshot_class=await _volume_snapshot_class_for(
+                k8s_client, storage_class
+            ),
         )
         snapshot_obj, pvc_obj, *extra_dependents = dependents
         created_snapshot = await create_object(k8s_client, snapshot_obj)

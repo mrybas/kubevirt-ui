@@ -97,10 +97,18 @@ beforeEach(() => {
 
 function renderModal(images: GoldenImage[]) {
   const onClose = vi.fn();
-  render(
+  const { rerender } = render(
     <TemplateModal goldenImages={images} projects={PROJECTS} defaultProject="" onClose={onClose} />
   );
-  return { onClose };
+  // `goldenImages` is a prop fed by `useGoldenImages()`, which react-query
+  // refetches after a successful import. A test that only ever renders one
+  // static list can never see what the user sees on the second submit — which
+  // is precisely how the dead-end below went unnoticed.
+  const refetch = (next: GoldenImage[]) =>
+    rerender(
+      <TemplateModal goldenImages={next} projects={PROJECTS} defaultProject="" onClose={onClose} />
+    );
+  return { onClose, refetch };
 }
 
 async function fillCommonFields(user: ReturnType<typeof userEvent.setup>) {
@@ -157,6 +165,98 @@ describe('the template form does not re-import an already-materialised catalogue
     // import produced, not the catalogue ref itself.
     expect(mockCreateTemplate.mock.calls[0][0]).toMatchObject({ golden_image_name: 'rocky-9-1-abc12' });
     expect(mockCreateTemplate.mock.calls[1][0]).toMatchObject({ golden_image_name: 'rocky-9-1-abc12' });
+  });
+
+  it('retries against the disk the refetch now shows, not the catalogue ref', async () => {
+    // What the merged list looks like once the import has landed: the
+    // catalogue row is GONE — `merge()` prefers the cluster row and drops its
+    // catalogue counterpart — and the disk that replaced it carries the ref as
+    // provenance. `goldenImageName` still holds "p/rocky-9:1".
+    //
+    // Before the fix, `projectImages.find` matched cluster rows on `name`
+    // only, so nothing matched: the reuse branch and the import branch were
+    // both skipped and "p/rocky-9:1" went out as `golden_image_name`. That is
+    // a disk name the backend has never heard of, so the retry 404'd — the
+    // "cannot import twice" property held only because the user dead-ended.
+    const MATERIALISED: GoldenImage = {
+      name: 'rocky-9-1-abc12',
+      namespace: 'acme-dev',
+      display_name: 'Rocky 9',
+      size: '20Gi',
+      status: 'Ready',
+      disk_type: 'image',
+      persistent: false,
+      scope: 'environment',
+      origin: 'cluster',
+      catalog_ref: 'p/rocky-9:1',
+    };
+
+    const user = userEvent.setup();
+    mockCreateImage.mockResolvedValue({ name: 'rocky-9-1-abc12' });
+    mockCreateTemplate
+      .mockRejectedValueOnce(new Error('template "my-template" already exists'))
+      .mockResolvedValueOnce({});
+
+    const { onClose, refetch } = renderModal([CATALOG_IMAGE]);
+
+    await fillCommonFields(user);
+    await pickFromSelect(user, 'Select a project...', 'Acme Dev');
+    await pickFromSelect(user, 'Select an image...', 'Rocky 9 (will be imported)');
+
+    await submit(user);
+    await waitFor(() => expect(mockCreateTemplate).toHaveBeenCalledTimes(1));
+    await screen.findByText(/already exists/i);
+
+    // The import succeeded, so the list the modal is given now reflects it.
+    refetch([MATERIALISED]);
+
+    await submit(user);
+    await waitFor(() => expect(mockCreateTemplate).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+
+    // Still exactly one import, and — the part that was broken — the retry
+    // references the disk, never the raw catalogue ref.
+    expect(mockCreateImage).toHaveBeenCalledTimes(1);
+    expect(mockCreateTemplate.mock.calls[1][0]).toMatchObject({
+      golden_image_name: 'rocky-9-1-abc12',
+    });
+  });
+
+  it('picks a merged cluster row up by its catalogue ref on a fresh submit', async () => {
+    // The same lookup, with no prior submit at all: a user who imported the
+    // image in an earlier session sees one merged row whose select value is
+    // its disk name, so this is really about the select still holding a ref
+    // (edit mode, a restored draft) — the resolution must not depend on the
+    // in-memory cache a fresh mount does not have.
+    const MERGED: GoldenImage = {
+      name: 'rocky-9-1-abc12',
+      namespace: 'acme-dev',
+      display_name: 'Rocky 9',
+      size: '20Gi',
+      status: 'Ready',
+      disk_type: 'image',
+      persistent: false,
+      scope: 'environment',
+      origin: 'cluster',
+      catalog_ref: 'p/rocky-9:1',
+    };
+
+    const user = userEvent.setup();
+    mockCreateTemplate.mockResolvedValue({});
+
+    const { onClose } = renderModal([MERGED]);
+
+    await fillCommonFields(user);
+    await pickFromSelect(user, 'Select a project...', 'Acme Dev');
+    await pickFromSelect(user, 'Select an image...', 'Rocky 9 (20Gi)');
+
+    await submit(user);
+
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1));
+    expect(mockCreateImage).not.toHaveBeenCalled();
+    expect(mockCreateTemplate.mock.calls[0][0]).toMatchObject({
+      golden_image_name: 'rocky-9-1-abc12',
+    });
   });
 
   it('never attempts template creation when the import itself fails, and surfaces the failure', async () => {

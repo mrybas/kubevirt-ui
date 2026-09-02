@@ -460,14 +460,32 @@ export function TemplateModal({ goldenImages, projects, defaultProject, editTemp
     // against the filtered list by `origin`, not by guessing at the
     // string's shape — a catalogue ref like "p/rocky-9:1" is not reliably
     // distinguishable from a disk name by pattern alone.
+    //
+    // A cluster row is ALSO matched on its `catalog_ref`, and that is what
+    // makes a retry survive a refetch. Once the import succeeds, the backend
+    // merges the two halves: the catalogue row is dropped and the cluster row
+    // it produced carries the ref as provenance. `goldenImageName` still holds
+    // the ref the user picked, so matching cluster rows on `name` alone found
+    // nothing at all — neither the reuse branch nor the import branch ran, and
+    // the raw ref went out as `golden_image_name`, which the backend answers
+    // 404 for. No duplicate import, but only because the user dead-ended with
+    // an error that named a disk they never asked for. The two keys cannot
+    // collide: a disk name is DNS-1123 and can hold neither "/" nor ":".
     const selectedImage = projectImages.find((img) =>
-      img.origin === 'catalog' ? img.catalog_ref === goldenImageName : img.name === goldenImageName
+      img.origin === 'catalog'
+        ? img.catalog_ref === goldenImageName
+        : img.name === goldenImageName || img.catalog_ref === goldenImageName
     );
 
     setImportError(null);
     let imageName = goldenImageName;
 
-    if (selectedImage?.origin === 'catalog') {
+    if (selectedImage && selectedImage.origin !== 'catalog') {
+      // Either an ordinary cluster selection, or the disk a previous submit
+      // materialised and the refetch has now brought back. Both cases want
+      // the disk's real name, never the value the select still holds.
+      imageName = selectedImage.name;
+    } else if (selectedImage?.origin === 'catalog') {
       const materialisedKey = `${selectedProject}/${selectedImage.catalog_ref}`;
       const alreadyMaterialised = materialisedImages[materialisedKey];
 

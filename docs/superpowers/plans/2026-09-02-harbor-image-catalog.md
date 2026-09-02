@@ -772,6 +772,19 @@ The create path builds `{"registry": {"url": ...}}` today with no credentials, s
 - Consumes: Task 3's model fields
 - Produces: the create request accepts `source_registry_secret: str | None` and `source_registry_ca_configmap: str | None`; the rendered DataVolume carries `spec.source.registry.secretRef` and `.certConfigMap` when they are set
 
+> **SUPERSEDED — do not implement this task as written.** Those two request
+> fields are a credential-exfiltration primitive: paired with the
+> `source_registry` this same task accepts, a caller can name any registry in
+> the world AND the tenant's Harbor robot Secret, and CDI will authenticate to
+> that registry with the tenant's robot password. The code blocks below are
+> kept as the historical record of what was built, not as instructions.
+>
+> Both fields were removed. The credential is derived server-side from the
+> RESOLVED registry host and attached only when that host is
+> `harbor_registry_host()`; see `_harbor_credentials_for` in
+> `backend/app/api/v1/images.py` and the design spec's "Materialising an image"
+> section. Anything else gets an anonymous pull — the pre-feature behaviour.
+
 - [ ] **Step 1: Write the failing test**
 
 Create `backend/tests/test_a_catalog_image_becomes_a_disk_with_credentials.py`:

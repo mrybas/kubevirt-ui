@@ -88,13 +88,21 @@ class TestTheCatalogueHalf:
         assert [item["origin"] for item in data["items"]] == ["catalog"]
         assert data["items"][0]["catalog_ref"] == "vm-images-public/ubuntu-2204:20260901"
 
-    def test_flag_off_is_byte_identical_and_never_calls_harbor(
+    def test_flag_off_never_calls_harbor_and_leaves_the_body_unchanged(
         self,
         client: TestClient,
         fake_user: User,
         mock_harbor_client: MagicMock,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Renamed from "byte identical", which claimed more than is true.
+
+        `catalog_available` is in the response body whether the flag is on or
+        off — it is a model field with a default, not something the branch
+        adds. What the flag guarantees is that no Harbor call is made and no
+        catalogue row appears; the value serialised with it off is the
+        model's own default. See the comment at the assignment in images.py.
+        """
         monkeypatch.delenv("HARBOR_IMAGE_ENABLED", raising=False)
         # Even with a token available, the flag being off must mean the
         # catalogue code path is never reached at all.
@@ -183,6 +191,77 @@ class TestTheCatalogueHalf:
         assert [i for i in data["items"] if i.get("origin") == "catalog"] == []
         # The rejection must be caught before enumeration is ever attempted.
         mock_harbor_client.list_projects.assert_not_called()
+
+    def test_an_undesigned_failure_in_the_catalogue_never_500s_the_page(
+        self,
+        client: TestClient,
+        fake_user: User,
+        mock_harbor_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """"GET /images never fails because Harbor failed" held for two cases.
+
+        The handler caught HarborUnauthorized and HarborUnavailable — the two
+        exceptions the design named — and nothing else. Anything the design
+        did not think of (an AttributeError off a row Harbor returned in an
+        unexpected shape, a ValueError out of a zip, a JSON decode failure)
+        went straight past `except ApiException` and 500'd the whole page,
+        taking the cluster rows with it. The catalogue is an enrichment;
+        losing the disks the user already has to it is the one outcome the
+        promise exists to prevent.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        fake_user.raw_token = "caller-token-abc"
+        mock_harbor_client.list_projects = AsyncMock(
+            side_effect=TypeError("'NoneType' object is not iterable")
+        )
+
+        with _cluster_with_one_disk():
+            response = client.get("/api/v1/images")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [item["name"] for item in data["items"]] == ["ubuntu-existing"]
+        assert data["catalog_available"] is False
+
+    def test_a_partly_readable_catalogue_returns_what_it_could_and_says_so(
+        self,
+        client: TestClient,
+        fake_user: User,
+        mock_harbor_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One project the caller cannot read used to empty the catalogue.
+
+        The rows that WERE readable are real and are returned; the banner
+        says the list may be short, which is the truth.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        fake_user.raw_token = "caller-token-abc"
+        mock_harbor_client.list_projects = AsyncMock(
+            return_value=[{"name": "vm-images-public"}, {"name": "locked"}]
+        )
+
+        async def _artifacts(_token, project):
+            if project == "locked":
+                raise HarborUnavailable("500 from harbor")
+            return [{
+                "repository_name": "vm-images-public/ubuntu-2204",
+                "size": 2147483648,
+                "tags": [{"name": "20260901"}],
+            }]
+
+        mock_harbor_client.list_project_artifacts = AsyncMock(side_effect=_artifacts)
+
+        with _no_cluster_resources():
+            response = client.get("/api/v1/images")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert [i["catalog_ref"] for i in data["items"]] == [
+            "vm-images-public/ubuntu-2204:20260901"
+        ]
+        assert data["catalog_available"] is False
 
     def test_a_valid_identity_with_a_genuinely_empty_catalogue_is_still_available(
         self,

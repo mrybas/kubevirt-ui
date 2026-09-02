@@ -2,6 +2,13 @@
 
 CDI resolves secretRef in the DataVolume's OWN namespace, so the Secret has to
 be in the target namespace — which is where the harbor-robots chart puts it.
+
+The credential is NEVER named by the caller. `source_registry_secret` and
+`source_registry_ca_configmap` used to be request fields, which is how a
+request naming `docker://attacker.tld/x:1` could also name the tenant's robot
+Secret and have CDI authenticate to the attacker with it. Both are derived
+from the resolved registry host now, so every test here configures HARBOR_URL
+and the convention names instead of passing them in the body.
 """
 
 from types import SimpleNamespace
@@ -58,6 +65,12 @@ def _k8s_with_namespace() -> MagicMock:
     return k8s
 
 
+@pytest.fixture(autouse=True)
+def _a_configured_harbor(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HARBOR_URL", "https://harbor.example")
+    monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+
+
 async def test_a_missing_robot_secret_is_named_in_the_refusal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -67,13 +80,27 @@ async def test_a_missing_robot_secret_is_named_in_the_refusal(
     CDI, as an import error that never mentions the Secret — the user would
     learn nothing useful from that. This has to happen first, and it has to
     name the Secret.
+
+    Driven through `catalog_ref`, because that is the path where the
+    credential is the point: a catalogue image is materialised from the
+    tenant's Harbor and pulling it anonymously is a failure dressed as a
+    success. A caller-supplied `source_registry` that happens to name the same
+    host degrades to an anonymous pull instead — see
+    `test_a_public_harbor_project_with_no_robot_secret_still_pulls`.
     """
     from app.api.v1 import images
 
     monkeypatch.delenv("OPERATOR_IMAGE_ENABLED", raising=False)
+    # The convention name for this deployment. It is what the URL's host —
+    # harbor.example, the configured Harbor — resolves to; nothing in the
+    # request names it.
+    monkeypatch.setenv("HARBOR_ROBOT_SECRET", "absent-secret")
 
     k8s = _k8s_with_namespace()
     k8s.core_api.read_namespaced_secret = AsyncMock(
+        side_effect=ApiException(status=404)
+    )
+    k8s.core_api.read_namespaced_config_map = AsyncMock(
         side_effect=ApiException(status=404)
     )
 
@@ -89,8 +116,7 @@ async def test_a_missing_robot_secret_is_named_in_the_refusal(
 
     image = GoldenImageCreate(
         display_name="Tenant A Ubuntu",
-        source_registry="docker://harbor.example/vm-images-tenant-a/ubuntu:1",
-        source_registry_secret="absent-secret",
+        catalog_ref="vm-images-tenant-a/ubuntu:1",
         size="10Gi",
     )
 
@@ -126,11 +152,16 @@ async def test_the_managed_image_writer_carries_the_secret_and_ca_too(
     from app.api.v1 import images
 
     monkeypatch.setenv("OPERATOR_IMAGE_ENABLED", "true")
+    monkeypatch.setenv("HARBOR_ROBOT_SECRET", "harbor-robot-tenant-a")
+    monkeypatch.setenv("HARBOR_CA_CONFIGMAP", "harbor-ca")
 
     k8s = _k8s_with_namespace()
     # The Secret exists this time — the pre-flight check must pass through
     # so the create actually happens and there is a body to inspect.
     k8s.core_api.read_namespaced_secret = AsyncMock(return_value=MagicMock())
+    # And so does the CA ConfigMap, which is attached only when it really is
+    # there (CDI refuses an import whose certConfigMap names nothing).
+    k8s.core_api.read_namespaced_config_map = AsyncMock(return_value=MagicMock())
 
     captured: dict = {}
 
@@ -152,8 +183,6 @@ async def test_the_managed_image_writer_carries_the_secret_and_ca_too(
     image = GoldenImageCreate(
         display_name="Tenant A Ubuntu",
         source_registry="docker://harbor.example/vm-images-tenant-a/ubuntu:1",
-        source_registry_secret="harbor-robot-tenant-a",
-        source_registry_ca_configmap="harbor-ca",
         size="10Gi",
     )
 

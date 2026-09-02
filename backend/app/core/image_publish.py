@@ -206,6 +206,41 @@ def scratch_pvc_size(source_size: str) -> str:
     return f"{math.ceil(wanted / 1024**3)}Gi"
 
 
+# A publish reads the whole disk twice — once through `dd` (Block) or `tar`
+# (Filesystem), once over the network into the registry — so the time it needs
+# is a function of the disk's size and nothing else. A fixed 1800s was fine for
+# the 10Gi test image it was written against and guaranteed failure for
+# anything real: a 200Gi disk cannot be copied and pushed in half an hour on
+# any storage this runs on, so the Job was killed mid-push, every time,
+# reporting DeadlineExceeded rather than "too slow".
+#
+# The floor covers everything that is not proportional to size (scheduling,
+# waiting for the restored PVC to bind, the registry handshake). The rate is
+# deliberately pessimistic — roughly 9 MiB/s end to end — because the cost of
+# over-estimating is a Job that hangs a bit longer before failing, and the cost
+# of under-estimating is a publish that never succeeds at all.
+_DEADLINE_FLOOR_SECONDS = 1800
+_DEADLINE_SECONDS_PER_GIB = 120
+# 24h. Not a real expectation, a backstop: activeDeadlineSeconds is the only
+# thing that reaps a Job that hangs, so it must stay finite however large the
+# disk is.
+_DEADLINE_CEILING_SECONDS = 86400
+
+
+def publish_deadline_seconds(source_size: str) -> int:
+    """`activeDeadlineSeconds` for publishing a disk of `source_size`.
+
+    An unparseable size gets the floor — the same fixed value this used to
+    hand every disk — rather than an invented number.
+    """
+    raw = _parse_quantity(source_size)
+    if raw <= 0:
+        return _DEADLINE_FLOOR_SECONDS
+    gib = raw / 1024**3
+    wanted = _DEADLINE_FLOOR_SECONDS + int(math.ceil(gib * _DEADLINE_SECONDS_PER_GIB))
+    return min(wanted, _DEADLINE_CEILING_SECONDS)
+
+
 def cleanup_names(job_name: str) -> tuple[str, str]:
     """Names of the two objects every publish leaves behind if it dies.
 
@@ -234,8 +269,9 @@ def publish_job(
     *,
     registry: str = "",
     secret_name: str = "",
-    active_deadline_seconds: int = 1800,
+    active_deadline_seconds: int | None = None,
     volume_mode: str = "Block",
+    source_size: str = "",
 ) -> dict[str, Any]:
     """The publish Job, created SUSPENDED so it can own its dependents.
 
@@ -269,8 +305,14 @@ def publish_job(
     `activeDeadlineSeconds` bounds a publish that hangs (a snapshot restore
     that never binds, a registry that never answers) so it fails loudly
     instead of sitting suspended-turned-running forever, un-reaped because it
-    never reaches a terminal phase.
+    never reaches a terminal phase. It is derived from `source_size` (see
+    `publish_deadline_seconds`) rather than fixed, because the work it bounds
+    is proportional to the disk. An explicit `active_deadline_seconds` still
+    wins, for tests and for an operator who knows better.
     """
+    if active_deadline_seconds is None:
+        active_deadline_seconds = publish_deadline_seconds(source_size)
+
     full_ref = f"{registry}/{ref}" if registry else ref
     env: list[dict[str, Any]] = [{"name": "REF", "value": full_ref}]
     if registry:
@@ -357,6 +399,7 @@ def publish_dependents(
     volume_mode: str = "Block",
     access_modes: list[str] | None = None,
     storage_size: str = "1Gi",
+    snapshot_class: str = "",
 ) -> list[dict[str, Any]]:
     """The snapshot, the temporary PVC, and — for a Block source — the scratch
     PVC the Job's `dd` writes into. All owned by the Job.
@@ -383,6 +426,10 @@ def publish_dependents(
     `storage_class`/`access_modes`/`storage_size` default to values that keep
     planner-only unit tests working without a live disk to read from; a real
     publish always supplies the source PVC's own values.
+
+    `snapshot_class` names the VolumeSnapshotClass. Empty means "leave the
+    field off", which is only correct where a cluster-default class exists;
+    the handler resolves one rather than betting on that.
     """
     snap_name, tmp_name = cleanup_names(job_name)
     owner = [
@@ -404,7 +451,16 @@ def publish_dependents(
                 "namespace": namespace,
                 "ownerReferences": owner,
             },
-            "spec": {"source": {"persistentVolumeClaimName": pvc}},
+            "spec": {
+                "source": {"persistentVolumeClaimName": pvc},
+                # Named explicitly when the caller resolved one. Omitting it
+                # relies on the cluster having a class annotated as default,
+                # which disks.py:create_disk_snapshot already declines to
+                # assume — and a snapshot with no class resolves sits Pending
+                # with an event and no ApiException, so the publish handler
+                # would see success and the Job would time out.
+                **({"volumeSnapshotClassName": snapshot_class} if snapshot_class else {}),
+            },
         },
         {
             "apiVersion": "v1",

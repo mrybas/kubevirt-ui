@@ -182,6 +182,43 @@ backend:
     # the ManagedNetworkPeering object, so turning this on rewrites nothing and
     # turning it off orphans nothing.
     OPERATOR_PEERING_ENABLED: ""
+    # -- The Harbor image catalogue: list Harbor artifacts alongside cluster
+    # disks on the Images tab, materialise one into a disk, and publish a
+    # running VM's disk back to Harbor. Empty/false → none of it: no Harbor
+    # call is made on any path, GET /images returns exactly what it did
+    # before, and POST /images with a `catalog_ref` and POST /images/publish
+    # both answer 501.
+    #
+    # Nothing enabled the feature before this: the flag is read by the backend
+    # but the chart never emitted it, so `HARBOR_IMAGE_ENABLED` had to be set
+    # by editing the Deployment by hand. HARBOR_URL below is what the other
+    # three settings are derived from, so setting the flag without it gets a
+    # 503 on materialise rather than a mystery.
+    HARBOR_IMAGE_ENABLED: ""
+    # -- Harbor's base URL, WITH a scheme (httpx needs one), e.g.
+    # "https://harbor.example.com". Its host[:port] — the scheme stripped — is
+    # the registry host every pull and push reference is built against, in
+    # both directions, and is also what decides whether a caller-supplied
+    # `source_registry` is Harbor's own. REQUIRED whenever
+    # HARBOR_IMAGE_ENABLED is on.
+    HARBOR_URL: ""
+    # -- Name of the Secret in each TENANT namespace holding that tenant's
+    # Harbor robot credential, in CDI's accessKeyId/secretKey shape. One name,
+    # the same in every namespace: what makes it "the tenant's" is which
+    # namespace it is in, which is also the only namespace CDI resolves a
+    # secretRef in. Provisioned there by the harbor-robots chart. Empty →
+    # "harbor-robot".
+    #
+    # It is attached ONLY to a pull whose resolved registry host is HARBOR_URL's.
+    # It is never named by the API caller — that is what let a request name an
+    # arbitrary registry and this credential in the same breath.
+    HARBOR_ROBOT_SECRET: ""
+    # -- Name of the ConfigMap in each tenant namespace holding Harbor's CA,
+    # for a Harbor behind a private certificate. Empty → "harbor-ca". Attached
+    # only when a ConfigMap by that name actually exists in the target
+    # namespace: CDI refuses an import outright when certConfigMap names
+    # nothing, so a publicly-trusted Harbor must not have one asserted.
+    HARBOR_CA_CONFIGMAP: ""
     # -- Namespace where kube-ovn-controller Deployment lives. Backend
     # reads this to locate the kube-ovn install instead of doing a
     # cluster-wide Deployment scan. Cluster-wide discovery still runs as
