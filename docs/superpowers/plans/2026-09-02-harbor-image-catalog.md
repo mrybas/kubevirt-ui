@@ -241,6 +241,7 @@ either level — they are for the registry API (pull and push) only.
 import logging
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -266,6 +267,14 @@ class HarborClient:
         self._transport: httpx.AsyncBaseTransport | None = None
 
     async def _get(self, token: str, path: str) -> list[dict[str, Any]]:
+        """GET a list from Harbor.
+
+        The two designed exceptions are exhaustive: every failure path leaves
+        this method as HarborUnauthorized or HarborUnavailable, never as a raw
+        httpx or json error. A caller that catches only the documented two must
+        not be able to receive a third type -- that surfaces as an unhandled
+        500 rather than a clean message.
+        """
         url = f"{self._base_url}/api/v2.0{path}"
         try:
             async with httpx.AsyncClient(
@@ -279,25 +288,34 @@ class HarborClient:
 
         if resp.status_code in (401, 403):
             raise HarborUnauthorized(f"Harbor rejected the token for {path}")
-        if resp.status_code >= 500:
+        if resp.status_code >= 400:
+            # Everything else that is not success -- 404, 400, 409, 422 -- is a
+            # registry we cannot get an answer from. Letting raise_for_status()
+            # escape here would emit httpx.HTTPStatusError, a third type.
             raise HarborUnavailable(f"Harbor returned {resp.status_code} for {path}")
-        resp.raise_for_status()
 
-        body = resp.json()
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise HarborUnavailable(f"Harbor returned a non-JSON body for {path}") from exc
         return body if isinstance(body, list) else []
 
     async def list_projects(self, token: str) -> list[dict[str, Any]]:
         return await self._get(token, "/projects?page_size=100")
 
     async def list_repositories(self, token: str, project: str) -> list[dict[str, Any]]:
-        return await self._get(token, f"/projects/{project}/repositories?page_size=100")
+        # quote(safe="") because Harbor repository names are routinely
+        # multi-segment ("team/subimage"). An unencoded slash does not error --
+        # it addresses a DIFFERENT resource, which is the dangerous failure.
+        p = quote(project, safe="")
+        return await self._get(token, f"/projects/{p}/repositories?page_size=100")
 
     async def list_artifacts(
         self, token: str, project: str, repository: str
     ) -> list[dict[str, Any]]:
+        p, r = quote(project, safe=""), quote(repository, safe="")
         return await self._get(
-            token,
-            f"/projects/{project}/repositories/{repository}/artifacts?page_size=100",
+            token, f"/projects/{p}/repositories/{r}/artifacts?page_size=100"
         )
 ```
 
