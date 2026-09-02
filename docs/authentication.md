@@ -232,6 +232,49 @@ connectors:
       bindPW: admin_password
 ```
 
+### Additional OIDC Clients (Helm)
+
+The chart registers KubeVirt UI's own client automatically. To let the same Dex
+issue tokens for another application on the cluster — Harbor, Grafana — add it
+to `dex.staticClients`:
+
+```yaml
+dex:
+  enabled: true
+  staticClients:
+    - id: harbor
+      name: Harbor
+      redirectURIs:
+        - "https://harbor.example.com/c/oidc/callback"
+      secretEnv: HARBOR_CLIENT_SECRET
+    - id: grafana
+      name: Grafana
+      redirectURIs:
+        - "https://grafana.example.com/login/generic_oauth"
+      secretEnv: GRAFANA_CLIENT_SECRET
+
+  # Supply the referenced variables from a Secret so the client secrets never
+  # appear in the rendered ConfigMap.
+  envFrom:
+    - secretRef:
+        name: dex-oidc-clients
+```
+
+Entries are appended after the built-in client, so adding one cannot displace
+KubeVirt UI's own. Each is handed to Dex verbatim and may use any field Dex
+accepts on a client.
+
+One directory and one admin group then govern every application: point the
+other application at the same issuer and reuse the group KubeVirt UI already
+matches on (`auth.adminGroups`).
+
+If the consuming application keys on a claim other than `sub` or `email` —
+Harbor's `oidc_user_claim: preferred_username`, for instance — make sure the
+connector actually emits it. Dex's LDAP connector omits `preferred_username`
+entirely unless `userSearch.preferredUsernameAttr` is set, and the resulting
+failure surfaces in the application as a user it cannot create, not as a login
+error.
+
 ### Token Expiry (Development)
 
 | Token | Lifetime |
