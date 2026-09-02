@@ -12,6 +12,7 @@ either level — they are for the registry API (pull and push) only.
 import logging
 import os
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -50,22 +51,35 @@ class HarborClient:
 
         if resp.status_code in (401, 403):
             raise HarborUnauthorized(f"Harbor rejected the token for {path}")
-        if resp.status_code >= 500:
+        if resp.status_code >= 400:
+            # Any other 4xx (404 not-found, 400, 409, 422, ...) and any 5xx.
+            # HarborUnauthorized/HarborUnavailable are meant to be exhaustive
+            # for callers — a bare httpx.HTTPStatusError must never escape.
             raise HarborUnavailable(f"Harbor returned {resp.status_code} for {path}")
-        resp.raise_for_status()
 
-        body = resp.json()
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            # A 2xx with an empty or non-JSON body is equally undesigned —
+            # fold it into the same exhaustive exception surface.
+            raise HarborUnavailable(
+                f"Harbor returned an unparseable body for {path}"
+            ) from exc
+
         return body if isinstance(body, list) else []
 
     async def list_projects(self, token: str) -> list[dict[str, Any]]:
         return await self._get(token, "/projects?page_size=100")
 
     async def list_repositories(self, token: str, project: str) -> list[dict[str, Any]]:
+        project = quote(project, safe="")
         return await self._get(token, f"/projects/{project}/repositories?page_size=100")
 
     async def list_artifacts(
         self, token: str, project: str, repository: str
     ) -> list[dict[str, Any]]:
+        project = quote(project, safe="")
+        repository = quote(repository, safe="")
         return await self._get(
             token,
             f"/projects/{project}/repositories/{repository}/artifacts?page_size=100",

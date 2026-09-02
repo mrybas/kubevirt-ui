@@ -78,3 +78,41 @@ async def test_artifacts_are_read_per_repository_not_per_project():
     assert seen["path"] == (
         "/api/v2.0/projects/vm-images-public/repositories/ubuntu-2204/artifacts"
     )
+
+
+async def test_a_not_found_response_is_still_one_of_the_designed_exceptions():
+    """404 (and any other undesigned 4xx) must not escape as httpx.HTTPStatusError.
+
+    HarborUnauthorized/HarborUnavailable are meant to be exhaustive: a caller
+    catching only those two must never see a bare httpx exception leak through.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"errors": [{"code": "NOT_FOUND"}]})
+
+    with pytest.raises((HarborUnauthorized, HarborUnavailable)):
+        await _client(handler).list_projects("fine-token")
+
+
+async def test_a_repository_name_with_a_slash_is_a_single_path_segment():
+    """Harbor repository names are frequently multi-segment (team/subimage).
+
+    An unencoded slash would silently address a different, possibly valid,
+    resource. It must reach Harbor as one encoded path segment instead.
+    """
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        # request.url.path returns the *unquoted* path (httpx decodes %2F back
+        # to "/" there), which would hide exactly the bug this test guards
+        # against. raw_path preserves the wire encoding, so it is the only
+        # place the fix is actually observable.
+        seen["raw_path"] = request.url.raw_path
+        return httpx.Response(200, json=[{"tags": [{"name": "20260901"}]}])
+
+    await _client(handler).list_artifacts("t", "vm-images-public", "team/subimage")
+
+    assert seen["raw_path"] == (
+        b"/api/v2.0/projects/vm-images-public/repositories/team%2Fsubimage/artifacts"
+        b"?page_size=100"
+    )
