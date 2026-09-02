@@ -60,6 +60,44 @@ def mock_k8s_client() -> MagicMock:
 
 
 @pytest.fixture
+def mock_harbor_client() -> MagicMock:
+    """A Harbor that answers with one project, one repository, one tag.
+
+    Note this fake accepts ANY bearer token. That is fine for merge and
+    degradation tests and useless for proving token forwarding — a mock will
+    happily confirm an identity scheme that does not work. The e2e test in
+    Task 9 covers that claim against a real Harbor.
+    """
+    mock = MagicMock()
+    # Accepts identity verification unconditionally — tests that need to
+    # prove the reverse (a rejected identity) override this per-test.
+    mock.verify_identity = AsyncMock(return_value=None)
+    mock.list_projects = AsyncMock(return_value=[{"name": "vm-images-public"}])
+    # What catalogue enumeration actually reads: one project-wide call whose
+    # artifacts carry their own repository_name.
+    mock.list_project_artifacts = AsyncMock(
+        return_value=[
+            {
+                "repository_name": "vm-images-public/ubuntu-2204",
+                "size": 2147483648,
+                "tags": [{"name": "20260901"}],
+            }
+        ]
+    )
+    # Still real methods on the client, still used — publish reads one
+    # repository's tags through list_artifacts to check the tag is free — but
+    # NOT part of enumeration any more. A test that wants to prove enumeration
+    # does not fall back to the per-repository walk asserts on these.
+    mock.list_repositories = AsyncMock(
+        return_value=[{"name": "vm-images-public/ubuntu-2204"}]
+    )
+    mock.list_artifacts = AsyncMock(
+        return_value=[{"size": 2147483648, "tags": [{"name": "20260901"}]}]
+    )
+    return mock
+
+
+@pytest.fixture
 def mock_vm_cache(mock_k8s_client: MagicMock) -> MagicMock:
     """VM cache mock — delegates to ``mock_k8s_client.list_virtual_machines``.
 
@@ -78,7 +116,16 @@ def mock_vm_cache(mock_k8s_client: MagicMock) -> MagicMock:
 
 @pytest.fixture
 def fake_user() -> User:
-    """Default authenticated user for endpoint tests."""
+    """Default authenticated user for endpoint tests.
+
+    `raw_token` is left at its dataclass default of `None` — the same shape
+    `get_current_user` produces under AUTH_TYPE=none. A test asserting
+    anything about token *forwarding* (e.g. to Harbor) against the unmodified
+    `client` fixture is silently exercising the no-token path instead and
+    proves nothing; mutate `fake_user.raw_token` before firing the request
+    (the `client` fixture's auth-override closure returns this same object,
+    so the mutation is visible) or it will pass for the wrong reason.
+    """
     return User(
         id="testuser",
         email="testuser@local",
@@ -89,7 +136,10 @@ def fake_user() -> User:
 
 @pytest.fixture
 def client(
-    mock_k8s_client: MagicMock, mock_vm_cache: MagicMock, fake_user: User,
+    mock_k8s_client: MagicMock,
+    mock_vm_cache: MagicMock,
+    mock_harbor_client: MagicMock,
+    fake_user: User,
 ) -> Iterator[TestClient]:
     """Create a test client with mocked K8s client, VM cache, and auth bypass.
 
@@ -101,6 +151,12 @@ def client(
     """
     app.state.k8s_client = mock_k8s_client
     app.state.vm_cache = mock_vm_cache
+    # main.py's lifespan (which would otherwise construct this) never runs
+    # here — TestClient(app) below is built without `with`, so no startup
+    # event fires. Without this line, any test that flips
+    # HARBOR_IMAGE_ENABLED on would hit a missing app.state.harbor_client
+    # (AttributeError) rather than exercising real behaviour.
+    app.state.harbor_client = mock_harbor_client
 
     async def _return_fake_user() -> User:
         return fake_user

@@ -4,6 +4,12 @@ export default defineConfig({
   testDir: './tests',
   outputDir: './results/test-results',
 
+  // harbor-identity.spec.ts needs the three Harbor services and
+  // HARBOR_IMAGE_ENABLED, which live in docker-compose.harbor-e2e.yml and are
+  // composed only by `make test-e2e-harbor` (via harbor.config.ts). Excluded
+  // here so the ordinary run neither needs a Harbor nor fails without one.
+  testIgnore: '**/harbor-identity.spec.ts',
+
   timeout: 60_000,
   expect: { timeout: 15_000 },
 

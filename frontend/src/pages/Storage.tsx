@@ -39,6 +39,8 @@ import { useGoldenImages, useCreateGoldenImage, useDeleteGoldenImage } from '../
 import { useNamespaces } from '../hooks/useNamespaces';
 import { useFoldersFlat } from '../hooks/useFolders';
 import { FolderBreadcrumb } from '../components/folders/FolderBreadcrumb';
+import { ImageRows, type ImageRowItem } from '../components/images/ImageRows';
+import { matchesStorageFilters } from './storageFilters';
 import { LoadingSkeleton } from '../components/common/LoadingSkeleton';
 import { usePagination } from '../hooks/usePagination';
 import { Pagination } from '../components/common/Pagination';
@@ -54,6 +56,20 @@ interface Disk extends GoldenImage {
   persistent: boolean;
 }
 
+// Single source of truth for the Images/Data Disks table's columns. Both the
+// header row and ImageRows' warning-banner colSpan are derived from this, so
+// a column added or removed here cannot silently desync the banner's span
+// from the header (see __tests__/storageTableColumns.test.tsx).
+export const STORAGE_TABLE_COLUMNS: { label: string; className?: string }[] = [
+  { label: 'Name' },
+  { label: 'Namespace' },
+  { label: 'Size' },
+  { label: 'Status' },
+  { label: 'VMs' },
+  { label: 'Scope' },
+  { label: 'Actions', className: 'text-right' },
+];
+
 export function Storage() {
   const { selectedNamespace } = useAppStore();
   const navigate = useNavigate();
@@ -68,7 +84,7 @@ export function Storage() {
   const [deleteModalDisk, setDeleteModalDisk] = useState<Disk | null>(null);
   useEffect(() => { setPage(1); }, [searchQuery, filterProject, filterEnv, filterFolder, activeTab]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const { data: imagesData, isLoading, refetch: refetchImages } = useGoldenImages(selectedNamespace || undefined);
+  const { data: imagesData, catalogAvailable, isLoading, refetch: refetchImages } = useGoldenImages(selectedNamespace || undefined);
   const { data: namespacesData } = useNamespaces();
   const { data: scData } = useStorageClasses();
   const { data: foldersData } = useFoldersFlat();
@@ -110,15 +126,12 @@ export function Storage() {
       })()
     : new Set<string>();
 
-  // Filter disks
-  const filteredDisks = currentDisks.filter((disk) => {
-    const matchesSearch = disk.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (disk.display_name?.toLowerCase().includes(searchQuery.toLowerCase()));
-    const matchesProject = !filterProject || disk.project === filterProject;
-    const matchesEnv = !filterEnv || disk.environment === filterEnv;
-    const matchesFolder = !filterFolder || folderNamespaces.has(disk.namespace);
-    return matchesSearch && matchesProject && matchesEnv && matchesFolder;
-  });
+  // Filter disks. See storageFilters.ts for the placement-filter exemption
+  // catalogue rows get (folder/environment do not apply to something not
+  // materialised yet) and its tests.
+  const filteredDisks = currentDisks.filter((disk) =>
+    matchesStorageFilters(disk, { searchQuery, filterProject, filterEnv, filterFolder, folderNamespaces })
+  );
 
   const paginatedDisks = filteredDisks.slice((page - 1) * perPage, page * perPage);
   const totalPages = Math.max(1, Math.ceil(filteredDisks.length / perPage));
@@ -149,6 +162,37 @@ export function Storage() {
     await createMutation.mutateAsync({ data: createData as any, namespace });
     setShowImportImageModal(false);
     setShowNewDiskModal(false);
+  };
+
+  // Materialise a catalogue-only row into a real disk. Unlike handleCreate,
+  // this has no form to show a refusal inline, so it reports one itself —
+  // createMutation's errors are `handledLocally` and would otherwise be
+  // silently dropped.
+  const handleCreateFromCatalog = async (item: ImageRowItem) => {
+    if (!item.catalog_ref) return;
+    if (!selectedNamespace) {
+      notify.error('Select a project', 'Choose a project/environment before creating a disk from the catalog.');
+      return;
+    }
+    try {
+      await createMutation.mutateAsync({
+        // catalog_ref, NOT source_registry. See the field's comment in
+        // types/template.ts: the ref is host-less by design, so sending it
+        // as source_registry pulls from Docker Hub and permanently splits
+        // the image into two rows. The backend adds the host, the scheme and
+        // the tenant's credential.
+        data: {
+          display_name: item.display_name || item.name,
+          catalog_ref: item.catalog_ref,
+          disk_type: 'image',
+          persistent: false,
+        } as GoldenImageCreate & { disk_type: DiskType; persistent: boolean },
+        namespace: selectedNamespace,
+      });
+      notify.success('Import started', `Creating a disk from ${item.catalog_ref}.`);
+    } catch (e) {
+      notify.error('Could not create disk', e instanceof Error ? e.message : String(e));
+    }
   };
 
   const handleDelete = (disk: Disk) => {
@@ -416,17 +460,23 @@ export function Storage() {
           <table className="w-full">
             <thead className="bg-surface-800/50">
               <tr>
-                <th className="table-header">Name</th>
-                <th className="table-header">Namespace</th>
-                <th className="table-header">Size</th>
-                <th className="table-header">Status</th>
-                <th className="table-header">VMs</th>
-                <th className="table-header">Scope</th>
-                <th className="table-header text-right">Actions</th>
+                {STORAGE_TABLE_COLUMNS.map((col) => (
+                  <th key={col.label} className={clsx('table-header', col.className)}>{col.label}</th>
+                ))}
               </tr>
             </thead>
             <tbody className="divide-y divide-surface-800">
-              {paginatedDisks.map((disk) => {
+              {activeTab === 'images' ? (
+                <ImageRows
+                  items={paginatedDisks}
+                  catalogAvailable={catalogAvailable}
+                  colSpan={STORAGE_TABLE_COLUMNS.length}
+                  onRowClick={(item) => navigate(`/storage/${item.namespace}/${item.name}`)}
+                  onDelete={(item) => handleDelete(item as Disk)}
+                  onCreateFromCatalog={handleCreateFromCatalog}
+                />
+              ) : (
+              paginatedDisks.map((disk) => {
                 const status = mapStatus(disk.status, disk.used_by);
                 const vmCount = disk.used_by?.length || 0;
                 return (
@@ -447,7 +497,13 @@ export function Storage() {
                           <p className="font-medium text-surface-100">
                             {disk.display_name || disk.name}
                           </p>
-                          <p className="text-xs text-surface-500">{disk.name}</p>
+                          {/* Matches ImageRows' rule for the Images tab: only
+                              show the raw name a second time when it differs
+                              from the display name, so a disk with no display
+                              name does not show its own name twice. */}
+                          {disk.display_name && disk.display_name !== disk.name && (
+                            <p className="text-xs text-surface-500">{disk.name}</p>
+                          )}
                         </div>
                       </div>
                     </td>
@@ -502,7 +558,8 @@ export function Storage() {
                     </td>
                   </tr>
                 );
-              })}
+              })
+              )}
             </tbody>
           </table>
           <Pagination

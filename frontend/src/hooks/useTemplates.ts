@@ -4,6 +4,7 @@
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import * as templatesApi from '@/api/templates';
+import * as imagesApi from '@/api/images';
 import { pollWhile, settle } from './settle';
 import type {
 
@@ -76,9 +77,9 @@ export function useDeleteTemplate() {
 // =============================================================================
 
 export function useImages(namespace?: string) {
-  return useQuery({
+  const query = useQuery({
     queryKey: ['images', namespace],
-    queryFn: () => templatesApi.listImages(namespace),
+    queryFn: () => imagesApi.listImages(namespace),
     // An import takes minutes and the row was fetched once: a disk that had
     // been Ready for eighty seconds still read Pending until somebody
     // reloaded the page. The status is honest now — Pending during an import
@@ -88,6 +89,18 @@ export function useImages(namespace?: string) {
       (data?.items ?? []).some((image) => image.status === 'Pending'),
     ),
   });
+
+  return {
+    ...query,
+    // Convenience accessors so callers do not each repeat `data?.items` and
+    // `data?.catalog_available` — the query's own `data`/`isLoading`/`refetch`
+    // etc. are still spread above for existing consumers.
+    items: query.data?.items ?? [],
+    // Defaults true: no response yet, or a response from before this field
+    // existed, both read as "the catalogue is fine" rather than a warning
+    // with nothing behind it.
+    catalogAvailable: query.data?.catalog_available ?? true,
+  };
 }
 
 export function useCreateImage() {
@@ -95,7 +108,7 @@ export function useCreateImage() {
   
   return useMutation({
     mutationFn: ({ data, namespace }: { data: GoldenImageCreate; namespace: string }) => 
-      templatesApi.createImage(data, namespace),
+      imagesApi.createImage(data, namespace),
     // The Storage dialogs catch this and show it inline, in the form that was
     // refused. A toast as well would report one refusal twice.
     meta: { handledLocally: true },
@@ -110,7 +123,7 @@ export function useDeleteImage() {
   
   return useMutation({
     mutationFn: ({ name, namespace }: { name: string; namespace: string }) => 
-      templatesApi.deleteImage(name, namespace),
+      imagesApi.deleteImage(name, namespace),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['images'] });
     },
@@ -122,7 +135,7 @@ export function useUpdateImage() {
   
   return useMutation({
     mutationFn: ({ name, namespace, data }: { name: string; namespace: string; data: GoldenImageUpdate }) =>
-      templatesApi.updateImage(name, namespace, data),
+      imagesApi.updateImage(name, namespace, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['images'] });
     },
@@ -134,7 +147,7 @@ export function useCreateImageFromDisk() {
   
   return useMutation({
     mutationFn: (data: CreateImageFromDiskRequest) =>
-      templatesApi.createImageFromDisk(data),
+      imagesApi.createImageFromDisk(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['images'] });
     },

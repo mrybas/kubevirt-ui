@@ -7,11 +7,6 @@ import type {
   VMTemplate,
   VMTemplateCreate,
   VMTemplateListResponse,
-  GoldenImage,
-  GoldenImageCreate,
-  GoldenImageUpdate,
-  GoldenImageListResponse,
-  CreateImageFromDiskRequest,
   PersistentDisk,
   PersistentDiskCreate,
   PersistentDiskListResponse,
@@ -52,50 +47,21 @@ export async function deleteTemplate(name: string): Promise<void> {
   });
 }
 
-// =============================================================================
-// Golden Images
-// =============================================================================
-
-export async function listImages(namespace?: string): Promise<GoldenImageListResponse> {
-  const params = namespace ? `?namespace=${namespace}` : '';
-  return apiRequest<GoldenImageListResponse>(`/images${params}`);
-}
-
-export async function createImage(data: GoldenImageCreate, namespace: string): Promise<GoldenImage> {
-  return apiRequest<GoldenImage>(`/images?namespace=${namespace}`, {
-    method: 'POST',
-    body: data,
-  });
-}
-
-export async function deleteImage(name: string, namespace: string): Promise<void> {
-  await apiRequest<void>(`/images/${name}?namespace=${namespace}`, {
-    method: 'DELETE',
-  });
-}
-
-export async function updateImage(name: string, namespace: string, data: GoldenImageUpdate): Promise<GoldenImage> {
-  return apiRequest<GoldenImage>(`/images/${name}?namespace=${namespace}`, {
-    method: 'PATCH',
-    body: data,
-  });
-}
-
-export async function createImageFromDisk(
-  data: CreateImageFromDiskRequest
-): Promise<GoldenImage> {
-  return apiRequest<GoldenImage>('/images/from-disk', {
-    method: 'POST',
-    body: data,
-  });
-}
-
-// Aliases for backward compatibility
-export const listGoldenImages = listImages;
-export const createGoldenImage = createImage;
-export const deleteGoldenImage = deleteImage;
-export const updateGoldenImage = updateImage;
-export const createGoldenImageFromDisk = createImageFromDisk;
+// Golden Images now live in ./images (mirrors the backend's images.py split
+// out of templates.py). Re-exported here so any existing import of these
+// names from '@/api/templates' keeps working.
+export {
+  listImages,
+  createImage,
+  deleteImage,
+  updateImage,
+  createImageFromDisk,
+  listGoldenImages,
+  createGoldenImage,
+  deleteGoldenImage,
+  updateGoldenImage,
+  createGoldenImageFromDisk,
+} from './images';
 
 // =============================================================================
 // Persistent Disks

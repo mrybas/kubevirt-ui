@@ -92,7 +92,7 @@ def test_every_path_that_makes_a_disk_asks_first() -> None:
 
     from app.api.v1.disks import create_persistent_disk
     from app.api.v1.storage import create_datavolume
-    from app.api.v1.templates import create_golden_image
+    from app.api.v1.images import create_golden_image
 
     for fn in (create_persistent_disk, create_datavolume, create_golden_image):
         source = inspect.getsource(fn)

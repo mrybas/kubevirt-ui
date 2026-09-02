@@ -1,3 +1,17 @@
+# The ordinary e2e overlay. NOTHING Harbor-related lives here.
+#
+# It used to: this file set HARBOR_IMAGE_ENABLED=true on the shared `backend`
+# service, and the Makefile composes this overlay for EVERY spec — so every
+# existing GET /images in the suite ran identity verification and catalogue
+# enumeration against a Harbor, and could render the amber "catalog could not
+# be reached" banner over unrelated tests. The comment that stood here claimed
+# it "does not change any other e2e behaviour", which was exactly backwards:
+# a flag on a shared service changes every spec that touches that service.
+#
+# Harbor now lives in docker-compose.harbor-e2e.yml, composed only by
+# `make test-e2e-harbor`. The default run sees the flag off, which is also
+# what the feature's own "Done when" bar asks for: with HARBOR_IMAGE_ENABLED
+# unset, GET /images behaves exactly as it did before this branch.
 services:
   e2e:
     build:

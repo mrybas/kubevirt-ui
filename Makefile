@@ -69,6 +69,13 @@ test-frontend: ## Run frontend tests
 test-e2e: ## Run end-to-end tests
 	$(DOCKER_COMPOSE) -f docker-compose.yml -f docker-compose.e2e.yml up --abort-on-container-exit --exit-code-from e2e
 
+# The Harbor spec only. Its fixture (three Harbor services, and
+# HARBOR_IMAGE_ENABLED on the SHARED backend) lives in its own overlay so it
+# is not applied to every other spec — a flag on a shared service changes the
+# behaviour of everything that touches it.
+test-e2e-harbor: ## Run the Harbor identity e2e spec against a real Harbor
+	$(DOCKER_COMPOSE) -f docker-compose.yml -f docker-compose.e2e.yml -f docker-compose.harbor-e2e.yml up --abort-on-container-exit --exit-code-from e2e
+
 # =============================================================================
 # Linting
 # =============================================================================

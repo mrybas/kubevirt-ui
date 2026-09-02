@@ -54,7 +54,7 @@ class TestImageFromDiskTargeting:
     """create_golden_image_from_disk must not copy the source's class."""
 
     async def _run(self, storage_class: str | None) -> dict[str, Any]:
-        from app.api.v1 import templates
+        from app.api.v1 import images
 
         captured: dict[str, Any] = {}
 
@@ -81,8 +81,8 @@ class TestImageFromDiskTargeting:
             display_name="My Image", storage_class=storage_class,
         )
 
-        with patch.object(templates.client, "CustomObjectsApi", return_value=api):
-            await templates.create_golden_image_from_disk(
+        with patch.object(images.client, "CustomObjectsApi", return_value=api):
+            await images.create_golden_image_from_disk(
                 req=req, request=request, user=MagicMock(),
             )
 

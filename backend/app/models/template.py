@@ -151,6 +151,13 @@ class VMImage(BaseModel):
     scope: str = "environment"  # "environment" (single ns) or "project" (all envs)
     project: str | None = None  # Project name (set for project-scoped images)
     environment: str | None = None  # Environment name (from namespace label)
+    # Where this row came from. "cluster" is a DataVolume that exists; "catalog"
+    # is a Harbor artifact that has not been materialised yet.
+    origin: str = "cluster"
+    # "<project>/<repository>:<tag>" when the row has a Harbor counterpart.
+    # Present on catalog rows and on cluster rows imported from Harbor, which is
+    # what lets the two be merged into one row.
+    catalog_ref: str | None = None
 
 
 class VMImageCreate(BaseModel):
@@ -185,6 +192,41 @@ class VMImageCreate(BaseModel):
     # Source - one of these
     source_url: str | None = Field(None, description="HTTP URL to download image")
     source_registry: str | None = Field(None, description="Container registry URL")
+    # A catalogue selection, exactly as GET /images reported it: host-less
+    # "<project>/<repository>:<tag>". The backend expands it into the full
+    # docker:// URL and attaches the tenant's credential, because the registry
+    # host and the credential's name are server-side facts — a browser that
+    # builds registry URLs is a browser that can build the wrong one, and a
+    # credential name in a page is a credential name in a bug report.
+    #
+    # The pattern is a whitelist, not a nicety: this string is interpolated
+    # into a URL, so "../" and a scheme of its own are both refused here
+    # rather than resolved somewhere downstream.
+    catalog_ref: str | None = Field(
+        None,
+        pattern=(
+            r"^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+"
+            r":[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$"
+        ),
+        max_length=512,
+        description=(
+            "Harbor catalogue reference '<project>/<repository>:<tag>' "
+            "(no registry host — the backend adds it)"
+        ),
+    )
+    # DELIBERATELY ABSENT: source_registry_secret / source_registry_ca_configmap.
+    #
+    # They used to be here, and a caller could set BOTH `source_registry` (any
+    # URL at all) and `source_registry_secret` — so a request naming
+    # `docker://attacker.tld/x:1` plus the tenant's Harbor robot Secret made
+    # CDI authenticate to the attacker's registry with the tenant's robot
+    # password. Validating the URL and keeping the field is the wrong shape:
+    # an allow-list on a caller-supplied string that gates a credential is one
+    # bypass away from the same bug. The credential is derived server-side from
+    # the RESOLVED registry host instead, and is attached only when that host
+    # is the configured Harbor (see images.py's create_golden_image). A
+    # `source_registry` pointing anywhere else gets an anonymous pull, which is
+    # exactly what it got before the catalogue existed.
     source_pvc: str | None = Field(None, description="PVC name to clone from")
     source_pvc_namespace: str | None = Field(None, description="PVC namespace to clone from")
     
@@ -205,6 +247,10 @@ class VMImageListResponse(BaseModel):
 
     items: list[VMImage]
     total: int
+    # False when the catalogue could not be read. The cluster rows are still
+    # correct and complete; only the catalogue half is missing. The list must
+    # never fail outright because Harbor is down.
+    catalog_available: bool = True
 
 
 class VMImageUpdate(BaseModel):
@@ -305,3 +351,26 @@ class CreateImageFromDiskRequest(BaseModel):
     description: str | None = None
     os_type: str = "linux"
     os_version: str | None = None
+
+
+class ImagePublishRequest(BaseModel):
+    """Publish a VM's disk to the Harbor catalogue without stopping the VM.
+
+    The disk is snapshotted rather than read live, so `namespace`/`disk_name`
+    name the source PVC and the VM using it keeps running throughout.
+    `project`/`repository`/`tag` name where the pushed image lands in Harbor.
+
+    `secret_name` names the tenant's robot credential Secret, in this same
+    `namespace` — the harbor-robots chart provisions it there. Required:
+    Harbor never accepts an anonymous push. Unlike the pull direction, naming
+    it here leaks nothing: the push target is always
+    `harbor_registry_host()`, never a caller-supplied URL, and `namespace` is
+    checked against the caller's own bindings before this Secret is read.
+    """
+
+    namespace: str
+    disk_name: str
+    project: str
+    repository: str
+    tag: str
+    secret_name: str
