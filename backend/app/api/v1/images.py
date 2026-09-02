@@ -391,16 +391,31 @@ async def list_golden_images(
         # response is byte-identical to before.
         catalog_available = True
         if harbor_image_path_enabled():
-            harbor = request.app.state.harbor_client
-            try:
-                catalog = await catalog_images(harbor, user.raw_token or "")
-                images = merge(images, catalog)
-            except HarborUnauthorized:
-                logger.info("harbor rejected the caller's token; listing cluster images only")
+            if not user.raw_token:
+                # AUTH_TYPE=none (documented dev mode) returns a User with no
+                # raw_token — get_current_user never had one to carry. Sending
+                # an empty bearer would draw Harbor's 401 and log identically
+                # to a rejected/expired token, sending whoever reads that log
+                # chasing a token-expiry theory for a deployment that has no
+                # auth configured at all. Different condition, different
+                # message — and the round-trip can never succeed anyway, so
+                # skip it rather than waste it.
+                logger.info(
+                    "no caller token to forward to harbor (unauthenticated "
+                    "request or AUTH_TYPE=none); listing cluster images only"
+                )
                 catalog_available = False
-            except HarborUnavailable as exc:
-                logger.warning("harbor unreachable (%s); listing cluster images only", exc)
-                catalog_available = False
+            else:
+                harbor = request.app.state.harbor_client
+                try:
+                    catalog = await catalog_images(harbor, user.raw_token)
+                    images = merge(images, catalog)
+                except HarborUnauthorized:
+                    logger.info("harbor rejected the caller's token; listing cluster images only")
+                    catalog_available = False
+                except HarborUnavailable as exc:
+                    logger.warning("harbor unreachable (%s); listing cluster images only", exc)
+                    catalog_available = False
 
         return GoldenImageListResponse(
             items=images, total=len(images), catalog_available=catalog_available
