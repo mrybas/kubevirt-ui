@@ -175,6 +175,38 @@ describe('the template form does not re-import an already-materialised catalogue
     expect(mockCreateTemplate).not.toHaveBeenCalled();
   });
 
+  it('imports with catalog_ref, never with the host-less ref as source_registry', async () => {
+    // The sibling of Storage.tsx's call site, and it carried the same defect.
+    // `catalog_ref` has no registry host in it by design, so sent as
+    // `source_registry` the import resolves against Docker Hub and the disk
+    // that results never re-joins its catalogue row. Asserting the mutation
+    // was CALLED — which is all the tests above do — could not see that.
+    const user = userEvent.setup();
+    mockCreateImage.mockResolvedValue({ name: 'rocky-9-1-abc12' });
+    mockCreateTemplate.mockResolvedValue({});
+
+    renderModal([CATALOG_IMAGE]);
+
+    await fillCommonFields(user);
+    await pickFromSelect(user, 'Select a project...', 'Acme Dev');
+    await pickFromSelect(user, 'Select an image...', 'Rocky 9 (will be imported)');
+    await submit(user);
+
+    await waitFor(() => expect(mockCreateImage).toHaveBeenCalledTimes(1));
+    const { data, namespace } = mockCreateImage.mock.calls[0][0] as {
+      data: Record<string, unknown>;
+      namespace: string;
+    };
+
+    expect(data.catalog_ref).toBe('p/rocky-9:1');
+    expect(data.source_registry).toBeUndefined();
+    // No credential names in the browser — the backend attaches the tenant's
+    // robot Secret and CA by convention.
+    expect(data.source_registry_secret).toBeUndefined();
+    expect(data.source_registry_ca_configmap).toBeUndefined();
+    expect(namespace).toBe('acme-dev');
+  });
+
   it('never calls the import mutation for a cluster-row selection', async () => {
     const user = userEvent.setup();
     mockCreateTemplate.mockResolvedValue({});

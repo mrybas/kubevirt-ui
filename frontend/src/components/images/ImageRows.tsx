@@ -25,6 +25,7 @@ import {
   Cloud,
   Database,
   Image as ImageIcon,
+  Layers,
   Monitor,
   Trash2,
 } from 'lucide-react';
@@ -188,9 +189,24 @@ export function ImageRows({
               )}
             </td>
             <td className="table-cell">
-              <span className="text-surface-400 text-xs">
-                {isCatalog ? 'Catalog' : item.environment || 'env'}
-              </span>
+              {/* The Scope column, as Storage.tsx rendered it before the
+                  Images tab moved here. A project-scoped disk gets the cyan
+                  "All envs" badge; only an environment-scoped one shows its
+                  environment name. Collapsing both into `item.environment`
+                  quietly removed that badge from the Images tab while the
+                  Data Disks tab beside it kept showing it — the same disk,
+                  two tabs, two different answers about where it lives, with
+                  the flag OFF and Harbor nowhere in the picture. */}
+              {isCatalog ? (
+                <span className="text-surface-400 text-xs">Catalog</span>
+              ) : item.scope === 'project' ? (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-cyan-500/10 text-cyan-400">
+                  <Layers className="h-3 w-3" />
+                  All envs
+                </span>
+              ) : (
+                <span className="text-surface-400 text-xs">{item.environment || 'env'}</span>
+              )}
             </td>
             <td className="table-cell text-right">
               {isCatalog ? (

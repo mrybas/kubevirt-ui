@@ -63,17 +63,42 @@ def test_a_local_disk_with_no_catalog_counterpart_still_appears():
 class _MultiSegmentHarbor:
     """A repository whose name is itself multi-segment: "team/subimage"."""
 
+    def __init__(self, qualified: bool = True):
+        # Harbor reports repository names project-qualified in some responses
+        # and bare in others; both shapes must produce the same ref.
+        self.qualified = qualified
+        self.per_repository_calls = 0
+
     async def verify_identity(self, token):
         return None
 
     async def list_projects(self, token):
         return [{"name": "vm-images-public"}]
 
+    async def list_project_artifacts(self, token, project):
+        name = (
+            "vm-images-public/team/subimage" if self.qualified else "team/subimage"
+        )
+        return [
+            {
+                "repository_name": name,
+                "size": 2147483648,
+                "tags": [{"name": "20260901"}],
+            }
+        ]
+
     async def list_repositories(self, token, project):
-        return [{"name": "vm-images-public/team/subimage"}]
+        self.per_repository_calls += 1
+        raise AssertionError(
+            "enumeration must not walk repositories — the project-wide "
+            "artifact listing already carries repository_name"
+        )
 
     async def list_artifacts(self, token, project, repository):
-        return [{"size": 2147483648, "tags": [{"name": "20260901"}]}]
+        self.per_repository_calls += 1
+        raise AssertionError(
+            "enumeration must not read artifacts per repository"
+        )
 
 
 class _VerifiedButEmpty:
@@ -155,3 +180,28 @@ async def test_a_multi_segment_repository_name_still_joins_with_its_disk():
     assert len(rows) == 1
     assert rows[0].origin == "cluster"
     assert rows[0].catalog_ref == ref
+
+
+async def test_a_bare_repository_name_produces_the_same_ref_as_a_qualified_one():
+    """Whether Harbor qualifies the name with its project or not, the ref that
+    comes out has to be identical — it is the merge key, and two spellings of
+    it means the disk and its catalogue row never join."""
+    catalog = await catalog_images(_MultiSegmentHarbor(qualified=False), "tok")
+
+    assert [row.catalog_ref for row in catalog] == [
+        "vm-images-public/team/subimage:20260901"
+    ]
+
+
+async def test_enumeration_never_falls_back_to_the_per_repository_walk():
+    """The N+1 this replaced: 1 + P + (P x R) requests per catalogue read.
+
+    `list_repositories`/`list_artifacts` still exist and are still used by the
+    publish path's tag check, so nothing stops a refactor from quietly
+    reintroducing the walk here — the fake raises if either is touched.
+    """
+    harbor = _MultiSegmentHarbor()
+
+    await catalog_images(harbor, "tok")
+
+    assert harbor.per_repository_calls == 0

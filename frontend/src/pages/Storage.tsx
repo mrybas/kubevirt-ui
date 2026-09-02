@@ -176,9 +176,14 @@ export function Storage() {
     }
     try {
       await createMutation.mutateAsync({
+        // catalog_ref, NOT source_registry. See the field's comment in
+        // types/template.ts: the ref is host-less by design, so sending it
+        // as source_registry pulls from Docker Hub and permanently splits
+        // the image into two rows. The backend adds the host, the scheme and
+        // the tenant's credential.
         data: {
           display_name: item.display_name || item.name,
-          source_registry: item.catalog_ref,
+          catalog_ref: item.catalog_ref,
           disk_type: 'image',
           persistent: false,
         } as GoldenImageCreate & { disk_type: DiskType; persistent: boolean },

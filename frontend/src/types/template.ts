@@ -112,6 +112,23 @@ export interface GoldenImageCreate {
   os_version?: string;
   source_url?: string;
   source_registry?: string;
+  /**
+   * A catalogue selection, exactly as `GET /images` reported it: host-less
+   * `"<project>/<repository>:<tag>"`.
+   *
+   * Send THIS, not `source_registry`, for a catalogue row. `catalog_ref` is
+   * deliberately host-less, so sent as `source_registry` it reaches CDI with
+   * no registry host and resolves against Docker Hub — and the stored
+   * `source_url` then has no `docker://` prefix, so the finished disk never
+   * merges back with the catalogue row it came from and the list shows one
+   * image as two rows forever.
+   *
+   * The backend expands it: registry host, `docker://` scheme, the tenant's
+   * robot Secret and the CA. None of those belong in a browser — there is
+   * one source of truth for the registry host, and a credential name that
+   * never appears in a page cannot appear in a bug report either.
+   */
+  catalog_ref?: string;
   source_pvc?: string;  // For cloning existing disk
   source_pvc_namespace?: string;
   size?: string;

@@ -14,7 +14,13 @@ from kubernetes_asyncio.client.rest import ApiException
 from app.api.v1.images_catalog import catalog_images, merge
 from app.core.auth import User, require_auth
 from app.core.errors import validate_k8s_name
-from app.core.harbor_client import HarborUnauthorized, HarborUnavailable, harbor_registry_host
+from app.core.harbor_client import (
+    HarborUnauthorized,
+    HarborUnavailable,
+    harbor_ca_configmap_name,
+    harbor_registry_host,
+    harbor_robot_secret_name,
+)
 from app.core.image_publish import assert_tag_is_free, publish_dependents, publish_job
 from app.core.operator import (
     OPERATOR_GROUP,
@@ -95,6 +101,18 @@ async def list_golden_images(
     If namespace is provided, lists images from that namespace
     PLUS project-scoped images from sibling environments in the same project.
     If no namespace specified, lists images from all accessible project namespaces.
+
+    NOT PAGED, deliberately. The obvious next step — `page`/`page_size` over
+    the merged list — cannot be taken until search moves to the server: the
+    UI's search (`frontend/src/pages/storageFilters.ts`) filters whatever rows
+    it was given, so a paged response would make search find matches on the
+    current page only. That is a worse failure than a large payload: it looks
+    like the image simply is not there. Page the endpoint in the same change
+    that moves search server-side, never before it.
+
+    The Harbor client underneath DOES follow every page (see
+    `harbor_client._get`), which is a separate and unconditional correctness
+    fix — a truncated artifact list makes an occupied tag look free.
     """
     k8s_client = request.app.state.k8s_client
     custom_api = client.CustomObjectsApi(k8s_client._api_client)
@@ -660,6 +678,31 @@ async def _create_managed_image(
     )
 
 
+async def _configmap_exists(k8s_client: Any, namespace: str, name: str) -> bool:
+    """Whether a ConfigMap by this name is in this namespace.
+
+    Used only for the optional CA: `certConfigMap` naming something absent
+    makes CDI refuse the import, so a convention-derived name has to be
+    checked rather than assumed. Any error other than a clean 404 is treated
+    as "not there" too — the CA is optional, and failing a materialise
+    because a read of an optional object hiccuped would be worse than
+    pulling without it, which either works (public CA) or fails with CDI's
+    own TLS error.
+    """
+    try:
+        await k8s_client.core_api.read_namespaced_config_map(
+            name=name, namespace=namespace
+        )
+        return True
+    except ApiException as exc:
+        if exc.status != 404:
+            logger.warning(
+                "could not read ConfigMap %s/%s (%s); pulling without a CA",
+                namespace, name, exc.status,
+            )
+        return False
+
+
 def build_registry_source(
     url: str, secret_ref: str | None, cert_config_map: str | None
 ) -> dict[str, Any]:
@@ -747,18 +790,66 @@ async def create_golden_image(
         ns_labels = ns_obj.metadata.labels or {}
         project_name = image.project or ns_labels.get("kubevirt-ui.io/project")
         
+        # --- a catalogue selection becomes a registry source ---------------
+        # The browser sends back the host-less `catalog_ref` GET /images gave
+        # it ("project/repo:tag") and nothing else. Everything the pull
+        # actually needs is added here:
+        #
+        #   the registry host — from harbor_registry_host(), the single place
+        #     it is known, already used by the publish path. Sent host-less to
+        #     CDI, "project/repo:tag" resolves against Docker Hub.
+        #
+        #   the docker:// scheme — required by CDI, and ALSO what
+        #     catalog_ref_from_source_url() parses back out of the stored
+        #     source_url to re-join this disk with its catalogue row. Without
+        #     it the unified list shows one image as two rows, forever.
+        #
+        #   the credential — by convention (see harbor_robot_secret_name):
+        #     one Secret name, the same in every tenant namespace, which is
+        #     the only namespace CDI resolves it in. Without it every
+        #     materialise is an anonymous pull that works only against public
+        #     projects.
+        registry_url = image.source_registry
+        registry_secret = image.source_registry_secret
+        registry_ca = image.source_registry_ca_configmap
+        if image.catalog_ref and not registry_url:
+            host = harbor_registry_host()
+            if not host:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "HARBOR_URL is not configured, so a catalogue image "
+                        "cannot be turned into a disk"
+                    ),
+                )
+            registry_url = f"docker://{host}/{image.catalog_ref}"
+            registry_secret = registry_secret or harbor_robot_secret_name()
+            # The CA is genuinely optional — a Harbor behind a publicly
+            # trusted certificate has no ConfigMap to name, and CDI refuses
+            # the import outright if certConfigMap points at nothing. So it
+            # is attached only when it is really there. The Secret gets the
+            # opposite treatment on purpose: it is required, and its absence
+            # is refused loudly below rather than degraded into an anonymous
+            # pull that fails much later inside CDI.
+            if not registry_ca:
+                ca_name = harbor_ca_configmap_name()
+                if ca_name and await _configmap_exists(
+                    k8s_client, target_namespace, ca_name
+                ):
+                    registry_ca = ca_name
+
         # Determine source
         source_url_display = None
         if image.source_url:
             source = {"http": {"url": image.source_url}}
             source_url_display = image.source_url
-        elif image.source_registry:
+        elif registry_url:
             source = build_registry_source(
-                image.source_registry,
-                image.source_registry_secret,
-                image.source_registry_ca_configmap,
+                registry_url,
+                registry_secret,
+                registry_ca,
             )
-            source_url_display = image.source_registry
+            source_url_display = registry_url
         elif image.source_pvc:
             # Clone from existing PVC
             pvc_ns = image.source_pvc_namespace or target_namespace
@@ -777,17 +868,17 @@ async def create_golden_image(
         # would learn nothing useful from it. Checked ahead of the
         # image_path_enabled() branch so both writers (DataVolume and
         # ManagedImage) get the same refusal.
-        if image.source_registry_secret:
+        if registry_secret:
             try:
                 await k8s_client.core_api.read_namespaced_secret(
-                    name=image.source_registry_secret, namespace=target_namespace
+                    name=registry_secret, namespace=target_namespace
                 )
             except ApiException as exc:
                 if exc.status == 404:
                     raise HTTPException(
                         status_code=422,
                         detail=(
-                            f"Secret '{image.source_registry_secret}' not found in "
+                            f"Secret '{registry_secret}' not found in "
                             f"namespace '{target_namespace}'. CDI resolves secretRef "
                             "in the DataVolume's own namespace; the harbor-robots "
                             "chart provisions it there."
@@ -1417,13 +1508,57 @@ async def publish_image(
     if source_pvc.status and source_pvc.status.capacity:
         source_capacity = source_pvc.status.capacity.get("storage", source_capacity)
 
+    # No token, no publish. `user.raw_token or ""` used to stand here, which
+    # sent Harbor an empty bearer: against a public project Harbor answers
+    # that 200, so the tag check "passed" while proving nothing, and against
+    # a private one it drew a 401 that read exactly like an expired session.
+    # Neither is a state this endpoint can proceed from — publishing needs a
+    # real identity — so it is refused here, distinctly, the way the list
+    # endpoint distinguishes it.
+    if not user.raw_token:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "no caller token to forward to Harbor (unauthenticated request "
+                "or AUTH_TYPE=none); publishing needs a real Harbor identity"
+            ),
+        )
+
     harbor = request.app.state.harbor_client
     try:
+        # Identity first, for the same reason the list endpoint checks it
+        # first: Harbor's list endpoints answer 200 for any bearer, filtered
+        # to what that identity can see, so a garbage token walking an empty
+        # artifact list would find the tag "free" and publish over whatever
+        # is actually there.
+        await harbor.verify_identity(user.raw_token)
         await assert_tag_is_free(
-            harbor, user.raw_token or "", req.project, req.repository, req.tag
+            harbor, user.raw_token, req.project, req.repository, req.tag
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HarborUnauthorized as exc:
+        # The caller's fault, and actionable: re-authenticate, or ask for
+        # access to this project.
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Harbor rejected your identity; the catalogue cannot be checked "
+                "for this tag, so nothing was published"
+            ),
+        ) from exc
+    except HarborUnavailable as exc:
+        # NOT the caller's fault. Publishing without a working tag check would
+        # mean pushing over a tag that may already exist, which CDI never
+        # re-imports — so this fails rather than proceeding blind.
+        logger.warning("publish: harbor unreachable (%s)", exc)
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Harbor could not be reached to check whether the tag is free; "
+                "nothing was published. Try again once it recovers."
+            ),
+        ) from exc
 
     # catalog_ref shape (no host) — matches images_catalog.py's merge key, and
     # is what the response and Harbor's own project/repository/tag naming use.
@@ -1432,14 +1567,37 @@ async def publish_image(
     registry = harbor_registry_host()
 
     # Suspended first, so its UID can own the snapshot and the temporary PVC.
-    job = await create_object(
-        k8s_client,
-        publish_job(
-            req.namespace, req.disk_name, ref,
-            registry=registry, secret_name=req.secret_name,
-            volume_mode=volume_mode,
-        ),
-    )
+    #
+    # This create sits OUTSIDE the rollback try below — there is nothing to
+    # roll back until it succeeds — so its own failures have to be answered
+    # here or they escape as a 500. A 409 is the one worth naming: Job names
+    # are unique per publish now, but `ttlSecondsAfterFinished` keeps a
+    # finished Job for an hour and a same-name collision is still possible,
+    # and "something is already publishing this" is a fact the caller can act
+    # on, unlike a stack trace.
+    try:
+        job = await create_object(
+            k8s_client,
+            publish_job(
+                req.namespace, req.disk_name, ref,
+                registry=registry, secret_name=req.secret_name,
+                volume_mode=volume_mode,
+            ),
+        )
+    except ApiException as exc:
+        if exc.status == 409:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"a publish job for '{req.disk_name}' already exists in "
+                    f"'{req.namespace}'; wait for it to finish before starting "
+                    "another"
+                ),
+            ) from exc
+        raise HTTPException(
+            status_code=422, detail=f"publish could not start: {exc.reason}"
+        ) from exc
+
     job_name = job["metadata"]["name"]
     job_uid = job["metadata"]["uid"]
 

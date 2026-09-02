@@ -88,17 +88,33 @@ def test_the_block_push_streams_the_archive_and_never_materialises_a_layer_file(
     assert "pipefail" in script
 
 
-def test_the_filesystem_push_is_unaffected_and_still_writes_an_intermediate_layer():
-    """Regression guard: the streaming fix is scoped to the Block script.
+def test_the_filesystem_push_streams_too_and_never_stages_a_layer_on_the_node():
+    """This test used to pin the OPPOSITE, and pinning it was the bug.
 
-    The reviewer was explicit that the Filesystem path stays exactly as it
-    was — this pins that it did.
+    Its earlier form asserted `layer.tar` was still written, on the grounds
+    that the streaming fix was scoped to the Block branch. But `/work` on the
+    Filesystem branch is the container's own writable layer — node EPHEMERAL
+    storage — so what it was protecting was a full-size tar of a VM disk
+    written to the node's filesystem. That is the exact failure the Block
+    branch refused an emptyDir to avoid (a 100GB write evicting unrelated
+    pods through node disk pressure), and it was worse here, because the
+    Block branch at least wrote to a PVC.
+
+    "Unchanged" is not the property that mattered; "does not fill the node"
+    is. So the assertion is inverted deliberately: no intermediate file, the
+    archive goes straight into crane's stdin.
     """
     job = publish_job("tenant-a", "ubuntu-disk", "p/u:1", volume_mode="Filesystem")
     script = " ".join(job["spec"]["template"]["spec"]["containers"][0]["args"])
 
-    assert "layer.tar" in script
-    assert "| crane append" not in script
+    assert "layer.tar" not in script
+    assert "tar -cf - disk | crane append" in script
+    # pipefail is load-bearing on a pipeline: without it the script's exit
+    # status is crane's, so a tar that died mid-stream would publish a
+    # truncated image that looks valid and boots to garbage.
+    assert "-o pipefail" in script
+    # Still no scratch PVC for this branch — nothing is materialised at all.
+    assert "/scratch" not in script
 
 
 def test_the_push_script_reads_from_the_mount_path_in_the_filesystem_case():

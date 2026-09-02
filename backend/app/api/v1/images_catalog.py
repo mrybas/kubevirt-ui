@@ -4,13 +4,29 @@ Kept out of the endpoint module so the merge rule can be tested without
 FastAPI, a Kubernetes client, or a Harbor.
 """
 
+import asyncio
 import logging
+import os
 from typing import Any
 from urllib.parse import urlparse
 
 from app.models.template import VMImage
 
 logger = logging.getLogger(__name__)
+
+
+def _fetch_concurrency() -> int:
+    """How many Harbor list requests may be in flight at once.
+
+    Bounded rather than unlimited: a Harbor with hundreds of repositories
+    would otherwise open hundreds of sockets at once and be rate-limited or
+    simply refuse, turning a slow page into a broken one. Read per call so a
+    deployment can lower it without a rebuild.
+    """
+    try:
+        return max(1, int(os.getenv("HARBOR_FETCH_CONCURRENCY", "8")))
+    except ValueError:
+        return 8
 
 
 def catalog_ref_from_source_url(source_url: str | None) -> str | None:
@@ -48,6 +64,21 @@ def merge(cluster: list[VMImage], catalog: list[VMImage]) -> list[VMImage]:
     return rows
 
 
+def _repository_name(full: str, project: str) -> str:
+    """The repository name without its project prefix, if it carries one.
+
+    Harbor reports repository names project-qualified in some responses
+    ("vm-images-public/ubuntu-2204") and bare in others, and a repository name
+    may itself be multi-segment ("team/subimage"). Stripping a known project
+    prefix — rather than splitting on the first slash — handles both without
+    ever eating a segment of a multi-part name. Get this wrong and the ref
+    built from it stops matching what `catalog_ref_from_source_url` parses out
+    of a disk's `source_url`, and the two halves of the list never join.
+    """
+    prefix = f"{project}/"
+    return full[len(prefix):] if full.startswith(prefix) else full
+
+
 async def catalog_images(harbor: Any, token: str) -> list[VMImage]:
     """Every artifact the caller may see, as catalog-origin rows.
 
@@ -67,37 +98,49 @@ async def catalog_images(harbor: Any, token: str) -> list[VMImage]:
     """
     await harbor.verify_identity(token)
 
+    projects = [
+        name for name in (p.get("name") for p in await harbor.list_projects(token)) if name
+    ]
+
+    # One request per project, not one per repository. Harbor's project-wide
+    # artifact listing carries `repository_name` on every artifact, which is
+    # the only thing the repositories-then-artifacts walk was fetching, so
+    # `1 + P + (P x R)` requests collapse to `1 + P`. Following every page
+    # (which the client now does, because a truncated list makes an occupied
+    # tag look free) multiplies whatever this costs, so the shape of the walk
+    # is what decides whether that is affordable.
+    #
+    # Concurrent because it is free to be: one gather over the project list,
+    # bounded by a semaphore so a Harbor with hundreds of projects does not
+    # open hundreds of sockets at once. gather preserves argument order, so
+    # rows come out in the same deterministic order a serial loop produced.
+    sem = asyncio.Semaphore(_fetch_concurrency())
+
+    async def artifacts_of(project_name: str) -> list[dict[str, Any]]:
+        async with sem:
+            return await harbor.list_project_artifacts(token, project_name)
+
+    artifact_lists = await asyncio.gather(*(artifacts_of(p) for p in projects))
+
     rows: list[VMImage] = []
-    for project in await harbor.list_projects(token):
-        pname = project.get("name")
-        if not pname:
-            continue
-        for repo in await harbor.list_repositories(token, pname):
-            # Harbor returns repository names project-qualified, and a
-            # repository name may itself be multi-segment (e.g.
-            # "vm-images-public/team/subimage"). maxsplit=1 takes only the
-            # project off the front, leaving "team/subimage" intact — get
-            # this wrong and the ref built below no longer matches what
-            # catalog_ref_from_source_url parses back out of a disk's
-            # source_url, and the two rows never join.
-            full = repo.get("name", "")
-            rname = full.split("/", 1)[1] if "/" in full else full
+    for pname, artifacts in zip(projects, artifact_lists, strict=True):
+        for artifact in artifacts:
+            rname = _repository_name(artifact.get("repository_name") or "", pname)
             if not rname:
                 continue
-            for artifact in await harbor.list_artifacts(token, pname, rname):
-                for tag in artifact.get("tags") or []:
-                    tname = tag.get("name")
-                    if not tname:
-                        continue
-                    ref = f"{pname}/{rname}:{tname}"
-                    rows.append(
-                        VMImage(
-                            name=f"{rname}:{tname}",
-                            namespace="",
-                            status="Catalog",
-                            origin="catalog",
-                            catalog_ref=ref,
-                            size=str(artifact.get("size") or "") or None,
-                        )
+            for tag in artifact.get("tags") or []:
+                tname = tag.get("name")
+                if not tname:
+                    continue
+                ref = f"{pname}/{rname}:{tname}"
+                rows.append(
+                    VMImage(
+                        name=f"{rname}:{tname}",
+                        namespace="",
+                        status="Catalog",
+                        origin="catalog",
+                        catalog_ref=ref,
+                        size=str(artifact.get("size") or "") or None,
                     )
+                )
     return rows

@@ -73,6 +73,21 @@ def mock_harbor_client() -> MagicMock:
     # prove the reverse (a rejected identity) override this per-test.
     mock.verify_identity = AsyncMock(return_value=None)
     mock.list_projects = AsyncMock(return_value=[{"name": "vm-images-public"}])
+    # What catalogue enumeration actually reads: one project-wide call whose
+    # artifacts carry their own repository_name.
+    mock.list_project_artifacts = AsyncMock(
+        return_value=[
+            {
+                "repository_name": "vm-images-public/ubuntu-2204",
+                "size": 2147483648,
+                "tags": [{"name": "20260901"}],
+            }
+        ]
+    )
+    # Still real methods on the client, still used — publish reads one
+    # repository's tags through list_artifacts to check the tag is free — but
+    # NOT part of enumeration any more. A test that wants to prove enumeration
+    # does not fall back to the per-repository walk asserts on these.
     mock.list_repositories = AsyncMock(
         return_value=[{"name": "vm-images-public/ubuntu-2204"}]
     )

@@ -34,39 +34,70 @@ import { login, apiRequest } from './helpers';
 // every other spec under e2e/tests/) to attach a real bearer, which is the
 // only way to reach the code under test.
 //
-// *** THE HEADLINE FINDING (see task-9-report.md for the full reproduction,
-// run against a real Harbor 2.15.2 core+db+redis and this repo's own,
-// unmodified HarborClient/catalog_images code): the "wrong identity" test
-// below is expected to FAIL on this codebase as shipped, and that failure is
-// real, not a fixture problem. Harbor's GET /api/v2.0/projects — the first
-// call catalog_images() makes — returns HTTP 200 for ANY bearer (garbage,
-// absent, or valid), filtered to whatever that identity can see (empty once
-// no project is public). It never returns 401/403 from that endpoint, so
-// HarborUnauthorized is never raised, catalog_available never flips to
-// false, and a wrong identity silently gets catalog_available: true with
-// zero catalog rows — indistinguishable from a legitimately empty
-// catalogue. Harbor's per-project endpoints (e.g.
-// GET /projects/<name>/repositories) DO correctly 401 a bad bearer, but
-// catalog_images()'s loop never reaches them for a project the caller
-// cannot see. This test is left asserting the INTENDED behaviour (matching
-// the brief) rather than the observed one, precisely so it keeps failing
-// until that gap is closed — weakening the assertion to match what the code
-// currently does would be the exact failure mode this whole task exists to
-// avoid. ***
+// *** WHAT THIS SPEC FOUND, AND WHAT HAPPENED TO IT ***
+//
+// This file used to carry, in capitals, the claim that the "wrong identity"
+// test below was EXPECTED TO FAIL: Harbor's GET /api/v2.0/projects — the
+// first call catalog_images() made — returns 200 for any bearer, so
+// HarborUnauthorized was never raised and a wrong identity got
+// `catalog_available: true` with zero rows, indistinguishable from a
+// legitimately empty catalogue.
+//
+// The finding was real. It is also FIXED, in commit d12ca7f:
+// HarborClient.verify_identity() probes the auth-gated GET /users/current
+// (401/403 for an unrecognised bearer, 200 for a dex id_token, 412 for a
+// robot) and catalog_images() calls it before enumerating anything. Leaving
+// the old text in place would have left a prominent, false claim about the
+// branch's current state sitting in the branch itself.
+//
+// The test below is nevertheless marked `fixme` — for a different and
+// entirely mechanical reason, explained on it.
 
 const AUTH_STORAGE_KEY = 'kubevirt-ui-auth';
 
 test.describe('Harbor identity enforcement (real Harbor, no mock)', () => {
-  test('a request carrying the wrong identity is refused, not served', async () => {
-    const res = await apiRequest('/api/v1/images', { token: 'not-a-real-token' });
-    const body = await res.json();
+  // UNREACHABLE THROUGH THE HTTP API, which is why it is fixme rather than
+  // deleted or weakened.
+  //
+  // A syntactically-invalid bearer never reaches Harbor at all: kubevirt-ui's
+  // own `require_auth` (backend/app/core/auth.py) validates it against dex
+  // and answers 401 before the images handler runs. So the response has no
+  // body to read `catalog_available` off — it is `undefined`, and this
+  // assertion fails permanently for a reason that has nothing to do with
+  // Harbor identity.
+  //
+  // Proving the real claim needs a token that kubevirt-ui ACCEPTS and Harbor
+  // does not — a genuine dex user who is not onboarded into Harbor, or is
+  // onboarded with no project membership. That needs Harbor's OIDC bootstrap
+  // to work against this compose stack, and it does not yet: dex's single
+  // `issuer:` is pinned to the browser-facing LAN address for OAuth
+  // redirects, while Harbor's OIDC client fetches discovery over the internal
+  // compose hostname and rejects the mismatch (an anti-issuer-confusion check
+  // in the OIDC spec, not a bug in either service). See
+  // docker-compose.harbor-e2e.yml's harbor-init notes and task-9-report.md.
+  //
+  // Until a second, internally-consistent issuer exists for Harbor to use,
+  // the unit-level cover for this claim is
+  // backend/tests/test_the_harbor_client_never_uses_a_shared_identity.py
+  // (verify_identity's 401/403/412/5xx handling) and
+  // test_the_image_endpoint_wires_the_catalogue_and_the_callers_token.py
+  // (a rejected identity degrades to catalog_available: false).
+  test.fixme(
+    'a real dex identity that Harbor does not recognise is refused the catalogue',
+    async () => {
+      // Needs: a dex-issued token for a user with no Harbor account.
+      // `not-a-real-token` cannot stand in for one — require_auth rejects it
+      // first, so this never exercises Harbor at all.
+      const res = await apiRequest('/api/v1/images', { token: 'not-a-real-token' });
+      const body = await res.json();
 
-    // Cluster rows may still be returned; the catalogue half must not be.
-    expect(body.catalog_available).toBe(false);
-    expect(
-      (body.items ?? []).filter((i: { origin?: string }) => i.origin === 'catalog')
-    ).toHaveLength(0);
-  });
+      // Cluster rows may still be returned; the catalogue half must not be.
+      expect(body.catalog_available).toBe(false);
+      expect(
+        (body.items ?? []).filter((i: { origin?: string }) => i.origin === 'catalog')
+      ).toHaveLength(0);
+    }
+  );
 
   test('a valid identity sees the catalogue', async ({ page }) => {
     await login(page);

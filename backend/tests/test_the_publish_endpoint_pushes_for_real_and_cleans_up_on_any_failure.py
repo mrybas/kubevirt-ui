@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from kubernetes_asyncio.client.rest import ApiException
 
 from app.core.auth import User
+from app.core.harbor_client import HarborNotFound, HarborUnauthorized, HarborUnavailable
 
 PUBLISH_BODY = {
     "namespace": "tenant-a",
@@ -118,6 +119,20 @@ def _patches(batch_api: MagicMock, custom_api: MagicMock):
 
 def _post(client: TestClient, body: dict | None = None):
     return client.post("/api/v1/images/publish", json={**PUBLISH_BODY, **(body or {})})
+
+
+@pytest.fixture(autouse=True)
+def _a_caller_who_is_actually_signed_in(fake_user: User) -> None:
+    """Every test below fires as a caller with a real token.
+
+    `fake_user.raw_token` defaults to None (the AUTH_TYPE=none shape), and
+    publishing now refuses that outright: the handler used to send Harbor
+    `user.raw_token or ""`, an empty bearer that a public project answers 200
+    — so the tag check "passed" while proving nothing. Tests that left the
+    token unset were therefore exercising exactly the path that had to go.
+    The one test that wants the no-token case asks for it explicitly.
+    """
+    fake_user.raw_token = "caller-oidc-token"
 
 
 class TestTheGateAndTheRefusals:
@@ -492,3 +507,284 @@ class TestCleanupOnFailure:
         # secondary failure to clean it up.
         assert response.status_code == 422
         assert "etcd is unavailable" in response.json()["detail"]
+
+
+class TestWhatHarborsOwnFailuresLookLikeToTheCaller:
+    """C3: `assert_tag_is_free` calls Harbor, and Harbor has its own failures.
+
+    The handler used to catch `ValueError` only. Neither designed Harbor
+    exception was caught and there was no outer try, so every one of these
+    was a 500 — including the one that is not a failure at all: a repository
+    that does not exist yet, which is what EVERY first publish to a new
+    repository looks like.
+    """
+
+    def test_a_repository_that_does_not_exist_yet_publishes_normally(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        mock_harbor_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The ordinary case: nothing has ever been pushed to this repository.
+
+        Harbor answers the artifact listing with 404. Read as an outage that
+        is a guaranteed 500 on the first publish of every new image, which is
+        the most common publish there is.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        mock_harbor_client.list_artifacts = AsyncMock(
+            side_effect=HarborNotFound("Harbor returned 404 for /artifacts")
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202
+        batch_api.create_namespaced_job.assert_called_once()
+
+    def test_an_unreachable_harbor_is_a_502_not_a_500(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        mock_harbor_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Not the caller's fault, and nothing is created.
+
+        Publishing without a working tag check would mean pushing over a tag
+        that may already exist — which CDI never re-imports, so the image
+        would look published and be unbootable.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        mock_harbor_client.list_artifacts = AsyncMock(
+            side_effect=HarborUnavailable("no route to host")
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 502
+        batch_api.create_namespaced_job.assert_not_called()
+
+    def test_a_rejected_identity_is_a_403_not_a_500(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        mock_harbor_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        mock_harbor_client.verify_identity = AsyncMock(
+            side_effect=HarborUnauthorized("Harbor rejected the caller's identity")
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 403
+        batch_api.create_namespaced_job.assert_not_called()
+
+    def test_the_identity_is_verified_before_the_catalogue_is_read(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        mock_harbor_client: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Harbor's list endpoints answer 200 for any bearer.
+
+        So walking an artifact list proves nothing about who is walking it: a
+        garbage token sees an empty list, finds the tag "free", and publishes
+        over whatever is really there. `verify_identity` is the only call that
+        actually refuses a wrong identity, and it has to come first.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        order: list[str] = []
+        mock_harbor_client.verify_identity = AsyncMock(
+            side_effect=lambda *a, **k: order.append("verify")
+        )
+        mock_harbor_client.list_artifacts = AsyncMock(
+            side_effect=lambda *a, **k: (order.append("list"), [])[1]
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202
+        assert order == ["verify", "list"]
+
+    def test_the_callers_own_token_is_what_reaches_harbor(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        mock_harbor_client: MagicMock,
+        fake_user: User,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Not an empty string. `user.raw_token or ""` was back here."""
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        fake_user.raw_token = "the-callers-own-token"
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202
+        assert mock_harbor_client.verify_identity.call_args.args[0] == (
+            "the-callers-own-token"
+        )
+        assert mock_harbor_client.list_artifacts.call_args.args[0] == (
+            "the-callers-own-token"
+        )
+
+    def test_no_token_at_all_is_refused_rather_than_sent_as_an_empty_bearer(
+        self,
+        client: TestClient,
+        mock_k8s_client: MagicMock,
+        mock_harbor_client: MagicMock,
+        fake_user: User,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AUTH_TYPE=none produces a User with no raw_token.
+
+        An empty bearer is answered 200 by a public Harbor project, so the
+        tag check would "pass" having checked nothing at all.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        fake_user.raw_token = None
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 401
+        mock_harbor_client.list_artifacts.assert_not_called()
+        batch_api.create_namespaced_job.assert_not_called()
+
+
+class TestTheJobNameIsUniqueAndBounded:
+    """I3: `publish-{pvc}` collided and could exceed the 63-char Job cap."""
+
+    def test_a_long_disk_name_still_produces_a_creatable_job_name(
+        self, client: TestClient, mock_k8s_client: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A PVC may be 253 characters; a Job name may be 63.
+
+        The API server refuses the create outright — which arrives as an
+        unhandled exception, not as anything the user can read.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        long_name = "a" * 120
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client, {"disk_name": long_name})
+
+        assert response.status_code == 202
+        job_body = batch_api.create_namespaced_job.call_args.kwargs["body"]
+        assert len(job_body["metadata"]["name"]) <= 63
+
+    def test_publishing_the_same_disk_twice_does_not_reuse_the_name(
+        self, client: TestClient, mock_k8s_client: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ttlSecondsAfterFinished keeps a succeeded Job for an hour.
+
+        A name derived from the disk alone therefore makes the second publish
+        of the same disk an AlreadyExists — a failure the user cannot act on.
+        """
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            assert _post(client).status_code == 202
+            assert _post(client).status_code == 202
+
+        names = [
+            call.kwargs["body"]["metadata"]["name"]
+            for call in batch_api.create_namespaced_job.call_args_list
+        ]
+        assert names[0] != names[1]
+
+    def test_a_name_collision_surfaces_as_409_not_an_unhandled_500(
+        self, client: TestClient, mock_k8s_client: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """This create sits outside the rollback try — there is nothing to
+        roll back yet — so nothing else would catch it."""
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        batch_api.create_namespaced_job = AsyncMock(
+            side_effect=ApiException(status=409, reason="AlreadyExists")
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 409
+        assert "ubuntu-disk" in response.json()["detail"]
+
+
+class TestTheScratchPvcCanHoldWhatIsWrittenToIt:
+    """I2: `dd` writes the full source capacity into a FILE on this PVC."""
+
+    def test_the_scratch_pvc_is_larger_than_the_source_capacity(
+        self, client: TestClient, mock_k8s_client: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """ext4 metadata plus reserved blocks leave ~0.93-0.95 usable.
+
+        Sized 1:1 with the source, a full copy ENOSPCs partway through — at
+        the end of the slowest step, after the copy has already run.
+        """
+        from app.core.image_publish import _parse_quantity
+
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        mock_k8s_client.core_api.read_namespaced_persistent_volume_claim = AsyncMock(
+            return_value=_fake_source_pvc(volume_mode="Block", capacity="100Gi")
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202
+        pvc_bodies = [
+            call.kwargs["body"]
+            for call in mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_args_list
+        ]
+        scratch = next(b for b in pvc_bodies if b["metadata"]["name"].endswith("-scratch"))
+        asked = scratch["spec"]["resources"]["requests"]["storage"]
+
+        assert _parse_quantity(asked) > _parse_quantity("100Gi")
+
+    def test_the_temporary_clone_is_still_sized_at_the_source_capacity(
+        self, client: TestClient, mock_k8s_client: MagicMock, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The margin belongs to the scratch only — the clone is a block-level
+        restore of the snapshot, not a file written into a filesystem."""
+        monkeypatch.setenv("HARBOR_IMAGE_ENABLED", "true")
+        batch_api, custom_api = _wire_k8s_happy_path(mock_k8s_client)
+        mock_k8s_client.core_api.read_namespaced_persistent_volume_claim = AsyncMock(
+            return_value=_fake_source_pvc(volume_mode="Block", capacity="100Gi")
+        )
+
+        p1, p2, p3 = _patches(batch_api, custom_api)
+        with p1, p2, p3:
+            response = _post(client)
+
+        assert response.status_code == 202
+        first = mock_k8s_client.core_api.create_namespaced_persistent_volume_claim.call_args_list[0]
+        assert first.kwargs["body"]["spec"]["resources"]["requests"]["storage"] == "100Gi"

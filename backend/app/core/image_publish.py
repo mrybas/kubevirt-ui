@@ -8,7 +8,11 @@ The plan is data, not actions, so the ordering and the naming can be tested
 without a cluster.
 """
 
+import math
+import uuid
 from typing import Any
+
+from app.core.harbor_client import HarborNotFound
 
 PUBLISH_IMAGE = "gcr.io/go-containerregistry/crane:debug"
 
@@ -32,14 +36,30 @@ _BLOCK_DEVICE_PATH = "/dev/publish-disk"
 # called `disk/` holding the image file, whatever it is named inside.
 #
 # Filesystem source: the temporary PVC mounts as a filesystem at `/work/disk`
-# (not `/disk`), so `disk` is already that directory and `tar -cf layer.tar
-# disk`, run from `/work`, needs nothing else.
+# (not `/disk`), so `disk` is already that directory and `tar` run from
+# `/work` needs nothing else.
+#
+# The archive is streamed into crane rather than written to `layer.tar`
+# first, for the same reason the Block branch does it — except here the
+# reason is worse. `/work` is the container's own writable layer, which is
+# node EPHEMERAL storage: a full-size tar of a 100GB disk written there fills
+# the node's filesystem and evicts unrelated pods through disk pressure.
+# Refusing an emptyDir for the Block scratch (see below) and then writing the
+# same volume of data to an even less suitable place on the Filesystem branch
+# would have been the same mistake with a different name. `crane append -f -`
+# reads the tarball from stdin — verified by execution against the real
+# crane:debug image, not only from its source — so nothing is materialised at
+# all here: the temporary PVC is read and the bytes go straight out.
+#
+# `pipefail` matters for the same reason it does below: the pipeline's
+# default exit status under plain `set -e` is crane's, not tar's, so a tar
+# that died mid-stream would otherwise push a truncated image that looks
+# valid and boots to garbage.
 _FILESYSTEM_PUSH_SCRIPT = (
-    "set -eu; "
+    "set -eu -o pipefail; "
     "cd /work && "
-    "tar -cf layer.tar disk && "
     'crane auth login "$REGISTRY" -u "$ROBOT_USER" -p "$ROBOT_PASS" && '
-    'crane append --oci-empty-base -f layer.tar -t "$REF"'
+    'tar -cf - disk | crane append --oci-empty-base -f - -t "$REF"'
 )
 
 # Block source: there is no filesystem to mount, so the temporary PVC is
@@ -72,11 +92,95 @@ _FILESYSTEM_PUSH_SCRIPT = (
 _BLOCK_PUSH_SCRIPT = (
     "set -eu -o pipefail; "
     "mkdir -p /scratch/disk && "
-    f'dd if="{_BLOCK_DEVICE_PATH}" of=/scratch/disk/disk.img bs=4M && '
+    f'dd if="{_BLOCK_DEVICE_PATH}" of=/scratch/disk/disk.img bs=4M conv=sparse && '
     'crane auth login "$REGISTRY" -u "$ROBOT_USER" -p "$ROBOT_PASS" && '
     "cd /scratch && "
     'tar -cf - disk | crane append --oci-empty-base -f - -t "$REF"'
 )
+
+
+# A Job's name is used as a label value (`job-name`), so it is capped at 63
+# characters — while the PVC it is derived from is a DNS-1123 subdomain and
+# may be up to 253. A name built by concatenation alone therefore fails to
+# create at all for a long-named disk, and fails identically (AlreadyExists)
+# for a disk published twice inside `ttlSecondsAfterFinished`, which keeps a
+# successful Job around for an hour.
+_JOB_NAME_MAX = 63
+_JOB_PREFIX = "publish-"
+_JOB_SUFFIX_LEN = 8
+
+
+def publish_job_name(pvc: str) -> str:
+    """A Job name that is unique per publish and always within the 63-char cap.
+
+    Unique, because `ttlSecondsAfterFinished: 3600` means the Job from a
+    publish ten minutes ago is still there: a name derived from the disk
+    alone makes the second publish of the same disk an AlreadyExists — which
+    is not a conflict the user caused in any way they could act on.
+
+    Bounded, because a 200-character PVC name would otherwise produce a Job
+    name the API server refuses outright. The disk's name is truncated, never
+    the random suffix: two disks whose names agree in the first 46 characters
+    are still told apart by the suffix, whereas truncating the suffix would
+    reintroduce the collision this exists to remove.
+    """
+    suffix = uuid.uuid4().hex[:_JOB_SUFFIX_LEN]
+    budget = _JOB_NAME_MAX - len(_JOB_PREFIX) - 1 - _JOB_SUFFIX_LEN
+    stem = pvc[:budget].rstrip("-.")
+    return f"{_JOB_PREFIX}{stem}-{suffix}" if stem else f"{_JOB_PREFIX}{suffix}"
+
+
+# ext4 (and xfs) spend part of a fresh filesystem on metadata — inode tables,
+# journal, and the 5% root-reserved blocks — so a PVC of exactly N bytes
+# holds noticeably less than N bytes of file. Measured range is ~0.93-0.95
+# usable, and `dd` writes the full source capacity into a file on it, so a
+# scratch sized 1:1 with the source ENOSPCs partway through a full disk.
+_SCRATCH_MARGIN = 1.15
+# Plus a flat allowance, because the percentage alone is thin for a small
+# disk (a 1Gi source gains only 150Mi, and a fresh ext4's own overhead on a
+# volume that size is a bigger share than on a large one).
+_SCRATCH_FLOOR_BYTES = 512 * 1024**2
+
+_QUANTITY_UNITS = {
+    "Ki": 1024, "Mi": 1024**2, "Gi": 1024**3, "Ti": 1024**4, "Pi": 1024**5,
+    "K": 1000, "M": 1000**2, "G": 1000**3, "T": 1000**4, "P": 1000**5,
+}
+
+
+def _parse_quantity(value: str) -> int:
+    """Bytes for a Kubernetes quantity string, or 0 if it cannot be read."""
+    text = (value or "").strip()
+    for unit, mult in _QUANTITY_UNITS.items():
+        if text.endswith(unit):
+            try:
+                return int(float(text[: -len(unit)]) * mult)
+            except ValueError:
+                return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        return 0
+
+
+def scratch_pvc_size(source_size: str) -> str:
+    """How big the scratch PVC must be to hold a full copy of `source_size`.
+
+    Deliberately larger than the source: `dd` writes exactly the source
+    capacity into a FILE, and a filesystem cannot store its own size in
+    files. Rounded up to whole Gi both because CSI provisioners round up
+    anyway and because a scratch volume is short-lived — over-asking costs an
+    hour of capacity, under-asking costs the whole publish, at the end, after
+    the copy has already run.
+
+    An unparseable size falls back to the source string unchanged rather than
+    inventing a number: that keeps today's behaviour for anything this parser
+    does not understand instead of silently asking for something wrong.
+    """
+    raw = _parse_quantity(source_size)
+    if raw <= 0:
+        return source_size
+    wanted = int(raw * _SCRATCH_MARGIN) + _SCRATCH_FLOOR_BYTES
+    return f"{math.ceil(wanted / 1024**3)}Gi"
 
 
 def cleanup_names(job_name: str) -> tuple[str, str]:
@@ -162,7 +266,7 @@ def publish_job(
             },
         })
 
-    job_name = f"publish-{pvc}"
+    job_name = publish_job_name(pvc)
     tmp_name = cleanup_names(job_name)[1]
 
     container: dict[str, Any] = {
@@ -245,8 +349,11 @@ def publish_dependents(
     request smaller than the snapshot's `restoreSize`.
 
     The scratch PVC (present only when `volume_mode == "Block"`) is always
-    `Filesystem` — `dd` needs somewhere to write a regular file — sized the
-    same as the temporary PVC, since it holds a full copy of the same disk.
+    `Filesystem` — `dd` needs somewhere to write a regular file — and is
+    sized by `scratch_pvc_size()` rather than at the source capacity: it
+    holds a full copy of the same disk as a FILE, and a filesystem's own
+    metadata and reserved blocks mean a volume of exactly N bytes cannot hold
+    an N-byte file.
     Accepted cost: a Block publish transiently needs roughly twice the disk's
     size (the thin snapshot clone plus this scratch copy).
 
@@ -311,7 +418,7 @@ def publish_dependents(
                 "accessModes": ["ReadWriteOnce"],
                 "storageClassName": storage_class,
                 "volumeMode": "Filesystem",
-                "resources": {"requests": {"storage": storage_size}},
+                "resources": {"requests": {"storage": scratch_pvc_size(storage_size)}},
             },
         })
 
@@ -325,8 +432,21 @@ async def assert_tag_is_free(
 
     CDI imports a registry source exactly once, so overwriting a tag produces a
     publish that reports success and changes nothing anybody can boot.
+
+    A repository that does not exist yet answers 404, which is the ORDINARY
+    case: it is what every first publish to a new repository looks like. That
+    is caught here and read as "the tag is free", because it is. Only
+    HarborNotFound is caught — a real outage or a rejected token still
+    propagates, because neither is evidence the tag is available and
+    publishing over an occupied tag is the failure this function exists to
+    prevent.
     """
-    for artifact in await harbor.list_artifacts(token, project, repository):
+    try:
+        artifacts = await harbor.list_artifacts(token, project, repository)
+    except HarborNotFound:
+        return
+
+    for artifact in artifacts:
         for existing in artifact.get("tags") or []:
             if existing.get("name") == tag:
                 raise ValueError(

@@ -96,10 +96,53 @@ Methods, matching what the UI needs:
 list_projects(token)                        -> GET /projects
 list_repositories(token, project)           -> GET /projects/{p}/repositories
 list_artifacts(token, project, repository)  -> GET /projects/{p}/repositories/{r}/artifacts
+list_project_artifacts(token, project)      -> GET /projects/{p}/artifacts
 ```
 
-`GET /projects/{p}/artifacts` (project-wide) is deliberately unused: it returned
-401 for a project robot in testing and the browse flow does not need it.
+Catalogue browsing uses `GET /projects/{p}/artifacts` (project-wide): every
+artifact it returns carries `repository_name`, so the per-repository walk buys
+nothing and the read costs `1 + P` requests instead of `1 + P + (P x R)`.
+
+**Measured against the lab Harbor with a valid user OIDC token:** 200 on both a
+public and a private project; 401 with no token or a garbage bearer. So
+authorisation is genuinely enforced on this endpoint — better than `/projects`,
+which answers 200 to anyone, and which is why `verify_identity()` exists.
+`repository_name` is populated on every real artifact, not merely declared in
+the schema, and pagination behaves normally (`X-Total-Count` and
+`Link: rel="next"`).
+
+**`latest_in_repository=true` must not be used.** Harbor's documentation
+presents it as the way to return one current artifact per repository instead of
+every tag. On this Harbor build it is unusable, measured against real pushed
+artifacts:
+
+- `?latest_in_repository=true` alone → **HTTP 400**: *"either 'media_type' or
+  'artifact_type' must be specified, but not both, when querying with
+  latest_in_repository"*
+- adding the companion filter through Harbor's `q=` syntax → **HTTP 500** for
+  the brace and fuzzy forms, and **200 with zero results** for the bare form, on
+  artifacts that unambiguously match the queried values
+
+The requirement was traced to Harbor's own source and no syntax returns a
+correct non-empty result. Sent anyway, every catalogue read is a 400, which the
+client turns into `HarborUnavailable` — an empty catalogue with
+`catalog_available: false` on every page load.
+
+Dropping it forfeits nothing. The `1 + P` saving comes from calling the
+**project-wide** endpoint rather than the per-repository ones;
+`latest_in_repository` only ever reduced the number of *rows*, never the number
+of *requests*. Without it the catalogue lists every tag — exactly what the code
+on `main` does today — so there is no behaviour change either, only far fewer
+requests. A test asserts the parameter is absent, so it cannot be re-added from
+the documentation without something failing.
+
+An earlier version of this document said that endpoint was "deliberately unused:
+it returned 401 for a project robot in testing". That reasoning was void: the
+401 was measured with a **robot** account, and Harbor robots are refused the
+entire management API at every level regardless of permissions — the robot was
+failing everywhere, not that endpoint in particular.
+`list_repositories`/`list_artifacts` remain on the client and are still used by
+the publish path's tag check.
 
 **`app/api/v1/images.py`** (new). The `images_router` currently lives in
 `app/api/v1/templates.py`, which is 1802 lines. This work adds substantial

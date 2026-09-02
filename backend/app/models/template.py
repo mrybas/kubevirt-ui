@@ -192,8 +192,31 @@ class VMImageCreate(BaseModel):
     # Source - one of these
     source_url: str | None = Field(None, description="HTTP URL to download image")
     source_registry: str | None = Field(None, description="Container registry URL")
+    # A catalogue selection, exactly as GET /images reported it: host-less
+    # "<project>/<repository>:<tag>". The backend expands it into the full
+    # docker:// URL and attaches the tenant's credential, because the registry
+    # host and the credential's name are server-side facts — a browser that
+    # builds registry URLs is a browser that can build the wrong one, and a
+    # credential name in a page is a credential name in a bug report.
+    #
+    # The pattern is a whitelist, not a nicety: this string is interpolated
+    # into a URL, so "../" and a scheme of its own are both refused here
+    # rather than resolved somewhere downstream.
+    catalog_ref: str | None = Field(
+        None,
+        pattern=(
+            r"^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)+"
+            r":[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$"
+        ),
+        max_length=512,
+        description=(
+            "Harbor catalogue reference '<project>/<repository>:<tag>' "
+            "(no registry host — the backend adds it)"
+        ),
+    )
     # Secret in the TARGET namespace holding the Harbor robot credential.
     # CDI resolves secretRef in the DataVolume's own namespace and nowhere else.
+    # Optional: a catalog_ref fills this in by convention when it is omitted.
     source_registry_secret: str | None = None
     # ConfigMap holding the registry's CA, while Harbor uses a private one.
     source_registry_ca_configmap: str | None = None

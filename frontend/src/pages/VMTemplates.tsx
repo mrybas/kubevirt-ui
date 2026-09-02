@@ -484,9 +484,13 @@ export function TemplateModal({ goldenImages, projects, defaultProject, editTemp
         // sees it turn Ready without a reload.
         try {
           const created = await createImageFromCatalog.mutateAsync({
+            // catalog_ref, NOT source_registry — same reason as the sibling
+            // call in Storage.tsx: the ref carries no registry host, so as
+            // source_registry it resolves against Docker Hub and the disk
+            // never re-joins its catalogue row.
             data: {
               display_name: selectedImage.display_name || selectedImage.name,
-              source_registry: selectedImage.catalog_ref!,
+              catalog_ref: selectedImage.catalog_ref!,
               disk_type: 'image',
               persistent: false,
             },
