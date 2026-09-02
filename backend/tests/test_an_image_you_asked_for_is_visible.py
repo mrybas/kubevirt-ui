@@ -25,7 +25,8 @@ from app.api.v1.images import _described_but_unbuilt_images
 
 
 def _described(name: str, *, phase: str = "", conditions: list | None = None,
-               size: str = "100Gi", ns: str = "poc-transit-dev") -> dict:
+               size: str = "100Gi", ns: str = "poc-transit-dev",
+               source: dict | None = None) -> dict:
     return {
         "metadata": {
             "name": name, "namespace": ns,
@@ -34,7 +35,13 @@ def _described(name: str, *, phase: str = "", conditions: list | None = None,
                        "kubevirt-ui.io/persistent": "true"},
         },
         "spec": {"displayName": "Over quota", "size": size,
-                 "source": {"url": "http://example.test/x.qcow2"}},
+                 # NB: the flat {"url": ...} form. It is NOT what
+                 # `_create_managed_image` writes — that writes CDI's nested
+                 # shape — and this fixture's unrealistic default is why a
+                 # registry source went untested for so long. Kept as the
+                 # default because older resources carry it; the tests below
+                 # pass the real shapes explicitly.
+                 "source": source or {"url": "http://example.test/x.qcow2"}},
         "status": {"phase": phase, "conditions": conditions or []},
     }
 
@@ -107,3 +114,93 @@ def test_the_lister_asks_for_both() -> None:
     source = inspect.getsource(list_golden_images)
     assert "_described_but_unbuilt_images" in source
     assert source.index("datavolumes") < source.index("_described_but_unbuilt_images")
+
+
+class TestTheSourceUrlOfSomethingNotBuiltYet:
+    """`source.get("url") or source.get("registry")` was wrong twice over.
+
+    `_create_managed_image` writes CDI's nested source dict, so the first half
+    matched nothing and the second returned a **dict** for a registry source.
+    `VMImage.source_url` is `str | None`, so that is a Pydantic
+    ValidationError raised inside the list handler's `try` — whose only
+    `except` is `ApiException`. It escaped as a 500 that took out the entire
+    image list, in every namespace, for as long as one registry-sourced
+    ManagedImage stayed unbuilt.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_registry_source_does_not_500_the_whole_list(self) -> None:
+        """The regression, stated as what the user would have seen: not a
+        broken row — no list at all."""
+        rows = await _rows([
+            _described("catalogue-image", source={
+                "registry": {
+                    "url": "docker://harbor.example/vm-images-tenant-a/ubuntu:1",
+                    "secretRef": "harbor-robot",
+                    "certConfigMap": "harbor-ca",
+                },
+            }),
+        ])
+
+        assert len(rows) == 1
+        assert rows[0].source_url == (
+            "docker://harbor.example/vm-images-tenant-a/ubuntu:1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unbuilt_catalogue_image_still_joins_its_catalogue_row(
+        self,
+    ) -> None:
+        """Not just "does not crash" — the URL has to be the merge key.
+
+        `merge()` re-joins a row with its catalogue entry through
+        `catalog_ref_from_source_url`. An unbuilt catalogue image whose
+        source_url is None (or a dict) shows up as a SECOND row beside the
+        catalogue row it was made from, during exactly the window between
+        materialising an image and the operator building it.
+        """
+        from app.api.v1.images_catalog import catalog_ref_from_source_url
+
+        rows = await _rows([
+            _described("catalogue-image", source={
+                "registry": {
+                    "url": "docker://harbor.example/vm-images-public/ubuntu-2204:20260901",
+                },
+            }),
+        ])
+
+        assert catalog_ref_from_source_url(rows[0].source_url) == (
+            "vm-images-public/ubuntu-2204:20260901"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_nested_http_shape_is_read_too(self) -> None:
+        """The shape `_create_managed_image` actually writes for an HTTP
+        source. The old expression returned None for this as well — harmless,
+        but wrong, and it is why nothing noticed the registry case."""
+        rows = await _rows([
+            _described("http-image", source={
+                "http": {"url": "https://cloud-images.example/x.qcow2"},
+            }),
+        ])
+
+        assert rows[0].source_url == "https://cloud-images.example/x.qcow2"
+
+    @pytest.mark.asyncio
+    async def test_a_pvc_clone_reads_the_same_way_the_built_row_renders_it(
+        self,
+    ) -> None:
+        rows = await _rows([
+            _described("clone", source={
+                "pvc": {"name": "ubuntu-disk", "namespace": "tenant-a"},
+            }),
+        ])
+
+        assert rows[0].source_url == "pvc:tenant-a/ubuntu-disk"
+
+    @pytest.mark.asyncio
+    async def test_the_legacy_flat_form_still_works(self) -> None:
+        """Older resources carry `{"url": ...}` directly."""
+        rows = await _rows([_described("legacy")])
+
+        assert rows[0].source_url == "http://example.test/x.qcow2"

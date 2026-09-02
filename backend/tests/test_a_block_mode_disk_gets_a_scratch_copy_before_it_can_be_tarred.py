@@ -9,7 +9,47 @@ suspended-Job-as-owner choreography: pure functions, so the ordering and the
 per-mode shape can be pinned without a cluster to prove it against.
 """
 
+import re
+
+import pytest
+
 from app.core.image_publish import publish_dependents, publish_job, scratch_pvc_name
+
+# ---------------------------------------------------------------------------
+# What BusyBox's `dd` applet actually accepts, MEASURED against the real image
+# rather than read from a man page:
+#
+#   docker run --rm --entrypoint sh gcr.io/go-containerregistry/crane:debug \
+#       -c 'dd if=/dev/zero of=/tmp/x bs=1M count=1 conv=<value>; echo EXIT=$?'
+#
+# `conv` is the trap. GNU coreutils takes a long list; BusyBox takes five, and
+# answers anything else with `dd: invalid argument '<value>' to 'conv'` and
+# exit 1 — which, under the script's `set -eu`, aborts the publish on its
+# first command, before `crane auth login` ever runs. `conv=sparse` did
+# exactly that to every Block-mode publish and no test noticed, because
+# nothing here executes the script and a mocked Kubernetes API never execs
+# anything.
+#
+# `iflag`/`oflag` are deliberately NOT in the operand list: the applet parses
+# them, but their values are device-dependent (O_DIRECT on the measured setup
+# failed at open time), so they are unproven rather than known-good. Adding
+# one should mean measuring it and then extending this list.
+_BUSYBOX_DD_OPERANDS = frozenset(
+    {"if", "of", "bs", "ibs", "obs", "count", "seek", "skip", "conv", "status"}
+)
+_BUSYBOX_DD_CONV = frozenset({"notrunc", "sync", "noerror", "fsync", "swab"})
+
+
+def _dd_operands(script: str) -> dict[str, str]:
+    """The `name=value` operands of the script's `dd` invocation."""
+    match = re.search(r"\bdd\s+(.*?)(?:\s*&&|\s*\||\s*;|$)", script)
+    assert match, f"no dd invocation found in: {script}"
+    operands = {}
+    for token in match.group(1).split():
+        assert "=" in token, f"dd operand {token!r} is not name=value"
+        name, _, value = token.partition("=")
+        operands[name] = value
+    return operands
 
 
 def test_the_shell_the_job_invokes_actually_exists_in_the_image():
@@ -176,3 +216,71 @@ def test_the_scratch_pvc_is_filesystem_mode_even_though_the_source_is_block():
     )
 
     assert scratch["spec"]["volumeMode"] == "Filesystem"
+
+
+# ---------------------------------------------------------------------------
+# The image's userland, pinned.
+#
+# Three defects in this branch have now been the same mistake: assuming a GNU
+# userland in an image that ships BusyBox. `/bin/sh` (fixed in f5cc38f),
+# `dd conv=sparse` (this one), and whatever the next man page suggests. Each
+# passed the entire suite and died on the Job's first line in a real cluster,
+# because nothing here runs the script.
+#
+# These tests cannot execute BusyBox either. What they can do is refuse
+# operands that are known not to exist in it, so the next person reaching for
+# a GNU flag meets a red test with the measured list in it, instead of a Job
+# that aborts before it authenticates.
+# ---------------------------------------------------------------------------
+
+
+def test_the_block_scripts_dd_uses_only_operands_busybox_accepts():
+    """`conv=sparse` aborted every Block publish before `crane auth login`.
+
+    BusyBox `dd` answers an unknown conv value with `dd: invalid argument
+    'sparse' to 'conv'` and exit 1; `set -eu` turns that into a Job that
+    fails on its first command. Measured directly against
+    gcr.io/go-containerregistry/crane:debug — see the constants above.
+    """
+    job = publish_job("tenant-a", "ubuntu-disk", "p/u:1", volume_mode="Block")
+    script = " ".join(job["spec"]["template"]["spec"]["containers"][0]["args"])
+
+    operands = _dd_operands(script)
+
+    unknown = set(operands) - _BUSYBOX_DD_OPERANDS
+    assert not unknown, (
+        f"dd operand(s) {sorted(unknown)} are not in BusyBox's applet. "
+        f"Measure against the real image before adding one; BusyBox accepts "
+        f"{sorted(_BUSYBOX_DD_OPERANDS)}."
+    )
+
+    for value in filter(None, operands.get("conv", "").split(",")):
+        assert value in _BUSYBOX_DD_CONV, (
+            f"conv={value} is GNU-only. BusyBox accepts only "
+            f"{sorted(_BUSYBOX_DD_CONV)} and exits 1 on anything else, which "
+            f"under `set -eu` aborts the publish before crane ever runs."
+        )
+
+
+def test_the_block_script_does_not_reach_for_conv_sparse():
+    """Named directly, because it was added deliberately and reverted.
+
+    A thin, mostly-empty disk is copied in full. That is the accepted cost:
+    the scratch PVC is sized by `scratch_pvc_size()` for a full copy anyway,
+    so a dense copy is correct — only slower — while a sparse one does not
+    run at all.
+    """
+    job = publish_job("tenant-a", "ubuntu-disk", "p/u:1", volume_mode="Block")
+    script = " ".join(job["spec"]["template"]["spec"]["containers"][0]["args"])
+
+    assert "conv=sparse" not in script
+
+
+@pytest.mark.parametrize("volume_mode", ["Block", "Filesystem"])
+def test_neither_script_invokes_a_shell_the_image_does_not_have(volume_mode: str):
+    """The first of the three: `/bin/sh` does not exist in this image."""
+    job = publish_job("tenant-a", "ubuntu-disk", "p/u:1", volume_mode=volume_mode)
+    container = job["spec"]["template"]["spec"]["containers"][0]
+
+    assert container["command"][0] == "sh"
+    assert "/bin/sh" not in " ".join(container["command"])

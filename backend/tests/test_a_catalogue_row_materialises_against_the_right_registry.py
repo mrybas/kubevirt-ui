@@ -205,6 +205,33 @@ class TestTheCredentialTheBackendAttaches:
             "harbor-ca"
         )
 
+    async def test_a_transport_failure_reading_the_ca_does_not_fail_the_materialise(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The CA read is a best-effort look at an OPTIONAL object.
+
+        `except ApiException` alone let a reset connection or a DNS blip
+        escape as a 500 that failed the whole materialise — over a ConfigMap
+        that may legitimately not exist at all. The docstring already promised
+        this behaviour; the code only implemented half of it.
+        """
+        k8s = _k8s()
+        k8s.core_api.read_namespaced_config_map = AsyncMock(
+            side_effect=TimeoutError("connection reset")
+        )
+
+        captured, _ = await _create(
+            k8s,
+            GoldenImageCreate(display_name="U", catalog_ref="p/u:1", size="10Gi"),
+        )
+
+        registry = captured["body"]["spec"]["source"]["registry"]
+        assert "certConfigMap" not in registry
+        # The pull itself is still fully formed — this is a degradation, not
+        # a failure.
+        assert registry["url"].startswith("docker://")
+        assert registry["secretRef"] == "harbor-robot"
+
     async def test_an_absent_ca_config_map_is_omitted_rather_than_named(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:

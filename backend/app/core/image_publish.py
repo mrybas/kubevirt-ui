@@ -25,6 +25,26 @@ PUBLISH_IMAGE = "gcr.io/go-containerregistry/crane:debug"
 # One constant, so the decision can never drift between two call sites.
 _SHELL = "sh"
 
+# THE USERLAND IS BUSYBOX. This one fact has now caused three separate
+# defects in this file, each of which passed the whole test suite and died on
+# the Job's first line in a real cluster:
+#
+#   1. `command: ["/bin/sh", "-c"]` — there is no /bin/sh; the shell is at
+#      /busybox/sh and on PATH as bare `sh` (fixed in f5cc38f).
+#   2. `dd ... conv=sparse` — BusyBox `dd` accepts only
+#      notrunc/sync/noerror/fsync/swab for `conv`, and answers anything else
+#      with "dd: invalid argument 'sparse' to 'conv'", exit 1. Under
+#      `set -eu` that aborted every Block publish before `crane auth login`.
+#   3. (the same class) any GNU-only flag reached for from a man page.
+#
+# Nothing in this suite executes these scripts — a mocked Kubernetes API never
+# execs anything — so the only defences are this comment and the operand test
+# in test_a_block_mode_disk_gets_a_scratch_copy_before_it_can_be_tarred.py.
+# Before adding a flag here, check it against BusyBox's applet, not GNU
+# coreutils:
+#     docker run --rm --entrypoint sh gcr.io/go-containerregistry/crane:debug \
+#         -c '<the exact command>; echo EXIT=$?'
+
 # Where the raw block device is attached when the source disk is Block-mode.
 # volumeDevices (not volumeMounts) is the only way Kubernetes exposes a Block
 # PVC to a container — there is no filesystem underneath it to mount.
@@ -64,7 +84,10 @@ _FILESYSTEM_PUSH_SCRIPT = (
 
 # Block source: there is no filesystem to mount, so the temporary PVC is
 # attached as a raw block device instead (`volumeDevices`), and `dd` copies it
-# into a regular file — a block device cannot be tarred directly, and crane
+# into a regular file — in full, including the empty parts. `conv=sparse`
+# would skip those, and BusyBox `dd` does not implement it (see the userland
+# note above); the scratch PVC is sized by `scratch_pvc_size()` for a full
+# copy, so a dense copy is correct, only slower on a thin disk — a block device cannot be tarred directly, and crane
 # needs a regular file — on a scratch PVC (never emptyDir: a disk this size
 # on node ephemeral storage risks evicting unrelated pods through disk
 # pressure).
@@ -92,7 +115,7 @@ _FILESYSTEM_PUSH_SCRIPT = (
 _BLOCK_PUSH_SCRIPT = (
     "set -eu -o pipefail; "
     "mkdir -p /scratch/disk && "
-    f'dd if="{_BLOCK_DEVICE_PATH}" of=/scratch/disk/disk.img bs=4M conv=sparse && '
+    f'dd if="{_BLOCK_DEVICE_PATH}" of=/scratch/disk/disk.img bs=4M && '
     'crane auth login "$REGISTRY" -u "$ROBOT_USER" -p "$ROBOT_PASS" && '
     "cd /scratch && "
     'tar -cf - disk | crane append --oci-empty-base -f - -t "$REF"'

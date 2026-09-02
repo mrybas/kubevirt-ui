@@ -509,6 +509,51 @@ async def _refuse_a_duplicate_image(
             )
 
 
+def _unbuilt_source_url(source: dict[str, Any]) -> str | None:
+    """The displayable source URL of a ManagedImage that has no disk yet.
+
+    This was `source.get("url") or source.get("registry")`, and both halves
+    were wrong. `_create_managed_image` writes the same nested dict CDI uses —
+    `{"http": {"url": ...}}`, `{"registry": {"url": ..., "secretRef": ...}}`,
+    `{"pvc": {...}}`, `{"blank": {}}` — so the first half never matched
+    anything, and the second returned a **dict** for a registry source. Fed to
+    `VMImage.source_url`, typed `str | None`, that is a Pydantic
+    ValidationError, raised inside the list handler's `try` whose only
+    `except` is `ApiException` — so it escaped as a 500 that took out the
+    ENTIRE image list, for every namespace, for as long as one
+    registry-sourced ManagedImage stayed unbuilt.
+
+    It predates this wave but the wave makes it far likelier: `{"registry":
+    {...}}` is now the guaranteed shape for every catalogue image, and the
+    window it needs is exactly the seconds between materialising one and the
+    operator building it.
+
+    Returning the registry URL properly also fixes a second, quieter thing:
+    `merge()` re-joins a row with its catalogue entry through
+    `catalog_ref_from_source_url(source_url)`, so an unbuilt catalogue image
+    with no URL appeared as a second row beside the catalogue row it came
+    from — the same "one image, two rows" the frontend fix exists to prevent.
+
+    The flat `{"url": ...}` form is still read last, because older resources
+    (and this module's own tests) carry it.
+    """
+    for key in ("http", "registry"):
+        nested = source.get(key)
+        if isinstance(nested, dict) and isinstance(nested.get("url"), str):
+            return nested["url"]
+
+    pvc = source.get("pvc")
+    if isinstance(pvc, dict) and pvc.get("name"):
+        # Same rendering the built row uses, so the two agree.
+        return f"pvc:{pvc.get('namespace', '')}/{pvc['name']}"
+
+    if source.get("blank") is not None:
+        return "blank"
+
+    flat = source.get("url")
+    return flat if isinstance(flat, str) else None
+
+
 async def _described_but_unbuilt_images(
     custom_api: Any, namespaces: list[str], filter_namespace: str | None,
     already: set[str], ns_labels_map: dict[str, dict],
@@ -573,7 +618,7 @@ async def _described_but_unbuilt_images(
                 size=spec.get("size", "Unknown"),
                 status=display,
                 error_message=(message or reason) if display == "Error" else None,
-                source_url=source.get("url") or source.get("registry"),
+                source_url=_unbuilt_source_url(source),
                 created=meta.get("creationTimestamp"),
                 used_by=status_obj.get("usedBy") or None,
                 disk_type=labels.get("kubevirt-ui.io/disk-type", "image"),
@@ -700,6 +745,18 @@ async def _configmap_exists(k8s_client: Any, namespace: str, name: str) -> bool:
                 "could not read ConfigMap %s/%s (%s); pulling without a CA",
                 namespace, name, exc.status,
             )
+        return False
+    except Exception:
+        # Deliberately broad, and the docstring above is the contract this
+        # keeps: `except ApiException` alone let a transport error — a reset
+        # connection, a DNS blip, a timeout — escape as a 500 that failed the
+        # whole materialise over an OPTIONAL object. Logged rather than
+        # swallowed silently, since a read that keeps failing is worth
+        # noticing even when it is not worth refusing on.
+        logger.warning(
+            "could not read ConfigMap %s/%s; pulling without a CA",
+            namespace, name, exc_info=True,
+        )
         return False
 
 
