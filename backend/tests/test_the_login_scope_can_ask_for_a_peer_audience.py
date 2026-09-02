@@ -30,7 +30,14 @@ def test_a_peer_audience_can_be_requested(monkeypatch):
 
 
 def test_the_config_the_frontend_reads_carries_the_scope():
-    """The frontend builds the authorize URL from this, so it must be served."""
+    """AuthConfig can hold the scope.
+
+    This asserts on the internal model only. It does NOT prove the field is
+    served: `/api/v1/auth/config` answers with `AuthConfigResponse`, a separate
+    model, and this test passed for a release in which that response dropped
+    the field entirely. The wire contract is covered in
+    `test_the_served_auth_config_carries_the_scope.py`.
+    """
     cfg = auth.AuthConfig(type="oidc")
     assert cfg.scope == "openid profile email groups"
 

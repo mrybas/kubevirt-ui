@@ -34,6 +34,11 @@ class AuthConfigResponse(BaseModel):
     authorization_endpoint: str | None = None
     token_endpoint: str | None = None
     userinfo_endpoint: str | None = None
+    # Mirrors AuthConfig.scope. This model is filled in field by field, so a
+    # field that exists on AuthConfig but not here is dropped at the API
+    # boundary -- silently, with a 200 -- and the frontend falls back to its
+    # own default. That is how the peer audience went missing from the login.
+    scope: str = "openid profile email groups"
     user_management: str = "none"
 
 
@@ -75,6 +80,7 @@ async def get_config() -> AuthConfigResponse:
         authorization_endpoint=config.authorization_endpoint,
         token_endpoint=config.token_endpoint,
         userinfo_endpoint=config.userinfo_endpoint,
+        scope=config.scope,
         user_management=config.user_management,
     )
 
