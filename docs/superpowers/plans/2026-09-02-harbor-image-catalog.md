@@ -917,8 +917,18 @@ Snapshot first so a running VM never stops.
 **Interfaces:**
 - Consumes: `HarborClient` (Task 2)
 - Produces:
-  - `app.core.image_publish.publish_plan(namespace: str, pvc: str, ref: str) -> list[dict[str, Any]]` — the ordered objects to create
+  - `app.core.image_publish.publish_job(namespace: str, pvc: str, ref: str) -> dict[str, Any]` — a **suspended** Job
+  - `app.core.image_publish.publish_dependents(namespace: str, pvc: str, job_name: str, job_uid: str) -> list[dict[str, Any]]` — snapshot and temp PVC, each owned by the Job
   - `app.core.image_publish.cleanup_names(job_name: str) -> tuple[str, str]` — `(snapshot_name, temp_pvc_name)`
+  - `app.core.image_publish.assert_tag_is_free(harbor, token, project, repository, tag) -> None`
+
+**Why the Job is created first, and suspended:** an `ownerReference` needs the
+owner's UID, which does not exist until the owner is created. Creating the
+snapshot and PVC first therefore cannot make the Job their owner. So: create the
+Job suspended, take its UID, create the two dependents owned by it, then
+unsuspend. Kubernetes garbage-collects both whatever the Job's outcome — which a
+request handler cannot do, because the request is long finished by the time a
+Job fails.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -931,30 +941,49 @@ Orphans here are invisible until the storage pool fills, which is the worst
 time to discover them.
 """
 
-from app.core.image_publish import cleanup_names, publish_plan
+from app.core.image_publish import cleanup_names, publish_dependents, publish_job
 
 
-def test_the_plan_snapshots_before_it_reads():
-    kinds = [o["kind"] for o in publish_plan("tenant-a", "ubuntu-disk", "p/u:1")]
+def test_the_job_starts_suspended_so_it_can_own_what_it_waits_for():
+    job = publish_job("tenant-a", "ubuntu-disk", "p/u:1")
+
+    assert job["spec"]["suspend"] is True
+
+
+def test_the_snapshot_comes_before_the_pvc_that_is_made_from_it():
+    kinds = [
+        o["kind"]
+        for o in publish_dependents("tenant-a", "ubuntu-disk", "publish-ubuntu-disk", "uid-1")
+    ]
 
     assert kinds.index("VolumeSnapshot") < kinds.index("PersistentVolumeClaim")
-    assert kinds.index("PersistentVolumeClaim") < kinds.index("Job")
 
 
 def test_the_temporary_pvc_is_made_from_the_snapshot_not_the_live_disk():
-    plan = publish_plan("tenant-a", "ubuntu-disk", "p/u:1")
-    pvc = next(o for o in plan if o["kind"] == "PersistentVolumeClaim")
+    dependents = publish_dependents("tenant-a", "ubuntu-disk", "publish-ubuntu-disk", "uid-1")
+    pvc = next(o for o in dependents if o["kind"] == "PersistentVolumeClaim")
 
     assert pvc["spec"]["dataSource"]["kind"] == "VolumeSnapshot"
 
 
+def test_both_dependents_are_owned_by_the_job_so_kubernetes_reaps_them():
+    """A request handler cannot clean up after a Job that fails later."""
+    dependents = publish_dependents("tenant-a", "ubuntu-disk", "publish-ubuntu-disk", "uid-1")
+
+    for obj in dependents:
+        owner = obj["metadata"]["ownerReferences"][0]
+        assert owner["kind"] == "Job"
+        assert owner["uid"] == "uid-1"
+        assert owner["controller"] is True
+
+
 def test_every_created_object_is_named_after_the_job_that_owns_it():
     """Cleanup keys off the Job name, so the names must be derivable from it."""
-    plan = publish_plan("tenant-a", "ubuntu-disk", "p/u:1")
-    job = next(o for o in plan if o["kind"] == "Job")
-    snap, tmp = cleanup_names(job["metadata"]["name"])
+    job = publish_job("tenant-a", "ubuntu-disk", "p/u:1")
+    name = job["metadata"]["name"]
+    snap, tmp = cleanup_names(name)
 
-    names = {o["metadata"]["name"] for o in plan}
+    names = {o["metadata"]["name"] for o in publish_dependents("tenant-a", "ubuntu-disk", name, "uid-1")}
     assert snap in names
     assert tmp in names
 
@@ -1033,21 +1062,87 @@ def cleanup_names(job_name: str) -> tuple[str, str]:
     return f"{job_name}-snap", f"{job_name}-tmp"
 
 
-def publish_plan(namespace: str, pvc: str, ref: str) -> list[dict[str, Any]]:
-    """Ordered objects to create for one publish."""
-    job_name = f"publish-{pvc}"
+def publish_job(namespace: str, pvc: str, ref: str) -> dict[str, Any]:
+    """The publish Job, created SUSPENDED so it can own its dependents.
+
+    An ownerReference needs the owner's UID, which exists only once the owner
+    is created. Creating the snapshot and PVC first would leave them ownerless
+    and therefore un-reaped when the Job fails.
+    """
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {"name": f"publish-{pvc}", "namespace": namespace},
+        "spec": {
+            "suspend": True,
+            "backoffLimit": 1,
+            "ttlSecondsAfterFinished": 3600,
+            "template": {
+                "spec": {
+                    "restartPolicy": "Never",
+                    "containers": [
+                        {
+                            "name": "publish",
+                            "image": PUBLISH_IMAGE,
+                            "env": [{"name": "REF", "value": ref}],
+                            "volumeMounts": [
+                                {"name": "disk", "mountPath": "/disk", "readOnly": True}
+                            ],
+                        }
+                    ],
+                    "volumes": [
+                        {
+                            "name": "disk",
+                            "persistentVolumeClaim": {
+                                "claimName": cleanup_names(f"publish-{pvc}")[1],
+                                "readOnly": True,
+                            },
+                        }
+                    ],
+                }
+            },
+        },
+    }
+
+
+def publish_dependents(
+    namespace: str, pvc: str, job_name: str, job_uid: str
+) -> list[dict[str, Any]]:
+    """The snapshot and the temporary PVC, both owned by the Job.
+
+    Ownership is what makes cleanup unconditional: Kubernetes reaps these when
+    the Job goes, whether it succeeded, failed, or was deleted by hand.
+    """
     snap_name, tmp_name = cleanup_names(job_name)
+    owner = [
+        {
+            "apiVersion": "batch/v1",
+            "kind": "Job",
+            "name": job_name,
+            "uid": job_uid,
+            "controller": True,
+            "blockOwnerDeletion": False,
+        }
+    ]
     return [
         {
             "apiVersion": "snapshot.storage.k8s.io/v1",
             "kind": "VolumeSnapshot",
-            "metadata": {"name": snap_name, "namespace": namespace},
+            "metadata": {
+                "name": snap_name,
+                "namespace": namespace,
+                "ownerReferences": owner,
+            },
             "spec": {"source": {"persistentVolumeClaimName": pvc}},
         },
         {
             "apiVersion": "v1",
             "kind": "PersistentVolumeClaim",
-            "metadata": {"name": tmp_name, "namespace": namespace},
+            "metadata": {
+                "name": tmp_name,
+                "namespace": namespace,
+                "ownerReferences": owner,
+            },
             "spec": {
                 "accessModes": ["ReadWriteOnce"],
                 "dataSource": {
@@ -1056,42 +1151,6 @@ def publish_plan(namespace: str, pvc: str, ref: str) -> list[dict[str, Any]]:
                     "apiGroup": "snapshot.storage.k8s.io",
                 },
                 "resources": {"requests": {"storage": "0"}},
-            },
-        },
-        {
-            "apiVersion": "batch/v1",
-            "kind": "Job",
-            "metadata": {"name": job_name, "namespace": namespace},
-            "spec": {
-                "backoffLimit": 1,
-                "ttlSecondsAfterFinished": 3600,
-                "template": {
-                    "spec": {
-                        "restartPolicy": "Never",
-                        "containers": [
-                            {
-                                "name": "publish",
-                                "image": PUBLISH_IMAGE,
-                                "volumeMounts": [
-                                    {
-                                        "name": "disk",
-                                        "mountPath": "/disk",
-                                        "readOnly": True,
-                                    }
-                                ],
-                            }
-                        ],
-                        "volumes": [
-                            {
-                                "name": "disk",
-                                "persistentVolumeClaim": {
-                                    "claimName": tmp_name,
-                                    "readOnly": True,
-                                },
-                            }
-                        ],
-                    }
-                },
             },
         },
     ]
@@ -1148,18 +1207,19 @@ async def publish_image(
 
     k8s_client = request.app.state.k8s_client
     ref = f"{req.project}/{req.repository}:{req.tag}"
-    plan = publish_plan(req.namespace, req.disk_name, ref)
-    job_name = next(o["metadata"]["name"] for o in plan if o["kind"] == "Job")
 
-    created: list[dict[str, Any]] = []
+    # Suspended first, so its UID can own the snapshot and the temporary PVC.
+    job = await create_object(k8s_client, publish_job(req.namespace, req.disk_name, ref))
+    job_name = job["metadata"]["name"]
     try:
-        for obj in plan:
+        for obj in publish_dependents(
+            req.namespace, req.disk_name, job_name, job["metadata"]["uid"]
+        ):
             await create_object(k8s_client, obj)
-            created.append(obj)
+        await unsuspend_job(k8s_client, req.namespace, job_name)
     except ApiException as exc:
-        # Roll back what we made. Leaving a snapshot and a temp PVC behind is
-        # invisible until the pool fills, which is the worst time to find out.
-        await delete_objects(k8s_client, reversed(created))
+        # Deleting the Job takes its owned dependents with it.
+        await delete_job(k8s_client, req.namespace, job_name)
         raise HTTPException(
             status_code=422, detail=f"publish could not start: {exc.reason}"
         ) from exc
@@ -1169,15 +1229,19 @@ async def publish_image(
 
 Add `ImagePublishRequest` to `app/models/template.py` with `namespace`, `disk_name`, `project`, `repository`, `tag` — all `str`.
 
-`create_object` and `delete_objects` are thin helpers over
-`client.CustomObjectsApi` / `core_api`; write them beside the handler.
+`create_object`, `unsuspend_job` and `delete_job` are thin helpers over
+`client.BatchV1Api` / `CustomObjectsApi` / `core_api`; write them beside the
+handler. `create_object` must return the created object, because the Job's UID
+is read from it.
 
-The `except` covers only failures while *creating* the objects. Cleanup after
-the Job itself fails is the Job's `ttlSecondsAfterFinished` plus a
-`VolumeSnapshot` and PVC owned by it — set `ownerReferences` on both to the Job
-in `publish_plan`, so Kubernetes garbage-collects them regardless of outcome.
-That is the part a `finally` in the request handler cannot do, because the
-request is long gone by the time the Job fails.
+The `except` covers only failures while *creating* the objects, and it recovers
+by deleting the Job — which takes the snapshot and temporary PVC with it,
+because they are owned by it.
+
+Cleanup after the *Job itself* fails is the Job's `ttlSecondsAfterFinished`
+plus those same `ownerReferences`: Kubernetes garbage-collects both dependents
+whatever the outcome. That is the part a `finally` in the request handler
+cannot do, because the request is long gone by the time the Job fails.
 
 - [ ] **Step 6: Run the whole suite**
 
