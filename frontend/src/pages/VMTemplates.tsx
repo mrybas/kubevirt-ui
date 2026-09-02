@@ -24,7 +24,7 @@ import {
   List,
 } from 'lucide-react';
 import { useTemplates, useGoldenImages, useCreateTemplate, useUpdateTemplate, useDeleteTemplate, useCreateImage } from '../hooks/useTemplates';
-import type { VMTemplate, VMTemplateCreate, GoldenImage, GoldenImageCreate } from '../types/template';
+import type { VMTemplate, VMTemplateCreate, GoldenImage } from '../types/template';
 import { useNamespaces } from '../hooks/useNamespaces';
 import { useAppStore } from '../store';
 import { CustomSelect } from '../components/common/CustomSelect';
@@ -383,7 +383,10 @@ interface TemplateModalProps {
   onClose: () => void;
 }
 
-function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, onClose }: TemplateModalProps) {
+// Exported so the catalogue-import-retry behaviour in `handleSubmit` can be
+// exercised directly (see `__tests__/CatalogueImportIsNotRetried.test.tsx`)
+// without standing up the whole `VMTemplates` page and its own data hooks.
+export function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, onClose }: TemplateModalProps) {
   const isEditMode = !!editTemplate;
   
   const [name, setName] = useState(editTemplate?.name || '');
@@ -406,6 +409,16 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
   const updateTemplate = useUpdateTemplate();
   const createImageFromCatalog = useCreateImage();
   const [importError, setImportError] = useState<string | null>(null);
+  // Once a catalogue selection has been materialised into a real disk, this
+  // remembers which selection produced which disk — keyed by "namespace/ref"
+  // (the namespace matters too: the same catalogue ref could in principle be
+  // imported into a different project on a later attempt). A retried submit
+  // (e.g. after the template-create step itself fails with a 409/5xx) checks
+  // this before importing again. Without it, `goldenImageName` still holds
+  // the catalogue ref after the first import succeeds, so pressing submit a
+  // second time would resolve to the same catalogue row and re-run the
+  // import, leaving an orphaned second disk behind silently.
+  const [materialisedImages, setMaterialisedImages] = useState<Record<string, string>>({});
 
   // Filter images by selected project. Catalogue rows (`origin: 'catalog'`)
   // arrive with no namespace — they are import candidates for any project,
@@ -413,6 +426,12 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
   // way Storage.tsx exempts them from its own folder/environment filters.
   // Reusing that predicate here (instead of a second `namespace === project`
   // check) keeps the one rule in one place.
+  //
+  // NB: with `selectedProject === ''` this widens to every namespace. That
+  // is unreachable today because the picker below only renders once a
+  // project is selected (see the `!selectedProject` branch further down),
+  // so this filter never actually runs with an empty `selectedProject` — but
+  // it would become live if that gating were ever reordered.
   const projectImages = goldenImages.filter((img) =>
     matchesStorageFilters(img, {
       searchQuery: '',
@@ -449,24 +468,36 @@ function TemplateModal({ goldenImages, projects, defaultProject, editTemplate, o
     let imageName = goldenImageName;
 
     if (selectedImage?.origin === 'catalog') {
-      // A catalogue row is not a disk yet — materialise it first so the
-      // template can reference a real DataVolume. The disk starts Pending;
-      // useImages already polls while any image is Pending, so the caller
-      // sees it turn Ready without a reload.
-      try {
-        const created = await createImageFromCatalog.mutateAsync({
-          data: {
-            display_name: selectedImage.display_name || selectedImage.name,
-            source_registry: selectedImage.catalog_ref!,
-            disk_type: 'image',
-            persistent: false,
-          } as GoldenImageCreate,
-          namespace: selectedProject,
-        });
-        imageName = created.name;
-      } catch (err) {
-        setImportError(err instanceof Error ? err.message : String(err));
-        return;
+      const materialisedKey = `${selectedProject}/${selectedImage.catalog_ref}`;
+      const alreadyMaterialised = materialisedImages[materialisedKey];
+
+      if (alreadyMaterialised) {
+        // This exact catalogue selection was already imported on a previous
+        // submit of this same selection (the earlier attempt got past the
+        // import but failed at template-create). Reuse the disk it produced
+        // instead of importing it again.
+        imageName = alreadyMaterialised;
+      } else {
+        // A catalogue row is not a disk yet — materialise it first so the
+        // template can reference a real DataVolume. The disk starts Pending;
+        // useImages already polls while any image is Pending, so the caller
+        // sees it turn Ready without a reload.
+        try {
+          const created = await createImageFromCatalog.mutateAsync({
+            data: {
+              display_name: selectedImage.display_name || selectedImage.name,
+              source_registry: selectedImage.catalog_ref!,
+              disk_type: 'image',
+              persistent: false,
+            },
+            namespace: selectedProject,
+          });
+          imageName = created.name;
+          setMaterialisedImages((prev) => ({ ...prev, [materialisedKey]: created.name }));
+        } catch (err) {
+          setImportError(err instanceof Error ? err.message : String(err));
+          return;
+        }
       }
     }
 
