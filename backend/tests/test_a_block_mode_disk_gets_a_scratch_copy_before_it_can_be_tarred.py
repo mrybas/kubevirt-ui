@@ -40,6 +40,44 @@ def test_the_push_script_reads_from_the_device_path_in_the_block_case():
     assert "/dev/publish-disk" in script
 
 
+def test_the_block_push_streams_the_archive_and_never_materialises_a_layer_file():
+    """Peak scratch usage must stay at one copy of the disk, not two.
+
+    `dd` already writes a full-size copy to the scratch PVC. Writing
+    `tar -cf layer.tar disk` there too — beside the file it is reading —
+    means both are alive at once: the scratch PVC is sized for a single
+    copy, so a second, uncompressed one is an ENOSPC partway through `tar`,
+    not a clean failure. Piping `tar`'s output straight into `crane append
+    -f -` (crane reads a tarball from stdin — see `pkg/crane/append.go`'s
+    `streamFile`, which special-cases `path == "-"` to `os.Stdin` and wraps
+    it in a real streaming layer) avoids the second copy entirely.
+    """
+    job = publish_job("tenant-a", "ubuntu-disk", "p/u:1", volume_mode="Block")
+    script = " ".join(job["spec"]["template"]["spec"]["containers"][0]["args"])
+
+    assert "layer.tar" not in script
+    assert "tar -cf - disk" in script
+    assert "crane append" in script
+    assert "-f -" in script
+    # The pipe's default exit status (under plain `set -e`) is the last
+    # command's — without pipefail a `tar` that died output-starved would
+    # not fail the script at all.
+    assert "pipefail" in script
+
+
+def test_the_filesystem_push_is_unaffected_and_still_writes_an_intermediate_layer():
+    """Regression guard: the streaming fix is scoped to the Block script.
+
+    The reviewer was explicit that the Filesystem path stays exactly as it
+    was — this pins that it did.
+    """
+    job = publish_job("tenant-a", "ubuntu-disk", "p/u:1", volume_mode="Filesystem")
+    script = " ".join(job["spec"]["template"]["spec"]["containers"][0]["args"])
+
+    assert "layer.tar" in script
+    assert "| crane append" not in script
+
+
 def test_the_push_script_reads_from_the_mount_path_in_the_filesystem_case():
     job = publish_job("tenant-a", "ubuntu-disk", "p/u:1", volume_mode="Filesystem")
     script = " ".join(job["spec"]["template"]["spec"]["containers"][0]["args"])

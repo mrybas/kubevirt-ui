@@ -38,17 +38,35 @@ _FILESYSTEM_PUSH_SCRIPT = (
 # into a regular file — a block device cannot be tarred directly, and crane
 # needs a regular file — on a scratch PVC (never emptyDir: a disk this size
 # on node ephemeral storage risks evicting unrelated pods through disk
-# pressure). The scratch PVC is written to (and the layer built) entirely on
-# that persistent volume, not the container's own ephemeral writable layer,
-# for the same reason.
+# pressure).
+#
+# The archive is piped straight into crane rather than materialised as a
+# second file: `tar -cf layer.tar disk` followed by `crane append -f
+# layer.tar` would need `layer.tar` and `disk.img` alive on the scratch PVC
+# at the same time (tar has to finish reading disk.img before anything could
+# delete it), so peak usage would be ~2x the source capacity against a PVC
+# sized for one copy — an ENOSPC partway through `tar`, not a clean failure.
+# `crane append -f -` reads the tarball from stdin: confirmed against
+# crane's own source (`pkg/crane/append.go`, `streamFile`), which special-
+# cases `path == "-"` to `os.Stdin` and wraps it in a genuine streaming
+# layer (`stream.NewLayer`) rather than falling back to a seekable-file
+# read — this is a real, intentional feature, not an accident of the flag's
+# name. That keeps peak scratch usage to the one `dd` copy, matching what
+# the scratch PVC is actually sized for.
+#
+# `pipefail` matters here specifically because the pipeline's default exit
+# status (under plain `set -e`) is `crane`'s, not `tar`'s — a `tar` that
+# died output-starved would otherwise not fail the script at all. If this
+# image's `/bin/sh` does not support `-o pipefail` the `set` line itself
+# fails immediately, which is a clear failure at the very first line rather
+# than a silent partial push.
 _BLOCK_PUSH_SCRIPT = (
-    "set -eu; "
+    "set -eu -o pipefail; "
     "mkdir -p /scratch/disk && "
     f'dd if="{_BLOCK_DEVICE_PATH}" of=/scratch/disk/disk.img bs=4M && '
-    "cd /scratch && "
-    "tar -cf layer.tar disk && "
     'crane auth login "$REGISTRY" -u "$ROBOT_USER" -p "$ROBOT_PASS" && '
-    'crane append --oci-empty-base -f layer.tar -t "$REF"'
+    "cd /scratch && "
+    'tar -cf - disk | crane append --oci-empty-base -f - -t "$REF"'
 )
 
 
