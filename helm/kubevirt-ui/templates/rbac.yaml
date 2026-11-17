@@ -272,6 +272,11 @@ rules:
       - limitranges
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
+  # AAQ quotas (KubeVirt's per-VM quota): read for the dashboard's usage cards
+  - apiGroups: ["aaq.kubevirt.io"]
+    resources: ["applicationawareresourcequotas"]
+    verbs: ["get", "list", "watch"]
+
   # -----------------------------------------------------------------------
   # Storage
   # -----------------------------------------------------------------------

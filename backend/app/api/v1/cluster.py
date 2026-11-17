@@ -10,7 +10,7 @@ from kubernetes_asyncio.client import ApiException
 from pydantic import BaseModel
 
 from app.core.auth import User, require_auth
-from app.core.groups import get_user_namespaces
+from app.core.groups import get_user_namespaces, is_admin
 from app.models.cluster import ClusterStatusResponse, NodeListResponse, NodeResponse, NodeResourceUsage
 
 router = APIRouter()
@@ -112,139 +112,224 @@ def _parse_storage_gi(s: str) -> float:
         return 0
 
 
+def _usage(used: float, total: float, unit: str = "") -> ResourceUsage:
+    fmt = "{:.1f}" if unit == "" else "{:.1f}" + unit
+    return ResourceUsage(
+        used=fmt.format(used),
+        total=("{:.0f}" + unit).format(total),
+        percentage=round(used / total * 100 if total > 0 else 0, 1),
+    )
+
+
+async def _vm_counts(custom_api: Any, namespaces: list[str]) -> tuple[int, int]:
+    total_vms = 0
+    running_vms = 0
+    for ns in namespaces:
+        try:
+            vms = await custom_api.list_namespaced_custom_object(
+                group="kubevirt.io", version="v1",
+                namespace=ns, plural="virtualmachines",
+            )
+            total_vms += len(vms.get("items", []))
+
+            vmis = await custom_api.list_namespaced_custom_object(
+                group="kubevirt.io", version="v1",
+                namespace=ns, plural="virtualmachineinstances",
+            )
+            running_vms += len(vmis.get("items", []))
+        except ApiException:
+            continue
+    return total_vms, running_vms
+
+
+# Quota keys per resource: a ResourceQuota's requests.* first, else AAQ's per-VM keys.
+_QUOTA_KEYS = {
+    "cpu": ("requests.cpu", "cpu/vmi"),
+    "memory": ("requests.memory", "memory/vmi"),
+    "storage": ("requests.storage",),
+}
+
+
+async def _quota_usage(
+    k8s_client: Any, custom_api: Any, namespaces: list[str],
+) -> dict[str, ResourceUsage]:
+    """Used vs hard of the caller's own quotas, summed over their namespaces.
+
+    The cluster's nodes and other tenants' pods are not the caller's business,
+    and their own budget is what the numbers should be measured against.
+    """
+    from app.api.v1.folders import parse_quantity
+
+    totals = {field: [0.0, 0.0] for field in _QUOTA_KEYS}
+    for ns in namespaces:
+        quotas: list[tuple[dict, dict]] = []
+        try:
+            for q in (await k8s_client.core_api.list_namespaced_resource_quota(namespace=ns)).items:
+                quotas.append(((q.spec.hard if q.spec else None) or {},
+                               (q.status.used if q.status else None) or {}))
+        except ApiException:
+            pass
+        try:
+            aaqs = await custom_api.list_namespaced_custom_object(
+                group="aaq.kubevirt.io", version="v1alpha1",
+                namespace=ns, plural="applicationawareresourcequotas",
+            )
+            for q in aaqs.get("items", []):
+                quotas.append((q.get("spec", {}).get("hard") or {},
+                               q.get("status", {}).get("used") or {}))
+        except ApiException:
+            pass
+        for field, keys in _QUOTA_KEYS.items():
+            key = next((k for k in keys if any(k in hard for hard, _ in quotas)), None)
+            if key is None:
+                continue
+            totals[field][0] += max(parse_quantity(used.get(key)) or 0 for _, used in quotas)
+            totals[field][1] += max(parse_quantity(hard.get(key)) or 0 for hard, _ in quotas)
+
+    gi = 1024 ** 3
+    return {
+        "cpu": _usage(totals["cpu"][0], totals["cpu"][1]),
+        "memory": _usage(totals["memory"][0] / gi, totals["memory"][1] / gi, "Gi"),
+        "storage": _usage(totals["storage"][0] / gi, totals["storage"][1] / gi, "Gi"),
+    }
+
+
+async def _cluster_usage(
+    k8s_client: Any, accessible_ns: list[str],
+) -> tuple[dict[str, ResourceUsage], SchedulableSlot | None]:
+    """Pod requests vs node allocatable over the whole cluster, for admins."""
+    # --- CPU / Memory: allocatable vs requests ---
+    # Only count schedulable nodes (no NoSchedule taints) for capacity,
+    # so the percentage reflects resources actually available for VMs.
+    core_api = k8s_client.core_api
+    nodes_result = await core_api.list_node()
+
+    total_cpu = 0.0
+    total_memory_gi = 0.0
+    schedulable_node_names: set[str] = set()
+    # Track per-node allocatable for max-slot calculation
+    node_alloc: dict[str, dict[str, float]] = {}
+
+    for node in nodes_result.items:
+        # Skip nodes with NoSchedule taints (e.g. control-plane)
+        taints = node.spec.taints or []
+        has_no_schedule = any(
+            t.effect in ("NoSchedule", "NoExecute") for t in taints
+        )
+        if has_no_schedule:
+            continue
+
+        name = node.metadata.name
+        schedulable_node_names.add(name)
+        alloc = node.status.allocatable or {}
+        cpu_val = _parse_cpu(alloc.get("cpu", "0"))
+        mem_val = _parse_memory_gi(alloc.get("memory", "0"))
+        total_cpu += cpu_val
+        total_memory_gi += mem_val
+        node_alloc[name] = {"cpu": cpu_val, "mem": mem_val}
+
+    # Sum resource requests from running pods on schedulable nodes only
+    all_pods = await core_api.list_pod_for_all_namespaces(
+        field_selector="status.phase=Running",
+    )
+
+    requested_cpu = 0.0
+    requested_memory_gi = 0.0
+    # Track per-node requests for max-slot calculation
+    node_req: dict[str, dict[str, float]] = {n: {"cpu": 0.0, "mem": 0.0} for n in schedulable_node_names}
+
+    for pod in all_pods.items:
+        node_name = pod.spec.node_name
+        if node_name not in schedulable_node_names:
+            continue
+        for container in pod.spec.containers or []:
+            req = (container.resources or client.V1ResourceRequirements()).requests or {}
+            cpu_r = _parse_cpu(req.get("cpu", "0"))
+            mem_r = _parse_memory_gi(req.get("memory", "0"))
+            requested_cpu += cpu_r
+            requested_memory_gi += mem_r
+            node_req[node_name]["cpu"] += cpu_r
+            node_req[node_name]["mem"] += mem_r
+
+    # Find the node with the most free CPU (largest schedulable slot)
+    max_slot: SchedulableSlot | None = None
+    for name in schedulable_node_names:
+        free_cpu = node_alloc[name]["cpu"] - node_req.get(name, {}).get("cpu", 0)
+        free_mem = node_alloc[name]["mem"] - node_req.get(name, {}).get("mem", 0)
+        if max_slot is None or free_cpu > max_slot.cpu_cores:
+            max_slot = SchedulableSlot(
+                cpu_cores=round(free_cpu, 2),
+                memory_gi=round(free_mem, 1),
+                node=name,
+            )
+
+    # --- Storage: PV capacity vs PVC usage ---
+    pvs = await core_api.list_persistent_volume()
+    total_storage_gi = 0.0
+    for pv in pvs.items:
+        cap = (pv.spec.capacity or {}).get("storage", "0")
+        total_storage_gi += _parse_storage_gi(cap)
+
+    used_storage_gi = 0.0
+    for ns in accessible_ns:
+        try:
+            pvcs = await core_api.list_namespaced_persistent_volume_claim(namespace=ns)
+            for pvc in pvcs.items:
+                cap = (pvc.status.capacity or {}).get("storage", "0")
+                used_storage_gi += _parse_storage_gi(cap)
+        except ApiException:
+            continue
+
+
+    return {
+        "cpu": ResourceUsage(
+            used=f"{requested_cpu:.1f}",
+            total=f"{total_cpu:.0f}",
+            percentage=round((requested_cpu / total_cpu * 100) if total_cpu > 0 else 0, 1),
+        ),
+        "memory": ResourceUsage(
+            used=f"{requested_memory_gi:.1f}Gi",
+            total=f"{total_memory_gi:.0f}Gi",
+            percentage=round((requested_memory_gi / total_memory_gi * 100) if total_memory_gi > 0 else 0, 1),
+        ),
+        "storage": ResourceUsage(
+            used=f"{used_storage_gi:.0f}Gi",
+            total=f"{total_storage_gi:.0f}Gi",
+            percentage=round((used_storage_gi / total_storage_gi * 100) if total_storage_gi > 0 else 0, 1),
+        ),
+    }, max_slot
+
+
 @router.get("/resources", response_model=UserResourcesResponse)
 async def get_user_resources(
     request: Request,
     user: User = Depends(require_auth),
 ) -> UserResourcesResponse:
-    """Get cluster resource usage based on all pod requests vs node allocatable."""
+    """VM counts and resource usage: the whole cluster for admins, the caller's quotas otherwise."""
     k8s_client = request.app.state.k8s_client
 
     try:
-        # --- VM counts ---
         # Use the same RBAC-filtered namespace discovery as the VM list page
         accessible_ns = await get_user_namespaces(k8s_client, user)
-
-        total_vms = 0
-        running_vms = 0
         custom_api = client.CustomObjectsApi(k8s_client._api_client)
+        total_vms, running_vms = await _vm_counts(custom_api, accessible_ns)
 
-        for ns in accessible_ns:
-            try:
-                vms = await custom_api.list_namespaced_custom_object(
-                    group="kubevirt.io", version="v1",
-                    namespace=ns, plural="virtualmachines",
-                )
-                total_vms += len(vms.get("items", []))
-
-                vmis = await custom_api.list_namespaced_custom_object(
-                    group="kubevirt.io", version="v1",
-                    namespace=ns, plural="virtualmachineinstances",
-                )
-                running_vms += len(vmis.get("items", []))
-            except ApiException:
-                continue
-
-        # --- CPU / Memory: allocatable vs requests ---
-        # Only count schedulable nodes (no NoSchedule taints) for capacity,
-        # so the percentage reflects resources actually available for VMs.
-        core_api = k8s_client.core_api
-        nodes_result = await core_api.list_node()
-
-        total_cpu = 0.0
-        total_memory_gi = 0.0
-        schedulable_node_names: set[str] = set()
-        # Track per-node allocatable for max-slot calculation
-        node_alloc: dict[str, dict[str, float]] = {}
-
-        for node in nodes_result.items:
-            # Skip nodes with NoSchedule taints (e.g. control-plane)
-            taints = node.spec.taints or []
-            has_no_schedule = any(
-                t.effect in ("NoSchedule", "NoExecute") for t in taints
-            )
-            if has_no_schedule:
-                continue
-
-            name = node.metadata.name
-            schedulable_node_names.add(name)
-            alloc = node.status.allocatable or {}
-            cpu_val = _parse_cpu(alloc.get("cpu", "0"))
-            mem_val = _parse_memory_gi(alloc.get("memory", "0"))
-            total_cpu += cpu_val
-            total_memory_gi += mem_val
-            node_alloc[name] = {"cpu": cpu_val, "mem": mem_val}
-
-        # Sum resource requests from running pods on schedulable nodes only
-        all_pods = await core_api.list_pod_for_all_namespaces(
-            field_selector="status.phase=Running",
-        )
-
-        requested_cpu = 0.0
-        requested_memory_gi = 0.0
-        # Track per-node requests for max-slot calculation
-        node_req: dict[str, dict[str, float]] = {n: {"cpu": 0.0, "mem": 0.0} for n in schedulable_node_names}
-
-        for pod in all_pods.items:
-            node_name = pod.spec.node_name
-            if node_name not in schedulable_node_names:
-                continue
-            for container in pod.spec.containers or []:
-                req = (container.resources or client.V1ResourceRequirements()).requests or {}
-                cpu_r = _parse_cpu(req.get("cpu", "0"))
-                mem_r = _parse_memory_gi(req.get("memory", "0"))
-                requested_cpu += cpu_r
-                requested_memory_gi += mem_r
-                node_req[node_name]["cpu"] += cpu_r
-                node_req[node_name]["mem"] += mem_r
-
-        # Find the node with the most free CPU (largest schedulable slot)
+        usage: dict[str, ResourceUsage] | None = None
         max_slot: SchedulableSlot | None = None
-        for name in schedulable_node_names:
-            free_cpu = node_alloc[name]["cpu"] - node_req.get(name, {}).get("cpu", 0)
-            free_mem = node_alloc[name]["mem"] - node_req.get(name, {}).get("mem", 0)
-            if max_slot is None or free_cpu > max_slot.cpu_cores:
-                max_slot = SchedulableSlot(
-                    cpu_cores=round(free_cpu, 2),
-                    memory_gi=round(free_mem, 1),
-                    node=name,
-                )
-
-        # --- Storage: PV capacity vs PVC usage ---
-        pvs = await core_api.list_persistent_volume()
-        total_storage_gi = 0.0
-        for pv in pvs.items:
-            cap = (pv.spec.capacity or {}).get("storage", "0")
-            total_storage_gi += _parse_storage_gi(cap)
-
-        used_storage_gi = 0.0
-        for ns in accessible_ns:
+        if is_admin(user.groups, user):
             try:
-                pvcs = await core_api.list_namespaced_persistent_volume_claim(namespace=ns)
-                for pvc in pvcs.items:
-                    cap = (pvc.status.capacity or {}).get("storage", "0")
-                    used_storage_gi += _parse_storage_gi(cap)
-            except ApiException:
-                continue
+                usage, max_slot = await _cluster_usage(k8s_client, accessible_ns)
+            except ApiException as e:
+                logger.warning(f"Cluster-wide usage unavailable, showing quotas: {e.reason}")
+        if usage is None:
+            usage = await _quota_usage(k8s_client, custom_api, accessible_ns)
 
         return UserResourcesResponse(
             vms_total=total_vms,
             vms_running=running_vms,
-            cpu=ResourceUsage(
-                used=f"{requested_cpu:.1f}",
-                total=f"{total_cpu:.0f}",
-                percentage=round((requested_cpu / total_cpu * 100) if total_cpu > 0 else 0, 1),
-            ),
-            memory=ResourceUsage(
-                used=f"{requested_memory_gi:.1f}Gi",
-                total=f"{total_memory_gi:.0f}Gi",
-                percentage=round((requested_memory_gi / total_memory_gi * 100) if total_memory_gi > 0 else 0, 1),
-            ),
-            storage=ResourceUsage(
-                used=f"{used_storage_gi:.0f}Gi",
-                total=f"{total_storage_gi:.0f}Gi",
-                percentage=round((used_storage_gi / total_storage_gi * 100) if total_storage_gi > 0 else 0, 1),
-            ),
+            cpu=usage["cpu"],
+            memory=usage["memory"],
+            storage=usage["storage"],
             max_schedulable=max_slot,
         )
 
