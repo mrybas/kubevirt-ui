@@ -10,6 +10,7 @@ from typing import Any, Callable
 import httpx
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +378,23 @@ async def validate_k8s_token(request: Request, token: str) -> User | None:
         return None
 
 
+def _issued_for_us(token: str) -> bool:
+    """Whether the token was issued to this client.
+
+    The userinfo endpoint is shared by every client of the issuer, so it accepts
+    a token minted for any other application there. Its claims are trustworthy
+    once userinfo has accepted it, so they are read without a signature check.
+    A token with no readable claims (opaque) cannot be attributed and is refused.
+    """
+    try:
+        claims = jwt.get_unverified_claims(token)
+    except JWTError:
+        return False
+    aud = claims.get("aud")
+    audiences = aud if isinstance(aud, list) else [aud]
+    return OIDC_CLIENT_ID in audiences or claims.get("azp") == OIDC_CLIENT_ID
+
+
 async def validate_oidc_token(token: str) -> User | None:
     """Validate OIDC token."""
     try:
@@ -398,6 +416,10 @@ async def validate_oidc_token(token: str) -> User | None:
 
             if response.status_code != 200:
                 logger.warning(f"OIDC userinfo failed: {response.status_code}")
+                return None
+
+            if not _issued_for_us(token):
+                logger.warning(f"OIDC token not issued to client {OIDC_CLIENT_ID!r}")
                 return None
 
             user_info = response.json()
