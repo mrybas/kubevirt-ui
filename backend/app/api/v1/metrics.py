@@ -19,13 +19,17 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
-from typing import Any
+from string import Template
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
-from app.core.auth import User, require_auth
+from app.api.v1.storage import require_namespace_access
+from app.core.auth import User, require_admin, require_auth
+from app.core.groups import get_user_namespaces, is_admin
 from kubernetes_asyncio import client
 from kubernetes_asyncio.client import ApiException
 
@@ -321,6 +325,8 @@ async def metrics_status(request: Request, user: User = Depends(require_auth)) -
     backend = await _discover_metrics_backend(k8s_client)
     return {
         "available": backend.discovered,
+        # Node metrics describe the whole cluster, not the caller's namespaces.
+        "cluster": is_admin(user.groups, user),
         "mode": "direct" if _is_direct_mode() else "proxy",
         "backend": (
             f"{backend.namespace}/{backend.service}:{backend.port}"
@@ -365,6 +371,7 @@ def _reject_oversized_range(start: float, end: float) -> None:
 @router.get("/query")
 async def metrics_query(
     request: Request,
+    user: User = Depends(require_admin),
     query: str = Query(..., description="PromQL query"),
     time: str | None = Query(None, description="Evaluation timestamp (Unix or RFC3339)"),
 ) -> dict:
@@ -389,6 +396,7 @@ async def metrics_query(
 @router.get("/query_range")
 async def metrics_query_range(
     request: Request,
+    user: User = Depends(require_admin),
     query: str = Query(..., description="PromQL query"),
     start: float = Query(..., description="Start timestamp (Unix epoch)"),
     end: float = Query(..., description="End timestamp (Unix epoch)"),
@@ -416,3 +424,130 @@ async def metrics_query_range(
     result = await _proxy_query(k8s_client, "api/v1/query_range", params)
     _cache_set(key, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Scoped queries
+#
+# Raw PromQL reads everything the metrics backend holds, so it is admin-only.
+# Everyone else names a metric; the query is built here with the namespace
+# selector the caller is allowed.
+# ---------------------------------------------------------------------------
+
+# The label carrying the VM's namespace. Behind a ServiceMonitor without
+# honorLabels the exporter's own `namespace` becomes `exported_namespace`.
+NAMESPACE_LABEL = os.getenv("METRICS_NAMESPACE_LABEL", "exported_namespace")
+
+_K8S_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
+_STEP = re.compile(r"^[0-9]+[smhd]$")
+
+VM_QUERIES: dict[str, str] = {
+    "cpu": "rate(kubevirt_vmi_cpu_usage_seconds_total{$sel}[2m]) * 100",
+    "memory_used": "kubevirt_vmi_memory_domain_bytes{$sel} - kubevirt_vmi_memory_unused_bytes{$sel}",
+    "memory_total": "kubevirt_vmi_memory_domain_bytes{$sel}",
+    "disk_read": "sum(rate(kubevirt_vmi_storage_read_traffic_bytes_total{$sel}[2m]))",
+    "disk_write": "sum(rate(kubevirt_vmi_storage_write_traffic_bytes_total{$sel}[2m]))",
+    "net_rx": "rate(kubevirt_vmi_network_receive_bytes_total{$sel}[2m])",
+    "net_tx": "rate(kubevirt_vmi_network_transmit_bytes_total{$sel}[2m])",
+}
+
+TOP_QUERIES: dict[str, str] = {
+    "cpu": "topk(5, rate(kubevirt_vmi_cpu_usage_seconds_total{$sel}[5m]) * 100)",
+    "memory": "topk(5, kubevirt_vmi_memory_domain_bytes{$sel} - kubevirt_vmi_memory_unused_bytes{$sel})",
+}
+
+CLUSTER_QUERIES: dict[str, str] = {
+    "cpu": '100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)',
+    "memory_used": "sum(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)",
+    "memory_total": "sum(node_memory_MemTotal_bytes)",
+}
+
+
+def _k8s_name(value: str) -> str:
+    """Names go into PromQL label values; only what Kubernetes allows passes."""
+    if not _K8S_NAME.match(value):
+        raise HTTPException(status_code=422, detail=f"invalid name: {value!r}")
+    return value
+
+
+def _range_params(query: str, start: float, end: float, step: str | None) -> dict[str, str]:
+    _reject_oversized_range(start, end)
+    if step is not None and not _STEP.match(step):
+        raise HTTPException(status_code=422, detail=f"invalid step: {step!r}")
+    return {
+        "query": query,
+        "start": str(start),
+        "end": str(end),
+        "step": step or _auto_step(start, end),
+    }
+
+
+async def _cached(k8s_client: Any, kind: str, path: str, params: dict[str, str]) -> dict:
+    key = _cache_key(kind, params)
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+    result = await _proxy_query(k8s_client, path, params)
+    _cache_set(key, result)
+    return result
+
+
+@router.get("/vms/{namespace}/{name}")
+async def vm_metric_range(
+    request: Request,
+    namespace: str,
+    name: str,
+    metric: Literal[tuple(VM_QUERIES)] = Query(...),  # type: ignore[valid-type]
+    start: float = Query(...),
+    end: float = Query(...),
+    step: str | None = Query(None),
+    user: User = Depends(require_auth),
+) -> dict:
+    """One metric of one VM over time."""
+    await require_namespace_access(request, user, namespace)
+    sel = f'name="{_k8s_name(name)}", {NAMESPACE_LABEL}="{_k8s_name(namespace)}"'
+    query = Template(VM_QUERIES[metric]).substitute(sel=sel)
+    return await _cached(
+        request.app.state.k8s_client, "range", "api/v1/query_range",
+        _range_params(query, start, end, step),
+    )
+
+
+@router.get("/top")
+async def top_vms(
+    request: Request,
+    metric: Literal[tuple(TOP_QUERIES)] = Query(...),  # type: ignore[valid-type]
+    user: User = Depends(require_auth),
+) -> dict:
+    """The five busiest VMs among the caller's namespaces.
+
+    Each series carries the namespace as `namespace`, whatever label the
+    backend stores it under.
+    """
+    k8s_client = request.app.state.k8s_client
+    namespaces = sorted(await get_user_namespaces(k8s_client, user))
+    if not namespaces:
+        return {"status": "success", "data": {"resultType": "vector", "result": []}}
+    pattern = "|".join(_k8s_name(n) for n in namespaces)
+    query = Template(TOP_QUERIES[metric]).substitute(sel=f'{NAMESPACE_LABEL}=~"{pattern}"')
+    result = await _cached(k8s_client, "instant", "api/v1/query", {"query": query})
+    for series in result.get("data", {}).get("result", []):
+        labels = series.get("metric", {})
+        labels["namespace"] = labels.get(NAMESPACE_LABEL, labels.get("namespace", ""))
+    return result
+
+
+@router.get("/cluster")
+async def cluster_metric_range(
+    request: Request,
+    metric: Literal[tuple(CLUSTER_QUERIES)] = Query(...),  # type: ignore[valid-type]
+    start: float = Query(...),
+    end: float = Query(...),
+    step: str | None = Query(None),
+    user: User = Depends(require_admin),
+) -> dict:
+    """Node CPU and memory of the whole cluster over time."""
+    return await _cached(
+        request.app.state.k8s_client, "range", "api/v1/query_range",
+        _range_params(CLUSTER_QUERIES[metric], start, end, step),
+    )

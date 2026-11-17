@@ -1,6 +1,8 @@
 export interface MetricsStatus {
   available: boolean;
   backend: string | null;
+  // Node metrics cover the whole cluster: admins only.
+  cluster?: boolean;
 }
 
 export interface PromQLSeries {

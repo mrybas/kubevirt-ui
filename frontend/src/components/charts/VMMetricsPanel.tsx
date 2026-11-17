@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react';
 import { RefreshCw, Clock, AlertTriangle, Loader2 } from 'lucide-react';
 import UPlotChart from './UPlotChart';
-import { useMetricsRange, useMetricsStatus, RANGE_SECONDS, type TimeRange } from '@/hooks/useMetrics';
+import { useVMMetricRange, useMetricsStatus, RANGE_SECONDS, type TimeRange } from '@/hooks/useMetrics';
 import {
   promRangeToUPlot,
   cpuChartOptions,
@@ -30,25 +30,13 @@ export default function VMMetricsPanel({ vmName, namespace }: VMMetricsPanelProp
 
   const enabled = metricsStatus?.available === true;
 
-  const escapePromQL = (s: string) => s.replace(/[\\\"{}]/g, '\\$&');
-
-  // PromQL queries scoped to this VM
-  const cpuQuery = `rate(kubevirt_vmi_cpu_usage_seconds_total{name="${escapePromQL(vmName)}", exported_namespace="${escapePromQL(namespace)}"}[2m]) * 100`;
-  const memUsedQuery = `kubevirt_vmi_memory_domain_bytes{name="${escapePromQL(vmName)}", exported_namespace="${escapePromQL(namespace)}"} - kubevirt_vmi_memory_unused_bytes{name="${escapePromQL(vmName)}", exported_namespace="${escapePromQL(namespace)}"}`;
-  const memTotalQuery = `kubevirt_vmi_memory_domain_bytes{name="${escapePromQL(vmName)}", exported_namespace="${escapePromQL(namespace)}"}`;
-  const diskReadQuery = `sum(rate(kubevirt_vmi_storage_read_traffic_bytes_total{name="${escapePromQL(vmName)}", exported_namespace="${escapePromQL(namespace)}"}[2m]))`;
-  const diskWriteQuery = `sum(rate(kubevirt_vmi_storage_write_traffic_bytes_total{name="${escapePromQL(vmName)}", exported_namespace="${escapePromQL(namespace)}"}[2m]))`;
-  const netRxQuery = `rate(kubevirt_vmi_network_receive_bytes_total{name="${escapePromQL(vmName)}", exported_namespace="${escapePromQL(namespace)}"}[2m])`;
-  const netTxQuery = `rate(kubevirt_vmi_network_transmit_bytes_total{name="${escapePromQL(vmName)}", exported_namespace="${escapePromQL(namespace)}"}[2m])`;
-
-  // Fetch all metrics
-  const cpu = useMetricsRange(cpuQuery, timeRange, enabled);
-  const memUsed = useMetricsRange(memUsedQuery, timeRange, enabled);
-  const memTotal = useMetricsRange(memTotalQuery, timeRange, enabled);
-  const diskRead = useMetricsRange(diskReadQuery, timeRange, enabled);
-  const diskWrite = useMetricsRange(diskWriteQuery, timeRange, enabled);
-  const netRx = useMetricsRange(netRxQuery, timeRange, enabled);
-  const netTx = useMetricsRange(netTxQuery, timeRange, enabled);
+  const cpu = useVMMetricRange(namespace, vmName, 'cpu', timeRange, enabled);
+  const memUsed = useVMMetricRange(namespace, vmName, 'memory_used', timeRange, enabled);
+  const memTotal = useVMMetricRange(namespace, vmName, 'memory_total', timeRange, enabled);
+  const diskRead = useVMMetricRange(namespace, vmName, 'disk_read', timeRange, enabled);
+  const diskWrite = useVMMetricRange(namespace, vmName, 'disk_write', timeRange, enabled);
+  const netRx = useVMMetricRange(namespace, vmName, 'net_rx', timeRange, enabled);
+  const netTx = useVMMetricRange(namespace, vmName, 'net_tx', timeRange, enabled);
 
   const isLoading = cpu.isLoading || memUsed.isLoading;
   const isRefreshing = cpu.isFetching || memUsed.isFetching;

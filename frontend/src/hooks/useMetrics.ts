@@ -47,6 +47,52 @@ export function useMetricsInstant(query: string, enabled = true) {
   });
 }
 
+export function useVMMetricRange(
+  namespace: string,
+  name: string,
+  metric: metricsApi.VMMetric,
+  timeRange: TimeRange = '1h',
+  enabled = true,
+) {
+  const now = Math.floor(Date.now() / 1000);
+  const start = now - RANGE_SECONDS[timeRange];
+
+  return useQuery({
+    queryKey: ['metrics', 'vm', namespace, name, metric, timeRange],
+    queryFn: () => metricsApi.queryVMRange(namespace, name, metric, start, now),
+    enabled: enabled && !!namespace && !!name,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+  });
+}
+
+export function useTopVMs(metric: metricsApi.TopMetric, enabled = true) {
+  return useQuery({
+    queryKey: ['metrics', 'top', metric],
+    queryFn: () => metricsApi.queryTopVMs(metric),
+    enabled,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+  });
+}
+
+export function useClusterMetricRange(
+  metric: metricsApi.ClusterMetric,
+  timeRange: TimeRange = '1h',
+  enabled = true,
+) {
+  const now = Math.floor(Date.now() / 1000);
+  const start = now - RANGE_SECONDS[timeRange];
+
+  return useQuery({
+    queryKey: ['metrics', 'cluster', metric, timeRange],
+    queryFn: () => metricsApi.queryClusterRange(metric, start, now),
+    enabled,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+  });
+}
+
 /**
  * Hook that manages time range selection + manual refresh for a metrics panel.
  */

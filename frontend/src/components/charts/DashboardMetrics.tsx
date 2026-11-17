@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react';
 import { RefreshCw, Loader2, BarChart3, AlertTriangle } from 'lucide-react';
 import UPlotChart from './UPlotChart';
-import { useMetricsInstant, useMetricsRange, useMetricsStatus, RANGE_SECONDS, type TimeRange } from '@/hooks/useMetrics';
+import { useClusterMetricRange, useMetricsStatus, useTopVMs, RANGE_SECONDS, type TimeRange } from '@/hooks/useMetrics';
 import {
   promRangeToUPlot,
   buildChartOptions,
@@ -21,26 +21,18 @@ export default function DashboardMetrics() {
   const { data: metricsStatus } = useMetricsStatus();
 
   const enabled = metricsStatus?.available === true;
+  const showCluster = enabled && metricsStatus?.cluster === true;
 
-  // Top VMs by CPU (instant)
-  const topCpuQuery = 'topk(5, rate(kubevirt_vmi_cpu_usage_seconds_total[5m]) * 100)';
-  const topCpu = useMetricsInstant(topCpuQuery, enabled);
+  // Top VMs among the caller's namespaces (instant)
+  const topCpu = useTopVMs('cpu', enabled);
+  const topMem = useTopVMs('memory', enabled);
 
-  // Top VMs by Memory (instant)
-  const topMemQuery = 'topk(5, kubevirt_vmi_memory_domain_bytes - kubevirt_vmi_memory_unused_bytes)';
-  const topMem = useMetricsInstant(topMemQuery, enabled);
+  // Node CPU and memory over time, admins only
+  const clusterCpu = useClusterMetricRange('cpu', timeRange, showCluster);
+  const clusterMemUsed = useClusterMetricRange('memory_used', timeRange, showCluster);
+  const clusterMemTotal = useClusterMetricRange('memory_total', timeRange, showCluster);
 
-  // Cluster CPU usage over time (sum across all nodes)
-  const clusterCpuQuery = '100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)';
-  const clusterCpu = useMetricsRange(clusterCpuQuery, timeRange, enabled);
-
-  // Cluster memory usage over time
-  const clusterMemUsedQuery = 'sum(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)';
-  const clusterMemTotalQuery = 'sum(node_memory_MemTotal_bytes)';
-  const clusterMemUsed = useMetricsRange(clusterMemUsedQuery, timeRange, enabled);
-  const clusterMemTotal = useMetricsRange(clusterMemTotalQuery, timeRange, enabled);
-
-  const isLoading = topCpu.isLoading || clusterCpu.isLoading;
+  const isLoading = topCpu.isLoading || (showCluster && clusterCpu.isLoading);
   const isRefreshing = topCpu.isFetching || clusterCpu.isFetching;
 
   // Compute time window boundaries for X-axis pinning
@@ -53,7 +45,7 @@ export default function DashboardMetrics() {
     return result
       .map((s) => ({
         name: s.metric.name || 'unknown',
-        namespace: s.metric.exported_namespace || '',
+        namespace: s.metric.namespace || '',
         value: parseFloat(s.value?.[1] ?? '0'),
       }))
       .sort((a, b) => b.value - a.value);
@@ -65,7 +57,7 @@ export default function DashboardMetrics() {
     return result
       .map((s) => ({
         name: s.metric.name || 'unknown',
-        namespace: s.metric.exported_namespace || '',
+        namespace: s.metric.namespace || '',
         value: parseFloat(s.value?.[1] ?? '0'),
       }))
       .sort((a, b) => b.value - a.value);
@@ -99,9 +91,11 @@ export default function DashboardMetrics() {
   const handleRefresh = () => {
     topCpu.refetch();
     topMem.refetch();
-    clusterCpu.refetch();
-    clusterMemUsed.refetch();
-    clusterMemTotal.refetch();
+    if (showCluster) {
+      clusterCpu.refetch();
+      clusterMemUsed.refetch();
+      clusterMemTotal.refetch();
+    }
   };
 
   if (!metricsStatus?.available) {
@@ -152,7 +146,7 @@ export default function DashboardMetrics() {
           </div>
 
           {/* Bottom row: time series */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {showCluster && <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <div className="bg-surface-900/50 border border-surface-700/50 rounded-xl p-3">
               <h4 className="text-xs font-medium text-surface-400 mb-2">Cluster CPU Usage</h4>
               <UPlotChart options={clusterCpuOpts} data={clusterCpuData as any} />
@@ -161,7 +155,7 @@ export default function DashboardMetrics() {
               <h4 className="text-xs font-medium text-surface-400 mb-2">Cluster Memory Usage</h4>
               <UPlotChart options={clusterMemOpts} data={clusterMemData as any} />
             </div>
-          </div>
+          </div>}
         </div>
       )}
     </div>

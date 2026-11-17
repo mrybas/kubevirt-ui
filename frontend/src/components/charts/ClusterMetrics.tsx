@@ -24,7 +24,7 @@ export default function ClusterMetrics({ nodeNames }: ClusterMetricsProps) {
   const [timeRange, setTimeRange] = useState<TimeRange>('1h');
   const { data: metricsStatus } = useMetricsStatus();
 
-  const enabled = metricsStatus?.available === true && nodeNames.length > 0;
+  const enabled = metricsStatus?.available === true && metricsStatus.cluster === true && nodeNames.length > 0;
 
   // Per-node CPU usage (group by instance since 'node' label is empty)
   const cpuPerNodeQuery = `100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)`;
@@ -107,7 +107,7 @@ export default function ClusterMetrics({ nodeNames }: ClusterMetricsProps) {
     diskData.refetch();
   };
 
-  if (!metricsStatus?.available) return null;
+  if (!metricsStatus?.available || !metricsStatus.cluster) return null;
 
   return (
     <div className="card">
