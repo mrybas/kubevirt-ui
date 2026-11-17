@@ -81,6 +81,8 @@ def _harness(crs: list[dict[str, Any]], legacy: dict[str, str] | None = None):
     k8s.core_api.replace_namespaced_config_map = AsyncMock()
     k8s.core_api.read_namespace = AsyncMock()
     k8s.core_api.create_namespaced_config_map = AsyncMock()
+    # No enabled namespaces: no template belongs to another tenant.
+    k8s.list_namespaces = AsyncMock(return_value=[])
 
     request = MagicMock()
     request.app.state.k8s_client = k8s

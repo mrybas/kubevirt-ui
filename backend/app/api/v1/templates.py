@@ -10,6 +10,7 @@ from kubernetes_asyncio import client
 from kubernetes_asyncio.client.rest import ApiException
 
 from app.core.auth import User, require_auth
+from app.core.groups import get_user_namespaces
 from app.core.operator import (
     OPERATOR_GROUP,
     OPERATOR_VERSION,
@@ -139,6 +140,18 @@ async def _find_template_cr(
     return matches[0]
 
 
+async def _foreign_image_namespaces(k8s_client: Any, user: User) -> set[str]:
+    """Enabled namespaces the caller has no binding in.
+
+    A template whose image lives in one of these belongs to another tenant: its
+    name, sizing and image reference are theirs. A template pointing at a
+    namespace outside the UI (a shared image namespace) stays visible to all.
+    """
+    enabled = await k8s_client.list_namespaces(label_selector="kubevirt-ui.io/enabled=true")
+    mine = set(await get_user_namespaces(k8s_client, user))
+    return {ns["name"] for ns in enabled} - mine
+
+
 @router.get("", response_model=VMTemplateListResponse)
 async def list_templates(
     request: Request,
@@ -183,6 +196,8 @@ async def list_templates(
             templates = [t for t in templates if t.name != converted.name]
             templates.append(converted)
 
+        foreign = await _foreign_image_namespaces(k8s_client, user)
+        templates = [t for t in templates if t.golden_image_namespace not in foreign]
         return VMTemplateListResponse(items=templates, total=len(templates))
 
     except HTTPException:
@@ -242,9 +257,19 @@ async def get_template(
     custom_api = client.CustomObjectsApi(k8s_client._api_client)
     existing = await _find_template_cr(custom_api, name)
     if existing is not None:
-        return _template_from_cr(existing)
+        template = _template_from_cr(existing)
+    else:
+        template = await _legacy_template(k8s_client, name)
 
-    
+    if template.golden_image_namespace in await _foreign_image_namespaces(k8s_client, user):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Template {name} not found",
+        )
+    return template
+
+
+async def _legacy_template(k8s_client: Any, name: str) -> VMTemplate:
     try:
         cm = await k8s_client.core_api.read_namespaced_config_map(
             name=TEMPLATE_CONFIGMAP_NAME,

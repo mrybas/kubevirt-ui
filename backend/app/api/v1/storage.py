@@ -438,6 +438,7 @@ async def get_image_usage(
     user: User = Depends(require_auth),
 ) -> ImageUsageResponse:
     """Get image usage - status and which VMs are using this image."""
+    await require_namespace_access(request, user, namespace)
     k8s_client = request.app.state.k8s_client
     
     try:

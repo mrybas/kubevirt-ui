@@ -890,23 +890,15 @@ def _folders_you_may_see(
     return {n: m for n, m in folders.items() if n in visible}
 
 
-@router.get("", response_model=FolderTreeResponse)
-async def list_folders(request: Request, flat: bool = False, user: User = Depends(require_auth)):
-    """List all folders. Returns tree structure by default, flat list if flat=true."""
-    k8s_client = request.app.state.k8s_client
-    data = await _ensure_folders_configmap(k8s_client)
-    folders = _parse_all_folders(data)
-
-    # Get all managed namespaces at once
+async def _namespaces_by_folder(k8s_client: Any) -> dict[str, list]:
+    """Enabled namespaces indexed by folder label, skipping tenant control-plane
+    namespaces so they don't surface as selectable environments."""
     try:
         all_ns = await k8s_client.core_api.list_namespace(
             label_selector=f"{ENV_ENABLED_LABEL}=true",
         )
     except ApiException:
-        all_ns = type("obj", (), {"items": []})()
-
-    # Index namespaces by folder label, skipping tenant control-plane
-    # namespaces so they don't surface as selectable environments.
+        return {}
     ns_by_folder: dict[str, list] = {}
     for ns in all_ns.items:
         if _is_tenant_ns(ns):
@@ -914,6 +906,37 @@ async def list_folders(request: Request, flat: bool = False, user: User = Depend
         folder = (ns.metadata.labels or {}).get(ENV_FOLDER_LABEL)
         if folder:
             ns_by_folder.setdefault(folder, []).append(ns)
+    return ns_by_folder
+
+
+async def _require_folder_visible(
+    k8s_client: Any, user: User, folders: dict[str, dict], name: str,
+) -> None:
+    """404 unless `GET /folders` would show this folder to the caller.
+
+    The single-folder reads otherwise hand out what the list hides: members,
+    environments, VM counts and quota of any folder whose name is known.
+    """
+    if name in folders and (
+        is_admin(user.groups, user)
+        or name in _folders_you_may_see(
+            user, folders,
+            set(await get_user_namespaces(k8s_client, user)),
+            await _namespaces_by_folder(k8s_client),
+        )
+    ):
+        return
+    raise HTTPException(status_code=404, detail="Folder not found")
+
+
+@router.get("", response_model=FolderTreeResponse)
+async def list_folders(request: Request, flat: bool = False, user: User = Depends(require_auth)):
+    """List all folders. Returns tree structure by default, flat list if flat=true."""
+    k8s_client = request.app.state.k8s_client
+    data = await _ensure_folders_configmap(k8s_client)
+    folders = _parse_all_folders(data)
+
+    ns_by_folder = await _namespaces_by_folder(k8s_client)
 
     if not is_admin(user.groups, user):
         folders = _folders_you_may_see(
@@ -1106,8 +1129,7 @@ async def get_folder(request: Request, name: str, user: User = Depends(require_a
     data = await _ensure_folders_configmap(k8s_client)
     folders = _parse_all_folders(data)
 
-    if name not in folders:
-        raise HTTPException(status_code=404, detail="Folder not found")
+    await _require_folder_visible(k8s_client, user, folders, name)
 
     meta = folders[name]
 
@@ -1997,8 +2019,7 @@ async def get_folder_quota_headroom(
     k8s_client = request.app.state.k8s_client
     data = await _ensure_folders_configmap(k8s_client)
     folders = _parse_all_folders(data)
-    if name not in folders:
-        raise HTTPException(status_code=404, detail="Folder not found")
+    await _require_folder_visible(k8s_client, user, folders, name)
 
     ceiling = (folders[name].get("quota") or {})
     allocated = await _allocated_env_quota(k8s_client, folders, name)
@@ -2098,8 +2119,7 @@ async def list_folder_access(request: Request, name: str, user: User = Depends(r
     data = await _ensure_folders_configmap(k8s_client)
     folders = _parse_all_folders(data)
 
-    if name not in folders:
-        raise HTTPException(status_code=404, detail="Folder not found")
+    await _require_folder_visible(k8s_client, user, folders, name)
 
     rbac_api = await _get_rbac_api(k8s_client)
 

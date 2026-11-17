@@ -23,6 +23,7 @@ from app.api.v1.images_catalog import (
 # a second copy from drifting away from that one.
 from app.api.v1.storage import require_namespace_access
 from app.core.auth import User, require_auth
+from app.core.groups import get_user_namespaces
 from app.core.errors import (
     validate_harbor_project,
     validate_k8s_name,
@@ -138,6 +139,7 @@ async def list_golden_images(
     
     # If a specific namespace is provided, check it + sibling/ancestor namespaces
     if namespace:
+        await require_namespace_access(request, user, namespace)
         namespaces_to_check.add(namespace)
         try:
             ns_obj = await k8s_client.core_api.read_namespace(namespace)
@@ -168,13 +170,9 @@ async def list_golden_images(
         except Exception as e:
             logger.debug(f"Could not resolve sibling/ancestor namespaces: {e}")
     else:
-        # Get all project namespaces (with kubevirt-ui.io/enabled=true label)
+        # Every enabled namespace the caller has a binding in; admins get all.
         try:
-            ns_list = await k8s_client.list_namespaces(
-                label_selector="kubevirt-ui.io/enabled=true"
-            )
-            for ns in ns_list:
-                namespaces_to_check.add(ns["name"])
+            namespaces_to_check.update(await get_user_namespaces(k8s_client, user))
         except Exception as e:
             logger.warning(f"Failed to list project namespaces: {e}")
     
