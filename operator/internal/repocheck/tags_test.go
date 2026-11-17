@@ -26,6 +26,11 @@ import (
 
 func tagsFor(t *testing.T, ref string) map[string]string {
 	t.Helper()
+	return tagsForRepository(t, ref, "mrybas/kubevirt-ui")
+}
+
+func tagsForRepository(t *testing.T, ref, repository string) map[string]string {
+	t.Helper()
 	root, err := filepath.Abs("../../..")
 	if err != nil {
 		t.Fatalf("locating the repository: %v", err)
@@ -35,7 +40,7 @@ func tagsFor(t *testing.T, ref string) map[string]string {
 		t.Fatalf("the script this guards is not at %s: %v", script, err)
 	}
 
-	command := exec.Command("bash", script, ref, "ghcr.io", "mrybas/kubevirt-ui")
+	command := exec.Command("bash", script, ref, "ghcr.io", repository)
 	command.Env = append(os.Environ(), "GITHUB_SHA=abcdef1234567890")
 	out, err := command.Output()
 	if err != nil {
@@ -49,6 +54,16 @@ func tagsFor(t *testing.T, ref string) map[string]string {
 		}
 	}
 	return got
+}
+
+// A fork owned by an organisation with capitals (`github.repository` keeps them)
+// must still produce valid image references.
+func TestAnUppercaseOwnerIsLowercased(t *testing.T) {
+	got := tagsForRepository(t, "refs/heads/main", "Some-Org/kubevirt-ui")
+	want := "ghcr.io/some-org/kubevirt-ui/backend:dev-abcdef1"
+	if got["tags_backend"] != want {
+		t.Errorf("tags_backend = %s, want %s", got["tags_backend"], want)
+	}
 }
 
 func TestAReleaseMovesLatest(t *testing.T) {

@@ -16,7 +16,8 @@ set -euo pipefail
 
 ref="${1:?git ref, e.g. refs/tags/2026.10.37-dev.1 or refs/heads/operator-dev}"
 registry="${2:-ghcr.io}"
-repository="${3:-mrybas/kubevirt-ui}"
+# Image references must be lowercase; github.repository keeps the owner's case.
+repository="$(printf '%s' "${3:-mrybas/kubevirt-ui}" | tr '[:upper:]' '[:lower:]')"
 sha="${GITHUB_SHA:-0000000}"
 
 versions=()
