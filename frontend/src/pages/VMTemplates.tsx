@@ -63,6 +63,10 @@ export function VMTemplates() {
   const goldenImages = goldenImagesData?.items || [];
   const projects = (namespacesData?.items || []).map(ns => ({ name: ns.name, display_name: (ns as any).display_name || ns.name }));
   
+  const isShared = (t: VMTemplate) => goldenImages.some(img =>
+    img.shared && img.namespace === t.golden_image_namespace && img.name === t.golden_image_name
+  );
+
   // Get unique project namespaces from templates
   const templateProjects = [...new Set(templates.map(t => t.golden_image_namespace).filter(Boolean))];
   
@@ -75,7 +79,7 @@ export function VMTemplates() {
       t.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       (t.description || '').toLowerCase().includes(searchQuery.toLowerCase());
     const matchesProject = selectedNamespace
-      ? t.golden_image_namespace === selectedNamespace
+      ? t.golden_image_namespace === selectedNamespace || isShared(t)
       : filterProject === 'all' || t.golden_image_namespace === filterProject;
     return matchesSearch && matchesProject;
   });
@@ -356,7 +360,10 @@ export function VMTemplates() {
       {createVMTemplate && (
         <CreateVMWizard
           projects={projects.map(p => ({ name: p.name, display_name: p.display_name }))}
-          defaultProject={createVMTemplate.golden_image_namespace}
+          // A shared template's image namespace is not where the VM goes.
+          defaultProject={isShared(createVMTemplate)
+            ? selectedNamespace || projects[0]?.name
+            : createVMTemplate.golden_image_namespace}
           defaultTemplate={createVMTemplate}
           onClose={() => setCreateVMTemplate(null)}
           onSuccess={() => setCreateVMTemplate(null)}

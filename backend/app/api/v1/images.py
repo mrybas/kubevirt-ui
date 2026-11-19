@@ -22,7 +22,9 @@ from app.api.v1.images_catalog import (
 # (a namespace in a query string is not an authorisation); importing it keeps
 # a second copy from drifting away from that one.
 from app.api.v1.storage import require_namespace_access
+from app.config import get_settings
 from app.core.auth import User, require_auth
+from app.core.groups import get_user_namespaces
 from app.core.errors import (
     validate_harbor_project,
     validate_k8s_name,
@@ -106,6 +108,63 @@ async def _resolve_folder_ancestors(k8s_client, folder_name: str) -> list[str]:
     return chain
 
 
+async def _list_data_sources(custom_api: Any, namespace: str) -> list[dict[str, Any]]:
+    try:
+        result = await custom_api.list_namespaced_custom_object(
+            group="cdi.kubevirt.io", version="v1beta1",
+            namespace=namespace, plural="datasources",
+        )
+    except ApiException as e:
+        logger.warning(f"Failed to list DataSources in {namespace}: {e}")
+        return []
+    return result.get("items", [])
+
+
+def _data_source_target(ds: dict[str, Any], namespace: str) -> tuple[str, str]:
+    pvc = ds.get("spec", {}).get("source", {}).get("pvc") or {}
+    return pvc.get("namespace", namespace), pvc.get("name", "")
+
+
+def _data_source_images(
+    namespace: str,
+    sources: list[dict[str, Any]],
+    image_usage: dict[str, list[str]],
+    sizes: dict[tuple[str, str], str],
+) -> list[GoldenImage]:
+    """DataSources in a shared namespace, as images.
+
+    A DataSource is the stable name for an image whose volume is replaced on
+    update (a DataImportCron's imports, or a versioned DataVolume), so the image
+    is listed under the DataSource with the size of the volume it points at.
+    """
+    rows = []
+    for ds in sources:
+        metadata = ds.get("metadata", {})
+        annotations = metadata.get("annotations", {})
+        labels = metadata.get("labels", {})
+        name = metadata.get("name")
+        ready = any(
+            c.get("type") == "Ready" and c.get("status") == "True"
+            for c in ds.get("status", {}).get("conditions", [])
+        )
+        used_by = image_usage.get(f"{namespace}/{name}")
+        rows.append(GoldenImage(
+            name=name,
+            namespace=namespace,
+            display_name=annotations.get("kubevirt-ui.io/display-name", name),
+            description=annotations.get("kubevirt-ui.io/description"),
+            os_type=labels.get("kubevirt-ui.io/os-type"),
+            os_version=labels.get("kubevirt-ui.io/os-version"),
+            size=sizes.get(_data_source_target(ds, namespace)),
+            status=("InUse" if used_by else "Ready") if ready else "Pending",
+            source_url=f"datasource:{namespace}/{name}",
+            created=metadata.get("creationTimestamp"),
+            used_by=used_by or None,
+            shared=True,
+        ))
+    return rows
+
+
 @images_router.get("", response_model=GoldenImageListResponse)
 async def list_golden_images(
     request: Request,
@@ -135,9 +194,11 @@ async def list_golden_images(
     
     images = []
     namespaces_to_check = set()
+    shared = set(get_settings().shared_image_namespaces_list)
     
     # If a specific namespace is provided, check it + sibling/ancestor namespaces
     if namespace:
+        await require_namespace_access(request, user, namespace)
         namespaces_to_check.add(namespace)
         try:
             ns_obj = await k8s_client.core_api.read_namespace(namespace)
@@ -168,16 +229,14 @@ async def list_golden_images(
         except Exception as e:
             logger.debug(f"Could not resolve sibling/ancestor namespaces: {e}")
     else:
-        # Get all project namespaces (with kubevirt-ui.io/enabled=true label)
+        # Every enabled namespace the caller has a binding in; admins get all.
         try:
-            ns_list = await k8s_client.list_namespaces(
-                label_selector="kubevirt-ui.io/enabled=true"
-            )
-            for ns in ns_list:
-                namespaces_to_check.add(ns["name"])
+            namespaces_to_check.update(await get_user_namespaces(k8s_client, user))
         except Exception as e:
             logger.warning(f"Failed to list project namespaces: {e}")
     
+    namespaces_to_check |= shared
+
     if not namespaces_to_check:
         # `catalog_available` defaults to True, so returning the bare response
         # here asserted that the catalogue was complete while Harbor had not
@@ -193,6 +252,13 @@ async def list_golden_images(
         return GoldenImageListResponse(items=[], total=0, catalog_available=False)
     
     try:
+        shared_sources = {ns: await _list_data_sources(custom_api, ns) for ns in sorted(shared)}
+        # Volumes a DataSource points at are listed under the DataSource.
+        behind_a_source = {
+            _data_source_target(ds, ns) for ns, items in shared_sources.items() for ds in items
+        }
+        source_sizes: dict[tuple[str, str], str] = {}
+
         # Pre-fetch namespace labels for project/environment resolution
         ns_labels_map: dict[str, dict[str, str]] = {}
         for ns in namespaces_to_check:
@@ -230,9 +296,11 @@ async def list_golden_images(
                     vm_full_name = f"{ns}/{vm_name}"
                     # Trace source golden image from this cloned DV
                     source = dv.get("spec", {}).get("source", {})
-                    if "pvc" in source:
-                        src_ns = source["pvc"].get("namespace", ns)
-                        src_name = source["pvc"].get("name")
+                    source_ref = dv.get("spec", {}).get("sourceRef", {})
+                    if "pvc" in source or source_ref.get("kind") == "DataSource":
+                        src = source.get("pvc") or source_ref
+                        src_ns = src.get("namespace", ns)
+                        src_name = src.get("name")
                         if src_name:
                             key = f"{src_ns}/{src_name}"
                             if key not in image_usage:
@@ -256,9 +324,11 @@ async def list_golden_images(
                     dv_templates = vm.get("spec", {}).get("dataVolumeTemplates", [])
                     for dv_template in dv_templates:
                         source = dv_template.get("spec", {}).get("source", {})
-                        if "pvc" in source:
-                            source_ns = source["pvc"].get("namespace", vm_ns)
-                            source_name = source["pvc"].get("name")
+                        source_ref = dv_template.get("spec", {}).get("sourceRef", {})
+                        if "pvc" in source or source_ref.get("kind") == "DataSource":
+                            src = source.get("pvc") or source_ref
+                            source_ns = src.get("namespace", vm_ns)
+                            source_name = src.get("name")
                             if source_name:
                                 key = f"{source_ns}/{source_name}"
                                 if key not in image_usage:
@@ -321,6 +391,10 @@ async def list_golden_images(
                     # Skip DataVolumes marked as VM disks (backup filter)
                     if labels.get("kubevirt-ui.io/vm-disk") == "true":
                         continue
+
+                    # A DataImportCron's imports are listed through its DataSource.
+                    if dv_ns in shared and "cdi.kubevirt.io/dataImportCron" in labels:
+                        continue
                     
                     # Determine source URL/type
                     source = spec.get("source", {})
@@ -337,6 +411,9 @@ async def list_golden_images(
                     # Get size from PVC spec
                     pvc_spec = spec.get("pvc", spec.get("storage", {}))
                     size = pvc_spec.get("resources", {}).get("requests", {}).get("storage", "Unknown")
+                    if (dv_ns, dv_name) in behind_a_source:
+                        source_sizes[(dv_ns, dv_name)] = size
+                        continue
                     
                     # Determine status: Pending, Ready, Error, or InUse
                     phase = status_obj.get("phase", "Unknown")
@@ -393,7 +470,10 @@ async def list_golden_images(
                     
                     # When filtering by namespace: skip images from sibling namespaces
                     # unless they are project-scoped or folder-scoped
-                    if namespace and dv_ns != namespace and dv_scope not in ("project", "folder"):
+                    if (
+                        namespace and dv_ns != namespace and dv_ns not in shared
+                        and dv_scope not in ("project", "folder")
+                    ):
                         continue
                     
                     images.append(GoldenImage(
@@ -415,10 +495,14 @@ async def list_golden_images(
                         scope=dv_scope,
                         project=resolved_project,
                         environment=resolved_env,
+                        shared=dv_ns in shared,
                     ))
             except ApiException as e:
                 logger.warning(f"Failed to list DataVolumes in {ns}: {e}")
                 continue
+
+        for ns, items in shared_sources.items():
+            images.extend(_data_source_images(ns, items, image_usage, source_sizes))
         
         # And the ones that were asked for but not built.
         #

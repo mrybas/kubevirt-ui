@@ -1517,6 +1517,24 @@ async def _label_secret_owner(
         logger.warning(f"Could not tie secret {secret_name} to VM {vm_name}: {e}")
 
 
+async def _clone_source(custom_api: Any, namespace: str, name: str) -> dict[str, Any]:
+    """The DataVolume spec fields that clone the template's image.
+
+    A DataSource is cloned by reference, so CDI follows it to its current PVC
+    (a DataImportCron moves it with every import); anything else is a PVC.
+    """
+    try:
+        await custom_api.get_namespaced_custom_object(
+            group="cdi.kubevirt.io", version="v1beta1",
+            namespace=namespace, plural="datasources", name=name,
+        )
+    except ApiException as e:
+        if e.status != 404:
+            raise
+        return {"source": {"pvc": {"name": name, "namespace": namespace}}}
+    return {"sourceRef": {"kind": "DataSource", "name": name, "namespace": namespace}}
+
+
 @router.post("/from-template", response_model=VMResponse, status_code=status.HTTP_201_CREATED)
 async def create_vm_from_template(
     request: Request,
@@ -1610,6 +1628,8 @@ async def create_vm_from_template(
         # DV → VM ownership is set automatically by KubeVirt via ownerReferences
         # when using dataVolumeTemplates — no client-side label is needed to track
         # which VM owns the DV.
+        custom_api = client.CustomObjectsApi(k8s_client._api_client)
+
         dv_template = {
             "metadata": {
                 "name": disk_name,
@@ -1619,17 +1639,10 @@ async def create_vm_from_template(
                 },
             },
             "spec": {
-                "source": {
-                    "pvc": {
-                        "name": golden_image_name,
-                        "namespace": golden_image_namespace,
-                    }
-                },
+                **await _clone_source(custom_api, golden_image_namespace, golden_image_name),
                 "storage": dv_storage,
             },
         }
-        
-        custom_api = client.CustomObjectsApi(k8s_client._api_client)
         
         # 4. Build cloud-init
         cloud_init_data = None

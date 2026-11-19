@@ -94,6 +94,7 @@ export interface GoldenImage {
   scope: ImageScope;  // environment (single ns) or project (all envs)
   project?: string;  // Project name (for project-scoped images)
   environment?: string;  // Environment name (from namespace label)
+  shared?: boolean;  // In a shared image namespace: usable from every namespace
   // Where this row came from. "cluster" is a DataVolume that exists; "catalog"
   // is a Harbor artifact that has not been materialised into a disk yet.
   // Optional here (the backend always sends it, defaulting to "cluster") so

@@ -151,6 +151,8 @@ class VMImage(BaseModel):
     scope: str = "environment"  # "environment" (single ns) or "project" (all envs)
     project: str | None = None  # Project name (set for project-scoped images)
     environment: str | None = None  # Environment name (from namespace label)
+    # In one of SHARED_IMAGE_NAMESPACES: usable from every namespace.
+    shared: bool = False
     # Where this row came from. "cluster" is a DataVolume that exists; "catalog"
     # is a Harbor artifact that has not been materialised yet.
     origin: str = "cluster"

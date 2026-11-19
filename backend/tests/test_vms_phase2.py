@@ -13,6 +13,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
+from kubernetes_asyncio.client import ApiException
 
 
 def _vm(
@@ -326,6 +327,8 @@ def test_create_vm_from_template_uses_generate_name(
     ):
         api = MagicMock()
         api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
+        # The template image is a PVC, not a DataSource.
+        api.get_namespaced_custom_object = AsyncMock(side_effect=ApiException(status=404))
         api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
         api.patch_namespaced_custom_object = patch_mock
         api_cls.return_value = api
@@ -432,6 +435,8 @@ def test_create_vm_from_template_halted_when_start_false(
     ):
         api = MagicMock()
         api.list_cluster_custom_object = AsyncMock(return_value={"items": []})
+        # The template image is a PVC, not a DataSource.
+        api.get_namespaced_custom_object = AsyncMock(side_effect=ApiException(status=404))
         api.create_namespaced_custom_object = AsyncMock(side_effect=_create)
         api_cls.return_value = api
 

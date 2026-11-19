@@ -47,6 +47,14 @@ class Settings(BaseSettings):
     # unreachable for everybody.
     admin_users: str = ""
 
+    # Images every user may build VMs from (SHARED_IMAGE_NAMESPACES). virt-controller clones as the
+    # VM's ServiceAccount (`default`), which needs `create datavolumes/source` in these namespaces.
+    shared_image_namespaces: str = ""
+
+    @property
+    def shared_image_namespaces_list(self) -> list[str]:
+        return [n.strip() for n in self.shared_image_namespaces.split(",") if n.strip()]
+
     @property
     def admin_groups_list(self) -> list[str]:
         return [g.strip() for g in self.admin_groups.split(",") if g.strip()]
